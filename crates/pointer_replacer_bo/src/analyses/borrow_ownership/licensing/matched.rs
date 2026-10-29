@@ -935,6 +935,94 @@ fn affected_by(
         .collect()
 }
 
+/// Relay main/387: a lineage-free (scope, seed, destination) triple, owned.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Triple(Scope, SeedKey, TripleDestination);
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum TripleDestination {
+    Port(Node),
+    Terminal(TerminalTarget),
+}
+
+impl Triple {
+    fn of(row: &Relation) -> Self {
+        let (scope, seed, output, _) = key_without_lineage(row);
+        let output = match output {
+            DestinationKey::Port(node) => TripleDestination::Port(node),
+            DestinationKey::Terminal(target) => TripleDestination::Terminal(target.clone()),
+        };
+        Self(scope.clone(), seed, output)
+    }
+}
+
+/// Relay main/387 (R1343-1, form (2)): the guard budget over the fixpoint's rows. Each triple keeps
+/// its distinct exact guard sets while they are at most the budget; the one past it -- or a marker
+/// row reaching the triple through a call -- collapses the triple to ONE marker row (the arriving
+/// row with its guards summarized and no proof), and a summarized triple absorbs every later row.
+/// A collapse removes rows and adds none past the marker, so the fixpoint terminates as before.
+struct GuardBudget {
+    budget: usize,
+    sets: BTreeMap<Triple, BTreeSet<GuardSet>>,
+    summarized: BTreeSet<Triple>,
+}
+
+impl GuardBudget {
+    fn new() -> Self {
+        Self {
+            budget: guard_budget(),
+            sets: BTreeMap::new(),
+            summarized: BTreeSet::new(),
+        }
+    }
+
+    /// The round's `added` rows that enter the relations: a summarized triple's absorbed, the
+    /// collapsing triples' exact rows (this round's and the relations' own) replaced by their
+    /// marker.
+    fn admit(
+        &mut self,
+        relations: &mut BTreeMap<Relation, Vec<Step>>,
+        added: Vec<(Relation, Vec<Step>)>,
+    ) -> Vec<(Relation, Vec<Step>)> {
+        let mut kept = Vec::with_capacity(added.len());
+        let mut collapsed = BTreeSet::new();
+        for (row, proof) in added {
+            let triple = Triple::of(&row);
+            if self.summarized.contains(&triple) {
+                continue;
+            }
+            let over = row.guards.is_summarized() || {
+                let sets = self.sets.entry(triple.clone()).or_default();
+                sets.insert(row.guards.clone());
+                sets.len() > self.budget
+            };
+            if over {
+                self.sets.remove(&triple);
+                self.summarized.insert(triple.clone());
+                collapsed.insert(triple);
+                let marker = Relation {
+                    guards: GuardSet::Summarized,
+                    ..row
+                };
+                kept.push((marker, Vec::new()));
+            } else {
+                kept.push((row, proof));
+            }
+        }
+        if !collapsed.is_empty() {
+            let scopes: BTreeSet<Scope> = collapsed.iter().map(|triple| triple.0.clone()).collect();
+            let exact_of_collapsed = |row: &Relation| {
+                !row.guards.is_summarized()
+                    && scopes.contains(&row.scope)
+                    && collapsed.contains(&Triple::of(row))
+            };
+            relations.retain(|row, _| !exact_of_collapsed(row));
+            kept.retain(|(row, _)| !exact_of_collapsed(row));
+        }
+        kept
+    }
+}
+
 /// **Relay main/379 (`matched`, step 1).** In tests, the old whole-collection scans the indexes
 /// replaced, for an equality witness; always `false` outside tests.
 pub(crate) fn reference_scans() -> bool {
@@ -2405,6 +2493,7 @@ impl MatchedTransport {
         }
         let mut functions: BTreeMap<Scope, Function> = BTreeMap::new();
         let mut affected: Option<BTreeSet<Scope>> = None;
+        let mut budget = GuardBudget::new();
         let mut round = 0usize;
         loop {
             round += 1;
@@ -2522,8 +2611,15 @@ impl MatchedTransport {
                     }
                 }
             }
+            // Relay main/387: the guard budget, before the round's rows enter -- on the 17 and the
+            // 376 no triple passes it, so `added` is unchanged there.
+            let added = budget.admit(&mut relations, added);
             crate::phase_log::sub("matched:round", "end", || {
-                round_sizes(round, &relations, &added)
+                format!(
+                    "{} summarized_triples={}",
+                    round_sizes(round, &relations, &added),
+                    budget.summarized.len()
+                )
             });
             if added.is_empty() {
                 // Relay main/385: the fixpoint's end, where the key-closure probe is stopped.
