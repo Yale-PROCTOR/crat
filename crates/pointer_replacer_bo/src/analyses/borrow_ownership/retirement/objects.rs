@@ -95,6 +95,11 @@ type Snapshot = FxHashMap<(Local, u8), ObjectSet>;
 #[derive(Default)]
 pub(crate) struct ObjectFacts {
     snapshots: FxHashMap<(LocalDefId, Location), Snapshot>,
+    /// Relay main/388 stage 3 (B) (`field_cells`): the pointers a function stored in fields of its
+    /// known objects, at the points where it holds any, and the points reached with nothing written
+    /// behind a pointer since its entry.
+    cells: FxHashMap<(LocalDefId, Location), super::field_cells::Cells>,
+    pristine: FxHashSet<(LocalDefId, Location)>,
 }
 
 fn snapshot(state: &State) -> Snapshot {
@@ -665,8 +670,33 @@ impl ObjectFacts {
                     snapshot(&state),
                 );
             }
+            let (cells, pristine) = super::field_cells::analyze(program, function, &body, &facts);
+            facts.cells.extend(
+                cells
+                    .into_iter()
+                    .map(|(location, cells)| ((function, location), cells)),
+            );
+            facts
+                .pristine
+                .extend(pristine.into_iter().map(|location| (function, location)));
         }
         facts
+    }
+
+    /// Stage 3 (B): what `function` stored in the field `key` names, at `location`, if it holds it.
+    pub(crate) fn field_cell(
+        &self,
+        function: LocalDefId,
+        location: Location,
+        key: &super::field_cells::CellKey,
+    ) -> Option<&ObjectSet> {
+        self.cells.get(&(function, location))?.get(key)
+    }
+
+    /// Stage 3 (B): whether nothing has written behind a pointer between `function`'s entry and
+    /// `location`, on every path.
+    pub(crate) fn pristine_at(&self, function: LocalDefId, location: Location) -> bool {
+        self.pristine.contains(&(function, location))
     }
 
     pub(crate) fn pointer_at(

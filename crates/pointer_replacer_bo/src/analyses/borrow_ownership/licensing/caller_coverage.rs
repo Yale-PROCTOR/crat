@@ -288,7 +288,7 @@ fn names_no_function(
         })
 }
 
-fn carries_pointer<'tcx>(
+pub(crate) fn carries_pointer<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     ty: rustc_middle::ty::Ty<'tcx>,
     seen: &mut rustc_hash::FxHashSet<rustc_hir::def_id::DefId>,

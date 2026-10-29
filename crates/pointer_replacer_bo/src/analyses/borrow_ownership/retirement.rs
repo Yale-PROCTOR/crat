@@ -28,6 +28,7 @@ use crate::{
 
 pub(crate) mod call_reach;
 pub(crate) mod discharge;
+mod field_cells;
 pub(crate) mod field_objects;
 pub(crate) mod inner_loan;
 pub(crate) mod local_outcome;
@@ -1436,3 +1437,6 @@ mod tests_out_params;
 
 #[cfg(test)]
 mod tests_directed_closure;
+
+#[cfg(test)]
+mod tests_release_summaries;

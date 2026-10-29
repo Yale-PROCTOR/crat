@@ -208,7 +208,26 @@ fn substitute(
             ObjectRoot::Stack { .. } => {
                 output.roots.insert(*root);
             }
-            // A field root's base names objects of THIS frame, and
+            // Stage 3 (B): what field `field` of the callee's formal held at the release, named
+            // by the caller's own store, when both are proven (`field_cells`).
+            ObjectRoot::Field {
+                base:
+                    super::field_objects::FieldBase::Input {
+                        function,
+                        parameter,
+                        depth,
+                    },
+                field,
+            } if function == step.callee => {
+                match resolve_field(program, row, step, metadata, facts, parameter, depth, field) {
+                    Some(objects) => {
+                        output.unknown |= objects.unknown;
+                        output.roots.extend(objects.roots.iter().copied());
+                    }
+                    None => output.unknown = true,
+                }
+            }
+            // Any other field root's base names objects of THIS frame, and
             // there is no rebasing rule for it. Fail closed rather than let
             // field identity cross a frame unrebased.
             ObjectRoot::Field { .. } => {
@@ -220,6 +239,48 @@ fn substitute(
         uncertainty.get_or_insert(RouteReason::UnknownObject);
     }
     (output, uncertainty)
+}
+
+/// Relay main/388 stage 3 (B): the callee freed what field `field` of its formal `parameter`'s object
+/// (at `depth`) held at the release. When the callee wrote nothing behind a pointer between its
+/// entry and the release (`pristine_at`), that is the content at the call, and the caller's cell for
+/// (the argument's one object, the formal's struct, `field`) names it. `None` -- Unknown, as before
+/// -- otherwise.
+#[allow(clippy::too_many_arguments)]
+fn resolve_field(
+    program: &RustProgram<'_>,
+    row: &FrameEvent,
+    step: RouteStep,
+    metadata: &SourceCallRoute,
+    facts: &ObjectFacts,
+    parameter: rustc_middle::mir::Local,
+    depth: u8,
+    field: u32,
+) -> Option<ObjectSet> {
+    if !facts.pristine_at(step.callee, row.location) {
+        return None;
+    }
+    let argument = parameter
+        .as_usize()
+        .checked_sub(1)
+        .and_then(|index| metadata.arguments.get(index))
+        .and_then(Option::as_ref)?;
+    let root =
+        super::field_cells::single(&facts.pointer_at(step.caller, step.location, argument, depth))?;
+    let adt = {
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(step.callee)
+            .borrow();
+        super::field_cells::pointee_struct(program.tcx, body.local_decls.get(parameter)?.ty, depth)?
+    };
+    facts
+        .field_cell(
+            step.caller,
+            step.location,
+            &super::field_cells::CellKey { root, adt, field },
+        )
+        .cloned()
 }
 
 pub(crate) fn expand(

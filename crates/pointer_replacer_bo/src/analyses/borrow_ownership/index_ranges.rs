@@ -3871,7 +3871,7 @@ impl FnFacts {
 
 /// The blocks on a cycle of the control flow: in a strongly connected
 /// component of more than one block, or with an edge to themselves.
-fn cyclic_blocks(body: &Body<'_>) -> FxHashSet<BasicBlock> {
+pub(crate) fn cyclic_blocks(body: &Body<'_>) -> FxHashSet<BasicBlock> {
     let mut graph = petgraph::graph::DiGraph::<BasicBlock, ()>::new();
     let nodes: Vec<_> = body
         .basic_blocks
