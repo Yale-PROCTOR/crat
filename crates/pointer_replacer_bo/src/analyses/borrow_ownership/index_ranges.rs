@@ -47,7 +47,12 @@
 //! recursive callee). A store to the holder in the body only replaces what
 //! the field holds, and every value stored into it carries the whole path in
 //! its own footprint. The escape walk keeps such a store (by a local of the
-//! base's family, onto a bounded path) from counting as the base's escape.
+//! base's family, its reach bounded) from counting as the base's escape. The
+//! holder then *carries* the base: the value kept in it is reached wherever
+//! the holder goes (a call handed `&holder`, a load out of it), and the
+//! engine checks none of those points against the base's loans. So a loan
+//! is discharged only when the reach of every carried value that is not of
+//! its own issuer's chain stays off the loan's bytes (whatever the access).
 //! Neither a loaded value nor a holder is ever a base: the discharge takes
 //! only a pointer formal.
 //!
@@ -92,6 +97,8 @@
 //! an unsigned product, or core's unsigned `wrapping_mul`, lies in
 //! `[0, c·hi(y)]` wrapped or not; a signed one is exact under
 //! `§28:index-step-no-wrap`), carried through copies and value-keeping casts.
+//! And a loop head widens only the bounds of the variables its natural loops
+//! assign, so an outer counter keeps its test's bound inside an inner loop.
 //!
 //! **The discharge** (`borrow_engine/invalidates.rs`, `check_access_for_conflict`,
 //! in the direct and the routed check): an invalidation `(access, loan)` that
@@ -423,8 +430,7 @@ fn instantiate_bound(b: Bound, actual: &dyn Fn(u32) -> Option<Bound>) -> Option<
     }
 }
 
-/// The most byte ranges a path keeps apart; past it they are merged, and then
-/// one hull.
+/// The most byte ranges a path keeps apart; past it they are one hull.
 const MAX_TOUCHED: usize = 64;
 
 /// E1, what a pointer's object gives out of the pointers stored in it, one
@@ -462,36 +468,23 @@ impl Path {
         if self.touched.len() <= MAX_TOUCHED {
             return;
         }
-        let mut constant: Vec<(i64, i64)> = Vec::new();
-        let mut rest = Vec::new();
-        for range in self.touched.drain(..) {
-            match range.and_then(|(lo, hi)| Some((lo.as_constant()?, hi.as_constant()?))) {
-                Some(range) => constant.push(range),
-                None => rest.push(range),
+        // Past the limit: one hull of them all, or none when any is unbounded.
+        let constant: Option<Vec<(i64, i64)>> = self
+            .touched
+            .iter()
+            .map(|range| range.and_then(|(lo, hi)| Some((lo.as_constant()?, hi.as_constant()?))))
+            .collect();
+        match constant {
+            Some(ranges) => {
+                let lo = ranges.iter().map(|range| range.0).min().unwrap_or(0);
+                let hi = ranges.iter().map(|range| range.1).max().unwrap_or(0);
+                self.touched = vec![Some((Bound::constant(lo), Bound::constant(hi)))];
             }
-        }
-        constant.sort();
-        let mut merged: Vec<(i64, i64)> = Vec::new();
-        for (lo, hi) in constant {
-            match merged.last_mut() {
-                Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
-                _ => merged.push((lo, hi)),
-            }
-        }
-        rest.dedup();
-        if merged.len() + rest.len() > MAX_TOUCHED {
-            if !rest.is_empty() {
+            None => {
+                self.touched.clear();
                 self.stop("touched");
             }
-            if let (Some(first), Some(last)) = (merged.first(), merged.last()) {
-                merged = vec![(first.0, last.1)];
-            }
         }
-        self.touched = merged
-            .into_iter()
-            .map(|(lo, hi)| Some((Bound::constant(lo), Bound::constant(hi))))
-            .chain(rest)
-            .collect();
     }
 
     /// The path of the pointer stored at `[off, off + size)`.
@@ -719,6 +712,10 @@ struct FnFacts {
     /// The paths of the pointer formals, by argument index (moved into the
     /// table).
     paths: FxHashMap<u32, Path>,
+    /// By base: each local of the base's family stored into a holder's field,
+    /// with the stored value's footprint relative to the base (its flow), the
+    /// reach of the holder wherever it goes.
+    carriers: FxHashMap<Local, Vec<(Local, Footprint)>>,
     /// The bases some use of which escapes the body: stored, returned,
     /// handed where the walk cannot follow, or a pointer read out of it. A
     /// copy so retained may reach the base behind every footprint's back, so
@@ -866,6 +863,21 @@ impl IndexRanges {
             return None;
         }
         let loan_bytes = loan_fp.constant()?;
+        // E1: a value of the base kept in a holder is reached wherever the
+        // holder goes (a call handed `&holder`, a load out of it), points the
+        // engine never checks against the base's loans (the reviewer's
+        // blocker). The loan is clear only when every such value not of its
+        // own issuer's chain stays off its bytes.
+        for (stored, carried) in facts.carriers.get(&loan_root).into_iter().flatten() {
+            if descends(body, &facts.shape, *stored, issuer) {
+                continue;
+            }
+            match (carried.constant(), loan_bytes) {
+                (Some(None), _) | (_, None) => {}
+                (Some(Some((c_lo, c_hi))), Some((l_lo, l_hi))) if c_hi <= l_lo || l_hi <= c_lo => {}
+                _ => return None,
+            }
+        }
         let access_bytes = access_fp.constant()?;
         if let (Some((a_lo, a_hi)), Some((b_lo, b_hi))) = (loan_bytes, access_bytes)
             && !(a_hi <= b_lo || b_hi <= a_lo)
@@ -1203,15 +1215,24 @@ impl Dbm {
         }
     }
 
-    /// The standard widening: a bound that grew is dropped.
-    fn widen(&self, newer: &Dbm) -> Dbm {
+    /// The standard widening on the bounds that involve a variable of
+    /// `only` (every bound when `None`): one that grew is dropped; the others
+    /// join (`newer` is the join).
+    fn widen(&self, newer: &Dbm, only: Option<&FxHashSet<usize>>) -> Dbm {
+        let n = self.n;
         Dbm {
-            n: self.n,
+            n,
             m: self
                 .m
                 .iter()
                 .zip(&newer.m)
-                .map(|(old, new)| if new > old { INF } else { *old })
+                .enumerate()
+                .map(|(index, (old, new))| {
+                    let widened = only.is_none_or(|vars| {
+                        vars.contains(&(index / n)) || vars.contains(&(index % n))
+                    });
+                    if widened && new > old { INF } else { *new }
+                })
                 .collect(),
         }
     }
@@ -1242,11 +1263,13 @@ struct IState {
 }
 
 impl IState {
-    fn join(&self, other: &IState, widen: bool) -> IState {
-        let dbm = if widen {
-            self.dbm.widen(&self.dbm.join(&other.dbm))
-        } else {
-            self.dbm.join(&other.dbm)
+    /// The join; at a loop head `widen` names what widens (`Some(None)`:
+    /// every bound).
+    fn join(&self, other: &IState, widen: Option<Option<&FxHashSet<usize>>>) -> IState {
+        let joined = self.dbm.join(&other.dbm);
+        let dbm = match widen {
+            Some(only) => self.dbm.widen(&joined, only),
+            None => joined,
         };
         IState {
             dbm,
@@ -1511,6 +1534,32 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
         }
     }
 
+    /// The tracked variables the blocks assign (a whole-local write, a call's
+    /// destination, a storage marker).
+    fn assigned_in(&self, blocks: &FxHashSet<BasicBlock>) -> Vec<usize> {
+        let mut vars = Vec::new();
+        for block in blocks {
+            let data = &self.body.basic_blocks[*block];
+            for statement in &data.statements {
+                let local = match &statement.kind {
+                    StatementKind::Assign(box (place, _)) => place.as_local(),
+                    StatementKind::SetDiscriminant { place, .. } | StatementKind::Deinit(place) => {
+                        place.as_local()
+                    }
+                    StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+                        Some(*local)
+                    }
+                    _ => None,
+                };
+                vars.extend(local.and_then(|local| self.var(local)));
+            }
+            if let TerminatorKind::Call { destination, .. } = &data.terminator().kind {
+                vars.extend(destination.as_local().and_then(|local| self.var(local)));
+            }
+        }
+        vars
+    }
+
     /// The fixpoint, then one recording pass over the converged states.
     fn run(&self) -> FxHashMap<(Location, Local), IntRange> {
         let mut recorded = FxHashMap::default();
@@ -1531,10 +1580,39 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
             order[block.index()] = index;
         }
         let mut head = vec![false; blocks];
+        // At a head, only the bounds of the variables its natural loops assign
+        // widen (stage 2: an outer counter keeps the bound its test gives it
+        // inside an inner loop). Those of the others reach the head only
+        // through the loop's entry, which the enclosing head widens. A
+        // retreating edge into a block that does not dominate its source
+        // (an irreducible loop) widens every bound there.
+        let mut assigned: Vec<Option<FxHashSet<usize>>> = vec![Some(FxHashSet::default()); blocks];
+        let dominators = self.body.basic_blocks.dominators();
+        let predecessors = self.body.basic_blocks.predecessors();
         for (block, data) in self.body.basic_blocks.iter_enumerated() {
             for target in data.terminator().successors() {
-                if order[target.index()] <= order[block.index()] {
-                    head[target.index()] = true;
+                if order[target.index()] > order[block.index()] {
+                    continue;
+                }
+                head[target.index()] = true;
+                if order[block.index()] == usize::MAX || !dominators.dominates(target, block) {
+                    assigned[target.index()] = None;
+                    continue;
+                }
+                // The natural loop: the head and every block reaching the
+                // latch without passing the head.
+                let mut seen = FxHashSet::default();
+                seen.insert(target);
+                let mut stack = vec![block];
+                while let Some(member) = stack.pop() {
+                    if !seen.insert(member) {
+                        continue;
+                    }
+                    stack.extend(predecessors[member].iter().copied());
+                }
+                let vars = self.assigned_in(&seen);
+                if let Some(set) = assigned[target.index()].as_mut() {
+                    set.extend(vars);
                 }
             }
         }
@@ -1562,7 +1640,9 @@ impl<'a, 'tcx> Ints<'a, 'tcx> {
                             continue;
                         }
                         visits[target.index()] += 1;
-                        old.join(&out, head[target.index()] && visits[target.index()] > 2)
+                        let widen = (head[target.index()] && visits[target.index()] > 2)
+                            .then(|| assigned[target.index()].as_ref());
+                        old.join(&out, widen)
                     }
                 };
                 *slot = Some(next);
@@ -3364,6 +3444,13 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
             && (core_pointer_step(self.tcx, &call.func).is_some()
                 || core_slice_buffer(self.tcx, self.body, func))
         {
+            // A step's result is the receiver moved: only a local's own
+            // derivation carries the step (a holder's field would take the
+            // receiver's offset).
+            if destination.as_local().is_none() && core_pointer_step(self.tcx, &call.func).is_some()
+            {
+                return Footprint::Unknown("stored");
+            }
             return self.flow(deriv, destination);
         }
         if k == 0 && core_is_null(self.tcx, &call.func) {
@@ -3463,12 +3550,9 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                     // whose path is bounded is retained only where that path
                     // reaches, and its footprint carries the path.
                     Use::Flow { dest }
-                        if self.derivs.contains_key(&local)
-                            && self.holder_field(dest).is_some_and(|(holder, off, size)| {
-                                !matches!(
-                                    self.holder_path(holder, off, size),
-                                    Footprint::Unknown(_)
-                                )
+                        if self.holder_field(dest).is_some()
+                            && self.derivs.get(&local).is_some_and(|deriv| {
+                                !matches!(self.flow(deriv, dest), Footprint::Unknown(_))
                             }) => {}
                     Use::Flow { dest } => into(dest, &mut work, &mut escaped),
                     Use::Bytes { place, write } => {
@@ -3561,6 +3645,7 @@ impl FnFacts {
         let holder_paths = RefCell::new(FxHashMap::default());
         let escaped: FxHashSet<Local>;
         let mut paths = FxHashMap::default();
+        let mut carriers: FxHashMap<Local, Vec<(Local, Footprint)>> = FxHashMap::default();
         let none = FxHashMap::default();
         let derivs: FxHashMap<Local, Deriv> = {
             let ctx = Ctx {
@@ -3635,6 +3720,27 @@ impl FnFacts {
                 }
             }
             escaped = ctx.escaped_roots();
+            for (local, list) in &uses {
+                let Some(deriv) = derivs.get(local) else {
+                    continue;
+                };
+                if !shape.fixed_formal(deriv.root) {
+                    continue;
+                }
+                for (_, occ) in list {
+                    if let Use::Flow { dest } = &occ.what
+                        && ctx.holder_field(dest).is_some()
+                    {
+                        carriers
+                            .entry(deriv.root)
+                            .or_default()
+                            .push((*local, ctx.flow(deriv, dest)));
+                    }
+                }
+            }
+            for list in carriers.values_mut() {
+                list.sort_by_key(|(local, _)| *local);
+            }
             for k in 0..body.arg_count {
                 let formal = Local::from_usize(k + 1);
                 if derivs
@@ -3653,9 +3759,50 @@ impl FnFacts {
             families,
             holder_paths,
             paths,
+            carriers,
             escaped,
         }
     }
+}
+
+/// Does `x`'s value derive from `issuer`'s, along the one-definition chain
+/// `derive_once` follows (copies, address-keeping casts, `&(*p).f`, a call's
+/// receiver)?
+fn descends(body: &Body<'_>, shape: &Shape, mut x: Local, issuer: Local) -> bool {
+    for _ in 0..256 {
+        if x == issuer {
+            return true;
+        }
+        let Some(location) = shape.only_def(x) else {
+            return false;
+        };
+        x = match at(body, location) {
+            At::Statement(statement) => match &statement.kind {
+                StatementKind::Assign(box (
+                    _,
+                    Rvalue::Use(Operand::Copy(p) | Operand::Move(p))
+                    | Rvalue::CopyForDeref(p)
+                    | Rvalue::Cast(_, Operand::Copy(p) | Operand::Move(p), _),
+                )) if p.projection.is_empty() => p.local,
+                StatementKind::Assign(box (_, Rvalue::Ref(_, _, p) | Rvalue::RawPtr(_, p)))
+                    if p.projection.first() == Some(&PlaceElem::Deref) =>
+                {
+                    p.local
+                }
+                _ => return false,
+            },
+            At::Terminator(terminator) => match &terminator.kind {
+                TerminatorKind::Call { args, .. } => {
+                    match args.first().and_then(|arg| operand_local(&arg.node)) {
+                        Some(receiver) => receiver,
+                        None => return false,
+                    }
+                }
+                _ => return false,
+            },
+        };
+    }
+    false
 }
 
 /// E1's holders: the local structs (never a formal, never a union) a pointer is
@@ -3667,6 +3814,7 @@ fn holders(body: &Body<'_>, shape: &Shape) -> FxHashSet<Local> {
             if let StatementKind::Assign(box (place, _)) = &statement.kind
                 && let [PlaceElem::Field(_, field_ty)] = place.projection[..]
                 && matches!(field_ty.kind(), TyKind::RawPtr(..))
+                && place.local != RETURN_PLACE
                 && !shape.is_formal(place.local)
                 && matches!(body.local_decls[place.local].ty.kind(), TyKind::Adt(def, _) if def.is_struct())
             {

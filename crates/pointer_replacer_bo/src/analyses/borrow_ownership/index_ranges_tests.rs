@@ -997,6 +997,122 @@ fn e5c_w267_b1e_a_second_field_into_the_base_meets() {
     );
 }
 
+/// The review's blocker: `info` carries `sig`, a loan is issued after the
+/// store, and one call is handed both `sig` and `&info`.
+const B1F: &str = r#"
+#![allow(dead_code, unused_mut, unused_variables, unused_assignments)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Info {
+    pub sig: *mut u8,
+    pub leaf: u32,
+}
+unsafe extern "C" fn first(mut p: *mut u8, mut info: *mut Info) {
+    *p.offset(3) = 1 as u8;
+    *((*info).sig).offset(100) = 2 as u8;
+}
+#[no_mangle]
+pub unsafe extern "C" fn sign(mut sig: *mut u8) {
+    let mut info: Info = Info {
+        sig: 0 as *mut u8,
+        leaf: 0 as u32,
+    };
+    info.sig = sig;
+    let mut lo: *mut u8 = sig.offset(100 as isize);
+    first(sig, &mut info);
+    *lo = 1 as u8;
+}
+"#;
+
+/// B1f (the review's blocker): `first` writes `sig[3]` through its first
+/// formal and `sig[100]` through `(*info).sig`; the engine sees the second
+/// route only as `&info`, so the access of `sig` at the call carries the
+/// holder's path, `[100, 101)` meets `lo`'s, and the edge stays.
+#[test]
+fn e5c_w267_b1f_a_holder_handed_beside_the_base_carries_its_path() {
+    assert!(edges(B1F, "sign") > 0, "the edge is there");
+    let (accepted, receipts) = accepts(B1F, "sign");
+    assert!(!accepted, "`sign` is not accepted");
+    with_program(B1F, |program| {
+        let sign = function(program, "sign");
+        let body = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(sign)
+            .borrow();
+        // `sig`'s copies: the stored one, `lo`'s, the argument.
+        let copies = copies_of(&body, Local::from_u32(1));
+        assert_eq!(copies.len(), 3, "{copies:?}");
+        assert!(
+            receipts.iter().all(|receipt| receipt.issuer != copies[1]),
+            "`lo`'s loan is never discharged: {receipts:?}"
+        );
+    });
+}
+
+/// B1g: `gen_leaf` writes the whole `*info`: the field's bytes are written,
+/// Unknown, the edge stays.
+#[test]
+fn e5c_w267_b1g_a_callee_writing_the_whole_holder_is_unknown() {
+    let code = B1.replace(
+        "        i = i.wrapping_add(1);\n    }\n}",
+        "        i = i.wrapping_add(1);\n    }\n    *info = Info {\n        sig: 0 as *mut u8,\n        leaf: 0 as u32,\n        steps: 0 as *mut u32,\n        addr: [0; 8],\n    };\n}",
+    );
+    assert!(code.contains("    *info = Info {"));
+    control(&code, "sign");
+}
+
+/// B1h: `gen_leaf` copies the field's bytes out (`memcpy` from `info`): Unknown,
+/// the edge stays.
+#[test]
+fn e5c_w267_b1h_a_copy_of_the_field_bytes_is_unknown() {
+    let code = B1.replace(
+        "        i = i.wrapping_add(1);\n    }\n}",
+        "        i = i.wrapping_add(1);\n    }\n    memcpy(dest as *mut core::ffi::c_void, info as *const core::ffi::c_void, 8 as core::ffi::c_ulong);\n}",
+    );
+    assert!(code.contains("info as *const core::ffi::c_void, 8"));
+    control(&code, "sign");
+}
+
+/// B1i: `&mut info.sig` handed to a callee that writes through it: Unknown,
+/// the edge stays.
+#[test]
+fn e5c_w267_b1i_the_field_address_written_by_a_callee_is_unknown() {
+    let code = B1.replace(
+        "    info.leaf = 7 as u32;",
+        "    info.leaf = 7 as u32;\n    reset(&mut info.sig);",
+    ) + "unsafe extern \"C\" fn reset(mut p: *mut *mut u8) {\n    *p = 0 as *mut u8;\n}\n";
+    assert!(code.contains("reset(&mut info.sig);"));
+    control(&code, "sign");
+}
+
+/// B1j: the holder's address kept in a global: Unknown, the edge stays.
+#[test]
+fn e5c_w267_b1j_a_holder_address_kept_in_a_global_is_unknown() {
+    let code = B1.replace(
+        "    info.leaf = 7 as u32;",
+        "    info.leaf = 7 as u32;\n    KEPT = &mut info;",
+    ) + "pub static mut KEPT: *mut Info = 0 as *mut Info;\n";
+    assert!(code.contains("KEPT = &mut info;"));
+    control(&code, "sign");
+}
+
+/// B1k: the value stored at an offset that is a formal: its reach is not
+/// constant, the edge stays.
+#[test]
+fn e5c_w267_b1k_a_stored_value_at_a_formal_offset_is_unknown() {
+    let code = B1
+        .replace(
+            "pub unsafe extern \"C\" fn sign(mut sig: *mut u8) {",
+            "pub unsafe extern \"C\" fn sign(mut sig: *mut u8, k: isize) {",
+        )
+        .replace(
+            "    info.sig = sig as *mut u8;",
+            "    info.sig = sig.offset(k);",
+        );
+    assert!(code.contains("info.sig = sig.offset(k);"));
+    control(&code, "sign");
+}
+
 // ---------------------------------------------------------------------------
 // The domain.
 // ---------------------------------------------------------------------------
@@ -1049,6 +1165,66 @@ fn e5c_w267_d2_wrapping_add_and_const_items_and_instantiation() {
         );
         let Footprint::Bytes(tail) = tail else { unreachable!() };
         assert!(tail.summaries.contains(&(fill, 0)));
+    });
+}
+
+/// The product's range: an unsigned `wrapping_mul` by 16 of `i ≤ 34` reaches
+/// `[0, 560)`; a signed one may wrap (defined, no premise), so it is Unknown.
+#[test]
+fn e5c_w267_d6_an_unsigned_product_is_bounded_a_signed_wrapping_one_is_not() {
+    const CODE: &str = r#"
+#![allow(dead_code, unused_mut)]
+unsafe extern "C" fn put_u(mut p: *mut u8, i: u32) {
+    if i < 35 as u32 {
+        *p.offset(i.wrapping_mul(16 as u32) as isize) = 0 as u8;
+    }
+}
+unsafe extern "C" fn put_i(mut p: *mut u8, i: i32) {
+    if i >= 0 as i32 && i < 35 as i32 {
+        *p.offset(i.wrapping_mul(16 as i32) as isize) = 0 as u8;
+    }
+}
+"#;
+    with_program(CODE, |program| {
+        let table = IndexRanges::build(program);
+        assert_eq!(
+            bytes(&table.ext(function(program, "put_u"), 0)),
+            Some((Bound::constant(0), Bound::constant(545), true))
+        );
+        assert!(matches!(
+            table.ext(function(program, "put_i"), 0),
+            Footprint::Unknown(_)
+        ));
+    });
+}
+
+/// An outer counter keeps the bound its test gives it inside an inner loop
+/// (005's `SPX_wots_gen_leafx1`, `i` under the `k` loop): only what a loop
+/// assigns widens at its head, so `Ext(put, p)` is `[0, 545)`.
+#[test]
+fn e5c_w267_d7_an_outer_counter_keeps_its_bound_in_an_inner_loop() {
+    const CODE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments)]
+unsafe extern "C" fn put(mut p: *mut u8, n: u32) {
+    let mut i: u32 = 0;
+    let mut k: u32 = 0;
+    i = 0 as u32;
+    while i < 35 as u32 {
+        k = 0 as u32;
+        while k < n {
+            *p.offset(i.wrapping_mul(16 as u32) as isize) = 0 as u8;
+            k = k.wrapping_add(1);
+        }
+        i = i.wrapping_add(1);
+    }
+}
+"#;
+    with_program(CODE, |program| {
+        let table = IndexRanges::build(program);
+        assert_eq!(
+            bytes(&table.ext(function(program, "put"), 0)),
+            Some((Bound::constant(0), Bound::constant(545), true))
+        );
     });
 }
 
