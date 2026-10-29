@@ -1714,9 +1714,19 @@ fn w6v_counted_position_at_a_pair_owned_call_holds_at_plan_time() {
         c.contains("fnlodepng_memcpy(mutdst:*mut::std::ffi::c_void,"),
         "dst holds typed instead of paying at the compile gate: {source}"
     );
+    // Re-pinned for relay main/388 stage 2 (R1351-2): era-5c 269 stage 1 admits
+    // `inflateNoCompression::out` -- its copy lent to `lodepng_memcpy`'s non-retaining
+    // `dst` no longer drags it raw -- so `out` is delivered as a slice and passes ONE raw
+    // view, beside the A5 raw `src` of another subject (`reader.data`). No view sits
+    // beside a raw `out` any more, so nothing routes to the pristine twin.
     assert!(
-        c.contains("__crat_raw_lodepng_memcpy(outas*mut::std::ffi::c_void,"),
-        "the single view beside the raw `out` routes to the pristine twin: {source}"
+        c.contains("fninflateNoCompression(mutout:&mut[u8],"),
+        "`out` is delivered as a slice: {source}"
+    );
+    assert!(
+        c.contains("lodepng_memcpy(out.as_mut_ptr().cast::<core::ffi::c_void>(),")
+            && !c.contains("__crat_raw_lodepng_memcpy("),
+        "the slice passes one raw view to the callee itself, no twin: {source}"
     );
 }
 

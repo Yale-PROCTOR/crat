@@ -117,18 +117,17 @@ fn dependency_edges(
 
 #[test]
 fn wave6o_optional_argument_at_optional_formal_depends_on_the_callee_class() {
-    // Re-pinned under R896-1 (2) (wave-5d 146c; 145c, R892-1): `GetValue(p,
-    // value)` hands the raw local `p = ptr as *mut u8`, a byte view of
-    // `get_value`'s `ptr`, beside the optional formal `value`. `get_value` is
-    // called in the program (no scope fact) and a byte pointee gets no type
-    // relief, so the pair is not shown disjoint: the site gate holds the call
-    // and no seam, hence no dependency edge, is placed there.
+    // Re-pinned for relay main/388 stage 2 (R1351-2): era-5c 269 stage 1 admits
+    // `GetValue::value` (it was raw beside the byte view `p`, R896-1 (2)), so it is
+    // delivered as `Option<&mut binn>` and `GetValue::p` settles raw. The call is no
+    // longer held: `get_value` hands its own optional `value` to the optional formal,
+    // the seam records the interface dependency, and the caller class depends on the
+    // callee's -- the dependency this test is named for.
     let (edge, depends, depends_on) = dependency_edges(ACCESSORS, "get_value", "GetValue");
     assert!(
-        !edge,
-        "the held call places no seam for `value` at the optional formal"
+        edge && depends,
+        "the optional argument at the optional formal depends on the callee class: {depends_on:?}"
     );
-    let _ = (depends, depends_on);
 }
 
 /// The held call's emission (split from the dependency pin above, wave-5d

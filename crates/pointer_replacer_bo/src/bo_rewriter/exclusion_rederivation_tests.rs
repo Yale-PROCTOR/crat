@@ -205,9 +205,18 @@ fn binn_emits_the_prior_deliveries_with_the_candidate_excluded() {
         "{rendered}"
     );
     assert!(rendered.contains("value: Option<&Binn>"), "{rendered}");
+    // Re-pinned for relay main/388 stage 2 (R1351-2), a LOSS, explained: era-5c 269
+    // stage 1 makes the callee's `is_bool_str::pbool` Ref in the model, so the raw
+    // boundary's hypothesis reads that formal safe and plans no bridge for its
+    // callers; the pair rule (R833: `pbool` beside the raw `p`, not shown disjoint)
+    // then holds the formal raw after the plan, and a thin `Option<&mut i32>` takes no
+    // late bridge into a raw formal (relay 122, `ThinOptionalToRaw`). So the caller's
+    // `pbool` is held `into-held-formal:is_bool_str#2` -- fail closed. Recovering it
+    // means planning the raw boundary against the settled holds (a design item, not
+    // built); until then this pins the held form.
     assert!(
-        rendered.contains("mut pbool: Option<&mut i32>"),
-        "the caller's candidate delivers once nothing collides: {rendered}"
+        rendered.contains("binn_get_bool(value: Option<&Binn>, pbool: *mut i32)"),
+        "the caller's `pbool` is held raw behind the held callee formal: {rendered}"
     );
     assert!(
         super::verify::type_checks_str(&rendered),
