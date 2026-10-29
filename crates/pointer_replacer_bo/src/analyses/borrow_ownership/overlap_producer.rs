@@ -1551,6 +1551,18 @@ mod tests {
             let slots = CrateSlots::build(&program);
             let origins = compute_origins(&program);
             let mutability = MutFacts::from_program(&program);
+            // Re-pinned at relay era-5c/269: `two(p, p)` lends two copies of `p` to a callee
+            // that retains neither, so the solve relaxes them (the call arm); the plain
+            // construction compared against it takes the same relaxation sites.
+            let _ranges = super::super::index_ranges::ensure(&program);
+            super::super::copy_relax::install(
+                super::super::construction::analyze_copy_relax_sites(
+                    &program,
+                    &slots,
+                    origins.native_flows(),
+                )
+                .0,
+            );
             let baseline_model = baseline(&program, &slots, &origins, &mutability);
 
             let baseline = solve_bo_overlap_config(
