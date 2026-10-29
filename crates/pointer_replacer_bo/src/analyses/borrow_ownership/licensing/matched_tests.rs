@@ -315,11 +315,15 @@ pub unsafe fn run() { let p = make(); release(p); }
                 meet.terminal.lineage,
                 SourceLineage::Exact(vec![call_key(release)])
             );
-            assert_eq!(meet.guards.get(&source_id), Some(&true));
-            assert_eq!(meet.guards.get(&sink_id), Some(&true));
+            assert_eq!(meet.guards.permissive().get(&source_id), Some(&true));
+            assert_eq!(meet.guards.permissive().get(&sink_id), Some(&true));
             assert!(
                 !transport
-                    .meets_selected(calls[0].1, |key| meet.guards.get(&key).copied())
+                    .meets_selected(calls[0].1, |key| meet
+                        .guards
+                        .permissive()
+                        .get(&key)
+                        .copied())
                     .is_empty()
             );
             assert!(
@@ -328,7 +332,7 @@ pub unsafe fn run() { let p = make(); release(p); }
                         if key == sink_id {
                             Some(false)
                         } else {
-                            meet.guards.get(&key).copied()
+                            meet.guards.permissive().get(&key).copied()
                         }
                     })
                     .is_empty(),

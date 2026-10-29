@@ -82,7 +82,7 @@ pub(crate) fn certify(
         || put_arm.guard == release_arm.guard
         || [put_arm.guard, release_arm.guard]
             .iter()
-            .any(|g| alt.free.guards.get(g) != Some(&true))
+            .any(|g| alt.free.guards.permissive().get(g) != Some(&true))
     {
         return None;
     }
@@ -191,6 +191,7 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
                             field.input_stores[0].applications[0].alternatives[0]
                                 .free
                                 .guards
+                                .permissive()
                                 .get(&guard),
                             Some(&true)
                         );
@@ -209,10 +210,12 @@ pub unsafe fn f(){let owner=make();let mut cell=Cell{ptr:0 as *mut i32};put(&mut
                     corrupt.input_stores[0].applications[0].alternatives[0]
                         .free
                         .guards
+                        .exact_mut()
                         .remove(&proof.release_guard);
                     corrupt.input_stores[0].applications[0].alternatives[0].forwarded_returns[0]
                         .continuation
                         .guards
+                        .exact_mut()
                         .remove(&proof.release_guard);
                     assert!(
                         super::certify(&facts, &corrupt, matched.guard_aliases()).is_none(),

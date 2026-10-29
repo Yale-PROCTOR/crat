@@ -149,6 +149,7 @@ pub unsafe fn run() { let p = malloc(4); free(p); }
             let mut dependencies: Vec<_> = grant
                 .meet
                 .guards
+                .permissive()
                 .iter()
                 .map(|(key, required)| {
                     let predicate = &facts

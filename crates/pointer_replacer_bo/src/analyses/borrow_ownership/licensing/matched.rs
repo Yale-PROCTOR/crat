@@ -107,8 +107,7 @@ pub(crate) struct TerminalInstance {
 pub(crate) struct Meet {
     pub(crate) source: SourceInstance,
     pub(crate) terminal: TerminalInstance,
-    #[serde(with = "ordered_pairs")]
-    pub(crate) guards: BTreeMap<EquationId, bool>,
+    pub(crate) guards: GuardSet,
     proof: Vec<Step>,
 }
 
@@ -178,6 +177,92 @@ pub(crate) struct ForwardedReturn {
 
 type Scope = (u32, String);
 type Guards = BTreeMap<EquationId, bool>;
+
+/// Relay main/387 (R1343-1): a row's guards -- the exact conjunction of guard literals, or the
+/// guard-summary marker a (scope, seed, destination) triple collapses to once its distinct exact
+/// guard sets pass [`GUARD_BUDGET`]. A marker stands for many guard sets at once; it absorbs in
+/// [`join`] (no conflict is detectable through it), so no reader may read it as exact: an absence
+/// check counts it as present, a count-based grant as more than one, exact support as nothing.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GuardSet {
+    Exact(Guards),
+    Summarized,
+}
+
+static NO_GUARDS: Guards = BTreeMap::new();
+
+impl GuardSet {
+    pub(crate) fn exact(&self) -> Option<&Guards> {
+        match self {
+            Self::Exact(guards) => Some(guards),
+            Self::Summarized => None,
+        }
+    }
+
+    pub(crate) fn is_summarized(&self) -> bool {
+        matches!(self, Self::Summarized)
+    }
+
+    /// Relay main/387, step 1 only: the readers' view before they are taught the marker -- a
+    /// marker read as no guards at all. The reader fixtures are RED against it.
+    pub(crate) fn permissive(&self) -> &Guards {
+        self.exact().unwrap_or(&NO_GUARDS)
+    }
+
+    /// Test-only: an exact set to edit (a fixture's negative case).
+    #[cfg(test)]
+    pub(crate) fn exact_mut(&mut self) -> &mut Guards {
+        match self {
+            Self::Exact(guards) => guards,
+            Self::Summarized => panic!("a guard-summary marker has no exact guards"),
+        }
+    }
+}
+
+impl serde::Serialize for GuardSet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            // The exact form is the ordered pairs as before, byte for byte.
+            Self::Exact(guards) => ordered_pairs::serialize(guards, serializer),
+            Self::Summarized => serializer.serialize_str("summarized"),
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for GuardSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = GuardSet;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("guard pairs or \"summarized\"")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<GuardSet, E> {
+                if value == "summarized" {
+                    Ok(GuardSet::Summarized)
+                } else {
+                    Err(E::custom("unknown guard state"))
+                }
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<GuardSet, A::Error> {
+                let mut guards = Guards::new();
+                while let Some((key, value)) = seq.next_element::<(EquationId, bool)>()? {
+                    if guards.insert(key, value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate ordered-map key"));
+                    }
+                }
+                Ok(GuardSet::Exact(guards))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
 
 /// Full receiver forwarding justified by one exact subtree-fold contract.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -267,8 +352,7 @@ struct Relation {
     scope: Scope,
     seed: Seed,
     output: Destination,
-    #[serde(with = "ordered_pairs")]
-    guards: Guards,
+    guards: GuardSet,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -368,8 +452,7 @@ enum Step {
 struct Arc {
     from: Node,
     to: Node,
-    #[serde(with = "ordered_pairs")]
-    guards: Guards,
+    guards: GuardSet,
     step: Step,
 }
 
@@ -377,8 +460,7 @@ struct Arc {
 struct Source {
     node: Node,
     instance: SourceInstance,
-    #[serde(with = "ordered_pairs")]
-    guards: Guards,
+    guards: GuardSet,
     proof: Vec<Step>,
 }
 
@@ -386,8 +468,7 @@ struct Source {
 struct EndAt {
     node: Node,
     terminal: TerminalInstance,
-    #[serde(with = "ordered_pairs")]
-    guards: Guards,
+    guards: GuardSet,
     suffix: Vec<Step>,
 }
 
@@ -468,6 +549,24 @@ fn combine(left: &Guards, right: &Guards) -> Option<Guards> {
         }
     }
     Some(result)
+}
+
+/// Relay main/387: `combine` lifted to [`GuardSet`] -- a marker absorbs.
+fn join(left: &GuardSet, right: &GuardSet) -> Option<GuardSet> {
+    match (left, right) {
+        (GuardSet::Exact(left), GuardSet::Exact(right)) => {
+            combine(left, right).map(GuardSet::Exact)
+        }
+        _ => Some(GuardSet::Summarized),
+    }
+}
+
+/// [`join`] with an exact right side (a boundary part's guards).
+fn join_exact(left: &GuardSet, right: &Guards) -> Option<GuardSet> {
+    match left {
+        GuardSet::Exact(left) => combine(left, right).map(GuardSet::Exact),
+        GuardSet::Summarized => Some(GuardSet::Summarized),
+    }
 }
 
 fn only<T>(mut values: impl Iterator<Item = T>) -> Option<T> {
@@ -555,7 +654,7 @@ fn round_sizes(
     // Relay main/385 (4): the same keys with their guards left out -- (scope, seed, destination)
     // triples -- and the most guard sets one triple carries, over the keys at the round's end.
     fn triple<'r>(
-        key: &(&'r Scope, SeedKey, DestinationKey<'r>, &'r Guards),
+        key: &(&'r Scope, SeedKey, DestinationKey<'r>, &'r GuardSet),
     ) -> (&'r Scope, SeedKey, DestinationKey<'r>) {
         (key.0, key.1, key.2)
     }
@@ -718,7 +817,7 @@ enum DestinationKey<'a> {
     Terminal(&'a TerminalTarget),
 }
 
-fn key_without_lineage(row: &Relation) -> (&Scope, SeedKey, DestinationKey<'_>, &Guards) {
+fn key_without_lineage(row: &Relation) -> (&Scope, SeedKey, DestinationKey<'_>, &GuardSet) {
     let seed = match &row.seed {
         Seed::Input(node) => SeedKey::Input(*node),
         Seed::Source(source) => SeedKey::Source(source.endpoint),
@@ -817,18 +916,21 @@ pub(crate) fn reference_scans() -> bool {
 impl Function {
     fn normalize_guards(&mut self, aliases: &BTreeMap<EquationId, EquationId>) {
         self.edges.retain_mut(|edge| {
-            let Some(guards) = normalize(&edge.guards, aliases) else { return false };
-            edge.guards = guards;
+            let GuardSet::Exact(exact) = &edge.guards else { return true };
+            let Some(guards) = normalize(exact, aliases) else { return false };
+            edge.guards = GuardSet::Exact(guards);
             true
         });
         self.sources.retain_mut(|source| {
-            let Some(guards) = normalize(&source.guards, aliases) else { return false };
-            source.guards = guards;
+            let GuardSet::Exact(exact) = &source.guards else { return true };
+            let Some(guards) = normalize(exact, aliases) else { return false };
+            source.guards = GuardSet::Exact(guards);
             true
         });
         self.terminals.retain_mut(|terminal| {
-            let Some(guards) = normalize(&terminal.guards, aliases) else { return false };
-            terminal.guards = guards;
+            let GuardSet::Exact(exact) = &terminal.guards else { return true };
+            let Some(guards) = normalize(exact, aliases) else { return false };
+            terminal.guards = GuardSet::Exact(guards);
             true
         });
     }
@@ -836,9 +938,9 @@ impl Function {
     fn paths(
         &self,
         start: Node,
-        guards: Guards,
+        guards: GuardSet,
         proof: Vec<Step>,
-    ) -> BTreeMap<(Node, Guards), Vec<Step>> {
+    ) -> BTreeMap<(Node, GuardSet), Vec<Step>> {
         let mut result = BTreeMap::new();
         // Relay main/379 (`matched`, step 1): each node's out-edges, in the edges' order, so a pop
         // follows its own edges instead of filtering all of them.
@@ -867,7 +969,7 @@ impl Function {
                 Box::new(out_edges.get(&node).into_iter().flatten().copied())
             };
             for edge in edges {
-                let Some(next) = combine(&guards, &edge.guards) else { continue };
+                let Some(next) = join(&guards, &edge.guards) else { continue };
                 let witness = if probe() {
                     Vec::new()
                 } else {
@@ -926,7 +1028,7 @@ impl MatchedTransport {
         .ok()
         .as_ref()
             != Some(fold)
-            || continuation.guards.get(&guard) != Some(&true)
+            || continuation.guards.permissive().get(&guard) != Some(&true)
         {
             return None;
         }
@@ -1042,7 +1144,7 @@ impl MatchedTransport {
         {
             return None;
         }
-        let guards = combine(&output.guards, &continuation.guards)?;
+        let guards = combine(output.guards.permissive(), continuation.guards.permissive())?;
         // These are actual retained meets, not caller-supplied endpoint labels.
         let observed: Vec<_> = self
             .source_nodes(call.construction, &path.first()?.caller, &output.source)
@@ -1149,10 +1251,11 @@ impl MatchedTransport {
         }
         if relation
             .guards
+            .permissive()
             .iter()
             .chain(receiver_part.guards.iter())
             .chain(input.iter().flat_map(|part| part.guards.iter()))
-            .any(|(key, value)| continuation.guards.get(key) != Some(value))
+            .any(|(key, value)| continuation.guards.permissive().get(key) != Some(value))
         {
             return None;
         }
@@ -1406,12 +1509,12 @@ impl MatchedTransport {
                     if !witness.contains(&Step::Local(Evidence::Transfer(store))) {
                         continue;
                     }
-                    let Some(guards) = combine(&relation.guards, &input.guards)
+                    let Some(guards) = combine(relation.guards.permissive(), &input.guards)
                         .and_then(|guards| combine(&guards, &output.guards))
                     else {
                         continue;
                     };
-                    if guards != arc.guards {
+                    if &guards != arc.guards.permissive() {
                         continue;
                     }
                     let mut route = InputStoreRoute {
@@ -1435,14 +1538,14 @@ impl MatchedTransport {
                             if reached != arc.from {
                                 continue;
                             }
-                            let Some(joined) = combine(&prefix_guards, &arc.guards) else {
+                            let Some(joined) = join(&prefix_guards, &arc.guards) else {
                                 continue;
                             };
                             let mut proof = prefix;
                             proof.push(arc.step.clone());
                             let anchor = InputStoreAnchor {
                                 source: source.instance.clone(),
-                                guards: joined.clone(),
+                                guards: joined.permissive().clone(),
                                 proof: proof.clone(),
                             };
                             if !route.anchors.contains(&anchor) {
@@ -1453,7 +1556,7 @@ impl MatchedTransport {
                             {
                                 for end in function.terminals.iter().filter(|end| end.node == node)
                                 {
-                                    let Some(guards) = combine(&suffix_guards, &end.guards) else {
+                                    let Some(guards) = join(&suffix_guards, &end.guards) else {
                                         continue;
                                     };
                                     let mut proof = suffix.clone();
@@ -1720,6 +1823,36 @@ impl MatchedTransport {
         &self.guard_aliases
     }
 
+    /// Relay main/387 (test-only): the distinct guard sets per lineage-free (scope, seed,
+    /// destination) triple over the relations, and the guard sets of the largest.
+    #[cfg(test)]
+    pub(crate) fn guard_sets_per_triple(&self) -> Vec<(String, usize, Vec<String>)> {
+        let mut sets: BTreeMap<String, BTreeSet<&GuardSet>> = BTreeMap::new();
+        for relation in self.relations.keys() {
+            let (scope, seed, output, guards) = key_without_lineage(relation);
+            let seed = match seed {
+                SeedKey::Input(node) => format!("in {node:?}"),
+                SeedKey::Source(endpoint) => format!("src {endpoint:?}"),
+            };
+            let output = match output {
+                DestinationKey::Port(node) => format!("port {node:?}"),
+                DestinationKey::Terminal(target) => format!("term {target:?}"),
+            };
+            sets.entry(format!("{}::{} | {seed} | {output}", scope.0, scope.1))
+                .or_default()
+                .insert(guards);
+        }
+        let mut rows: Vec<_> = sets
+            .into_iter()
+            .map(|(key, guards)| {
+                let shown = guards.iter().map(|g| format!("{g:?}")).collect();
+                (key, guards.len(), shown)
+            })
+            .collect();
+        rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        rows
+    }
+
     /// Metadata reconstruction performs no Bool/solver operation.
     pub(crate) fn build_metadata(
         facts: &Facts,
@@ -1960,11 +2093,12 @@ impl MatchedTransport {
                 }
             };
             let Some(function) = &point.function else { continue };
-            let guards = edge
-                .guard
-                .map(|guard| (guard.binding, guard.required))
-                .into_iter()
-                .collect();
+            let guards = GuardSet::Exact(
+                edge.guard
+                    .map(|guard| (guard.binding, guard.required))
+                    .into_iter()
+                    .collect(),
+            );
             base.entry((point.construction, function.clone()))
                 .or_default()
                 .edges
@@ -1987,7 +2121,7 @@ impl MatchedTransport {
                         endpoint: source.equation,
                         lineage: SourceLineage::Exact(Vec::new()),
                     },
-                    guards: BTreeMap::from([(source.equation, true)]),
+                    guards: GuardSet::Exact(BTreeMap::from([(source.equation, true)])),
                     proof: Vec::new(),
                 });
         }
@@ -2003,7 +2137,7 @@ impl MatchedTransport {
                         target: TerminalTarget::Free(sink.equation),
                         lineage: SourceLineage::Exact(Vec::new()),
                     },
-                    guards: Guards::from([(sink.equation, true)]),
+                    guards: GuardSet::Exact(Guards::from([(sink.equation, true)])),
                     suffix: Vec::new(),
                 });
         }
@@ -2027,7 +2161,7 @@ impl MatchedTransport {
                         },
                         lineage: SourceLineage::Exact(Vec::new()),
                     },
-                    guards: Guards::new(),
+                    guards: GuardSet::Exact(Guards::new()),
                     suffix: Vec::new(),
                 });
         }
@@ -2280,10 +2414,14 @@ impl MatchedTransport {
                 if affected.as_ref().is_some_and(|set| !set.contains(scope)) {
                     super::freeze_counts::function_reswept();
                 }
-                let inputs = function
-                    .inputs
-                    .iter()
-                    .map(|&node| (Seed::Input(node), node, Guards::new(), Vec::new()));
+                let inputs = function.inputs.iter().map(|&node| {
+                    (
+                        Seed::Input(node),
+                        node,
+                        GuardSet::Exact(Guards::new()),
+                        Vec::new(),
+                    )
+                });
                 let sources = function.sources.iter().map(|source| {
                     (
                         Seed::Source(source.instance.clone()),
@@ -2311,7 +2449,7 @@ impl MatchedTransport {
                             }
                         }
                         for terminal in function.terminals.iter().filter(|end| end.node == output) {
-                            let Some(guards) = combine(&guards, &terminal.guards) else { continue };
+                            let Some(guards) = join(&guards, &terminal.guards) else { continue };
                             let relation = Relation {
                                 scope: scope.clone(),
                                 seed: seed.clone(),
@@ -2417,8 +2555,8 @@ impl MatchedTransport {
                                 for input in
                                     call.inputs.iter().filter(|part| part.formal == *formal)
                                 {
-                                    let Some(guards) = combine(&relation.guards, &input.guards)
-                                        .and_then(|guards| combine(&guards, &output.guards))
+                                    let Some(guards) = join_exact(&relation.guards, &input.guards)
+                                        .and_then(|guards| join_exact(&guards, &output.guards))
                                     else {
                                         continue;
                                     };
@@ -2436,7 +2574,8 @@ impl MatchedTransport {
                                 }
                             }
                             Seed::Source(source) => {
-                                let Some(guards) = combine(&relation.guards, &output.guards) else {
+                                let Some(guards) = join_exact(&relation.guards, &output.guards)
+                                else {
                                     continue;
                                 };
                                 caller.sources.push(Source {
@@ -2457,7 +2596,7 @@ impl MatchedTransport {
                 Destination::Terminal(terminal) => {
                     if let Seed::Input(formal) = &relation.seed {
                         for input in call.inputs.iter().filter(|part| part.formal == *formal) {
-                            let Some(guards) = combine(&relation.guards, &input.guards) else {
+                            let Some(guards) = join_exact(&relation.guards, &input.guards) else {
                                 continue;
                             };
                             caller.terminals.push(EndAt {
@@ -2498,7 +2637,7 @@ impl MatchedTransport {
             function.contains(from)
                 && function.contains(to)
                 && function
-                    .paths(from, Guards::new(), Vec::new())
+                    .paths(from, GuardSet::Exact(Guards::new()), Vec::new())
                     .keys()
                     .any(|(node, _)| *node == to)
         })
@@ -2514,7 +2653,7 @@ impl MatchedTransport {
             .values()
             .filter(|function| function.contains(node))
         {
-            let backward = function.paths(node, Guards::new(), Vec::new());
+            let backward = function.paths(node, GuardSet::Exact(Guards::new()), Vec::new());
             for source in &function.sources {
                 let forward =
                     function.paths(source.node, source.guards.clone(), source.proof.clone());
@@ -2526,8 +2665,8 @@ impl MatchedTransport {
                         for ((_, backward_guards), backward_proof) in
                             backward.iter().filter(|((n, _), _)| *n == terminal.node)
                         {
-                            let Some(guards) = combine(forward_guards, backward_guards)
-                                .and_then(|guards| combine(&guards, &terminal.guards))
+                            let Some(guards) = join(forward_guards, backward_guards)
+                                .and_then(|guards| join(&guards, &terminal.guards))
                             else {
                                 continue;
                             };
@@ -2582,6 +2721,7 @@ impl MatchedTransport {
             .into_iter()
             .filter(|meet| {
                 meet.guards
+                    .permissive()
                     .iter()
                     .all(|(&guard, &required)| value(guard) == Some(required))
             })
@@ -2643,7 +2783,7 @@ mod tests {
             function.edges.push(Arc {
                 from: node(from),
                 to: node(to),
-                guards: BTreeMap::from([(binding, required)]),
+                guards: GuardSet::Exact(BTreeMap::from([(binding, required)])),
                 step: Step::Local(Evidence::Phi(binding)),
             });
         }
@@ -2657,7 +2797,7 @@ mod tests {
         ]));
         assert!(
             independent
-                .paths(node(1), Guards::new(), Vec::new())
+                .paths(node(1), GuardSet::Exact(Guards::new()), Vec::new())
                 .keys()
                 .any(|(n, _)| *n == node(3)),
             "distinct actual predicates remain independent"
@@ -2665,7 +2805,7 @@ mod tests {
         function.normalize_guards(&guard_aliases(&bindings));
         assert!(
             !function
-                .paths(node(1), Guards::new(), Vec::new())
+                .paths(node(1), GuardSet::Exact(Guards::new()), Vec::new())
                 .keys()
                 .any(|(n, _)| *n == node(3)),
             "same actual predicate must not be both true and false via distinct equation ordinals"

@@ -211,7 +211,10 @@ fn oc04_zero_receipt_rejects_owned_return_frees_and_changed_identities() {
         wrong.terminal.lineage = super::matched::SourceLineage::Exact(Vec::new());
         assert_eq!(certify(facts, member, &wrong), Err(Hold::Identity));
         let mut wrong = projected.clone();
-        wrong.guards.insert(member.declaration.guard, false);
+        wrong
+            .guards
+            .exact_mut()
+            .insert(member.declaration.guard, false);
         assert_eq!(certify(facts, member, &wrong), Err(Hold::Identity));
     });
 }

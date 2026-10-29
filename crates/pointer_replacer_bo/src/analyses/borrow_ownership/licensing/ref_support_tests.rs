@@ -46,7 +46,9 @@ fn context(facts: &Facts) -> (Candidate, ConsumedOutput, Meet, Meet) {
         .clone();
     assert_eq!(free.source, output.source);
     assert_eq!(
-        free.guards.get(&certificate.required_free.binding),
+        free.guards
+            .permissive()
+            .get(&certificate.required_free.binding),
         Some(&true)
     );
     (candidate, certificate, free, output)
@@ -80,11 +82,13 @@ fn c05_ref_support_requires_positive_present_same_free_guard() {
         let mut false_free = free.clone();
         false_free
             .guards
+            .exact_mut()
             .insert(certificate.required_free.binding, false);
         assert!(OutputDischarge::certify(&output, &false_free, &certificate).is_none());
         let mut absent_free = free.clone();
         absent_free
             .guards
+            .exact_mut()
             .remove(&certificate.required_free.binding);
         assert!(OutputDischarge::certify(&output, &absent_free, &certificate).is_none());
         let mut false_certificate = certificate.clone();
@@ -93,6 +97,7 @@ fn c05_ref_support_requires_positive_present_same_free_guard() {
         let mut contradictory_output = output.clone();
         contradictory_output
             .guards
+            .exact_mut()
             .insert(certificate.required_free.binding, false);
         assert!(OutputDischarge::certify(&contradictory_output, &free, &certificate).is_none());
     });

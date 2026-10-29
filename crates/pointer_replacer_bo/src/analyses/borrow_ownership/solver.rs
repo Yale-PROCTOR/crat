@@ -1473,7 +1473,7 @@ impl KindSolver {
         for store in &field.stores {
             support.push(own(store.destination_def)?);
             support.push(!own(store.source_def)?);
-            support.extend(guards(&store.meet.guards)?);
+            support.extend(guards(store.meet.guards.permissive())?);
         }
         for store in &field.input_stores {
             support.push(own(store.destination_def)?);
@@ -1484,8 +1484,8 @@ impl KindSolver {
                 for alternative in &application.alternatives {
                     let mut required = vec![own(alternative.route.actual_input)?];
                     required.extend(guards(&alternative.route.guards)?);
-                    required.extend(guards(&alternative.free.guards)?);
-                    required.extend(guards(&alternative.forwarded.output.guards)?);
+                    required.extend(guards(alternative.free.guards.permissive())?);
+                    required.extend(guards(alternative.forwarded.output.guards.permissive())?);
                     for forwarded in &alternative.forwarded_returns {
                         required.extend(guards(&forwarded.guards)?);
                     }
@@ -2348,7 +2348,7 @@ impl KindSolver {
                 .get(&grant.meet.source.endpoint)
                 .ok_or_else(|| anyhow::anyhow!("missing grant source dependency"))?;
             anyhow::ensure!(
-                grant.meet.guards.get(source) == Some(&true),
+                grant.meet.guards.permissive().get(source) == Some(&true),
                 "grant lost source dependency"
             );
             if let super::licensing::matched::TerminalTarget::Free(endpoint) =
@@ -2360,12 +2360,12 @@ impl KindSolver {
                     .get(&endpoint)
                     .ok_or_else(|| anyhow::anyhow!("missing grant sink dependency"))?;
                 anyhow::ensure!(
-                    grant.meet.guards.get(sink) == Some(&true),
+                    grant.meet.guards.permissive().get(sink) == Some(&true),
                     "grant lost sink dependency"
                 );
             }
             let mut dependencies = Vec::new();
-            for (key, required) in &grant.meet.guards {
+            for (key, required) in grant.meet.guards.permissive() {
                 let predicate = &facts
                     .guards
                     .iter()

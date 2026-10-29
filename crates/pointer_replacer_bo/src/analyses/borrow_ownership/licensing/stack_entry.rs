@@ -306,7 +306,12 @@ pub(crate) fn collect_known_stack_entries(
         }))?;
         if store.meet.terminal != certificate.free
             || !matches!(store.meet.source.lineage, SourceLineage::Exact(_))
-            || store.meet.guards.get(&certificate.required_free.binding) != Some(&true)
+            || store
+                .meet
+                .guards
+                .permissive()
+                .get(&certificate.required_free.binding)
+                != Some(&true)
             || !store
                 .discharged_outputs
                 .iter()

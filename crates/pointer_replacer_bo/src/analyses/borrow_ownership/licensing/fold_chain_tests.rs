@@ -130,7 +130,7 @@ fn gf08_conditional_root_transport_connects_the_original_source_and_free() {
                 .iter()
                 .any(|meet| meet.source.endpoint == payload_source
                     && matches!(meet.terminal.target, TerminalTarget::Free(_))
-                    && meet.guards.get(&declaration.guard) == Some(&true)),
+                    && meet.guards.permissive().get(&declaration.guard) == Some(&true)),
             "exact conditional source/call/return/free route: {meets:?}"
         );
         let frees = |node, source| {

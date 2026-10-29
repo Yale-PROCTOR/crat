@@ -42,8 +42,8 @@ pub(crate) fn certify(
     }
     let proof = traversal_correspondence::certify_metadata(facts, candidate, aliases).ok()?;
     if !proof.traversal.returned.contains(&node)
-        || chosen_free.guards.get(&candidate.guard) != Some(&true)
-        || output.guards.get(&candidate.guard) != Some(&false)
+        || chosen_free.guards.permissive().get(&candidate.guard) != Some(&true)
+        || output.guards.permissive().get(&candidate.guard) != Some(&false)
     {
         return None;
     }
@@ -60,10 +60,11 @@ pub(crate) fn certify(
     });
     terminals.next()?;
     if terminals.next().is_some()
-        || output.guards.iter().any(|(guard, value)| {
+        || output.guards.permissive().iter().any(|(guard, value)| {
             *guard != candidate.guard
                 && chosen_free
                     .guards
+                    .permissive()
                     .get(guard)
                     .is_some_and(|other| other != value)
         })

@@ -682,11 +682,17 @@ impl OutputDischarge {
             || certificate.output.lineage != certificate.free.lineage
             || !certificate.required_free.required
             || certificate.required_free.binding.construction != certificate.call.construction
-            || free.guards.get(&certificate.required_free.binding) != Some(&true)
-            || output
+            || free
                 .guards
-                .iter()
-                .any(|(key, required)| free.guards.get(key).is_some_and(|value| value != required))
+                .permissive()
+                .get(&certificate.required_free.binding)
+                != Some(&true)
+            || output.guards.permissive().iter().any(|(key, required)| {
+                free.guards
+                    .permissive()
+                    .get(key)
+                    .is_some_and(|value| value != required)
+            })
         {
             return None;
         }
@@ -926,10 +932,12 @@ fn input_alternative(
     if outputs
         .iter()
         .any(|other| other.terminal != output.terminal)
-        || output
-            .guards
-            .iter()
-            .any(|(key, required)| free.guards.get(key).is_some_and(|value| value != required))
+        || output.guards.permissive().iter().any(|(key, required)| {
+            free.guards
+                .permissive()
+                .get(key)
+                .is_some_and(|value| value != required)
+        })
     {
         return Err(Pending::TerminalRoleC);
     }

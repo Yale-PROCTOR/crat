@@ -275,12 +275,15 @@ fn oc02_detach_transports_each_exact_allocation_to_its_original_free() {
             assert_eq!(frees[0].terminal.target, TerminalTarget::Free(free));
             assert_eq!(frees[0].terminal.lineage, lineage);
             if role != "holder" {
-                assert_eq!(frees[0].guards.get(&declaration.guard), Some(&true));
+                assert_eq!(
+                    frees[0].guards.permissive().get(&declaration.guard),
+                    Some(&true)
+                );
             }
             if role == "leaf" {
                 for (key, value) in &membership.requirements.guards {
                     assert_eq!(
-                        frees[0].guards.get(key),
+                        frees[0].guards.permissive().get(key),
                         Some(value),
                         "member requirement {key:?} is part of the returned leaf route"
                     );
