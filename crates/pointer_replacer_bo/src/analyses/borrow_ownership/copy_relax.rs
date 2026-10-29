@@ -9,22 +9,27 @@
 //!   loans the source's origin requires must stay live through the view's uses.
 //!
 //! **The call arm** (relay era-5c/269, `construction::copy_relax_escape`). A copy whose value
-//! reaches a call only as arguments whose formals the callee provably never keeps
-//! (`index_ranges::formal_kept`; `memcpy` / `memmove` / `memset`'s contract rows) does not
-//! leave the function: during the call the callee's accesses through it are child accesses of
-//! the source's tag, and nothing of it outlives the call. The edge between two such copies
+//! reaches a call only as arguments whose formals the callee provably never retains
+//! (`index_ranges::never_retained`; `memcpy` / `memmove` / `memset`'s contract rows), and whose
+//! closure's own storage is never addressed, does not leave the function: during the call the
+//! callee's accesses through it are child accesses of the source's tag, and nothing of it
+//! outlives the call. The edge between two such copies
 //! lent to one call stays (it is real for references); only the source's drag to its copy goes.
 //!
 //! **The two-views hazard and the emission's obligation** (the seat's condition, relay
 //! era-5c/269 §1.3). When two or more arguments of one call are views of one `Ref` subject
 //! (`f(out, out)`), the subject's `Ref` is sound only if **every view of the subject passed to
-//! the call derives from ONE raw pointer** (`let p = out.as_mut_ptr(); f(p, p, …)`). Spelled as
-//! separate reborrows (`out.as_mut_ptr()` twice), the views are sibling nodes under Tree
-//! Borrows: a callee that writes through one view and then reads through another reads a
-//! Disabled tag (030's `fma_array(out, out, out, out, n)`; `thash`, `haraka512_perm` and
-//! `memmove` read before they write). Every such call an admitted copy reaches is exported as a
-//! `multi-view` row (`MultiView`, the `multi-view` export family); the spelling is the
-//! rewriter's.
+//! the call derives from ONE raw pointer** (`let p = out.as_mut_ptr(); f(p, p, …)`), and the
+//! callee's formals at those positions stay raw (R833's pair rule, which the rewriter already
+//! applies: two references into one object at one call are UB under the callee's protectors,
+//! whatever pointer they come from). Spelled as separate reborrows (`out.as_mut_ptr()` twice),
+//! the views are sibling nodes under Tree Borrows: a callee that writes through one view and
+//! then reads through another reads a Disabled tag (030's `fma_array(out, out, out, out, n)`;
+//! `thash`, `haraka512_perm` and `memmove` read before they write). Every call an admitted copy
+//! reaches with two or more views of its subject (`construction::copy_relax_views`) is exported
+//! as a `multi-view` row (`MultiView`, the `multi-view` export family), one per admission,
+//! whatever the subject's kind settles to (a Raw subject owes nothing); the spelling is the
+//! rewriter's. A `NotRecorded` family means unknown, not none.
 
 use std::cell::RefCell;
 

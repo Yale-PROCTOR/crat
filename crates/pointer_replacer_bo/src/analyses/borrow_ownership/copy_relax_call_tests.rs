@@ -453,12 +453,58 @@ fn e5c_w269_k_a_callee_casting_its_formal_to_an_integer_keeps_the_subject_raw() 
     assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
 }
 
-/// (l) A callee that writes its formal: no summary (fail closed), Raw.
+/// (l) A callee that steps its own formal (haraka's `br_range_dec32le`,
+/// `src = src.offset(4)`) is followed through every value the formal holds:
+/// only read through, Ref; the stepped value stored into a global, Raw.
 #[test]
-fn e5c_w269_l_a_callee_writing_its_formal_keeps_the_subject_raw() {
-    let code = program("", "inp = inp.offset(0);", IN_PLACE)
-        .replace("inp: *const u8, n: i32", "mut inp: *const u8, n: i32");
+fn e5c_w269_l_a_callee_stepping_its_formal_is_followed_through_its_values() {
+    let stepping = |extra: &str, tail: &str| {
+        program(
+            extra,
+            &format!(
+                "let mut k: i32 = 0; while k < n {{ *out = *out ^ *inp; inp = inp.offset(1); k += 1; }}{tail}"
+            ),
+            IN_PLACE,
+        )
+        .replace("inp: *const u8, n: i32", "mut inp: *const u8, n: i32")
+    };
+    let code = stepping("", "");
     assert!(code.contains("mut inp"));
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "ref", "{:#?}", solved.kinds);
+    let code = stepping(
+        "static mut LAST: *const u8 = 0 as *const u8;",
+        " LAST = inp;",
+    );
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
+}
+
+/// (q) A callee that copies bytes out of its formal (005's `SPX_thash`,
+/// `memcpy(buf, in, n)`): the bytes of the pointee carry none of the
+/// formal's value, so the subject is Ref.
+#[test]
+fn e5c_w269_q_a_callee_copying_bytes_out_of_its_formal_keeps_the_subject_ref() {
+    let code = program(
+        "unsafe extern \"C\" {\n    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, \
+         n: usize) -> *mut core::ffi::c_void;\n}",
+        "let mut b2: [u8; 64] = [0; 64]; \
+         memcpy(b2.as_mut_ptr() as *mut core::ffi::c_void, inp as *const core::ffi::c_void, 16); \
+         *out = b2[0];",
+        IN_PLACE,
+    );
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "ref", "{:#?}", solved.kinds);
+}
+
+/// (s) A callee that takes its formal's address: Raw.
+#[test]
+fn e5c_w269_s_a_callee_taking_its_formals_address_keeps_the_subject_raw() {
+    let code = program(
+        "static mut SLOT: *const *const u8 = 0 as *const *const u8;",
+        "SLOT = &raw const inp;",
+        IN_PLACE,
+    );
     let solved = solve(&code);
     assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
 }

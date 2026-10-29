@@ -901,7 +901,8 @@ pub(crate) struct MultiViewRow {
     pub(crate) arguments: Vec<u32>,
 }
 
-/// Why the family is `NotRecorded`: no solve was recorded.
+/// Why the family is `NotRecorded`: no solve was recorded. A reader takes it
+/// as unknown, never as no obligation.
 pub(crate) const MULTI_VIEW_NOT_RECORDED: &str =
     "multi-view rows not recorded: no solve was recorded";
 

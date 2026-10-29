@@ -67,17 +67,19 @@
 //! retained copy may reach the base behind every footprint's back, and the
 //! discharge refuses.
 //!
-//! **The kept formals** (relay era-5c/269, for the copy relaxation's call arm
-//! in `construction.rs`). `(g, k)` is kept when `g`'s pointer formal `k`
-//! provably never outlives a call to `g`: the formal is never written or
-//! addressed; the taint walk above finds none of its uses escaping, a local
-//! callee it is handed to followed only when that callee's formal is kept in
-//! turn (so a written or addressed formal, a recursive callee, a foreign one
-//! without a row and a call through a pointer all let it out); and `g` is in
-//! no recursive SCC. A store into a holder is E1's (the holder dies with the
-//! call, and its path is Unknown wherever its address or a load out of it
-//! goes beyond the walk). Absent = `g` may keep it. Bottom-up like `Ext`,
-//! from the MIR only.
+//! **The never-retained formals** (relay era-5c/269, for the copy
+//! relaxation's call arm in `construction.rs`). `g` never retains its
+//! pointer formal `k` past a call when: the formal is never addressed; the
+//! taint walk above, from every value it holds (the caller's and its own
+//! reassignments, `src = src.offset(4)`), finds none of its uses escaping, a
+//! local callee it is handed to followed only when that callee never retains
+//! that formal in turn (so an addressed formal, a recursive callee, a foreign
+//! one without a row and a call through a pointer all let it out), a load or
+//! a copy of bytes out of the pointee no escape (it carries none of the
+//! formal's value); and `g` is in no recursive SCC. A store into a
+//! holder is E1's (the holder dies with the call, and its path is Unknown
+//! wherever its address or a load out of it goes beyond the walk). Absent =
+//! `g` may retain it. Bottom-up like `Ext`, from the MIR only.
 //!
 //! **What no footprint covers:** an access through a pointer to the base that
 //! was retained before the function ran (a global or a heap cell holding the
@@ -676,14 +678,14 @@ pub(crate) fn ensure(program: &RustProgram<'_>) -> Scope {
     Scope(std::marker::PhantomData)
 }
 
-/// Relay era-5c/269: whether `callee`'s pointer formal `formal` provably
-/// never outlives a call (the module doc), by the installed table; `false`
-/// when none is installed.
-pub(crate) fn formal_kept(callee: LocalDefId, formal: u32) -> bool {
+/// Relay era-5c/269: whether `callee` provably never retains its pointer
+/// formal `formal` past a call (the module doc), by the installed table;
+/// `false` when none is installed.
+pub(crate) fn never_retained(callee: LocalDefId, formal: u32) -> bool {
     TABLE.with(|slot| {
         slot.borrow()
             .as_ref()
-            .is_some_and(|(table, _)| table.kept.contains(&(callee, formal)))
+            .is_some_and(|(table, _)| table.never_retained.contains(&(callee, formal)))
     })
 }
 
@@ -717,10 +719,10 @@ pub(crate) struct IndexRanges {
     /// The `(g, k)` whose formal escapes `g`: stored, returned, handed where
     /// the walk cannot follow, or read out as a pointer.
     escapes: FxHashSet<(LocalDefId, u32)>,
-    /// Relay era-5c/269: the `(g, k)` whose pointer formal provably never
-    /// outlives a call to `g` (the copy relaxation's call arm). Absent = `g`
-    /// may keep it.
-    kept: FxHashSet<(LocalDefId, u32)>,
+    /// Relay era-5c/269: the `(g, k)` whose pointer formal `g` provably never
+    /// retains past a call (the copy relaxation's call arm). Absent = `g` may
+    /// retain it.
+    never_retained: FxHashSet<(LocalDefId, u32)>,
     /// E1: `(g, k)`'s path, what `g` and its callees give out of the pointers
     /// stored in `*k`.
     paths: FxHashMap<(LocalDefId, u32), Path>,
@@ -754,9 +756,10 @@ struct FnFacts {
     /// such a base discharges nothing (the reviewer's same-body retention
     /// guard).
     escaped: FxHashSet<Local>,
-    /// Relay era-5c/269: the fixed formals some use of which escapes the body
-    /// by `escaped`'s walk with the callee arm asking `kept` (not `escapes`):
-    /// handed to a callee that may keep it is an escape.
+    /// Relay era-5c/269: the unaddressed formals some use of which escapes
+    /// the body by `escaped`'s walk in retention mode, the callee arm asking
+    /// `never_retained` (not `escapes`): handed to a callee that may retain it
+    /// is an escape; a load or a copy of bytes out of the pointee is not.
     outlives: FxHashSet<Local>,
 }
 
@@ -787,7 +790,7 @@ impl IndexRanges {
             functions: FxHashMap::default(),
             summaries: FxHashMap::default(),
             escapes: FxHashSet::default(),
-            kept: FxHashSet::default(),
+            never_retained: FxHashSet::default(),
             paths: FxHashMap::default(),
             scc: FxHashMap::default(),
         };
@@ -795,7 +798,7 @@ impl IndexRanges {
             for &member in &component {
                 table.scc.insert(graph[member], index);
             }
-            // Relay era-5c/269: a recursive SCC keeps no formal.
+            // Relay era-5c/269: a recursive SCC may retain every formal.
             let recursive = component.len() > 1 || graph.contains_edge(component[0], component[0]);
             for &member in &component {
                 let f = graph[member];
@@ -825,10 +828,10 @@ impl IndexRanges {
                         table.escapes.insert((f, k as u32));
                     }
                     if !recursive
-                        && facts.shape.fixed_formal(formal)
+                        && facts.shape.unaddressed_formal(formal)
                         && !facts.outlives.contains(&formal)
                     {
-                        table.kept.insert((f, k as u32));
+                        table.never_retained.insert((f, k as u32));
                     }
                 }
                 table.functions.insert(f, facts);
@@ -1041,6 +1044,12 @@ impl Shape {
         }
     }
 
+    /// A formal never addressed (relay era-5c/269): the taint walk follows
+    /// every value it holds, the caller's and its own reassignments.
+    fn unaddressed_formal(&self, local: Local) -> bool {
+        self.is_formal(local) && !self.address_taken.contains(&local)
+    }
+
     /// A formal never written and never addressed: its value is the caller's.
     fn fixed_formal(&self, local: Local) -> bool {
         self.is_formal(local)
@@ -1089,7 +1098,7 @@ fn operand_local(operand: &Operand<'_>) -> Option<Local> {
 
 /// O's key (relay 264): core's raw-pointer `offset` / `add` / `sub`, never the
 /// name alone; the result stays in the receiver's allocation under §28.
-fn core_pointer_step(tcx: TyCtxt<'_>, call: &CallKind) -> Option<bool> {
+pub(crate) fn core_pointer_step(tcx: TyCtxt<'_>, call: &CallKind) -> Option<bool> {
     let CallKind::RustLib(did) = call else {
         return None;
     };
@@ -1113,7 +1122,11 @@ fn core_is_null(tcx: TyCtxt<'_>, call: &CallKind) -> bool {
 
 /// Relay 265's key: core's slice `as_ptr` / `as_mut_ptr`, resolved, on an
 /// inherent impl of a slice type: the result is the receiver's buffer.
-fn core_slice_buffer<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, func: &Operand<'tcx>) -> bool {
+pub(crate) fn core_slice_buffer<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+) -> bool {
     func.const_fn_def().is_some_and(|(def_id, args)| {
         ty::Instance::try_resolve(tcx, body.typing_env(tcx), def_id, args)
             .ok()
@@ -3567,19 +3580,39 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
     /// is known or not. A carried use escapes when it stores, returns,
     /// aggregates or casts the value to an integer, takes its address, hands
     /// it to a foreign or recursive callee or to a local one whose formal
-    /// `callee_keeps` refuses, copies bytes out of it, or reads a pointer out
-    /// of it.
-    fn escaped_roots(&self, callee_keeps: &dyn Fn(LocalDefId, u32) -> bool) -> FxHashSet<Local> {
+    /// `callee_follows` refuses, copies bytes out of it, or reads a pointer out
+    /// of it. In `retention` mode (relay era-5c/269, the never-retained
+    /// formals) every pointer formal not addressed is a root, written or not,
+    /// and a load or a copy of bytes out of the pointee is no escape: it reads
+    /// the pointee and carries none of the formal's value (a pointer the
+    /// pointee holds is the retained-alias class every `Ref` formal meets).
+    fn escaped_roots(
+        &self,
+        callee_follows: &dyn Fn(LocalDefId, u32) -> bool,
+        retention: bool,
+    ) -> FxHashSet<Local> {
+        let roots: Vec<Local> = self
+            .body
+            .local_decls
+            .indices()
+            .filter(|&local| {
+                is_pointer(self.body, local)
+                    && if retention {
+                        self.shape.unaddressed_formal(local)
+                    } else {
+                        self.shape.fixed_formal(local)
+                    }
+            })
+            .collect();
+        // Without the uses nothing is known: every root escapes.
         let Some(uses) = self.uses else {
-            return FxHashSet::default();
+            return roots.into_iter().collect();
         };
         let mut carried: FxHashMap<Local, FxHashSet<Local>> = FxHashMap::default();
         let mut work = Vec::new();
-        for local in self.body.local_decls.indices() {
-            if self.shape.fixed_formal(local) && is_pointer(self.body, local) {
-                carried.entry(local).or_default().insert(local);
-                work.push(local);
-            }
+        for local in roots {
+            carried.entry(local).or_default().insert(local);
+            work.push(local);
         }
         let mut escaped = FxHashSet::default();
         while let Some(local) = work.pop() {
@@ -3614,8 +3647,10 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                     Use::Flow { dest } => into(dest, &mut work, &mut escaped),
                     Use::Bytes { place, write } => {
                         let through = place.projection[1..].contains(&PlaceElem::Deref);
-                        if through
-                            || (!*write && self.holds_pointer(place.ty(self.body, self.tcx).ty, 4))
+                        if !retention
+                            && (through
+                                || (!*write
+                                    && self.holds_pointer(place.ty(self.body, self.tcx).ty, 4)))
                         {
                             escaped.extend(roots.iter().copied());
                         }
@@ -3638,10 +3673,10 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                         {
                             into(destination, &mut work, &mut escaped);
                         } else if *k == 0 && core_is_null(self.tcx, &call.func) {
-                        } else if let Some((written, _, _)) = libc_row(&call.func) {
+                        } else if let Some((written, read, _)) = libc_row(&call.func) {
                             if *k == written {
                                 into(destination, &mut work, &mut escaped);
-                            } else {
+                            } else if !(retention && Some(*k) == read) {
                                 escaped.extend(roots.iter().copied());
                             }
                         } else {
@@ -3651,7 +3686,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                                 .filter(|callee| self.table.scc.contains_key(callee));
                             let follows = callee.is_some_and(|callee| {
                                 self.table.scc.get(&callee) != self.table.scc.get(&self.function)
-                                    && callee_keeps(callee, *k as u32)
+                                    && callee_follows(callee, *k as u32)
                             });
                             if !follows {
                                 escaped.extend(roots.iter().copied());
@@ -3777,8 +3812,11 @@ impl FnFacts {
                     }
                 }
             }
-            escaped = ctx.escaped_roots(&|callee, k| !table.escapes.contains(&(callee, k)));
-            outlives = ctx.escaped_roots(&|callee, k| table.kept.contains(&(callee, k)));
+            escaped = ctx.escaped_roots(&|callee, k| !table.escapes.contains(&(callee, k)), false);
+            outlives = ctx.escaped_roots(
+                &|callee, k| table.never_retained.contains(&(callee, k)),
+                true,
+            );
             for (local, list) in &uses {
                 let Some(deriv) = derivs.get(local) else {
                     continue;

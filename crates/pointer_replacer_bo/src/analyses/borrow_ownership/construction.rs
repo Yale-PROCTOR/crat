@@ -2523,7 +2523,6 @@ pub(crate) fn analyze_copy_relax_sites(
             program.tcx,
             &body,
             fn_did,
-            &value_flows,
             &admitted,
         ));
     }
@@ -2531,28 +2530,26 @@ pub(crate) fn analyze_copy_relax_sites(
 }
 
 /// Relay era-5c/269 §1.3: the calls an admitted copy of a subject reaches as an argument where
-/// two or more arguments are views of that subject (its value, or a copy, a cast, a step or an
-/// address under it: the relaxation's closure from the subject itself), one row per (subject,
+/// two or more arguments are views of that subject (`copy_relax_views`), one row per (subject,
 /// call).
 fn copy_relax_multi_views<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     body: &Body<'tcx>,
     fn_did: LocalDefId,
-    value_flows: &[(SlotOwner, SlotOwner)],
     admitted: &FxHashMap<Local, FxHashSet<SlotOwner>>,
 ) -> Vec<super::copy_relax::MultiView> {
     let argument = |operand: &Operand<'tcx>| {
         operand
             .place()
             .filter(|place| place.projection.is_empty())
-            .map(|place| SlotOwner::Local(place.local))
+            .map(|place| place.local)
     };
     let mut subjects: Vec<Local> = admitted.keys().copied().collect();
     subjects.sort();
     let mut rows = Vec::new();
     for subject in subjects {
         let reached = &admitted[&subject];
-        let mut views: Option<FxHashSet<SlotOwner>> = None;
+        let mut views: Option<FxHashSet<Local>> = None;
         for (block, data) in body.basic_blocks.iter_enumerated() {
             let Some(terminator) = data.terminator.as_ref() else {
                 continue;
@@ -2560,26 +2557,17 @@ fn copy_relax_multi_views<'tcx>(
             let Some(call) = terminator.as_call(tcx) else {
                 continue;
             };
-            if matches!(call.func, CallKind::RustLib(_))
-                || !call
-                    .args
-                    .iter()
-                    .any(|arg| argument(&arg.node).is_some_and(|owner| reached.contains(&owner)))
-            {
+            if !call.args.iter().any(|arg| {
+                argument(&arg.node).is_some_and(|local| reached.contains(&SlotOwner::Local(local)))
+            }) {
                 continue;
             }
-            let views = views.get_or_insert_with(|| {
-                copy_relax_closure(
-                    tcx,
-                    body,
-                    owner_closure([SlotOwner::Local(subject)], value_flows),
-                )
-            });
+            let views = views.get_or_insert_with(|| copy_relax_views(tcx, body, subject));
             let arguments: Vec<u32> = call
                 .args
                 .iter()
                 .enumerate()
-                .filter(|(_, arg)| argument(&arg.node).is_some_and(|owner| views.contains(&owner)))
+                .filter(|(_, arg)| argument(&arg.node).is_some_and(|local| views.contains(&local)))
                 .map(|(j, _)| j as u32)
                 .collect();
             if arguments.len() >= 2 {
@@ -2596,6 +2584,74 @@ fn copy_relax_multi_views<'tcx>(
         }
     }
     rows
+}
+
+/// The views of `subject`'s bytes in `body` (relay era-5c/269 §1.3): the subject and, to a
+/// fixpoint, every local assigned a copy or a cast of a view, an address under one
+/// (`&(*v).f`, `&raw (*v)[i]`, no further dereference), core's pointer step or slice
+/// `as_ptr` / `as_mut_ptr` on one, or the destination `memcpy` / `memmove` / `memset` return
+/// when one is their first argument. A pointer loaded through a view and the address of a
+/// view's own storage are not views.
+fn copy_relax_views<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    subject: Local,
+) -> FxHashSet<Local> {
+    let mut views: FxHashSet<Local> = [subject].into_iter().collect();
+    let whole = |operand: &Operand<'tcx>, views: &FxHashSet<Local>| {
+        operand
+            .place()
+            .is_some_and(|place| place.projection.is_empty() && views.contains(&place.local))
+    };
+    loop {
+        let mut changed = false;
+        for data in body.basic_blocks.iter() {
+            for statement in &data.statements {
+                let StatementKind::Assign(box (lhs, rvalue)) = &statement.kind else {
+                    continue;
+                };
+                let Some(dest) = lhs.as_local() else {
+                    continue;
+                };
+                if !rvalue.ty(body, tcx).is_any_ptr() {
+                    continue;
+                }
+                let view = match rvalue {
+                    Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => whole(operand, &views),
+                    Rvalue::CopyForDeref(place) => {
+                        place.projection.is_empty() && views.contains(&place.local)
+                    }
+                    Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                        place.projection.first() == Some(&ProjectionElem::Deref)
+                            && !place.projection[1..].contains(&ProjectionElem::Deref)
+                            && views.contains(&place.local)
+                    }
+                    _ => false,
+                };
+                if view {
+                    changed |= views.insert(dest);
+                }
+            }
+            if let Some(terminator) = data.terminator.as_ref()
+                && let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind
+                && let Some(call) = terminator.as_call(tcx)
+                && let Some(dest) = call.destination.as_local()
+                && call
+                    .args
+                    .first()
+                    .is_some_and(|arg| whole(&arg.node, &views))
+                && (super::index_ranges::core_pointer_step(tcx, &call.func).is_some()
+                    || super::index_ranges::core_slice_buffer(tcx, body, func)
+                    || super::index_ranges::libc_row(&call.func)
+                        .is_some_and(|(written, _, _)| written == 0))
+            {
+                changed |= views.insert(dest);
+            }
+        }
+        if !changed {
+            return views;
+        }
+    }
 }
 
 /// The relaxation's closure: the destination's value flows, plus every local assigned a
@@ -2649,7 +2705,7 @@ fn copy_relax_closure<'tcx>(
 /// Whether a member of the relaxation's closure leaves the function, wherever it is live: a store
 /// into memory (a field, an aggregate, through a pointer, an unresolved place), a return, or an
 /// argument of any call but a core pointer method, a local callee's formal it provably never
-/// keeps or a libc row's (relay era-5c/269).
+/// retains or a libc row's while no member's own storage is addressed (relay era-5c/269).
 fn copy_relax_escape<'tcx>(
     program: &RustProgram<'tcx>,
     slots: &CrateSlots,
@@ -2662,6 +2718,17 @@ fn copy_relax_escape<'tcx>(
     if closure.contains(&SlotOwner::Local(RETURN_PLACE)) {
         return Some(CopyLendEligibilityDrop::C3Return);
     }
+    // Relay era-5c/269: is the storage of a member itself addressed (`&x`, `&raw const x`)?
+    let addressed = body.basic_blocks.iter().any(|data| {
+        data.statements.iter().any(|statement| {
+            matches!(
+                &statement.kind,
+                StatementKind::Assign(box (_, Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)))
+                    if closure.contains(&SlotOwner::Local(place.local))
+                        && place.projection.first() != Some(&ProjectionElem::Deref)
+            )
+        })
+    });
     for (block, data) in body.basic_blocks.iter_enumerated() {
         for (statement_index, statement) in data.statements.iter().enumerate() {
             let location = Location {
@@ -2712,16 +2779,19 @@ fn copy_relax_escape<'tcx>(
         if matches!(call.func, CallKind::RustLib(_)) {
             continue;
         }
-        // Relay era-5c/269: an argument whose formal the callee provably never keeps lets
-        // nothing out. A local callee's formal is kept by `index_ranges::formal_kept` (fail
-        // closed: a recursive, foreign or pointer callee, an incomplete summary, a formal
-        // handed on to a callee that may keep it); `memcpy` / `memmove` / `memset` keep
-        // nothing and return their destination, which the closure then follows.
+        // Relay era-5c/269: an argument whose formal the callee provably never retains lets
+        // nothing out (`index_ranges::never_retained`, fail closed: a recursive, foreign or
+        // pointer callee, an incomplete summary, a formal handed on to a callee that may
+        // retain it); `memcpy` / `memmove` / `memset` retain nothing and return their
+        // destination, which the closure then follows. Not while a member's own storage is
+        // addressed: the closure holds `&x` too, and a callee copying bytes out of it
+        // (`memcpy(&g, &x, n)`) carries the copy's value out (the review's blocker).
         let kept = |j: usize, place: Place<'_>| {
-            place.projection.is_empty()
+            !addressed
+                && place.projection.is_empty()
                 && match &call.func {
                     CallKind::FreeStanding(callee) | CallKind::Impl(callee) => {
-                        super::index_ranges::formal_kept(*callee, j as u32)
+                        super::index_ranges::never_retained(*callee, j as u32)
                     }
                     CallKind::LibC(_) => super::index_ranges::libc_row(&call.func).is_some_and(
                         |(written, read, _)| {
