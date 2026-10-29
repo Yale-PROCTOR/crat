@@ -326,6 +326,7 @@ struct Context {
     function_names: BTreeMap<String, LocalDefId>,
     safe_holders: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
     copy_graph: FxHashMap<SlotRef, Vec<SlotRef>>,
+    directed_copies: local_outcome::DirectedCopies,
     exact_kinds: bool,
     unrepresented_inner: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
     /// The BO-owned loans for those of them that have one.
@@ -421,6 +422,7 @@ pub(crate) fn begin(
         function_names,
         safe_holders: Vec::new(),
         copy_graph: local_outcome::copy_graph(program, slots),
+        directed_copies: local_outcome::directed_copies(program, slots),
         exact_kinds: exact.is_some(),
         unrepresented_inner: Vec::new(),
         inner_loans: inner_loan::analyze(program, slots, &is_ref),
@@ -1431,3 +1433,6 @@ mod tests_object_scope;
 
 #[cfg(test)]
 mod tests_out_params;
+
+#[cfg(test)]
+mod tests_directed_closure;
