@@ -2636,8 +2636,25 @@ impl MatchedTransport {
             });
             if added.is_empty() {
                 // Relay main/385: the fixpoint's end, where the key-closure probe is stopped.
+                // Relay main/387 (3): the summarized triples and their share of the triples.
                 crate::phase_log::sub("matched:fixpoint", "end", || {
-                    format!("rounds={round} relations={}", relations.len())
+                    let triples: BTreeSet<_> = relations
+                        .keys()
+                        .map(|row| {
+                            let (scope, seed, output, _) = key_without_lineage(row);
+                            (scope, seed, output)
+                        })
+                        .collect();
+                    let markers = relations
+                        .keys()
+                        .filter(|row| row.guards.is_summarized())
+                        .count();
+                    format!(
+                        "rounds={round} relations={} triples={} summarized_triples={} marker_rows={markers}",
+                        relations.len(),
+                        triples.len(),
+                        budget.summarized.len()
+                    )
                 });
                 return (functions, relations);
             }
