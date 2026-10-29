@@ -509,6 +509,11 @@ pub(crate) struct BoExport {
     /// The final round's index-range discharges (relay era-5c/267), one per
     /// (access, loan); `None` when no round was recorded.
     pub(crate) range_disjoint: Option<Vec<super::index_ranges::RangeDisjoint>>,
+    /// The calls where two or more arguments are views of one subject, one
+    /// of them through a copy the relaxation's call arm admits (relay
+    /// era-5c/269), one per (subject, call); model-independent, recorded by
+    /// the solve before its rounds. `None` when no solve was recorded.
+    pub(crate) multi_view: Option<Vec<super::copy_relax::MultiView>>,
     /// Selector provenance, index-aligned with `Selectors`.
     pub source_sites: Vec<SelectorSite>,
     pub sink_sites: Vec<SelectorSite>,
@@ -1022,6 +1027,12 @@ pub(crate) fn record_range_disjoint(row: super::index_ranges::RangeDisjoint) {
             rows.push(row);
         }
     });
+}
+
+/// The solve's `multi-view` rows (relay era-5c/269), replacing any earlier
+/// solve's.
+pub(crate) fn record_multi_views(rows: Vec<super::copy_relax::MultiView>) {
+    record(|export| export.multi_view = Some(rows));
 }
 
 /// This round's store-as-move obligations (the final round's remain).

@@ -43,9 +43,13 @@ pub(crate) enum ExportFamily {
     /// One row per index-range discharge (relay era-5c/267): the access, the
     /// loan, the base and both byte ranges.
     RangeDisjoint,
+    /// One row per call with two or more views of one subject among its
+    /// arguments, one through a copy the relaxation's call arm admits (relay
+    /// era-5c/269): the subject, the call and the argument positions.
+    MultiView,
 }
 
-pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 23] = [
+pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 24] = [
     ExportFamily::OwnershipVersions,
     ExportFamily::OwnershipValues,
     ExportFamily::SourceSelectors,
@@ -69,6 +73,7 @@ pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 23] = [
     ExportFamily::MoveStoreObligations,
     ExportFamily::ArgOrderApplied,
     ExportFamily::RangeDisjoint,
+    ExportFamily::MultiView,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -176,6 +181,7 @@ impl PortableExport {
                             | ExportFamily::MoveStoreObligations
                             | ExportFamily::ArgOrderApplied
                             | ExportFamily::RangeDisjoint
+                            | ExportFamily::MultiView
                     ) && !reason.is_empty()
                         && payload.source_rows == 0
                         && payload.records.is_empty() => {}
@@ -678,6 +684,7 @@ fn record_key(family: ExportFamily, fields: &BTreeMap<String, Value>) -> Result<
         F::MoveStoreObligations => vec!["function", "store"],
         F::ArgOrderApplied => vec!["function", "call", "lent"],
         F::RangeDisjoint => vec!["function", "access", "loan", "issuer"],
+        F::MultiView => vec!["function", "subject", "call"],
         _ => fields.keys().map(String::as_str).collect(),
     };
     let identity = selected
@@ -876,6 +883,60 @@ pub(crate) fn range_disjoint_rows(
                 b.loan.statement,
                 b.issuer,
             ))
+    });
+    Ok(Some(out))
+}
+
+/// The typed row of the `multi-view` family (relay era-5c/269 §1.3): at
+/// `call` in `function`, the arguments `arguments` (by position, `k` of them,
+/// two or more) are views of the local `subject`. The emission owes them ONE
+/// raw pointer (`copy_relax`'s module doc).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MultiViewRow {
+    pub(crate) function: String,
+    pub(crate) subject: u32,
+    pub(crate) call: MoveStoreLocation,
+    pub(crate) k: u32,
+    pub(crate) arguments: Vec<u32>,
+}
+
+/// Why the family is `NotRecorded`: no solve was recorded.
+pub(crate) const MULTI_VIEW_NOT_RECORDED: &str =
+    "multi-view rows not recorded: no solve was recorded";
+
+/// The rows a solve recorded, in the portable form; `None` = not recorded.
+pub(crate) fn multi_view_rows(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    export: &BoExport,
+) -> Result<Option<Vec<MultiViewRow>>, String> {
+    let Some(rows) = &export.multi_view else {
+        return Ok(None);
+    };
+    let resolver = Resolver { program, slots };
+    let mut out = rows
+        .iter()
+        .map(|row| {
+            Ok(MultiViewRow {
+                function: resolver.function(row.function)?,
+                subject: row.subject.as_u32(),
+                call: MoveStoreLocation {
+                    block: row.call.block.as_u32(),
+                    statement: row.call.statement_index,
+                },
+                k: row.arguments.len() as u32,
+                arguments: row.arguments.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    out.sort_by(|a, b| {
+        (&a.function, a.call.block, a.call.statement, a.subject).cmp(&(
+            &b.function,
+            b.call.block,
+            b.call.statement,
+            b.subject,
+        ))
     });
     Ok(Some(out))
 }
@@ -1243,6 +1304,20 @@ pub(crate) fn collect(
                 .availability = CaptureAvailability::NotRecorded {
                 reason: RANGE_DISJOINT_NOT_RECORDED.into(),
             };
+        }
+    }
+    match multi_view_rows(program, slots, export)? {
+        Some(rows) => {
+            for row in rows {
+                let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                out.add(F::MultiView, fields, Value::Null)?;
+            }
+        }
+        None => {
+            out.families.get_mut(&F::MultiView).unwrap().availability =
+                CaptureAvailability::NotRecorded {
+                    reason: MULTI_VIEW_NOT_RECORDED.into(),
+                };
         }
     }
     for row in &export.realloc_version_sites {

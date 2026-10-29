@@ -1876,16 +1876,19 @@ fn solve_bo_overlap_config_with_source_events(
         CopyLendMode::RemovalOnly,
         "the overlap solve runs the baseline or the lend-arm copy-lend mode, never removal-only"
     );
-    // The copies the depth-0 relaxation may take, for this solve.
-    crate::phase_log::mark("solve:copy_relax", "start", "");
-    let eligible = analyze_copy_relax_sites(program, slots, origins.native_flows());
-    crate::phase_log::mark("solve:copy_relax", "end", "");
-    super::copy_relax::install(eligible);
     // The index-range table (relay era-5c/267): model-independent, built once
-    // for the whole solve; every replay below reads it.
+    // for the whole solve; every replay below reads it, and the copy
+    // relaxation's call arm asks it which formals a callee keeps (relay
+    // era-5c/269), so it is built first.
     crate::phase_log::mark("solve:index_ranges", "start", "");
     let _index_ranges = super::index_ranges::ensure(program);
     crate::phase_log::mark("solve:index_ranges", "end", "");
+    // The copies the depth-0 relaxation may take, for this solve.
+    crate::phase_log::mark("solve:copy_relax", "start", "");
+    let (eligible, multi_views) = analyze_copy_relax_sites(program, slots, origins.native_flows());
+    crate::phase_log::mark("solve:copy_relax", "end", "");
+    super::export::record_multi_views(multi_views);
+    super::copy_relax::install(eligible);
 
     let baseline_solver = KindSolver::new(slots);
     crate::phase_log::mark("solve:baseline_construction", "start", "");
@@ -2463,17 +2466,23 @@ pub(crate) fn analyze_copy_lend_eligibility(
 
 /// The copies the depth-0 relaxation may take. A bare copy `q = p` between locals is eligible
 /// only when the destination's value never leaves the function: no store into a field, an
-/// aggregate or an unresolved place, no return, no call argument and no release over the
+/// aggregate or an unresolved place, no return, no call argument but one whose formal the callee
+/// provably never keeps (relay era-5c/269, `copy_relax_escape`) and no release over the
 /// destination's depth-0 value-flow closure (the copy-lend arm's C3 and its free-destination
 /// rule, on the destination alone). Under Tree Borrows the raw copy carries its source's tag,
 /// and the merge liveness keeps the source's loans live only through the copy's uses in this
-/// function.
+/// function and the calls it is lent to. With the sites, the `multi-view` rows of the calls an
+/// admitted copy reaches (`copy_relax`'s module doc).
 pub(crate) fn analyze_copy_relax_sites(
     program: &RustProgram<'_>,
     slots: &CrateSlots,
     origin_flows: &OriginFlowResults,
-) -> FxHashMap<LocalDefId, FxHashSet<MirLocationKey>> {
+) -> (
+    FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>,
+    Vec<super::copy_relax::MultiView>,
+) {
     let mut eligible: FxHashMap<LocalDefId, FxHashSet<MirLocationKey>> = FxHashMap::default();
+    let mut multi_views = Vec::new();
     for &fn_did in &program.functions {
         let body = program
             .tcx
@@ -2487,6 +2496,8 @@ pub(crate) fn analyze_copy_relax_sites(
             .get(&fn_did)
             .unwrap_or_else(|| panic!("missing origin flow for {fn_did:?}"));
         let value_flows = flows.body.depth0_value_flows();
+        // By subject, the closures of its admitted copies (relay era-5c/269).
+        let mut admitted: FxHashMap<Local, FxHashSet<SlotOwner>> = FxHashMap::default();
         for site in sites {
             let closure = copy_relax_closure(
                 program.tcx,
@@ -2505,15 +2516,92 @@ pub(crate) fn analyze_copy_relax_sites(
             };
             if drop.is_none() {
                 eligible.entry(fn_did).or_default().insert(site.location);
+                admitted.entry(site.rhs_local).or_default().extend(closure);
+            }
+        }
+        multi_views.extend(copy_relax_multi_views(
+            program.tcx,
+            &body,
+            fn_did,
+            &value_flows,
+            &admitted,
+        ));
+    }
+    (eligible, multi_views)
+}
+
+/// Relay era-5c/269 §1.3: the calls an admitted copy of a subject reaches as an argument where
+/// two or more arguments are views of that subject (its value, or a copy, a cast, a step or an
+/// address under it: the relaxation's closure from the subject itself), one row per (subject,
+/// call).
+fn copy_relax_multi_views<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    fn_did: LocalDefId,
+    value_flows: &[(SlotOwner, SlotOwner)],
+    admitted: &FxHashMap<Local, FxHashSet<SlotOwner>>,
+) -> Vec<super::copy_relax::MultiView> {
+    let argument = |operand: &Operand<'tcx>| {
+        operand
+            .place()
+            .filter(|place| place.projection.is_empty())
+            .map(|place| SlotOwner::Local(place.local))
+    };
+    let mut subjects: Vec<Local> = admitted.keys().copied().collect();
+    subjects.sort();
+    let mut rows = Vec::new();
+    for subject in subjects {
+        let reached = &admitted[&subject];
+        let mut views: Option<FxHashSet<SlotOwner>> = None;
+        for (block, data) in body.basic_blocks.iter_enumerated() {
+            let Some(terminator) = data.terminator.as_ref() else {
+                continue;
+            };
+            let Some(call) = terminator.as_call(tcx) else {
+                continue;
+            };
+            if matches!(call.func, CallKind::RustLib(_))
+                || !call
+                    .args
+                    .iter()
+                    .any(|arg| argument(&arg.node).is_some_and(|owner| reached.contains(&owner)))
+            {
+                continue;
+            }
+            let views = views.get_or_insert_with(|| {
+                copy_relax_closure(
+                    tcx,
+                    body,
+                    owner_closure([SlotOwner::Local(subject)], value_flows),
+                )
+            });
+            let arguments: Vec<u32> = call
+                .args
+                .iter()
+                .enumerate()
+                .filter(|(_, arg)| argument(&arg.node).is_some_and(|owner| views.contains(&owner)))
+                .map(|(j, _)| j as u32)
+                .collect();
+            if arguments.len() >= 2 {
+                rows.push(super::copy_relax::MultiView {
+                    function: fn_did,
+                    subject,
+                    call: Location {
+                        block,
+                        statement_index: data.statements.len(),
+                    },
+                    arguments,
+                });
             }
         }
     }
-    eligible
+    rows
 }
 
 /// The relaxation's closure: the destination's value flows, plus every local assigned a
-/// pointer computed from a member (a copy, a cast, an address of a member's place) and the
-/// result of a core pointer method called on one, to a fixpoint.
+/// pointer computed from a member (a copy, a cast, an address of a member's place), the
+/// result of a core pointer method called on one and (relay era-5c/269) the destination
+/// `memcpy` / `memmove` / `memset` return when one is their first argument, to a fixpoint.
 fn copy_relax_closure<'tcx>(
     tcx: rustc_middle::ty::TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -2539,12 +2627,14 @@ fn copy_relax_closure<'tcx>(
             }
             if let Some(terminator) = data.terminator.as_ref()
                 && let Some(call) = terminator.as_call(tcx)
-                && matches!(call.func, CallKind::RustLib(_))
                 && call.destination.projection.is_empty()
-                && call.args.iter().any(|arg| {
+                && call.args.iter().enumerate().any(|(j, arg)| {
                     arg.node
                         .place()
                         .is_some_and(|place| closure.contains(&SlotOwner::Local(place.local)))
+                        && (matches!(call.func, CallKind::RustLib(_))
+                            || super::index_ranges::libc_row(&call.func)
+                                .is_some_and(|(written, _, _)| j == written))
                 })
             {
                 changed |= closure.insert(SlotOwner::Local(call.destination.local));
@@ -2558,7 +2648,8 @@ fn copy_relax_closure<'tcx>(
 
 /// Whether a member of the relaxation's closure leaves the function, wherever it is live: a store
 /// into memory (a field, an aggregate, through a pointer, an unresolved place), a return, or an
-/// argument of any call but a core pointer method.
+/// argument of any call but a core pointer method, a local callee's formal it provably never
+/// keeps or a libc row's (relay era-5c/269).
 fn copy_relax_escape<'tcx>(
     program: &RustProgram<'tcx>,
     slots: &CrateSlots,
@@ -2621,10 +2712,30 @@ fn copy_relax_escape<'tcx>(
         if matches!(call.func, CallKind::RustLib(_)) {
             continue;
         }
-        if call.args.iter().any(|arg| {
-            arg.node
-                .place()
-                .is_some_and(|place| closure.contains(&SlotOwner::Local(place.local)))
+        // Relay era-5c/269: an argument whose formal the callee provably never keeps lets
+        // nothing out. A local callee's formal is kept by `index_ranges::formal_kept` (fail
+        // closed: a recursive, foreign or pointer callee, an incomplete summary, a formal
+        // handed on to a callee that may keep it); `memcpy` / `memmove` / `memset` keep
+        // nothing and return their destination, which the closure then follows.
+        let kept = |j: usize, place: Place<'_>| {
+            place.projection.is_empty()
+                && match &call.func {
+                    CallKind::FreeStanding(callee) | CallKind::Impl(callee) => {
+                        super::index_ranges::formal_kept(*callee, j as u32)
+                    }
+                    CallKind::LibC(_) => super::index_ranges::libc_row(&call.func).is_some_and(
+                        |(written, read, _)| {
+                            (j == written && call.destination.projection.is_empty())
+                                || Some(j) == read
+                        },
+                    ),
+                    _ => false,
+                }
+        };
+        if call.args.iter().enumerate().any(|(j, arg)| {
+            arg.node.place().is_some_and(|place| {
+                closure.contains(&SlotOwner::Local(place.local)) && !kept(j, place)
+            })
         }) {
             return Some(match call.func {
                 CallKind::FreeStanding(_) | CallKind::Impl(_) => {

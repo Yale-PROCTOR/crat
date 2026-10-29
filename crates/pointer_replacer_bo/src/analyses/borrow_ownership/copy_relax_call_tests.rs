@@ -246,7 +246,10 @@ fn e5c_w269_b_a_callee_storing_into_a_global_keeps_the_subject_raw() {
     );
     let solved = solve(&code);
     assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
-    assert!(multi_views(&solved, "work").is_empty());
+    // The `out` copy is admitted (`mix` keeps `out`), so the call has its
+    // row; the `inp` copy is not, and drags the subject Raw: the row is per
+    // admission, and its obligation moot while the subject is Raw.
+    assert_eq!(multi_views(&solved, "work").len(), 1);
 }
 
 /// (b′) A callee that stores its formal into a field through another formal

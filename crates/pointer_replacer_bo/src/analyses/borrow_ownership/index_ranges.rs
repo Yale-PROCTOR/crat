@@ -67,6 +67,18 @@
 //! retained copy may reach the base behind every footprint's back, and the
 //! discharge refuses.
 //!
+//! **The kept formals** (relay era-5c/269, for the copy relaxation's call arm
+//! in `construction.rs`). `(g, k)` is kept when `g`'s pointer formal `k`
+//! provably never outlives a call to `g`: the formal is never written or
+//! addressed; the taint walk above finds none of its uses escaping, a local
+//! callee it is handed to followed only when that callee's formal is kept in
+//! turn (so a written or addressed formal, a recursive callee, a foreign one
+//! without a row and a call through a pointer all let it out); and `g` is in
+//! no recursive SCC. A store into a holder is E1's (the holder dies with the
+//! call, and its path is Unknown wherever its address or a load out of it
+//! goes beyond the walk). Absent = `g` may keep it. Bottom-up like `Ext`,
+//! from the MIR only.
+//!
 //! **What no footprint covers:** an access through a pointer to the base that
 //! was retained before the function ran (a global or a heap cell holding the
 //! base's pointer, set by a caller, used by a callee). That is the
@@ -664,6 +676,17 @@ pub(crate) fn ensure(program: &RustProgram<'_>) -> Scope {
     Scope(std::marker::PhantomData)
 }
 
+/// Relay era-5c/269: whether `callee`'s pointer formal `formal` provably
+/// never outlives a call (the module doc), by the installed table; `false`
+/// when none is installed.
+pub(crate) fn formal_kept(callee: LocalDefId, formal: u32) -> bool {
+    TABLE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|(table, _)| table.kept.contains(&(callee, formal)))
+    })
+}
+
 /// The discharge (the module doc), against the installed table; `None` when
 /// none is installed.
 pub(crate) fn discharge<'tcx>(
@@ -694,6 +717,10 @@ pub(crate) struct IndexRanges {
     /// The `(g, k)` whose formal escapes `g`: stored, returned, handed where
     /// the walk cannot follow, or read out as a pointer.
     escapes: FxHashSet<(LocalDefId, u32)>,
+    /// Relay era-5c/269: the `(g, k)` whose pointer formal provably never
+    /// outlives a call to `g` (the copy relaxation's call arm). Absent = `g`
+    /// may keep it.
+    kept: FxHashSet<(LocalDefId, u32)>,
     /// E1: `(g, k)`'s path, what `g` and its callees give out of the pointers
     /// stored in `*k`.
     paths: FxHashMap<(LocalDefId, u32), Path>,
@@ -727,6 +754,10 @@ struct FnFacts {
     /// such a base discharges nothing (the reviewer's same-body retention
     /// guard).
     escaped: FxHashSet<Local>,
+    /// Relay era-5c/269: the fixed formals some use of which escapes the body
+    /// by `escaped`'s walk with the callee arm asking `kept` (not `escapes`):
+    /// handed to a callee that may keep it is an escape.
+    outlives: FxHashSet<Local>,
 }
 
 impl IndexRanges {
@@ -756,6 +787,7 @@ impl IndexRanges {
             functions: FxHashMap::default(),
             summaries: FxHashMap::default(),
             escapes: FxHashSet::default(),
+            kept: FxHashSet::default(),
             paths: FxHashMap::default(),
             scc: FxHashMap::default(),
         };
@@ -763,6 +795,8 @@ impl IndexRanges {
             for &member in &component {
                 table.scc.insert(graph[member], index);
             }
+            // Relay era-5c/269: a recursive SCC keeps no formal.
+            let recursive = component.len() > 1 || graph.contains_edge(component[0], component[0]);
             for &member in &component {
                 let f = graph[member];
                 let body = tcx.mir_drops_elaborated_and_const_checked(f).borrow();
@@ -789,6 +823,12 @@ impl IndexRanges {
                     table.summaries.insert((f, k as u32), extent);
                     if facts.escaped.contains(&formal) {
                         table.escapes.insert((f, k as u32));
+                    }
+                    if !recursive
+                        && facts.shape.fixed_formal(formal)
+                        && !facts.outlives.contains(&formal)
+                    {
+                        table.kept.insert((f, k as u32));
                     }
                 }
                 table.functions.insert(f, facts);
@@ -1096,7 +1136,7 @@ fn core_slice_buffer<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>, func: &Operand<
 
 /// The libc rows: `(destination written, source read)` argument indices and
 /// the length's, for `memcpy` / `memmove` / `memset`.
-fn libc_row(call: &CallKind) -> Option<(usize, Option<usize>, usize)> {
+pub(crate) fn libc_row(call: &CallKind) -> Option<(usize, Option<usize>, usize)> {
     let CallKind::LibC(name) = call else {
         return None;
     };
@@ -3527,8 +3567,9 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
     /// is known or not. A carried use escapes when it stores, returns,
     /// aggregates or casts the value to an integer, takes its address, hands
     /// it to a foreign or recursive callee or to a local one whose formal
-    /// escapes, copies bytes out of it, or reads a pointer out of it.
-    fn escaped_roots(&self) -> FxHashSet<Local> {
+    /// `callee_keeps` refuses, copies bytes out of it, or reads a pointer out
+    /// of it.
+    fn escaped_roots(&self, callee_keeps: &dyn Fn(LocalDefId, u32) -> bool) -> FxHashSet<Local> {
         let Some(uses) = self.uses else {
             return FxHashSet::default();
         };
@@ -3610,7 +3651,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                                 .filter(|callee| self.table.scc.contains_key(callee));
                             let follows = callee.is_some_and(|callee| {
                                 self.table.scc.get(&callee) != self.table.scc.get(&self.function)
-                                    && !self.table.escapes.contains(&(callee, *k as u32))
+                                    && callee_keeps(callee, *k as u32)
                             });
                             if !follows {
                                 escaped.extend(roots.iter().copied());
@@ -3660,6 +3701,7 @@ impl FnFacts {
         let families = RefCell::new(FxHashMap::default());
         let holder_paths = RefCell::new(FxHashMap::default());
         let escaped: FxHashSet<Local>;
+        let outlives: FxHashSet<Local>;
         let mut paths = FxHashMap::default();
         let mut carriers: FxHashMap<Local, Vec<(Local, Footprint)>> = FxHashMap::default();
         let none = FxHashMap::default();
@@ -3735,7 +3777,8 @@ impl FnFacts {
                     }
                 }
             }
-            escaped = ctx.escaped_roots();
+            escaped = ctx.escaped_roots(&|callee, k| !table.escapes.contains(&(callee, k)));
+            outlives = ctx.escaped_roots(&|callee, k| table.kept.contains(&(callee, k)));
             for (local, list) in &uses {
                 let Some(deriv) = derivs.get(local) else {
                     continue;
@@ -3783,6 +3826,7 @@ impl FnFacts {
             carriers,
             cyclic: cyclic_blocks(body),
             escaped,
+            outlives,
         }
     }
 }

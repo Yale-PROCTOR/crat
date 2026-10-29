@@ -765,6 +765,22 @@ pub(crate) fn collect_to_path(
             };
         }
     }
+    // The `multi-view` rows (relay era-5c/269), as the in-memory writer
+    // writes them.
+    match super::multi_view_rows(program, slots, export)? {
+        Some(rows) => {
+            for row in rows {
+                let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                out.add(F::MultiView, fields, Value::Null)?;
+            }
+        }
+        None => {
+            out.families.get_mut(&F::MultiView).unwrap().availability =
+                CaptureAvailability::NotRecorded {
+                    reason: super::MULTI_VIEW_NOT_RECORDED.into(),
+                };
+        }
+    }
     for row in &export.realloc_version_sites {
         out.add(F::ReallocVersions,json!({"function":resolver.function(row.fn_did)?,"event":realloc_key(&row.event),"outcome":tag(row.outcome),"edge":row.edge,"location":mir_location(row.location),"local":row.local.as_u32(),"use_present":row.use_var.is_some()}),json!({"use_var":row.use_var.map(|v|v.as_u32()),"def_var":row.def_var.as_u32()}))?;
     }

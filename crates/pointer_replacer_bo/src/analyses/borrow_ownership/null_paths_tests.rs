@@ -3540,11 +3540,15 @@ fn e5c_w68_b_incompatible_pointees_are_not_overlap_partners() {
 }
 
 /// The control. `same_`'s two formals share one type: the route gives
-/// nothing and the conflict stays.
+/// nothing and the conflict stays, on the reborrow `n` (`_3`): Raw. Re-pinned
+/// at relay era-5c/269: `n := b` lent to `node_reset` (which keeps nothing) is
+/// a copy the relaxation's call arm admits, so `b` (`_2`) is no longer dragged
+/// to `n`'s kind, as with a dereference of `n` in place of the call at
+/// 56a5ffdb8.
 #[test]
 fn e5c_w68_c_one_type_keeps_its_overlap_partner() {
     let on = w68_lines();
-    assert_ne!(w63_kind(&on, "same_::_2@d0"), "ref", "{on:?}");
+    assert_eq!(w63_kind(&on, "same_::_3@d0"), "raw", "{on:?}");
 }
 
 /// The zero law's market, compile-only: every call from a local function to a

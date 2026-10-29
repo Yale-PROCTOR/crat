@@ -7,6 +7,24 @@
 //!   witnessed pass), a local the replay demoted keeps its group's live owners' provenances
 //!   live wherever it is live. Under Tree Borrows a raw view carries its source's tag, so the
 //!   loans the source's origin requires must stay live through the view's uses.
+//!
+//! **The call arm** (relay era-5c/269, `construction::copy_relax_escape`). A copy whose value
+//! reaches a call only as arguments whose formals the callee provably never keeps
+//! (`index_ranges::formal_kept`; `memcpy` / `memmove` / `memset`'s contract rows) does not
+//! leave the function: during the call the callee's accesses through it are child accesses of
+//! the source's tag, and nothing of it outlives the call. The edge between two such copies
+//! lent to one call stays (it is real for references); only the source's drag to its copy goes.
+//!
+//! **The two-views hazard and the emission's obligation** (the seat's condition, relay
+//! era-5c/269 §1.3). When two or more arguments of one call are views of one `Ref` subject
+//! (`f(out, out)`), the subject's `Ref` is sound only if **every view of the subject passed to
+//! the call derives from ONE raw pointer** (`let p = out.as_mut_ptr(); f(p, p, …)`). Spelled as
+//! separate reborrows (`out.as_mut_ptr()` twice), the views are sibling nodes under Tree
+//! Borrows: a callee that writes through one view and then reads through another reads a
+//! Disabled tag (030's `fma_array(out, out, out, out, n)`; `thash`, `haraka512_perm` and
+//! `memmove` read before they write). Every such call an admitted copy reaches is exported as a
+//! `multi-view` row (`MultiView`, the `multi-view` export family); the spelling is the
+//! rewriter's.
 
 use std::cell::RefCell;
 
@@ -35,6 +53,18 @@ thread_local! {
     /// sessions running side by side in one process do not see each other's sites.
     static ELIGIBLE: RefCell<Option<FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>>> =
         const { RefCell::new(None) };
+}
+
+/// One `multi-view` row (relay era-5c/269 §1.3): at the call terminating `call`'s block in
+/// `function`, the arguments `arguments` (two or more, by position) are views of the local
+/// `subject`, one of them at least through a copy the call arm admits. The emission owes them
+/// one raw pointer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MultiView {
+    pub(crate) function: LocalDefId,
+    pub(crate) subject: Local,
+    pub(crate) call: Location,
+    pub(crate) arguments: Vec<u32>,
 }
 
 pub(crate) fn install(eligible: FxHashMap<LocalDefId, FxHashSet<MirLocationKey>>) {

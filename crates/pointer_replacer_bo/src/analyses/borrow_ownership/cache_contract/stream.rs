@@ -773,6 +773,11 @@ impl<'de> Visitor<'de> for Family<'_> {
                     && !reason.is_empty()
                     && source_rows == 0
                     && records == 0 => {}
+            CaptureAvailability::NotRecorded { reason }
+                if self.family == ExportFamily::MultiView
+                    && !reason.is_empty()
+                    && source_rows == 0
+                    && records == 0 => {}
             _ => return Err(de::Error::custom("required capture unavailable")),
         }
         if source_rows != records {
