@@ -106,9 +106,11 @@ fn render_raw_view_source(
         )
     })?;
     let mut declarations = Vec::new();
-    for (argument_index, raw_expression, target_type, adapted_expression, extent_expression) in
-        views
-    {
+    let (expressions, order) = one_derivation(temp_stem, views);
+    for position in order {
+        let (argument_index, _, target_type, adapted_expression, extent_expression) =
+            &views[position];
+        let raw_expression = &expressions[position];
         let Some(argument) = arguments.get_mut(*argument_index) else {
             return Err("PAIR raw-view argument is outside the call arity".to_owned());
         };
@@ -137,6 +139,80 @@ fn render_raw_view_source(
         arguments.join(", "),
         &source[close + 1..],
     ))
+}
+
+/// Relay main/388 (R1347-1) item 3, era-5c 269 §1.3: the one-raw-pointer spelling. Several raw
+/// views of one Ref subject at one call -- each a reborrow of the same place (`from_mut(x)`,
+/// `from_ref(&*x)`, `from_ref(x)`, `x.as_mut_ptr()`, `x.as_ptr()`) -- derive from ONE raw pointer:
+/// the root view keeps its reborrow and every other view is a cast of the root's temporary. Under
+/// Tree Borrows two reborrows of one subject are siblings, and a callee that writes through one and
+/// then reads through the other reads through a disabled tag. The root is a mutable view when there
+/// is one, so the views it carries keep write permission. A view of another subject, or a raw value
+/// passed through, keeps its own expression. Returns each view's raw expression and the order the
+/// views are declared in (a root before the views cast from it).
+fn one_derivation(
+    temp_stem: &str,
+    views: &[(usize, String, String, String, Option<String>)],
+) -> (Vec<String>, Vec<usize>) {
+    let mut expressions: Vec<String> = views.iter().map(|view| view.1.clone()).collect();
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (position, view) in views.iter().enumerate() {
+        let Some((base, _)) = reborrow_base(&view.1) else { continue };
+        match groups.iter_mut().find(|(other, _)| *other == base) {
+            Some((_, members)) => members.push(position),
+            None => groups.push((base, vec![position])),
+        }
+    }
+    let mut derived = vec![false; views.len()];
+    for (_, members) in groups.iter().filter(|(_, members)| members.len() >= 2) {
+        let root = members
+            .iter()
+            .copied()
+            .find(|&position| reborrow_base(&views[position].1).is_some_and(|(_, mutable)| mutable))
+            .unwrap_or(members[0]);
+        let root_temp = format!("{temp_stem}_{}", views[root].0);
+        for &position in members.iter().filter(|&&position| position != root) {
+            expressions[position] = format!("{root_temp} as {}", views[position].2);
+            derived[position] = true;
+        }
+    }
+    let order = (0..views.len())
+        .filter(|&position| !derived[position])
+        .chain((0..views.len()).filter(|&position| derived[position]))
+        .collect();
+    (expressions, order)
+}
+
+/// The place a raw view reborrows, and whether the view is mutable -- only for a plain place (a
+/// local or a field path), so two equal texts name the same place at one call.
+fn reborrow_base(raw_expression: &str) -> Option<(&str, bool)> {
+    let expression = raw_expression.trim();
+    let wrapped = |prefix: &str| {
+        expression
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(')'))
+    };
+    let (base, mutable) = if let Some(base) = wrapped("core::ptr::from_mut(") {
+        (base, true)
+    } else if let Some(base) = wrapped("core::ptr::from_ref(&*") {
+        (base, false)
+    } else if let Some(base) = wrapped("core::ptr::from_ref(") {
+        (base, false)
+    } else if let Some(base) = expression.strip_suffix(".as_mut_ptr()") {
+        (base, true)
+    } else if let Some(base) = expression.strip_suffix(".as_ptr()") {
+        (base, false)
+    } else {
+        return None;
+    };
+    let plain = base.split('.').all(|part| {
+        let mut characters = part.chars();
+        characters
+            .next()
+            .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+            && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+    });
+    plain.then_some((base, mutable))
 }
 
 /// The call's argument list: its LAST top-level parenthesised group, found
@@ -556,5 +632,94 @@ mod tests {
             render_marked_source(&mark(), "two(&mut *p, pick(q, 1));").unwrap(),
             "{ let __crat_c9_4_2: i32 = *(pick(q, 1)); two(&mut *p, &__crat_c9_4_2) };"
         );
+    }
+
+    /// Relay main/388 (R1347-1) item 3, era-5c 269 §1.3: several raw views of one Ref subject at one
+    /// call derive from ONE raw pointer. Under Tree Borrows two reborrows of `out` -- here
+    /// `from_ref(&*out)` and `from_mut(out)` -- are sibling nodes: a callee that writes through one
+    /// view and then reads through the other has disabled the reader's tag at the write, and the
+    /// read is UB (030's `fma_array(out, out, out, out, len)`). One derivation gives every view one
+    /// tag. The mutable view is the root, whatever its position, and the shared one is a cast of it.
+    #[test]
+    fn r388_c_two_views_of_one_subject_take_one_derivation() {
+        let rendered = render_a5_raw_view_source(
+            "blend(out, out, 4)",
+            "__crat_a5_raw_9",
+            &[
+                (
+                    0,
+                    "core::ptr::from_ref(&*out)".to_owned(),
+                    "*const i32".to_owned(),
+                    A5_RAW_VALUE_PLACEHOLDER.to_owned(),
+                    None,
+                ),
+                (
+                    1,
+                    "core::ptr::from_mut(out)".to_owned(),
+                    "*mut i32".to_owned(),
+                    A5_RAW_VALUE_PLACEHOLDER.to_owned(),
+                    None,
+                ),
+            ],
+        )
+        .expect("renders");
+        assert_eq!(
+            rendered,
+            "{ let __crat_a5_raw_9_1: *mut i32 = core::ptr::from_mut(out); \
+             let __crat_a5_raw_9_0: *const i32 = __crat_a5_raw_9_1 as *const i32; \
+             blend(__crat_a5_raw_9_0, __crat_a5_raw_9_1, 4) }"
+        );
+    }
+
+    /// The slice spelling, through the PAIR renderer: `as_mut_ptr()` once, `as_ptr()` derived.
+    #[test]
+    fn r388_c_slice_views_take_one_derivation_through_the_pair_renderer() {
+        let rendered = render_pair_raw_view_source(
+            "SPX_thash(out, out, 1, ctx)",
+            "__crat_pair_raw_7",
+            &[
+                (0, "out.as_mut_ptr()".to_owned(), "*mut u8".to_owned()),
+                (1, "out.as_ptr()".to_owned(), "*const u8".to_owned()),
+            ],
+        )
+        .expect("renders");
+        assert_eq!(rendered.matches("out.as_").count(), 1, "{rendered}");
+        assert!(
+            rendered
+                .contains("let __crat_pair_raw_7_1: *const u8 = __crat_pair_raw_7_0 as *const u8;"),
+            "{rendered}"
+        );
+    }
+
+    /// Views of different subjects, and raw values passed through, keep their own expressions.
+    #[test]
+    fn r388_c_other_subjects_and_raw_values_keep_their_own_views() {
+        let rendered = render_pair_raw_view_source(
+            "f(a, b, p, p)",
+            "__crat_pair_raw_3",
+            &[
+                (
+                    0,
+                    "core::ptr::from_mut(a)".to_owned(),
+                    "*mut i32".to_owned(),
+                ),
+                (
+                    1,
+                    "core::ptr::from_ref(&*b)".to_owned(),
+                    "*const i32".to_owned(),
+                ),
+                (2, "p".to_owned(), "*mut i32".to_owned()),
+                (3, "p".to_owned(), "*const i32".to_owned()),
+            ],
+        )
+        .expect("renders");
+        for declaration in [
+            "let __crat_pair_raw_3_0: *mut i32 = core::ptr::from_mut(a);",
+            "let __crat_pair_raw_3_1: *const i32 = core::ptr::from_ref(&*b);",
+            "let __crat_pair_raw_3_2: *mut i32 = p;",
+            "let __crat_pair_raw_3_3: *const i32 = p;",
+        ] {
+            assert!(rendered.contains(declaration), "{declaration}: {rendered}");
+        }
     }
 }
