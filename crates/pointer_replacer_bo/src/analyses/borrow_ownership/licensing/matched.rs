@@ -51,6 +51,41 @@ pub(crate) fn probe() -> bool {
     *PROBE.get_or_init(|| std::env::var("CRAT_BO_MATCHED_PROBE").as_deref() == Ok("keys"))
 }
 
+/// Relay main/387 (R1343-1): the most distinct exact guard sets a lineage-free (scope, seed,
+/// destination) triple keeps; one more and the triple collapses to one guard-summary marker row.
+/// 14 = the most any of the 376 carries (main 269a), so the 376 carries no marker at this budget.
+pub(crate) const GUARD_BUDGET: usize = 14;
+
+/// The budget in force: `CRAT_BO_GUARD_BUDGET` when set -- for measurement runs only, never in a
+/// gate, never on the 17 or the 376 -- else [`GUARD_BUDGET`]; a test may set its own.
+fn guard_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = TEST_GUARD_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("CRAT_BO_GUARD_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(GUARD_BUDGET)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_GUARD_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: run `f` with the guard budget set to `budget` on this thread.
+#[cfg(test)]
+pub(crate) fn with_guard_budget<T>(budget: usize, f: impl FnOnce() -> T) -> T {
+    let previous = TEST_GUARD_BUDGET.with(|cell| cell.replace(Some(budget)));
+    let result = f();
+    TEST_GUARD_BUDGET.with(|cell| cell.set(previous));
+    result
+}
+
 /// The depth in force: `CRAT_BO_LINEAGE_DEPTH` when set -- for measurement runs only, never in a
 /// gate, never on the 17 or the 376 -- else [`LINEAGE_DEPTH`].
 fn lineage_depth() -> usize {
@@ -2337,6 +2372,21 @@ impl MatchedTransport {
         for line in closure_lines(facts, &base) {
             crate::phase_log::sub("matched:closure", "end", || line);
         }
+        let (functions, relations) = Self::relation_fixpoint(&base, &calls);
+        Self {
+            functions,
+            relations,
+            guard_aliases,
+            denials,
+        }
+    }
+
+    /// Relay main/387: the relation fixpoint over the base functions and the calls, factored out of
+    /// `build_using` unchanged, so a fixture can run it on synthetic functions.
+    fn relation_fixpoint(
+        base: &BTreeMap<Scope, Function>,
+        calls: &BTreeMap<CallKey, Call>,
+    ) -> (BTreeMap<Scope, Function>, BTreeMap<Relation, Vec<Step>>) {
         let mut relations = BTreeMap::new();
         // Relay main/379 (`matched`, step 1): the semi-naive fixpoint. After the first round, a
         // round re-applies and re-sweeps only the callers of the scopes the round before added
@@ -2347,7 +2397,7 @@ impl MatchedTransport {
         let scan = reference_scans();
         let callers_of = callers_of(&calls);
         let mut calls_by_caller: BTreeMap<Scope, Vec<(&CallKey, &Call)>> = BTreeMap::new();
-        for (key, call) in &calls {
+        for (key, call) in calls {
             calls_by_caller
                 .entry((key.construction, key.caller.clone()))
                 .or_default()
@@ -2480,12 +2530,7 @@ impl MatchedTransport {
                 crate::phase_log::sub("matched:fixpoint", "end", || {
                     format!("rounds={round} relations={}", relations.len())
                 });
-                return Self {
-                    functions,
-                    relations,
-                    guard_aliases,
-                    denials,
-                };
+                return (functions, relations);
             }
             affected = Some(affected_by(&callers_of, &added));
             for (relation, proof) in added {
@@ -2842,3 +2887,7 @@ mod folded_binding_tests {
         assert_eq!(serde_json::to_vec(&part).unwrap(), bytes);
     }
 }
+
+#[cfg(test)]
+#[path = "matched_budget_tests.rs"]
+mod budget_tests;
