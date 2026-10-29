@@ -1532,6 +1532,14 @@ pub(crate) fn audit(
     let (mut classify_calls, mut classify_wall) = (0usize, std::time::Duration::ZERO);
     let (mut assess_calls, mut assess_wall) = (0usize, std::time::Duration::ZERO);
     let (mut moved_wall, mut scans) = (std::time::Duration::ZERO, UnknownScans::default());
+    // Relay main/388 (R1356-1), 3c: `assess` reads only `facts`, so one evaluation serves every field.
+    let started = std::time::Instant::now();
+    let complete =
+        super::caller_coverage::assess(facts) == super::caller_coverage::Status::Complete;
+    assess_wall += started.elapsed();
+    assess_calls += 1;
+    // 3d: the `Unknown`-atom lookup, built once.
+    let ports = loads_by_port(facts);
     for (index, proof) in fields.values_mut().enumerate() {
         let field_started = std::time::Instant::now();
         let held: Vec<Site> = proof
@@ -1545,7 +1553,7 @@ pub(crate) fn audit(
                 continue;
             }
             let started = std::time::Instant::now();
-            let origin = classify_store_source(facts, origins, &site, &mut scans);
+            let origin = classify_store_source(facts, origins, &ports, &site, &mut scans);
             classify_wall += started.elapsed();
             classify_calls += 1;
             proof.classified.push(ClassifiedStore { site, origin });
@@ -1553,11 +1561,6 @@ pub(crate) fn audit(
         // The moved-input rule: a parameter store held for its terminal role or its
         // callers is supported by its own post-store token, when the transfer is
         // linear and the program's callers are all known.
-        let started = std::time::Instant::now();
-        let complete =
-            super::caller_coverage::assess(facts) == super::caller_coverage::Status::Complete;
-        assess_wall += started.elapsed();
-        assess_calls += 1;
         let started = std::time::Instant::now();
         if complete {
             let moved: Vec<(Site, Node)> = proof
@@ -1621,8 +1624,75 @@ pub(crate) fn audit(
     fields.into_values().collect()
 }
 
+/// Relay main/388 (R1356-1), 3d: `classify_store_source`'s `Unknown`-atom question, answered once per
+/// audit. The scan asked, per atom, for the field key of every load that has a consume row at the
+/// load's point (function, block, statement) in the atom's construction whose `Present` window
+/// starts its def or its use at the atom's var. Here every (load, consume row at its point) pair is
+/// visited once, and the load's key is filed under (construction, `def_start`) and (construction,
+/// `use_start`): the same predicate, evaluated once. A consume row with a `None` point component
+/// never matched a load and is not indexed.
+type LoadsByPort = rustc_hash::FxHashMap<(u32, u32), BTreeSet<String>>;
+
+fn loads_by_port(facts: &Facts) -> LoadsByPort {
+    let mut at: rustc_hash::FxHashMap<(&str, u32, usize), Vec<_>> = Default::default();
+    for consume in &facts.consumes {
+        let point = &consume.point;
+        if let (Some(function), Some(block), Some(statement)) =
+            (point.function.as_deref(), point.block, point.statement)
+        {
+            at.entry((function, block, statement))
+                .or_default()
+                .push(consume);
+        }
+    }
+    let mut ports = LoadsByPort::default();
+    for load in &facts.field_support_inputs.loads {
+        let point = (
+            load.site.function.as_str(),
+            load.site.block,
+            load.site.statement,
+        );
+        for consume in at.get(&point).into_iter().flatten() {
+            if let Availability::Present(window) = &consume.projected {
+                for var in [window.def_start, window.use_start] {
+                    ports
+                        .entry((consume.point.construction, var))
+                        .or_default()
+                        .insert(load.site.field_key.clone());
+                }
+            }
+        }
+    }
+    ports
+}
+
+/// The scan 3d replaces, kept as the lookup's oracle (`field_support_lookup_tests.rs`).
+#[cfg(test)]
+fn loads_by_scan(facts: &Facts, port: Node) -> BTreeSet<String> {
+    facts
+        .field_support_inputs
+        .loads
+        .iter()
+        .filter(|load| {
+            facts.consumes.iter().any(|consume| {
+                consume.point.function.as_deref() == Some(load.site.function.as_str())
+                    && consume.point.block == Some(load.site.block)
+                    && consume.point.statement == Some(load.site.statement)
+                    && consume.point.construction == port.construction
+                    && matches!(
+                        &consume.projected,
+                        Availability::Present(window)
+                            if window.def_start == port.var
+                                || window.use_start == port.var
+                    )
+            })
+        })
+        .map(|load| load.site.field_key.clone())
+        .collect()
+}
+
 /// Relay main/388 (R1352-2): the load scans `classify_store_source` runs for its `Unknown` atoms,
-/// counted and timed (log only).
+/// counted and timed (log only). With 3d, a scan is one lookup.
 #[derive(Default)]
 struct UnknownScans {
     count: usize,
@@ -1665,6 +1735,7 @@ pub(crate) fn moved_transfer(operation: &str, by_move: bool) -> bool {
 fn classify_store_source(
     facts: &Facts,
     origins: &ValueOrigins,
+    ports: &LoadsByPort,
     site: &Site,
     scans: &mut UnknownScans,
 ) -> StoreSourceOrigin {
@@ -1745,32 +1816,13 @@ fn classify_store_source(
                 let started = std::time::Instant::now();
                 // The port is the load's definition, or the field place's
                 // own use window at the load (the token as read out of it).
-                let loaded: BTreeSet<String> = facts
-                    .field_support_inputs
-                    .loads
-                    .iter()
-                    .filter(|load| {
-                        facts.consumes.iter().any(|consume| {
-                            consume.point.function.as_deref() == Some(load.site.function.as_str())
-                                && consume.point.block == Some(load.site.block)
-                                && consume.point.statement == Some(load.site.statement)
-                                && consume.point.construction == port.construction
-                                && matches!(
-                                    &consume.projected,
-                                    Availability::Present(window)
-                                        if window.def_start == port.var
-                                            || window.use_start == port.var
-                                )
-                        })
-                    })
-                    .map(|load| load.site.field_key.clone())
-                    .collect();
+                let loaded = ports.get(&(port.construction, port.var));
                 scans.count += 1;
                 scans.wall += started.elapsed();
-                if loaded.is_empty() {
+                let Some(loaded) = loaded.filter(|loaded| !loaded.is_empty()) else {
                     return StoreSourceOrigin::Unknown;
-                }
-                keys.extend(loaded);
+                };
+                keys.extend(loaded.iter().cloned());
             }
             _ => return StoreSourceOrigin::Unknown,
         }
@@ -1785,3 +1837,7 @@ fn classify_store_source(
 #[cfg(test)]
 #[path = "field_support_budget_tests.rs"]
 mod budget_tests;
+
+#[cfg(test)]
+#[path = "field_support_lookup_tests.rs"]
+mod lookup_tests;
