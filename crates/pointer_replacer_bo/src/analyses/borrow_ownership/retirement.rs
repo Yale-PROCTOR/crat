@@ -1425,3 +1425,6 @@ mod tests_owner_guards;
 
 #[cfg(test)]
 mod tests_object_scope;
+
+#[cfg(test)]
+mod tests_out_params;
