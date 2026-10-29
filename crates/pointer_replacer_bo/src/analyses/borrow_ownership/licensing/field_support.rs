@@ -1516,7 +1516,24 @@ pub(crate) fn audit(
     // Classify the source origin of every store the owned path held with
     // `OwnedInputOrOriginC`. The classification is recorded; whether it licenses
     // anything is the solver's, under the pin.
-    for proof in fields.values_mut() {
+    // Relay main/388 (R1352-2): a tick per `FIELD_TICK` fields with the classification's and the
+    // caller-coverage assessment's calls and wall so far (log only).
+    const FIELD_TICK: usize = 10;
+    let field_count = fields.len();
+    crate::phase_log::sub("field_support:classify", "start", || {
+        let held = fields
+            .values()
+            .flat_map(|proof| proof.holds.iter())
+            .filter(|hold| hold.reason == Pending::OwnedInputOrOriginC && hold.site.is_some())
+            .count();
+        let input_stores: usize = fields.values().map(|proof| proof.input_stores.len()).sum();
+        format!("fields={field_count} held_origin={held} input_stores={input_stores}")
+    });
+    let (mut classify_calls, mut classify_wall) = (0usize, std::time::Duration::ZERO);
+    let (mut assess_calls, mut assess_wall) = (0usize, std::time::Duration::ZERO);
+    let (mut moved_wall, mut scans) = (std::time::Duration::ZERO, UnknownScans::default());
+    for (index, proof) in fields.values_mut().enumerate() {
+        let field_started = std::time::Instant::now();
         let held: Vec<Site> = proof
             .holds
             .iter()
@@ -1527,13 +1544,22 @@ pub(crate) fn audit(
             if proof.classified.iter().any(|store| store.site == site) {
                 continue;
             }
-            let origin = classify_store_source(facts, origins, &site);
+            let started = std::time::Instant::now();
+            let origin = classify_store_source(facts, origins, &site, &mut scans);
+            classify_wall += started.elapsed();
+            classify_calls += 1;
             proof.classified.push(ClassifiedStore { site, origin });
         }
         // The moved-input rule: a parameter store held for its terminal role or its
         // callers is supported by its own post-store token, when the transfer is
         // linear and the program's callers are all known.
-        if super::caller_coverage::assess(facts) == super::caller_coverage::Status::Complete {
+        let started = std::time::Instant::now();
+        let complete =
+            super::caller_coverage::assess(facts) == super::caller_coverage::Status::Complete;
+        assess_wall += started.elapsed();
+        assess_calls += 1;
+        let started = std::time::Instant::now();
+        if complete {
             let moved: Vec<(Site, Node)> = proof
                 .input_stores
                 .iter()
@@ -1566,9 +1592,41 @@ pub(crate) fn audit(
                 });
             }
         }
+        moved_wall += started.elapsed();
+        let field_wall = field_started.elapsed().as_secs_f64();
+        if (index + 1) % FIELD_TICK == 0 || field_wall >= 30.0 {
+            crate::phase_log::sub("field_support:classify", "tick", || {
+                format!(
+                    "done={} of={field_count} field_wall={field_wall:.1}s classify={classify_calls} classify_wall={:.1}s unknown_scans={} unknown_wall={:.1}s assess={assess_calls} assess_wall={:.1}s moved_wall={:.1}s",
+                    index + 1,
+                    classify_wall.as_secs_f64(),
+                    scans.count,
+                    scans.wall.as_secs_f64(),
+                    assess_wall.as_secs_f64(),
+                    moved_wall.as_secs_f64()
+                )
+            });
+        }
     }
-    crate::phase_log::sub("field_support:classify", "end", String::new);
+    crate::phase_log::sub("field_support:classify", "end", || {
+        format!(
+            "classify={classify_calls} classify_wall={:.1}s unknown_scans={} unknown_wall={:.1}s assess={assess_calls} assess_wall={:.1}s moved_wall={:.1}s",
+            classify_wall.as_secs_f64(),
+            scans.count,
+            scans.wall.as_secs_f64(),
+            assess_wall.as_secs_f64(),
+            moved_wall.as_secs_f64()
+        )
+    });
     fields.into_values().collect()
+}
+
+/// Relay main/388 (R1352-2): the load scans `classify_store_source` runs for its `Unknown` atoms,
+/// counted and timed (log only).
+#[derive(Default)]
+struct UnknownScans {
+    count: usize,
+    wall: std::time::Duration,
 }
 
 /// Relay main/388 (R1352-2): a `slow` mark for one store whose audit took at least 10 s, written
@@ -1604,7 +1662,12 @@ pub(crate) fn moved_transfer(operation: &str, by_move: bool) -> bool {
 /// consume rows and `ValueOrigins`. `Input` and `FieldToken` name the slot the
 /// solver must tie the support to; anything the origins do not resolve is
 /// `Unknown` and never supported.
-fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> StoreSourceOrigin {
+fn classify_store_source(
+    facts: &Facts,
+    origins: &ValueOrigins,
+    site: &Site,
+    scans: &mut UnknownScans,
+) -> StoreSourceOrigin {
     use super::super::ownership_boundary::{Role, Variables};
     let Some(store) = facts.field_support_inputs.stores.iter().find(|store| {
         store.site.function == site.function
@@ -1679,6 +1742,7 @@ fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> 
             // A load anywhere in the program (vars are program-wide per
             // construction): the field it was loaded from.
             OriginAtom::Unknown(port) => {
+                let started = std::time::Instant::now();
                 // The port is the load's definition, or the field place's
                 // own use window at the load (the token as read out of it).
                 let loaded: BTreeSet<String> = facts
@@ -1701,6 +1765,8 @@ fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> 
                     })
                     .map(|load| load.site.field_key.clone())
                     .collect();
+                scans.count += 1;
+                scans.wall += started.elapsed();
                 if loaded.is_empty() {
                     return StoreSourceOrigin::Unknown;
                 }
