@@ -15,7 +15,9 @@ use super::{
     fold_laws::{self, Plan},
     fold_member_output::ZeroOutput,
     fold_subtree::Membership,
-    matched::{MatchedTransport, Meet, MemberReturn, SourceInstance, TerminalTarget},
+    matched::{
+        MatchedTransport, Meet, MemberReturn, SourceInstance, SourceLineage, TerminalTarget,
+    },
     transport::Node,
 };
 
@@ -34,11 +36,16 @@ pub(crate) struct MemberPlan {
 }
 
 /// Relay main/385 (R1335-1): the one free a source endpoint's route ends at -- `[meet] = frees`,
-/// else competing responsibility.
+/// else competing responsibility -- and only with an `Exact` lineage: a `Recursive` marker may
+/// stand for several paths to the free (3b' collapses the lineages deeper than LINEAGE_DEPTH
+/// through one call into one), so a lone marker is not one free.
 pub(crate) fn single_free(frees: &[Meet]) -> Result<&Meet, Hold> {
     let [meet] = frees else {
         return Err(Hold::CompetingResponsibility);
     };
+    if !matches!(meet.terminal.lineage, SourceLineage::Exact(_)) {
+        return Err(Hold::CompetingResponsibility);
+    }
     Ok(meet)
 }
 
