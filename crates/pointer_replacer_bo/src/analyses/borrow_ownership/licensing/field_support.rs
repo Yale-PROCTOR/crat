@@ -1640,3 +1640,7 @@ fn classify_store_source(facts: &Facts, origins: &ValueOrigins, site: &Site) -> 
     };
     result
 }
+
+#[cfg(test)]
+#[path = "field_support_budget_tests.rs"]
+mod budget_tests;

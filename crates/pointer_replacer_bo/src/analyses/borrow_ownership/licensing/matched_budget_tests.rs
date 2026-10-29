@@ -100,6 +100,35 @@ fn r387_a_fifteen_guard_sets_collapse_to_one_marker_and_fourteen_stay_exact() {
     assert_eq!(rows(&relations, "narrow"), (14, 0), "14: the exact rows");
 }
 
+/// (a′): the marker summarizes the guard dimension only. One allocation endpoint seeded under two
+/// lineages, 15 arms to the output: one triple past the budget, ONE marker row per lineage.
+#[test]
+fn r387_a_the_marker_keeps_each_lineage() {
+    let mut lin = function(
+        &[],
+        &[2],
+        (0..15).map(|i| edge(1, 2, Some(300 + i))).collect(),
+    );
+    for via in ["a", "b"] {
+        lin.sources.push(Source {
+            node: node(1),
+            instance: SourceInstance {
+                endpoint: literal(900),
+                lineage: SourceLineage::Exact(vec![call_key("x", via)]),
+            },
+            guards: GuardSet::Exact(Guards::new()),
+            proof: Vec::new(),
+        });
+    }
+    let base = BTreeMap::from([(scope("lin"), lin)]);
+    let (_, relations) = MatchedTransport::relation_fixpoint(&base, &BTreeMap::new());
+    assert_eq!(
+        rows(&relations, "lin"),
+        (0, 2),
+        "one marker row per lineage"
+    );
+}
+
 /// (b): a marker absorbs -- no conflict is detectable through it; exact sets still conflict.
 #[test]
 fn r387_b_a_marker_absorbs_in_join() {
@@ -127,12 +156,9 @@ fn r387_b_a_marker_absorbs_in_join() {
     );
 }
 
-/// (d): the P02 shape in miniature -- level k calls level k - 1 and then routes the result through
-/// three arms, each its own literal, so level k's triple carries 3^(k+1) guard sets: 3, 9, 27.
-/// The marker appears where the product passes 14 (level 2), and `top`, which only calls level 2,
-/// gets one marker row, not 27.
-#[test]
-fn r387_d_multiplying_arms_collapse_where_the_product_passes_the_budget() {
+/// The P02 shape in miniature: level k calls level k - 1 and then routes the result through three
+/// arms, each its own literal; `top` (in 30, out 32) only calls level 2.
+fn p02_shape() -> (BTreeMap<Scope, Function>, BTreeMap<CallKey, Call>) {
     let mut base = BTreeMap::new();
     let mut calls = BTreeMap::new();
     base.insert(
@@ -169,6 +195,16 @@ fn r387_d_multiplying_arms_collapse_where_the_product_passes_the_budget() {
             outputs: vec![part(22, 31, 1)],
         },
     );
+    (base, calls)
+}
+
+/// (d): the P02 shape in miniature -- level k calls level k - 1 and then routes the result through
+/// three arms, each its own literal, so level k's triple carries 3^(k+1) guard sets: 3, 9, 27.
+/// The marker appears where the product passes 14 (level 2), and `top`, which only calls level 2,
+/// gets one marker row, not 27.
+#[test]
+fn r387_d_multiplying_arms_collapse_where_the_product_passes_the_budget() {
+    let (base, calls) = p02_shape();
     let (_, relations) = MatchedTransport::relation_fixpoint(&base, &calls);
     assert_eq!(rows(&relations, "level0"), (3, 0));
     assert_eq!(rows(&relations, "level1"), (9, 0));
@@ -182,4 +218,55 @@ fn r387_d_multiplying_arms_collapse_where_the_product_passes_the_budget() {
         (0, 1),
         "the caller above gets a marker, not 27 rows"
     );
+}
+
+/// Exact support (`reaches`, a fold's required member path): a path only through a marker is no
+/// reach. Absence (`meets_for` / `sources_for`, "is there a meet / another source here?"): the
+/// marker meet and the source it carries count as present.
+#[test]
+fn r387_c_a_path_through_a_marker_is_present_but_no_reach() {
+    let (mut base, calls) = p02_shape();
+    let top = base.get_mut(&scope("top")).unwrap();
+    top.edges.push(edge(30, 33, None));
+    let instance = SourceInstance {
+        endpoint: literal(901),
+        lineage: SourceLineage::Exact(Vec::new()),
+    };
+    top.sources.push(Source {
+        node: node(30),
+        instance: instance.clone(),
+        guards: GuardSet::Exact(Guards::new()),
+        proof: Vec::new(),
+    });
+    top.terminals.push(EndAt {
+        node: node(32),
+        terminal: TerminalInstance {
+            target: TerminalTarget::Free(literal(902)),
+            lineage: SourceLineage::Exact(Vec::new()),
+        },
+        guards: GuardSet::Exact(Guards::new()),
+        suffix: Vec::new(),
+    });
+    let (functions, relations) = MatchedTransport::relation_fixpoint(&base, &calls);
+    let transport = MatchedTransport {
+        functions,
+        relations,
+        guard_aliases: BTreeMap::new(),
+        denials: Vec::new(),
+    };
+    assert!(
+        transport.reaches(node(30), node(33)),
+        "control: an exact path reaches"
+    );
+    assert!(
+        !transport.reaches(node(30), node(32)),
+        "a path only through level 2's marker is no reach"
+    );
+    let meets = transport.meets_for(node(30));
+    assert_eq!(meets.len(), 1);
+    assert!(
+        meets[0].guards.is_summarized(),
+        "the meet is present, as a marker"
+    );
+    assert!(transport.sources_for(node(32)).contains(&instance));
 }

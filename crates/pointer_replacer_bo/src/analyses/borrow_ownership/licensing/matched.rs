@@ -146,6 +146,23 @@ pub(crate) struct Meet {
     proof: Vec<Step>,
 }
 
+/// Test-only: a meet with no proof, a reader fixture's input (relay main/387).
+#[cfg(test)]
+impl Meet {
+    pub(crate) fn for_test(
+        source: SourceInstance,
+        terminal: TerminalInstance,
+        guards: GuardSet,
+    ) -> Self {
+        Self {
+            source,
+            terminal,
+            guards,
+            proof: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum InputStoreStatus {
     MissingCorrespondence,
@@ -958,9 +975,11 @@ impl Triple {
 
 /// Relay main/387 (R1343-1, form (2)): the guard budget over the fixpoint's rows. Each triple keeps
 /// its distinct exact guard sets while they are at most the budget; the one past it -- or a marker
-/// row reaching the triple through a call -- collapses the triple to ONE marker row (the arriving
-/// row with its guards summarized and no proof), and a summarized triple absorbs every later row.
-/// A collapse removes rows and adds none past the marker, so the fixpoint terminates as before.
+/// row reaching the triple through a call -- collapses the triple: each of its rows becomes its
+/// marker row (the row with its guards summarized and no proof), one per lineage, so the marker
+/// summarizes the guard dimension only and every (seed, destination) instance stays. A summarized
+/// triple absorbs every later row into its lineage's marker. A collapse removes rows and adds at
+/// most one row per lineage, so the fixpoint terminates as before.
 struct GuardBudget {
     budget: usize,
     sets: BTreeMap<Triple, BTreeSet<GuardSet>>,
@@ -976,38 +995,42 @@ impl GuardBudget {
         }
     }
 
-    /// The round's `added` rows that enter the relations: a summarized triple's absorbed, the
-    /// collapsing triples' exact rows (this round's and the relations' own) replaced by their
-    /// marker.
+    /// The round's `added` rows that enter the relations: a summarized triple's rows as their
+    /// lineage's marker (nothing when that marker is in already), and a collapsing triple's exact
+    /// rows -- this round's and the relations' own -- replaced by their markers.
     fn admit(
         &mut self,
         relations: &mut BTreeMap<Relation, Vec<Step>>,
         added: Vec<(Relation, Vec<Step>)>,
     ) -> Vec<(Relation, Vec<Step>)> {
         let mut kept = Vec::with_capacity(added.len());
+        let mut markers = BTreeSet::new();
         let mut collapsed = BTreeSet::new();
+        let mut push_marker = |kept: &mut Vec<_>, row: Relation, relations: &BTreeMap<_, _>| {
+            let marker = Relation {
+                guards: GuardSet::Summarized,
+                ..row
+            };
+            if !relations.contains_key(&marker) && markers.insert(marker.clone()) {
+                kept.push((marker, Vec::new()));
+            }
+        };
         for (row, proof) in added {
             let triple = Triple::of(&row);
-            if self.summarized.contains(&triple) {
-                continue;
-            }
-            let over = row.guards.is_summarized() || {
+            let summarized = self.summarized.contains(&triple) || row.guards.is_summarized() || {
                 let sets = self.sets.entry(triple.clone()).or_default();
                 sets.insert(row.guards.clone());
                 sets.len() > self.budget
             };
-            if over {
-                self.sets.remove(&triple);
-                self.summarized.insert(triple.clone());
-                collapsed.insert(triple);
-                let marker = Relation {
-                    guards: GuardSet::Summarized,
-                    ..row
-                };
-                kept.push((marker, Vec::new()));
-            } else {
+            if !summarized {
                 kept.push((row, proof));
+                continue;
             }
+            if self.summarized.insert(triple.clone()) {
+                self.sets.remove(&triple);
+                collapsed.insert(triple);
+            }
+            push_marker(&mut kept, row, relations);
         }
         if !collapsed.is_empty() {
             let scopes: BTreeSet<Scope> = collapsed.iter().map(|triple| triple.0.clone()).collect();
@@ -1016,8 +1039,24 @@ impl GuardBudget {
                     && scopes.contains(&row.scope)
                     && collapsed.contains(&Triple::of(row))
             };
-            relations.retain(|row, _| !exact_of_collapsed(row));
-            kept.retain(|(row, _)| !exact_of_collapsed(row));
+            let mut stale = Vec::new();
+            relations.retain(|row, _| {
+                let drop = exact_of_collapsed(row);
+                if drop {
+                    stale.push(row.clone());
+                }
+                !drop
+            });
+            kept.retain(|(row, _)| {
+                let drop = exact_of_collapsed(row);
+                if drop {
+                    stale.push(row.clone());
+                }
+                !drop
+            });
+            for row in stale {
+                push_marker(&mut kept, row, relations);
+            }
         }
         kept
     }
