@@ -114,8 +114,10 @@ pub(crate) enum LeakKind {
     LocalCallee,
     /// An argument of a call through a function pointer.
     FnPointer,
-    /// An argument of a call into a foreign function (`memcpy` and its family among them).
+    /// An argument of a call into a foreign function other than `memcpy` / `memmove`.
     Foreign,
+    /// An argument of a foreign `memcpy` / `memmove` (split from `Foreign` for R1352-1 (b)'s count).
+    Memcpy,
     /// An argument of any other library call: a pointer method that reads or writes the pointee
     /// (`read`, `write`, `replace`, `swap`, `copy_*`, ...) among them.
     Library,
@@ -131,6 +133,7 @@ impl LeakKind {
             Self::LocalCallee => "local-callee-argument",
             Self::FnPointer => "fn-pointer-argument",
             Self::Foreign => "foreign-argument",
+            Self::Memcpy => "memcpy-argument",
             Self::Library => "library-argument",
             Self::Return => "return",
             Self::Union => "union",
@@ -227,10 +230,17 @@ pub(crate) fn directed_copies<'tcx>(
                         .impl_of_method(callee)
                         .is_some_and(|block| tcx.type_of(block).skip_binder().is_raw_ptr())
             });
+            // An `extern` block's item has a local `DefId`: ask for a foreign item first.
             let kind = match callee {
                 None => LeakKind::FnPointer,
-                Some(callee) if callee.is_local() => LeakKind::LocalCallee,
+                Some(callee)
+                    if tcx.is_foreign_item(callee)
+                        && matches!(tcx.item_name(callee).as_str(), "memcpy" | "memmove") =>
+                {
+                    LeakKind::Memcpy
+                }
                 Some(callee) if tcx.is_foreign_item(callee) => LeakKind::Foreign,
+                Some(callee) if callee.is_local() => LeakKind::LocalCallee,
                 Some(_) => LeakKind::Library,
             };
             for place in args.iter().filter_map(|argument| argument.node.place()) {
@@ -274,6 +284,25 @@ pub(crate) fn directed_copies<'tcx>(
         }
     }
     graph
+}
+
+/// R1352-1 (b): the kinds of every leak the directed walk from `holder` meets, not only the first
+/// (log only: which channels a fallback would have to model to stay directed).
+fn directed_leak_kinds(holder: SlotRef, directed: &DirectedCopies) -> Vec<&'static str> {
+    let mut kinds = std::collections::BTreeSet::new();
+    let mut pending = vec![holder];
+    let mut visited = FxHashSet::default();
+    while let Some(slot) = pending.pop() {
+        if !visited.insert(slot) {
+            continue;
+        }
+        if let Some(kind) = directed.leaks.get(&slot) {
+            kinds.insert(kind.label());
+        }
+        pending.extend(directed.forward.get(&slot).into_iter().flatten());
+        pending.extend(directed.identity.get(&slot).into_iter().flatten());
+    }
+    kinds.into_iter().collect()
 }
 
 /// Relay main/388 stage 2: the slots a demoted holder's VALUE can reach -- forward along copies, both
@@ -369,10 +398,11 @@ impl Context {
                 "retirement:fallback",
                 "leak",
                 &format!(
-                    "holder={} kind={} leak={} chain={}",
+                    "holder={} kind={} leak={} kinds={} chain={}",
                     key(&holder),
                     kind.label(),
                     key(&slot),
+                    directed_leak_kinds(holder, &self.directed_copies).join(","),
                     chain.keys().cloned().collect::<Vec<_>>().join(",")
                 ),
             );

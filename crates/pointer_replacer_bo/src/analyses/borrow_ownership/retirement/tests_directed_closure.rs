@@ -134,6 +134,14 @@ pub unsafe fn other_load(t: *mut Table) {
     let elsewhere: *mut Node = (*t).head;
     let _ = elsewhere;
 }
+extern "C" {
+    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+}
+pub unsafe fn copies(p: *mut *mut Node, q: *mut *mut Node) {
+    memcpy(p.cast::<u8>(), q.cast::<u8>().cast_const(), 8);
+    let r: *mut Node = *p;
+    let _ = r;
+}
 "#;
 
 /// The closure of `function::holder` (depth 0) in `METHODS`: whether it reaches `other_load::
@@ -198,4 +206,10 @@ fn r388_d_a_pointer_probe_adds_nothing_and_leaks_nothing() {
 #[test]
 fn r388_d_a_pointee_write_is_a_leak() {
     assert_eq!(method_closure("writes", "q").1, Some("library-argument"));
+}
+
+/// (b) a foreign `memcpy` argument is a leak of its own kind (split from the other foreign calls).
+#[test]
+fn r388_d_a_memcpy_argument_is_a_memcpy_leak() {
+    assert_eq!(method_closure("copies", "q").1, Some("memcpy-argument"));
 }
