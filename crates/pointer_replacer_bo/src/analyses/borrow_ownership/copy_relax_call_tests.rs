@@ -610,3 +610,76 @@ fn e5c_w269_p_a_reborrow_live_across_the_call_is_not_ref_beside_the_subject() {
         solved.kinds
     );
 }
+
+/// The second review: a copy admitted through the call arm whose value also
+/// reaches a core call that stores it (`ptr::write_volatile`, C2Rust's
+/// volatile store), or an integer, leaves the function: Raw.
+#[test]
+fn e5c_w269_t_a_copy_also_stored_by_a_core_call_keeps_the_subject_raw() {
+    let code = program(
+        "static mut G: *mut u8 = 0 as *mut u8;",
+        "",
+        "let x: *mut u8 = out; core::ptr::write_volatile(&raw mut G, x); \
+         mix(x, out, 16, addr.as_mut_ptr())",
+    );
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
+}
+
+#[test]
+fn e5c_w269_u_a_copy_also_cast_to_an_integer_keeps_the_subject_raw() {
+    let code = program(
+        "static mut ADDR: usize = 0;",
+        "",
+        "let x: *mut u8 = out; ADDR = x as usize; mix(x, out, 16, addr.as_mut_ptr())",
+    );
+    let solved = solve(&code);
+    assert_eq!(kind(&solved, "work::out"), "raw", "{:#?}", solved.kinds);
+}
+
+/// The second review's Q2b: the subject's own storage copied out by `memcpy`
+/// beside an admitted copy: Raw.
+#[test]
+fn e5c_w269_v_the_subjects_own_storage_copied_out_keeps_it_raw() {
+    let code = r#"
+unsafe extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void;
+}
+static mut SAVED: *mut u8 = 0 as *mut u8;
+unsafe extern "C" fn keep_none(p: *mut u8) { *p = 7; }
+unsafe extern "C" fn f(y: *mut u8) {
+    let x: *mut u8 = y;
+    *y = 1;
+    memcpy(
+        &raw mut SAVED as *mut core::ffi::c_void,
+        &raw const y as *const core::ffi::c_void,
+        8,
+    );
+    keep_none(x);
+    *y = 2;
+    *SAVED = 3;
+}
+#[no_mangle] pub unsafe extern "C" fn run() -> u8 {
+    let mut b: [u8; 8] = [0; 8];
+    f(b.as_mut_ptr());
+    return b[0];
+}
+"#;
+    let solved = solve(code);
+    assert_eq!(kind(&solved, "f::y"), "raw", "{:#?}", solved.kinds);
+}
+
+/// The second review's minor: a view stepped by core's `wrapping_add` is a
+/// view, so `f(x.wrapping_add(1), x)` has its row.
+#[test]
+fn e5c_w269_w_a_wrapping_step_is_a_view() {
+    let code = program(
+        "",
+        "",
+        "mix(out.wrapping_add(1), out, 16, addr.as_mut_ptr())",
+    );
+    let solved = solve(&code);
+    let rows = multi_views(&solved, "work");
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["k"], 2, "{rows:#?}");
+}
