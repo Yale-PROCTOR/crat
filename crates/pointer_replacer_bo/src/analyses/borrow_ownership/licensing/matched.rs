@@ -37,13 +37,30 @@ pub(crate) struct SourceInstance {
 }
 
 /// Relay main/385 (R1335-1), 3b': the longest `Exact` lineage kept; a deeper one becomes the
-/// `Recursive` marker of the call being prepended (the scope's own call). Set in the GREEN commit.
+/// `Recursive` marker of the call being prepended (the scope's own call). 7 = the longest lineage
+/// any of the 376 reads (main 267), so the 376 carries no marker at this depth.
 pub(crate) const LINEAGE_DEPTH: usize = 7;
 
+/// The depth in force: `CRAT_BO_LINEAGE_DEPTH` when set -- for measurement runs only, never in a
+/// gate, never on the 17 or the 376 -- else [`LINEAGE_DEPTH`].
+fn lineage_depth() -> usize {
+    static DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DEPTH.get_or_init(|| {
+        std::env::var("CRAT_BO_LINEAGE_DEPTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(LINEAGE_DEPTH)
+    })
+}
+
 impl SourceLineage {
+    /// Relay main/385 (R1335-1), 3b': an `Exact` lineage that would pass the depth becomes the
+    /// marker as a repeated call does. The marker is still a row, counted by every reader that
+    /// counts; it then fails their `Exact` / `== [call]` / forwarding checks (main 266 §3), so
+    /// a grant that rested on an `Exact` lineage that deep is lost and none is added.
     pub(crate) fn through(&self, call: &CallKey) -> Self {
         match self {
-            Self::Exact(calls) if !calls.contains(call) => {
+            Self::Exact(calls) if !calls.contains(call) && calls.len() < lineage_depth() => {
                 let mut applications = vec![call.clone()];
                 applications.extend(calls.iter().cloned());
                 Self::Exact(applications)
