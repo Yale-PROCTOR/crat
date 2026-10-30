@@ -3,6 +3,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use super::{
     super::origin_evidence::SourceSite,
     facts::{EquationId, Facts},
@@ -1187,18 +1189,42 @@ pub(crate) fn return_port_owning(
             holds.entry(key.clone()).or_insert(reason);
         }
     };
+    // Relay main/388 walls 3+4 (R1363-1): the whole-table reads per roster, per head and per store
+    // read their scope's group instead (R1-R3); the cost per part is marked (log only).
+    let started = std::time::Instant::now();
+    let consumes = super::grants::by_scope(&facts.consumes, |row| &row.point);
+    let boundaries = super::grants::by_scope(&facts.boundary_substitutions, |row| &row.point);
+    let freeing = freeing_frames(facts);
+    let mut heads_of: FxHashMap<&str, Vec<&super::value_origins::RawHead>> = FxHashMap::default();
+    for head in &facts.raw_pointer_heads {
+        heads_of
+            .entry(head.function.as_str())
+            .or_default()
+            .push(head);
+    }
+    let mut cost = ReturnPortCost::default();
+    crate::phase_log::sub("return_port:tables", "end", || {
+        format!(
+            "rosters={} consumes={} boundaries={} wall={:.1}s",
+            facts.body_rosters.len(),
+            facts.consumes.len(),
+            facts.boundary_substitutions.len(),
+            started.elapsed().as_secs_f64()
+        )
+    });
     for roster in &facts.body_rosters {
         let Some(function) = roster.point.function.as_deref() else { continue };
         let construction = roster.point.construction;
         let node = |var| Node { construction, var };
-        let ports: Vec<Node> = facts
-            .boundary_substitutions
-            .iter()
-            .filter(|row| {
-                row.role == Role::ExitReturn
-                    && row.point.construction == construction
-                    && row.point.function.as_deref() == Some(function)
-            })
+        cost.rosters += 1;
+        if cost.rosters % 500 == 0 {
+            crate::phase_log::sub("return_port:rosters", "tick", || cost.line());
+        }
+        let scoped_consumes = super::grants::scoped(&consumes, construction, function);
+        let scoped_boundaries = super::grants::scoped(&boundaries, construction, function);
+        let started = std::time::Instant::now();
+        let ports: Vec<Node> = role_rows(scoped_boundaries, Role::ExitReturn)
+            .into_iter()
             .flat_map(|row| {
                 row.matched
                     .iter()
@@ -1208,15 +1234,17 @@ pub(crate) fn return_port_owning(
                     })
             })
             .collect();
+        cost.ports += started.elapsed();
         if ports.is_empty() {
             continue;
         }
+        cost.port_rosters += 1;
         // (1) every port is fresh-or-null, and some port carries a token.
         let atoms: Vec<_> = ports.iter().flat_map(|port| origins.at(*port)).collect();
-        let frame_heads: Vec<String> = facts
-            .raw_pointer_heads
+        let function_heads: &[&super::value_origins::RawHead] =
+            heads_of.get(function).map(Vec::as_slice).unwrap_or(&[]);
+        let frame_heads: Vec<String> = function_heads
             .iter()
-            .filter(|head| head.function == function)
             .map(|head| head.slot_key.clone())
             .collect();
         if !atoms
@@ -1237,38 +1265,28 @@ pub(crate) fn return_port_owning(
             continue;
         }
         // A free anywhere in the frame refuses it; see the note above.
-        if facts.equations.iter().any(|equation| {
-            equation.point.construction == construction
-                && equation.point.function.as_deref() == Some(function)
-                && equation
-                    .endpoint
-                    .as_ref()
-                    .is_some_and(|endpoint| endpoint.callee == "free")
-        }) {
+        if freeing.contains(&(construction, function)) {
             hold(&frame_heads, ReturnPortHold::ReturnSiteDeliveryUnknown);
             continue;
         }
         // The node a place holds at a site, from the frame's own consume rows.
+        let at_place_calls = std::cell::Cell::new(0usize);
+        let at_place_wall = std::cell::Cell::new(std::time::Duration::ZERO);
         let at_place =
             |block: u32, statement: usize, place: &super::super::ownership_access::PlaceSyntax| {
-                facts
-                    .consumes
-                    .iter()
-                    .filter(|consume| {
-                        consume.point.construction == construction
-                            && consume.point.function.as_deref() == Some(function)
-                            && consume.point.block == Some(block)
-                            && consume.point.statement == Some(statement)
-                            && consume.local == place.local
-                            && consume.projection == place.projection
-                    })
+                let started = std::time::Instant::now();
+                let nodes = place_rows(scoped_consumes, block, statement, place)
+                    .into_iter()
                     .filter_map(|consume| match &consume.projected {
                         Present(window) if window.use_start != window.use_end => {
                             Some(node(window.use_start))
                         }
                         _ => None,
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                at_place_calls.set(at_place_calls.get() + 1);
+                at_place_wall.set(at_place_wall.get() + started.elapsed());
+                nodes
             };
         let escapes = |source: EquationId| {
             // (3) stored into a field.
@@ -1285,11 +1303,10 @@ pub(crate) fn return_port_owning(
                     }
             });
             // (4) handed to a callee.
-            let passed = facts.boundary_substitutions.iter().any(|row| {
-                row.role == Role::CallArgument
-                    && row.point.construction == construction
-                    && row.point.function.as_deref() == Some(function)
-                    && row.matched.iter().any(|pair| match pair.actual {
+            let passed = role_rows(scoped_boundaries, Role::CallArgument)
+                .into_iter()
+                .any(|row| {
+                    row.matched.iter().any(|pair| match pair.actual {
                         Variables::Single { var } => {
                             origins.at(node(var)).contains(&OriginAtom::Fresh(source))
                         }
@@ -1297,22 +1314,19 @@ pub(crate) fn return_port_owning(
                             .at(node(use_var))
                             .contains(&OriginAtom::Fresh(source)),
                     })
-            });
+                });
             stored || passed
         };
-        for head in facts
-            .raw_pointer_heads
-            .iter()
-            .filter(|head| head.function == function)
-        {
+        let started = std::time::Instant::now();
+        for head in function_heads {
+            cost.heads += 1;
             // (2) this allocation reaches a port: the slot's own versions carry a
             // returned `Fresh`, and nothing else.
             let mut reaches = None;
-            for consume in facts.consumes.iter().filter(|consume| {
-                consume.point.construction == construction
-                    && consume.point.function.as_deref() == Some(function)
-                    && consume.local == head.local
-            }) {
+            for consume in scoped_consumes
+                .iter()
+                .filter(|consume| consume.local == head.local)
+            {
                 let Present(window) = &consume.projected else { continue };
                 for var in [window.use_start, window.def_start] {
                     for atom in origins.at(node(var)) {
@@ -1335,7 +1349,147 @@ pub(crate) fn return_port_owning(
                 }
             }
         }
+        cost.head_scans += started.elapsed();
+        cost.at_place_calls += at_place_calls.get();
+        cost.at_place += at_place_wall.get();
     }
+    crate::phase_log::sub("return_port:rosters", "end", || cost.line());
     holds.retain(|key, _| !admitted.contains(key));
     (admitted, holds)
+}
+
+/// Relay main/388 walls 3+4 (R1363-1): `return_port_owning`'s own cost, per part (log only): the
+/// ports, the heads' scans (the stores' `at_place` inside them), `at_place` itself.
+#[derive(Default)]
+struct ReturnPortCost {
+    rosters: usize,
+    port_rosters: usize,
+    heads: usize,
+    at_place_calls: usize,
+    ports: std::time::Duration,
+    head_scans: std::time::Duration,
+    at_place: std::time::Duration,
+}
+
+impl ReturnPortCost {
+    fn line(&self) -> String {
+        format!(
+            "rosters={} port_rosters={} heads={} at_place_calls={} ports={:.1}s head_scans={:.1}s at_place={:.1}s",
+            self.rosters,
+            self.port_rosters,
+            self.heads,
+            self.at_place_calls,
+            self.ports.as_secs_f64(),
+            self.head_scans.as_secs_f64(),
+            self.at_place.as_secs_f64()
+        )
+    }
+}
+
+/// R2: the scope's boundary rows of one role, in table order.
+pub(super) fn role_rows<'f>(
+    scoped_boundaries: &[&'f super::super::ownership_boundary::Substitution],
+    role: super::super::ownership_boundary::Role,
+) -> Vec<&'f super::super::ownership_boundary::Substitution> {
+    scoped_boundaries
+        .iter()
+        .copied()
+        .filter(|row| row.role == role)
+        .collect()
+}
+
+/// The scan [`role_rows`] replaces (its oracle).
+#[cfg(test)]
+pub(super) fn role_rows_by_scan<'f>(
+    facts: &'f Facts,
+    construction: u32,
+    function: &str,
+    role: super::super::ownership_boundary::Role,
+) -> Vec<&'f super::super::ownership_boundary::Substitution> {
+    facts
+        .boundary_substitutions
+        .iter()
+        .filter(|row| {
+            row.role == role
+                && row.point.construction == construction
+                && row.point.function.as_deref() == Some(function)
+        })
+        .collect()
+}
+
+/// R1: the scope's consume rows of `place` at a site, in table order.
+pub(super) fn place_rows<'f>(
+    scoped_consumes: &[&'f super::super::ownership_occurrence::Consumption],
+    block: u32,
+    statement: usize,
+    place: &super::super::ownership_access::PlaceSyntax,
+) -> Vec<&'f super::super::ownership_occurrence::Consumption> {
+    scoped_consumes
+        .iter()
+        .copied()
+        .filter(|consume| {
+            consume.point.block == Some(block)
+                && consume.point.statement == Some(statement)
+                && consume.local == place.local
+                && consume.projection == place.projection
+        })
+        .collect()
+}
+
+/// The scan [`place_rows`] replaces (its oracle).
+#[cfg(test)]
+pub(super) fn place_rows_by_scan<'f>(
+    facts: &'f Facts,
+    construction: u32,
+    function: &str,
+    block: u32,
+    statement: usize,
+    place: &super::super::ownership_access::PlaceSyntax,
+) -> Vec<&'f super::super::ownership_occurrence::Consumption> {
+    facts
+        .consumes
+        .iter()
+        .filter(|consume| {
+            consume.point.construction == construction
+                && consume.point.function.as_deref() == Some(function)
+                && consume.point.block == Some(block)
+                && consume.point.statement == Some(statement)
+                && consume.local == place.local
+                && consume.projection == place.projection
+        })
+        .collect()
+}
+
+/// R3: the (construction, function) scopes with an equation whose endpoint is a `free`, once.
+pub(super) fn freeing_frames(facts: &Facts) -> FxHashSet<(u32, &str)> {
+    facts
+        .equations
+        .iter()
+        .filter(|equation| {
+            equation
+                .endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.callee == "free")
+        })
+        .filter_map(|equation| {
+            equation
+                .point
+                .function
+                .as_deref()
+                .map(|function| (equation.point.construction, function))
+        })
+        .collect()
+}
+
+/// The scan [`freeing_frames`] replaces (its oracle).
+#[cfg(test)]
+pub(super) fn frees_by_scan(facts: &Facts, construction: u32, function: &str) -> bool {
+    facts.equations.iter().any(|equation| {
+        equation.point.construction == construction
+            && equation.point.function.as_deref() == Some(function)
+            && equation
+                .endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.callee == "free")
+    })
 }

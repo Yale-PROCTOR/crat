@@ -85,12 +85,19 @@ impl FrozenTransport {
             .map(|call| super::traversal_correspondence::certify(facts, call))
             .collect();
         step("freeze:grants")?;
-        let (objective_grants, grant_holds) = super::grants::plan(
-            facts,
-            &super::transport::CandidateGraph::build(facts),
-            &matched,
-            &value_origins,
-        );
+        // Relay main/388 walls 3+4 (R1363-1): `grants:<sub>` marks inside this plan only.
+        let (objective_grants, grant_holds) = crate::phase_log::with_sub_marks(|| {
+            let started = std::time::Instant::now();
+            let graph = super::transport::CandidateGraph::build(facts);
+            crate::phase_log::sub("grants:graph", "end", || {
+                format!(
+                    "edges={} wall={:.1}s",
+                    graph.edges.len(),
+                    started.elapsed().as_secs_f64()
+                )
+            });
+            super::grants::plan(facts, &graph, &matched, &value_origins)
+        });
         step("freeze:fold_callers")?;
         let fold_callers = super::fold_eligibility::plan(facts);
         step("freeze:fold_members")?;

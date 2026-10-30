@@ -2540,7 +2540,9 @@ impl KindSolver {
             self.assert_return_port_rows(std::slice::from_ref(row));
             self.check_sat_count
                 .set(self.check_sat_count.get().saturating_add(1));
-            if self.solver.check(&[]) == SatResult::Sat {
+            if crate::phase_log::z3_query("return-port-row", || self.solver.check(&[]))
+                == SatResult::Sat
+            {
                 // Keep it asserted: the next row is judged against a system that
                 // already carries everything kept before it.
                 kept.push(row.clone());
@@ -2864,7 +2866,7 @@ impl KindSolver {
         for literal in &bundle {
             hard.solver.assert(literal);
         }
-        let initial = hard.solver.check();
+        let initial = crate::phase_log::z3_query("hard-check", || hard.solver.check());
         let query_reason = (initial == SatResult::Unknown)
             .then(|| hard.solver.get_reason_unknown())
             .flatten();
@@ -2879,7 +2881,9 @@ impl KindSolver {
         let outcome = if initial == SatResult::Unsat {
             self.lazy_tracked_recheck_count
                 .set(self.lazy_tracked_recheck_count.get().saturating_add(1));
-            let tracked = hard.solver.check_assumptions(&bundle);
+            let tracked = crate::phase_log::z3_query("hard-recheck", || {
+                hard.solver.check_assumptions(&bundle)
+            });
             let reason = (tracked == SatResult::Unknown)
                 .then(|| hard.solver.get_reason_unknown())
                 .flatten();
@@ -3226,7 +3230,7 @@ impl KindSolver {
         }
         self.assert_return_port_rows(&rows);
         self.prepare_demand_query(QueryPhase::Materialization, None);
-        let mut outcome = self.solver.check(&[]);
+        let mut outcome = crate::phase_log::z3_query("optimize", || self.solver.check(&[]));
         if outcome == SatResult::Unsat && !rows.is_empty() {
             self.solver.pop();
             rows = self.return_port_admissible_subset(&rows, &bundle);
@@ -3238,7 +3242,7 @@ impl KindSolver {
             self.prepare_demand_query(QueryPhase::Materialization, None);
             self.check_sat_count
                 .set(self.check_sat_count.get().saturating_add(1));
-            outcome = self.solver.check(&[]);
+            outcome = crate::phase_log::z3_query("optimize-subset", || self.solver.check(&[]));
         }
         self.return_port_kept.borrow_mut().push(rows.len());
         *self.return_port_last_rows.borrow_mut() = rows.iter().map(|(_, slot)| *slot).collect();

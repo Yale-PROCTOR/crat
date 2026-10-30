@@ -527,8 +527,15 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
         if let Some(tracker) = kind_solver.tracker() {
             tracker.set_context("r377-return-port");
         }
-        let origins = licensing::value_origins::ValueOrigins::build(&facts);
-        let (admitted, _holds) = licensing::fold_caller::return_port_owning(&facts, &origins);
+        // Relay main/388 walls 3+4 (R1363-1): `return_port:<sub>` marks inside this step only.
+        let (admitted, _holds) = crate::phase_log::with_sub_marks(|| {
+            let started = std::time::Instant::now();
+            let origins = licensing::value_origins::ValueOrigins::build(&facts);
+            crate::phase_log::sub("return_port:origins", "end", || {
+                format!("wall={:.1}s", started.elapsed().as_secs_f64())
+            });
+            licensing::fold_caller::return_port_owning(&facts, &origins)
+        });
         for slot_key in admitted {
             if let Some(&slot) = facts.slot_refs.get(&slot_key) {
                 // The refusal machinery stays authoritative: a slot some other

@@ -4,13 +4,16 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use super::{
     super::{
         origin_evidence::{OriginAvailability, SourceCallee},
         ownership_access::Expression,
-        ownership_occurrence::Availability,
+        ownership_boundary::{CallArgRegistration, Substitution},
+        ownership_evidence::{Equation, Point},
+        ownership_occurrence::{Availability, Consumption, Terminal, Transfer},
     },
     facts::Facts,
     matched::{MatchedTransport, Meet, SourceLineage, TerminalTarget},
@@ -103,19 +106,26 @@ pub(crate) struct Hold {
 /// The existing inference pass erases an argument temporary by registering
 /// its source's consume. Accept only the exact non-reference, single-use free
 /// proxy; a coincident Var or an arbitrary missing consume is insufficient.
-fn free_proxies(facts: &Facts, construction: u32, function: &str) -> BTreeMap<u32, usize> {
+fn free_proxies(
+    facts: &Facts,
+    tables: &Tables<'_>,
+    construction: u32,
+    function: &str,
+) -> BTreeMap<u32, usize> {
     use super::super::{ownership_access::OperandSyntax, ownership_boundary::Window};
     let mut result = BTreeMap::new();
     let Some(occurrences) = facts.source_occurrences.get(function) else { return result };
-    for registration in &facts.call_arg_registrations {
-        if registration.point.construction != construction
-            || registration.point.function.as_deref() != Some(function)
-            || registration.by_reference
-        {
+    // Relay main/388 walls 3+4 (G1): every table read below is the scope's own group; a row of
+    // another scope never passed these predicates (`registration.point` names this scope).
+    let registrations = scoped(&tables.registrations, construction, function);
+    let consumes = scoped(&tables.consumes, construction, function);
+    let equations = scoped(&tables.equations, construction, function);
+    for registration in registrations {
+        if registration.by_reference {
             continue;
         }
         let Availability::Present(source) = registration.source_occurrence else { continue };
-        let Some(consume) = facts.consumes.iter().find(|row| {
+        let Some(consume) = consumes.iter().find(|row| {
             row.ordinal == source && row.point == registration.point && row.projection.is_empty()
         }) else {
             continue;
@@ -173,7 +183,7 @@ fn free_proxies(facts: &Facts, construction: u32, function: &str) -> BTreeMap<u3
         if !matches!(&call.callee, Some(SourceCallee::ForeignC(name)) if name == "free")
             || call.site.block != definition.site.block
             || call.site.statement <= definition.site.statement
-            || !facts.equations.iter().any(|row| {
+            || !equations.iter().any(|row| {
                 row.operation == "sink"
                     && row.variables == [window.use_start]
                     && row.point.construction == construction
@@ -184,14 +194,9 @@ fn free_proxies(facts: &Facts, construction: u32, function: &str) -> BTreeMap<u3
         {
             continue;
         }
-        if facts
-            .call_arg_registrations
+        if registrations
             .iter()
-            .filter(|row| {
-                row.point.construction == construction
-                    && row.point.function.as_deref() == Some(function)
-                    && row.proxy_local == registration.proxy_local
-            })
+            .filter(|row| row.proxy_local == registration.proxy_local)
             .count()
             != 1
         {
@@ -200,6 +205,292 @@ fn free_proxies(facts: &Facts, construction: u32, function: &str) -> BTreeMap<u3
         result.insert(registration.proxy_local, source);
     }
     result
+}
+
+/// Relay main/388 walls 3+4 (R1363-1), G1: a fact table's rows grouped once by (construction,
+/// function), in table order. A row whose point names no function is in no group: the per-roster
+/// filters this replaces (`point.construction == c && point.function == Some(f)`) never kept one.
+pub(crate) type Scoped<'f, T> = FxHashMap<&'f str, FxHashMap<u32, Vec<&'f T>>>;
+
+pub(crate) fn by_scope<'f, T>(rows: &'f [T], point: impl Fn(&'f T) -> &'f Point) -> Scoped<'f, T> {
+    let mut groups: Scoped<'f, T> = FxHashMap::default();
+    for row in rows {
+        let point = point(row);
+        if let Some(function) = point.function.as_deref() {
+            groups
+                .entry(function)
+                .or_default()
+                .entry(point.construction)
+                .or_default()
+                .push(row);
+        }
+    }
+    groups
+}
+
+/// One scope's rows, in table order; empty when it has none.
+pub(crate) fn scoped<'s, 'f, T>(
+    groups: &'s Scoped<'f, T>,
+    construction: u32,
+    function: &str,
+) -> &'s [&'f T] {
+    groups
+        .get(function)
+        .and_then(|by_construction| by_construction.get(&construction))
+        .map(Vec::as_slice)
+        .unwrap_or(&[])
+}
+
+/// The tables `plan` reads per roster, grouped once per call (G1).
+pub(crate) struct Tables<'f> {
+    terminals: Scoped<'f, Terminal>,
+    boundaries: Scoped<'f, Substitution>,
+    equations: Scoped<'f, Equation>,
+    consumes: Scoped<'f, Consumption>,
+    registrations: Scoped<'f, CallArgRegistration>,
+    heads: FxHashMap<&'f str, Vec<&'f super::value_origins::RawHead>>,
+}
+
+impl<'f> Tables<'f> {
+    pub(crate) fn build(facts: &'f Facts) -> Self {
+        let mut heads: FxHashMap<&str, Vec<_>> = FxHashMap::default();
+        for head in &facts.raw_pointer_heads {
+            heads.entry(head.function.as_str()).or_default().push(head);
+        }
+        Self {
+            terminals: by_scope(&facts.terminals, |row| &row.point),
+            boundaries: by_scope(&facts.boundary_substitutions, |row| &row.point),
+            equations: by_scope(&facts.equations, |row| &row.point),
+            consumes: by_scope(&facts.consumes, |row| &row.point),
+            registrations: by_scope(&facts.call_arg_registrations, |row| &row.point),
+            heads,
+        }
+    }
+}
+
+/// G2: the rows recorded at `equation`'s point for its `transfer`. Every such row has the point of
+/// an equation of this scope, so the scope's own equations hold all of them, in table order.
+fn transfer_rows<'f>(
+    scoped_equations: &[&'f Equation],
+    equation: &Equation,
+    transfer: &Transfer,
+) -> Vec<&'f Equation> {
+    scoped_equations
+        .iter()
+        .copied()
+        .filter(|row| row.point == equation.point && row.transfer.as_ref() == Some(transfer))
+        .collect()
+}
+
+/// The scan [`transfer_rows`] replaces (its oracle).
+#[cfg(test)]
+pub(super) fn transfer_rows_by_scan<'f>(
+    facts: &'f Facts,
+    equation: &Equation,
+    transfer: &Transfer,
+) -> Vec<&'f Equation> {
+    facts
+        .equations
+        .iter()
+        .filter(|row| row.point == equation.point && row.transfer.as_ref() == Some(transfer))
+        .collect()
+}
+
+/// G3: whether the scope records `operation` with an outcome-free endpoint at a site.
+fn endpoint_row(
+    scoped_equations: &[&Equation],
+    operation: &str,
+    block: u32,
+    statement: usize,
+) -> bool {
+    scoped_equations.iter().any(|row| {
+        row.operation == operation
+            && row.point.block == Some(block)
+            && row.point.statement == Some(statement)
+            && row
+                .endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.outcome.is_none())
+    })
+}
+
+/// G3: the scope's unprojected consume rows of `local` at a site, in table order.
+fn definitions<'f>(
+    scoped_consumes: &[&'f Consumption],
+    block: u32,
+    statement: usize,
+    local: u32,
+) -> Vec<&'f Consumption> {
+    scoped_consumes
+        .iter()
+        .copied()
+        .filter(|row| {
+            row.point.block == Some(block)
+                && row.point.statement == Some(statement)
+                && row.local == local
+                && row.projection.is_empty()
+        })
+        .collect()
+}
+
+/// The scans [`endpoint_row`] and [`definitions`] replace (their oracles).
+#[cfg(test)]
+pub(super) fn endpoint_row_by_scan(
+    facts: &Facts,
+    construction: u32,
+    function: &str,
+    operation: &str,
+    block: u32,
+    statement: usize,
+) -> bool {
+    facts.equations.iter().any(|row| {
+        row.point.construction == construction
+            && row.point.function.as_deref() == Some(function)
+            && row.operation == operation
+            && row.point.block == Some(block)
+            && row.point.statement == Some(statement)
+            && row
+                .endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.outcome.is_none())
+    })
+}
+
+#[cfg(test)]
+pub(super) fn definitions_by_scan<'f>(
+    facts: &'f Facts,
+    construction: u32,
+    function: &str,
+    block: u32,
+    statement: usize,
+    local: u32,
+) -> Vec<&'f Consumption> {
+    facts
+        .consumes
+        .iter()
+        .filter(|row| {
+            row.point.construction == construction
+                && row.point.function.as_deref() == Some(function)
+                && row.point.block == Some(block)
+                && row.point.statement == Some(statement)
+                && row.local == local
+                && row.projection.is_empty()
+        })
+        .collect()
+}
+
+/// G4: a roster's local evidence -- the ordinals of its equations and of its exit-return
+/// boundary rows -- built once, so the per-edge locality test is a lookup.
+struct Locality {
+    construction: u32,
+    equations: FxHashSet<usize>,
+    exits: FxHashSet<usize>,
+}
+
+impl Locality {
+    fn build(
+        construction: u32,
+        scoped_equations: &[&Equation],
+        scoped_boundaries: &[&Substitution],
+    ) -> Self {
+        Self {
+            construction,
+            equations: scoped_equations.iter().map(|row| row.ordinal).collect(),
+            exits: scoped_boundaries
+                .iter()
+                .filter(|row| row.role == super::super::ownership_boundary::Role::ExitReturn)
+                .map(|row| row.ordinal)
+                .collect(),
+        }
+    }
+
+    fn local(&self, evidence: &Evidence) -> bool {
+        match *evidence {
+            Evidence::Frame { equation, .. }
+            | Evidence::Phi(equation)
+            | Evidence::Transfer(equation)
+            | Evidence::TraversalFrame(equation)
+            | Evidence::ReferenceEffect(equation) => {
+                equation.construction == self.construction
+                    && self.equations.contains(&equation.ordinal)
+            }
+            Evidence::Boundary {
+                construction,
+                ordinal,
+                ..
+            } => construction == self.construction && self.exits.contains(&ordinal),
+        }
+    }
+}
+
+/// The scan [`Locality::local`] replaces (its oracle).
+#[cfg(test)]
+pub(super) fn local_by_scan(
+    facts: &Facts,
+    evidence: &Evidence,
+    construction: u32,
+    function: &str,
+) -> bool {
+    let scope = |point: &Point| {
+        point.construction == construction && point.function.as_deref() == Some(function)
+    };
+    match *evidence {
+        Evidence::Frame { equation, .. }
+        | Evidence::Phi(equation)
+        | Evidence::Transfer(equation)
+        | Evidence::TraversalFrame(equation)
+        | Evidence::ReferenceEffect(equation) => facts.equations.iter().any(|row| {
+            scope(&row.point)
+                && row.ordinal == equation.ordinal
+                && equation.construction == construction
+        }),
+        Evidence::Boundary {
+            construction: c,
+            ordinal,
+            ..
+        } => {
+            c == construction
+                && facts.boundary_substitutions.iter().any(|row| {
+                    scope(&row.point)
+                        && row.ordinal == ordinal
+                        && row.role == super::super::ownership_boundary::Role::ExitReturn
+                })
+        }
+    }
+}
+
+/// Relay main/388 walls 3+4 (R1363-1): `plan`'s own cost, per part (log only): the per-roster
+/// filters, `free_proxies`, the transfer rows, the occurrences, the per-edge locality.
+#[derive(Default)]
+struct PlanCost {
+    rosters: usize,
+    held: usize,
+    transfers: usize,
+    occurrences: usize,
+    edge_rosters: usize,
+    filters: std::time::Duration,
+    proxies: std::time::Duration,
+    transfer_rows: std::time::Duration,
+    occurrence_checks: std::time::Duration,
+    locality: std::time::Duration,
+}
+
+impl PlanCost {
+    fn line(&self) -> String {
+        format!(
+            "rosters={} held={} transfers={} occurrences={} edge_rosters={} filters={:.1}s proxies={:.1}s transfer_rows={:.1}s occurrences_wall={:.1}s locality={:.1}s",
+            self.rosters,
+            self.held,
+            self.transfers,
+            self.occurrences,
+            self.edge_rosters,
+            self.filters.as_secs_f64(),
+            self.proxies.as_secs_f64(),
+            self.transfer_rows.as_secs_f64(),
+            self.occurrence_checks.as_secs_f64(),
+            self.locality.as_secs_f64()
+        )
+    }
 }
 
 /// **Relay main/378 (c), R1324-1.** An exit belongs to the functions whose terminal carries its
@@ -267,41 +558,49 @@ pub(crate) fn plan(
     let mut holds = Vec::new();
     let carriers = origins.no_ref_carriers(facts);
     let exits_of = exits_by_function(facts, graph);
+    // Relay main/388 walls 3+4 (R1363-1): every per-roster read of a whole table reads its scope's
+    // group instead (G1-G4); the cost per part is marked (log only).
+    let started = std::time::Instant::now();
+    let tables = Tables::build(facts);
+    let mut cost = PlanCost::default();
+    crate::phase_log::sub("grants:tables", "end", || {
+        format!(
+            "rosters={} equations={} consumes={} edges={} wall={:.1}s",
+            facts.body_rosters.len(),
+            facts.equations.len(),
+            facts.consumes.len(),
+            graph.edges.len(),
+            started.elapsed().as_secs_f64()
+        )
+    });
     for roster in &facts.body_rosters {
         let Some(function) = &roster.point.function else { continue };
         let construction = roster.point.construction;
         let scope = |point: &super::super::ownership_evidence::Point| {
             point.construction == construction && point.function.as_ref() == Some(function)
         };
+        cost.rosters += 1;
+        if cost.rosters % 500 == 0 {
+            crate::phase_log::sub("grants:rosters", "tick", || cost.line());
+        }
+        let scoped_equations = scoped(&tables.equations, construction, function);
+        let scoped_consumes = scoped(&tables.consumes, construction, function);
+        let scoped_boundaries = scoped(&tables.boundaries, construction, function);
         let mut reasons = BTreeSet::new();
-        let proxies = free_proxies(facts, construction, function);
+        let started = std::time::Instant::now();
+        let proxies = free_proxies(facts, &tables, construction, function);
+        cost.proxies += started.elapsed();
+        let started = std::time::Instant::now();
         if super::coverage::validate_returns(facts, construction, function).is_err() {
             reasons.insert(HoldReason::Coverage);
         }
-        let terminals: Vec<_> = facts
-            .terminals
+        let terminals: Vec<_> = scoped(&tables.terminals, construction, function)
             .iter()
-            .filter(|row| scope(&row.point))
-            .cloned()
+            .map(|row| (*row).clone())
             .collect();
-        let boundaries: Vec<_> = facts
-            .boundary_substitutions
-            .iter()
-            .filter(|row| scope(&row.point))
-            .cloned()
-            .collect();
-        let equations: Vec<_> = facts
-            .equations
-            .iter()
-            .filter(|row| scope(&row.point))
-            .cloned()
-            .collect();
-        let consumes: Vec<_> = facts
-            .consumes
-            .iter()
-            .filter(|row| scope(&row.point))
-            .cloned()
-            .collect();
+        let boundaries: Vec<_> = scoped_boundaries.iter().map(|row| (*row).clone()).collect();
+        let equations: Vec<_> = scoped_equations.iter().map(|row| (*row).clone()).collect();
+        let consumes: Vec<_> = scoped_consumes.iter().map(|row| (*row).clone()).collect();
         if super::super::ownership_occurrence::validate(function, &consumes, &equations).is_err() {
             reasons.insert(HoldReason::Coverage);
         }
@@ -342,10 +641,12 @@ pub(crate) fn plan(
         if order.len() != blocks.len() || !roster.phis.is_empty() {
             reasons.insert(HoldReason::BranchOrLoop);
         }
-        let heads: Vec<_> = facts
-            .raw_pointer_heads
-            .iter()
-            .filter(|head| &head.function == function)
+        let heads: Vec<_> = tables
+            .heads
+            .get(function.as_str())
+            .into_iter()
+            .flatten()
+            .copied()
             .collect();
         if heads
             .iter()
@@ -353,7 +654,7 @@ pub(crate) fn plan(
         {
             reasons.insert(HoldReason::InputContract);
         }
-        for consume in facts.consumes.iter().filter(|row| scope(&row.point)) {
+        for consume in scoped_consumes {
             if consume.projection.is_empty()
                 && (facts
                     .unit_locals
@@ -367,7 +668,9 @@ pub(crate) fn plan(
                 reasons.insert(HoldReason::FieldOrReference);
             }
         }
-        for equation in facts.equations.iter().filter(|row| scope(&row.point)) {
+        cost.filters += started.elapsed();
+        let started = std::time::Instant::now();
+        for equation in scoped_equations {
             if equation.validate().is_err() {
                 reasons.insert(HoldReason::Coverage);
             }
@@ -380,10 +683,8 @@ pub(crate) fn plan(
                 {
                     reasons.insert(HoldReason::Coverage);
                 }
-                let at = |row: &&super::super::ownership_evidence::Equation| {
-                    row.point == equation.point && row.transfer.as_ref() == Some(transfer)
-                };
-                let rows: Vec<_> = facts.equations.iter().filter(at).collect();
+                cost.transfers += 1;
+                let rows = transfer_rows(scoped_equations, equation, transfer);
                 let zero = |var| {
                     rows.iter().any(|row| {
                         row.operation == "assume"
@@ -412,6 +713,8 @@ pub(crate) fn plan(
                 }
             }
         }
+        cost.transfer_rows += started.elapsed();
+        let started = std::time::Instant::now();
         let sources: Vec<_> = graph
             .sources
             .iter()
@@ -458,16 +761,12 @@ pub(crate) fn plan(
                     _ => None,
                 };
                 if !expected.is_some_and(|operation| {
-                    facts.equations.iter().any(|row| {
-                        scope(&row.point)
-                            && row.operation == operation
-                            && row.point.block == Some(occurrence.site.block)
-                            && row.point.statement == Some(occurrence.site.statement)
-                            && row
-                                .endpoint
-                                .as_ref()
-                                .is_some_and(|endpoint| endpoint.outcome.is_none())
-                    })
+                    endpoint_row(
+                        scoped_equations,
+                        operation,
+                        occurrence.site.block,
+                        occurrence.site.statement,
+                    )
                 }) {
                     reasons.insert(HoldReason::CallOrOutcome);
                 }
@@ -484,17 +783,12 @@ pub(crate) fn plan(
                     reasons.insert(HoldReason::FieldOrReference);
                     continue;
                 }
-                let definitions: Vec<_> = facts
-                    .consumes
-                    .iter()
-                    .filter(|row| {
-                        scope(&row.point)
-                            && row.point.block == Some(occurrence.site.block)
-                            && row.point.statement == Some(occurrence.site.statement)
-                            && row.local == occurrence.syntax.destination.local
-                            && row.projection.is_empty()
-                    })
-                    .collect();
+                let definitions = definitions(
+                    scoped_consumes,
+                    occurrence.site.block,
+                    occurrence.site.statement,
+                    occurrence.syntax.destination.local,
+                );
                 if definitions.len() != 1 {
                     reasons.insert(HoldReason::Coverage);
                     continue;
@@ -520,7 +814,9 @@ pub(crate) fn plan(
                 }
             }
         }
+        cost.occurrence_checks += started.elapsed();
         if !reasons.is_empty() {
+            cost.held += 1;
             holds.push(Hold {
                 construction,
                 function: function.clone(),
@@ -533,8 +829,7 @@ pub(crate) fn plan(
             // A source's retirement is its final recorded operation in this
             // fragment. Even copying/returning a dangling alias cannot supply
             // a second owning output after that original C free.
-            let point = facts
-                .equations
+            let point = scoped_equations
                 .iter()
                 .find(|row| scope(&row.point) && row.ordinal == sink.equation.ordinal)
                 .unwrap();
@@ -564,31 +859,12 @@ pub(crate) fn plan(
                 },
             )
         };
+        let started = std::time::Instant::now();
+        cost.edge_rosters += 1;
+        let locality = Locality::build(construction, scoped_equations, scoped_boundaries);
         let mut edges: BTreeMap<Node, BTreeSet<Node>> = BTreeMap::new();
         for edge in &graph.edges {
-            let local = match edge.evidence {
-                Evidence::Frame { equation, .. }
-                | Evidence::Phi(equation)
-                | Evidence::Transfer(equation)
-                | Evidence::TraversalFrame(equation)
-                | Evidence::ReferenceEffect(equation) => facts.equations.iter().any(|row| {
-                    scope(&row.point)
-                        && row.ordinal == equation.ordinal
-                        && equation.construction == construction
-                }),
-                Evidence::Boundary {
-                    construction: c,
-                    ordinal,
-                    ..
-                } => {
-                    c == construction
-                        && facts.boundary_substitutions.iter().any(|row| {
-                            scope(&row.point)
-                                && row.ordinal == ordinal
-                                && row.role == super::super::ownership_boundary::Role::ExitReturn
-                        })
-                }
-            };
+            let local = locality.local(&edge.evidence);
             if local
                 && edge.guard.is_none()
                 && matches!(edge.rule, Rule::Frame | Rule::Return | Rule::Copy)
@@ -613,6 +889,7 @@ pub(crate) fn plan(
         for successors in edges.values_mut() {
             successors.retain(|to| reaches.contains(to));
         }
+        cost.locality += started.elapsed();
         let mut route = vec![source.node];
         while *route.last().unwrap() != terminal {
             let Some(out) = edges
@@ -629,10 +906,9 @@ pub(crate) fn plan(
             }
             route.push(next);
         }
-        for equation in facts
-            .equations
+        for equation in scoped_equations
             .iter()
-            .filter(|row| scope(&row.point) && row.operation == "linear")
+            .filter(|row| row.operation == "linear")
         {
             let Some(split) = &equation.transfer else {
                 reasons.insert(HoldReason::Coverage);
@@ -684,5 +960,10 @@ pub(crate) fn plan(
             });
         }
     }
+    crate::phase_log::sub("grants:rosters", "end", || cost.line());
     (grants, holds)
 }
+
+#[cfg(test)]
+#[path = "grants_index_tests.rs"]
+mod index_tests;

@@ -1902,14 +1902,17 @@ fn solve_bo_overlap_config_with_source_events(
             })?;
     crate::phase_log::mark("solve:baseline_construction", "end", "");
     crate::phase_log::mark("solve:baseline_verify", "start", "");
-    let (baseline_model, baseline_round_stats) = verify_bo_construction_counting(
-        program,
-        slots,
-        origins,
-        &baseline_solver,
-        &baseline_construction,
-        mut_facts,
-    );
+    // Relay main/388 walls 3+4 (R1363-1): the verify's `verify:<sub>` / `z3:<sub>` marks, here only.
+    let (baseline_model, baseline_round_stats) = crate::phase_log::with_sub_marks(|| {
+        verify_bo_construction_counting(
+            program,
+            slots,
+            origins,
+            &baseline_solver,
+            &baseline_construction,
+            mut_facts,
+        )
+    });
     crate::phase_log::mark(
         "solve:baseline_verify",
         "end",

@@ -1087,7 +1087,12 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     backend: LoopBackend,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
     let _reader_facts = super::licensing::reader_replay::enter_facts(solver.ownership_facts());
+    // Relay main/388 walls 3+4 (R1363-1): `verify:<sub>` marks, inside the baseline verify only.
+    let started = std::time::Instant::now();
     let source_inventory = super::source_events::for_construction(program);
+    crate::phase_log::sub("verify:inventory", "end", || {
+        format!("wall={:.1}s", started.elapsed().as_secs_f64())
+    });
     let _source_scope = super::source_events::enter_inventory(&source_inventory);
     super::source_events::record_replay();
     // Release-active guard: a tracked solver's hard constraints are
@@ -1184,21 +1189,42 @@ fn verify_rounds(
     // Constrain each struct-field slot's ownership to `field.own <=> AND(stored
     // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the
     // flow-insensitive global-field over-claim). Must precede the first solve.
+    let started = std::time::Instant::now();
     super::coherence::constrain_field_ownership(solver, slots, program);
+    crate::phase_log::sub("verify:field_ownership", "end", || {
+        format!("wall={:.1}s", started.elapsed().as_secs_f64())
+    });
+    let started = std::time::Instant::now();
     let hard =
         matches!(backend, LoopBackend::HardCheckRoundOptimize).then(|| solver.hard_loop_solver());
+    crate::phase_log::sub("verify:hard_solver", "end", || {
+        format!("wall={:.1}s", started.elapsed().as_secs_f64())
+    });
     let mut stats = RoundStats::default();
     // Resolve the repair strategy ONCE per invocation into a local; NO mid-loop re-reads, so the
     // whole fixpoint runs one consistent strategy. It is stamped into `stats` here.
     stats.repair = repair;
-    let Some((mut model, dropped)) = solve_round(
+    crate::phase_log::sub("verify:solve", "start", || {
+        format!("round=0 repair={repair:?}")
+    });
+    let started = std::time::Instant::now();
+    let first = solve_round(
         solver,
         selectors,
         backend,
         hard.as_ref(),
         planner.as_ref(),
         &mut stats,
-    ) else {
+    );
+    crate::phase_log::sub("verify:solve", "end", || {
+        format!(
+            "round=0 sat={} wall={:.1}s z3={}",
+            first.is_some(),
+            started.elapsed().as_secs_f64(),
+            crate::phase_log::z3_summary()
+        )
+    });
+    let Some((mut model, dropped)) = first else {
         return (None, stats);
     };
     record_dropped(&mut stats, selectors, &dropped);
@@ -1380,14 +1406,25 @@ fn verify_rounds(
             }
             stats.commits_conflict += raw_targets.len();
             stats.commits_per_round.push(raw_targets.len());
-            let Some((next, dropped)) = solve_round(
+            let started = std::time::Instant::now();
+            let solved = solve_round(
                 solver,
                 selectors,
                 backend,
                 hard.as_ref(),
                 planner.as_ref(),
                 &mut stats,
-            ) else {
+            );
+            crate::phase_log::sub("verify:solve", "end", || {
+                format!(
+                    "round={} sat={} wall={:.1}s z3={}",
+                    stats.rounds,
+                    solved.is_some(),
+                    started.elapsed().as_secs_f64(),
+                    crate::phase_log::z3_summary()
+                )
+            });
+            let Some((next, dropped)) = solved else {
                 return (None, stats);
             };
             model = next;
@@ -1450,14 +1487,25 @@ fn verify_rounds(
                 }
                 stats.commits_conflict += owning.len();
                 stats.commits_per_round.push(owning.len());
-                let Some((next, dropped)) = solve_round(
+                let started = std::time::Instant::now();
+                let solved = solve_round(
                     solver,
                     selectors,
                     backend,
                     hard.as_ref(),
                     planner.as_ref(),
                     &mut stats,
-                ) else {
+                );
+                crate::phase_log::sub("verify:solve", "end", || {
+                    format!(
+                        "round={} sat={} wall={:.1}s z3={}",
+                        stats.rounds,
+                        solved.is_some(),
+                        started.elapsed().as_secs_f64(),
+                        crate::phase_log::z3_summary()
+                    )
+                });
+                let Some((next, dropped)) = solved else {
                     return (None, stats);
                 };
                 model = next;

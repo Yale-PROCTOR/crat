@@ -65,6 +65,53 @@ pub(crate) fn sub_marks_on() -> bool {
     on() && SUB_MARKS.get()
 }
 
+thread_local! {
+    static Z3_QUERIES: std::cell::RefCell<std::collections::BTreeMap<&'static str, (usize, f64)>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// Relay main/388 walls 3+4 (R1363-1): one z3 query, timed inside [`with_sub_marks`] (log only).
+/// Each `stage`'s count and wall accumulate for [`z3_summary`]; a query of at least 30 s writes a
+/// `slow` line, and every 100th query of a stage a `tick` line. Outside the scope it only runs `f`.
+pub(crate) fn z3_query<T>(stage: &'static str, f: impl FnOnce() -> T) -> T {
+    if !sub_marks_on() {
+        return f();
+    }
+    let started = std::time::Instant::now();
+    let result = f();
+    let wall = started.elapsed().as_secs_f64();
+    let (count, total) = Z3_QUERIES.with(|queries| {
+        let mut queries = queries.borrow_mut();
+        let entry = queries.entry(stage).or_insert((0, 0.0));
+        entry.0 += 1;
+        entry.1 += wall;
+        *entry
+    });
+    if wall >= 30.0 {
+        sub("z3:query", "slow", || {
+            format!("stage={stage} n={count} wall={wall:.1}s")
+        });
+    }
+    if count % 100 == 0 {
+        sub("z3:query", "tick", || {
+            format!("stage={stage} n={count} total={total:.1}s")
+        });
+    }
+    result
+}
+
+/// The z3 queries timed so far, per stage: `stage=count/wall` (log only).
+pub(crate) fn z3_summary() -> String {
+    Z3_QUERIES.with(|queries| {
+        queries
+            .borrow()
+            .iter()
+            .map(|(stage, (count, wall))| format!("{stage}={count}/{wall:.1}s"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
 /// One sub-mark inside [`with_sub_marks`]; `detail` is called only when the line is written.
 pub(crate) fn sub(phase: &str, edge: &str, detail: impl FnOnce() -> String) {
     if on() && SUB_MARKS.get() {
