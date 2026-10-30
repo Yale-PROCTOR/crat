@@ -10,7 +10,7 @@ use super::{
             freeing_frames, frees_by_scan, place_rows, place_rows_by_scan, role_rows,
             role_rows_by_scan,
         },
-        graph_tests::with_facts,
+        graph_tests::{with_facts, with_solver_facts},
         transport::CandidateGraph,
         value_origins::ValueOrigins,
     },
@@ -309,5 +309,33 @@ fn r1365_r4_the_freezes_origins_equal_the_rebuilt() {
         assert_ne!(rebuilt, ValueOrigins::default(), "the fixture has origins");
         let _index = coverage::index_returns(facts);
         assert_eq!(*shared, ValueOrigins::build(facts), "the indexed rebuild");
+    });
+}
+
+/// Relay main/388 R6 (R1368-1): `certified_null_stores` (the verify's `constrain_field_ownership`)
+/// reads the freeze's own `value_origins`. The facts the verify reads (`KindSolver::ownership_facts`)
+/// are the frozen object itself, and a rebuild from them there -- by the scan, and with the index
+/// held -- equals the freeze's.
+#[test]
+fn r1368_r6_the_freezes_origins_equal_the_verifys_rebuild() {
+    with_solver_facts(WALLS, |facts, solver, _| {
+        let at_verify = solver.ownership_facts().expect("the verify's facts");
+        assert!(
+            std::ptr::eq(&*at_verify, facts),
+            "the verify reads the frozen object"
+        );
+        let shared = &at_verify.licensing.as_ref().expect("frozen").value_origins;
+        assert_eq!(
+            *shared,
+            ValueOrigins::build(&at_verify),
+            "the scan's rebuild"
+        );
+        assert_ne!(*shared, ValueOrigins::default(), "the fixture has origins");
+        let _index = coverage::index_returns(&at_verify);
+        assert_eq!(
+            *shared,
+            ValueOrigins::build(&at_verify),
+            "the indexed rebuild"
+        );
     });
 }

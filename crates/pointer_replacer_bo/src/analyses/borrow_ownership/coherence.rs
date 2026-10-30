@@ -517,11 +517,31 @@ pub(crate) fn constrain_field_ownership(
     slots: &CrateSlots,
     program: &RustProgram<'_>,
 ) {
+    // Relay main/388 verify marks (R1367-2): `field_ownership:<part>` marks, log only.
+    let started = std::time::Instant::now();
     let null_stores = solver
         .ownership_facts()
         .map(|facts| certified_null_stores(&facts))
         .unwrap_or_default();
+    crate::phase_log::sub("field_ownership:null_stores", "end", || {
+        format!(
+            "certified={} wall={:.1}s",
+            null_stores.len(),
+            started.elapsed().as_secs_f64()
+        )
+    });
+    let started = std::time::Instant::now();
     let (owned_stores, blocked) = scan_field_stores(slots, program, &null_stores);
+    crate::phase_log::sub("field_ownership:scan", "end", || {
+        format!(
+            "functions={} owned_fields={} blocked={} wall={:.1}s",
+            program.functions.len(),
+            owned_stores.len(),
+            blocked.len(),
+            started.elapsed().as_secs_f64()
+        )
+    });
+    let started = std::time::Instant::now();
     for (field, rhs) in &owned_stores {
         if !blocked.contains(field) {
             solver.constrain_field_own(*field, rhs);
@@ -530,6 +550,18 @@ pub(crate) fn constrain_field_ownership(
     for &field in &blocked {
         solver.forbid_field_own(field);
     }
+    crate::phase_log::sub("field_ownership:constrain", "end", || {
+        let constrained = owned_stores
+            .iter()
+            .filter(|(field, _)| !blocked.contains(field));
+        format!(
+            "constrained={} rhs={} forbidden={} wall={:.1}s",
+            constrained.clone().count(),
+            constrained.map(|(_, rhs)| rhs.len()).sum::<usize>(),
+            blocked.len(),
+            started.elapsed().as_secs_f64()
+        )
+    });
 }
 
 #[derive(Clone, Debug, Default)]
@@ -699,11 +731,7 @@ fn certified_null_stores(
     super::ownership_access::PlaceSyntax,
 )> {
     use super::{
-        licensing::{
-            field_support::StoredValue,
-            transport::Node,
-            value_origins::{OriginAtom, ValueOrigins},
-        },
+        licensing::{field_support::StoredValue, transport::Node, value_origins::OriginAtom},
         ownership_occurrence::Availability::Present,
     };
     let Some(frozen) = &facts.licensing else {
@@ -717,9 +745,21 @@ fn certified_null_stores(
     if observations.is_empty() {
         return Vec::new();
     }
-    // Reconstruct current alternatives; an old cached proof cannot erase a
-    // new non-null store demand after its actual evidence changes.
-    let origins = ValueOrigins::build(facts);
+    // Current alternatives, so an old cached proof cannot erase a new non-null store demand after
+    // its actual evidence changes. Relay main/388 R6 (R1368-1): the freeze's own origins -- these
+    // facts are the frozen object the freeze built them from, and nothing writes its tables after.
+    // Relay main/388 verify marks (R1367-2): the mark stays, log only.
+    let started = std::time::Instant::now();
+    let origins = &frozen.value_origins;
+    crate::phase_log::sub("field_ownership:origins", "end", || {
+        format!(
+            "observations={} wall={:.1}s shared",
+            observations.len(),
+            started.elapsed().as_secs_f64()
+        )
+    });
+    let started = std::time::Instant::now();
+    let mut examined = 0usize;
     let mut result = Vec::new();
     for store in &facts.field_support_inputs.stores {
         let StoredValue::Value(source) = &store.value else {
@@ -728,6 +768,7 @@ fn certified_null_stores(
         if !observations.contains(&&store.site) {
             continue;
         }
+        examined += 1;
         let rows: Vec<_> = facts
             .consumes
             .iter()
@@ -762,6 +803,16 @@ fn certified_null_stores(
         }
         result.push((store.site.clone(), source.clone()));
     }
+    crate::phase_log::sub("field_ownership:stores", "end", || {
+        format!(
+            "stores={} examined={examined} certified={} consumes={} equations={} wall={:.1}s",
+            facts.field_support_inputs.stores.len(),
+            result.len(),
+            facts.consumes.len(),
+            facts.equations.len(),
+            started.elapsed().as_secs_f64()
+        )
+    });
     result
 }
 

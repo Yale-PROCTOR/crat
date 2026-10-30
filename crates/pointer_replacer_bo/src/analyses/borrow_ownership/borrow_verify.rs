@@ -1093,8 +1093,13 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     crate::phase_log::sub("verify:inventory", "end", || {
         format!("wall={:.1}s", started.elapsed().as_secs_f64())
     });
+    let started = std::time::Instant::now();
     let _source_scope = super::source_events::enter_inventory(&source_inventory);
     super::source_events::record_replay();
+    // Relay main/388 verify marks (R1367-2): log only.
+    crate::phase_log::sub("verify:record_replay", "end", || {
+        format!("wall={:.1}s", started.elapsed().as_secs_f64())
+    });
     // Release-active guard: a tracked solver's hard constraints are
     // track-gated; every solve in this loop would be vacuously SAT and the
     // accepted model meaningless. Tracked instances belong to the explain path.
@@ -1126,7 +1131,11 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     // live in a scope that is popped before the plain run, so that run sees the solver exactly as
     // a plain-only run would. An accepting guarded run keeps its scope, as a plain run keeps its
     // commits.
+    let started = std::time::Instant::now();
     solver.push_scope();
+    crate::phase_log::sub("verify:push_scope", "end", || {
+        format!("wall={:.1}s", started.elapsed().as_secs_f64())
+    });
     let (model, guarded) = rounds(RepairMode::Guarded);
     if model.is_some() {
         return (model, guarded);
@@ -1162,6 +1171,8 @@ fn verify_rounds(
     // The guarded planner lives across rounds, and is told of every round -- the
     // retirement pins' and the field-own repair's as empty ones -- so its validation counter
     // stays equal to `stats.rounds`. Its own cap (10S + 1) bounds the guarded rounds.
+    // Relay main/388 verify marks (R1367-2): the planner's set-up, the cap and the budget check, log only.
+    let started = std::time::Instant::now();
     let mut planner = (repair == RepairMode::Guarded).then(|| {
         let slot_count = slots
             .fn_local_slots
@@ -1186,6 +1197,12 @@ fn verify_rounds(
             },
         );
     }
+    crate::phase_log::sub("verify:planner", "end", || {
+        format!(
+            "repair={repair:?} cap={cap} wall={:.1}s",
+            started.elapsed().as_secs_f64()
+        )
+    });
     // Constrain each struct-field slot's ownership to `field.own <=> AND(stored
     // owns)`, so a field mixing an owned source and a borrowed value settles non-Owning (the
     // flow-insensitive global-field over-claim). Must precede the first solve.
