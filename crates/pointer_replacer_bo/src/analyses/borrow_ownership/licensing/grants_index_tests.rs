@@ -5,12 +5,14 @@
 use super::{
     super::{
         super::ownership_boundary::Role,
+        coverage,
         fold_caller::{
             freeing_frames, frees_by_scan, place_rows, place_rows_by_scan, role_rows,
             role_rows_by_scan,
         },
         graph_tests::with_facts,
         transport::CandidateGraph,
+        value_origins::ValueOrigins,
     },
     *,
 };
@@ -292,5 +294,20 @@ fn r1363_r3_the_freeing_scopes_equal_the_scan() {
             }
         }
         assert!(frees >= 1 && clean >= 1, "both answers occur");
+    });
+}
+
+/// Relay main/388 R4 + R5 (R1365-1): `own:return_port` reads the freeze's own `value_origins`, and
+/// it equals a rebuild from the frozen facts -- without the index (the scan) and with the index the
+/// post-freeze steps now hold (`coverage::index_returns`, keyed on these facts' address).
+#[test]
+fn r1365_r4_the_freezes_origins_equal_the_rebuilt() {
+    with_facts(WALLS, |facts| {
+        let shared = &facts.licensing.as_ref().expect("frozen").value_origins;
+        let rebuilt = ValueOrigins::build(facts);
+        assert_eq!(*shared, rebuilt, "the scan's rebuild");
+        assert_ne!(rebuilt, ValueOrigins::default(), "the fixture has origins");
+        let _index = coverage::index_returns(facts);
+        assert_eq!(*shared, ValueOrigins::build(facts), "the indexed rebuild");
     });
 }

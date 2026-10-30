@@ -509,6 +509,10 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     crate::phase_log::mark("own:freeze_facts", "end", "");
     crate::phase_log::mark("own:return_port", "start", "");
     crate::analysis_budget::check("own:return_port")?;
+    // Relay main/388 R5 (R1365-1): from here through `own:fold_callers`, `validate_returns` on these
+    // frozen facts reads relay 378 (d)'s index, as it does inside the freeze (the facts are
+    // immutable, so the index's rows and memo answer as the whole-table scan does).
+    let returns_index = licensing::coverage::index_returns(&facts);
     if let Some(tracker) = kind_solver.tracker() {
         tracker.set_context("licensing-origin-admissibility");
     }
@@ -523,18 +527,19 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     // irrelevant (the bodies share the InterCtxt signature vars), so the loop
     // above is left untouched and this adds rows rather than changing any.
     if let Some(frozen) = facts.licensing.as_ref() {
-        let _ = frozen;
         if let Some(tracker) = kind_solver.tracker() {
             tracker.set_context("r377-return-port");
         }
         // Relay main/388 walls 3+4 (R1363-1): `return_port:<sub>` marks inside this step only.
         let (admitted, _holds) = crate::phase_log::with_sub_marks(|| {
             let started = std::time::Instant::now();
-            let origins = licensing::value_origins::ValueOrigins::build(&facts);
+            // Relay main/388 R4 (R1365-1): the freeze's own origins, built from these same tables
+            // (nothing after `freeze:value_origins` writes them), not a rebuild.
+            let origins = &frozen.value_origins;
             crate::phase_log::sub("return_port:origins", "end", || {
-                format!("wall={:.1}s", started.elapsed().as_secs_f64())
+                format!("wall={:.1}s shared", started.elapsed().as_secs_f64())
             });
-            licensing::fold_caller::return_port_owning(&facts, &origins)
+            licensing::fold_caller::return_port_owning(&facts, origins)
         });
         for slot_key in admitted {
             if let Some(&slot) = facts.slot_refs.get(&slot_key) {
@@ -585,6 +590,7 @@ fn emit_crate_ownership_constraints_impl<'tcx>(
     crate::analysis_budget::check("own:fold_callers")?;
     kind_solver.constrain_fold_callers(&facts)?;
     crate::phase_log::mark("own:fold_callers", "end", "");
+    drop(returns_index);
     crate::phase_log::mark("own:record_ownership_facts", "start", "");
     crate::analysis_budget::check("own:record_ownership_facts")?;
     export::record_ownership_facts(&facts);
