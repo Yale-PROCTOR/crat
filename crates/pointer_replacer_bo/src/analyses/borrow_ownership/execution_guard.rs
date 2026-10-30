@@ -6,6 +6,22 @@ use std::cell::{Cell, RefCell};
 
 pub(crate) const QUERY_TIMEOUT_MS: u32 = 600_000;
 
+/// Relay main/388 (R1370-1): the per-query timeout in force -- `CRAT_BO_QUERY_TIMEOUT_MS` when set
+/// (a measurement switch, for a run the user's word names only; never in a gate, never on the 17
+/// or the 376, and not part of the model cache's key), else [`QUERY_TIMEOUT_MS`] exactly. Read once.
+pub(crate) fn query_timeout_ms() -> u32 {
+    static TIMEOUT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| timeout_from(std::env::var("CRAT_BO_QUERY_TIMEOUT_MS").ok().as_deref()))
+}
+
+/// [`query_timeout_ms`]'s reading of the variable's value, as `CRAT_BO_GUARD_BUDGET` is read:
+/// unset or not a `u32`, the sealed cap.
+fn timeout_from(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(QUERY_TIMEOUT_MS)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueryStage {
     HardCheck,

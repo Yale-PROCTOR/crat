@@ -106,3 +106,19 @@ fn e5_i_guard_last_unknown_records_only_actual_unknown_and_clears() {
         "new worker/model scope can explicitly clear stale evidence"
     );
 }
+
+/// Relay main/388 (R1370-1): unset, the timeout in force is the sealed 600_000 exactly; a set value
+/// is honoured; an unparsable one is the sealed cap.
+#[test]
+fn r1370_the_query_timeout_is_the_sealed_cap_unset_and_the_switch_value_when_set() {
+    assert_eq!(timeout_from(None), 600_000);
+    assert_eq!(timeout_from(Some("1800000")), 1_800_000);
+    assert_eq!(timeout_from(Some("ten minutes")), QUERY_TIMEOUT_MS);
+    if std::env::var_os("CRAT_BO_QUERY_TIMEOUT_MS").is_none() {
+        assert_eq!(
+            query_timeout_ms(),
+            QUERY_TIMEOUT_MS,
+            "the gate's process sets nothing"
+        );
+    }
+}

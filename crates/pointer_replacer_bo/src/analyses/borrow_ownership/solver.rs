@@ -29,7 +29,7 @@ use super::{
 /// Parameters shared by every production backend and subsequent setter.
 fn fixed_query_params() -> z3::Params {
     let mut params = z3::Params::new();
-    params.set_u32("timeout", execution_guard::QUERY_TIMEOUT_MS);
+    params.set_u32("timeout", execution_guard::query_timeout_ms());
     params
 }
 
@@ -3284,6 +3284,16 @@ impl KindSolver {
                 }
             }
         } else {
+            // Relay main/388 (R1371-1): what z3 still holds after an Unknown, logged only; the round
+            // returns `None` as before and the model is dropped unread by anything else.
+            if outcome == SatResult::Unknown && crate::phase_log::on() {
+                let detail = unknown_incumbent_detail(
+                    &self.solver,
+                    self.vars.values().map(|vars| (&vars.ref_, &vars.own)),
+                    unknown_reason.as_deref(),
+                );
+                crate::phase_log::mark("z3:unknown", "optimize", &detail);
+            }
             self.record_round_model_failure(match outcome {
                 SatResult::Unsat => RoundModelFailure::OptimizeUnsat {
                     active_endpoint_retraction: relaxed.assumptions.len(),
@@ -3787,6 +3797,40 @@ fn assert_hard(
         }
     }
 }
+
+/// Relay main/388 (R1371-1): after an Unknown optimize, z3's reason, whether it still holds a
+/// model, and if so how many of `vars`' slots (`(ref_, own)` per slot) that model gives each kind,
+/// read as `read_kinds` reads -- a log line only. `Optimize::get_model` is a null check on
+/// `Z3_optimize_get_model` (the bindings clear the context's error handler), so asking after an
+/// Unknown is safe; nothing is asserted, and the model is dropped here. z3 0.19's `Optimize`
+/// exposes no objective lower / upper bounds, so the kind counts stand in for them.
+fn unknown_incumbent_detail<'a>(
+    optimize: &Optimize,
+    vars: impl Iterator<Item = (&'a Bool, &'a Bool)>,
+    reason: Option<&str>,
+) -> String {
+    let reason = reason.unwrap_or("-");
+    let Some(model) = optimize.get_model() else {
+        return format!("reason={reason:?} model=none");
+    };
+    let (mut slots, mut owning, mut reference) = (0usize, 0usize, 0usize);
+    for (ref_, own) in vars {
+        slots += 1;
+        if is_true(&model, own) {
+            owning += 1;
+        } else if is_true(&model, ref_) {
+            reference += 1;
+        }
+    }
+    format!(
+        "reason={reason:?} model=some slots={slots} owning={owning} ref={reference} raw={}",
+        slots - owning - reference
+    )
+}
+
+#[cfg(test)]
+#[path = "solver_unknown_tests.rs"]
+mod unknown_tests;
 
 fn is_true(model: &Model, b: &Bool) -> bool {
     model
