@@ -499,8 +499,9 @@ fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &
     if function.sig.header.coroutine_kind.is_some() {
         return Err("async functions are unsupported");
     }
-    if function.sig.decl.c_variadic() {
-        return Err("variadic functions are unsupported");
+    if function.sig.decl.c_variadic() && matches!(function.sig.header.ext, rustc_ast::Extern::None)
+    {
+        return Err("variadic functions require an external calling convention");
     }
     if function
         .sig
@@ -1066,6 +1067,18 @@ fn validate_signature(expected: &ParsedExpected, result: &Item) -> Vec<Validatio
     let expected_params = &expected_fn.sig.decl.inputs;
     let result_params = &result_fn.sig.decl.inputs;
     let mut errors = vec![];
+    if (expected_fn.sig.decl.c_variadic() || result_fn.sig.decl.c_variadic())
+        && crate::preservation::function_signature(expected_fn)
+            != crate::preservation::function_signature(result_fn)
+    {
+        errors.push(error(
+            "variadic_signature_mismatch",
+            function_message(
+                expected,
+                "preserve the complete variadic function signature".to_owned(),
+            ),
+        ));
+    }
     let expected_generics = lifetime_generic_declaration(&expected_fn.generics);
     let result_generics = lifetime_generic_declaration(&result_fn.generics);
     if expected_generics != result_generics {

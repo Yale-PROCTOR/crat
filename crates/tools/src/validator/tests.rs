@@ -77,6 +77,28 @@ fn expected_function(id: u64, name: &str, skeleton: &str) -> ExpectedFunction {
     }
 }
 
+#[test]
+fn variadic_bodies_can_change_but_the_complete_signature_is_fixed() {
+    let skeleton =
+        r#"unsafe extern "C" fn f(fmt: *const i8, mut args: ...) -> i32 { #[proctor(0)] todo!() }"#;
+    let valid = skeleton.replace("todo!()", "7");
+    assert_valid(skeleton, &valid);
+    for (old, new) in [
+        ("*const i8", "*mut i8"),
+        ("-> i32", "-> i64"),
+        ("extern \"C\" ", ""),
+        (", mut args: ...", ""),
+        ("mut args", "mut other"),
+        ("mut args", "args"),
+    ] {
+        assert_code(
+            skeleton,
+            &valid.replace(old, new),
+            "variadic_signature_mismatch",
+        );
+    }
+}
+
 fn preservation_request(
     skeleton: &str,
     transformed: Vec<u32>,
@@ -1316,7 +1338,6 @@ fn invalid_expected_skeleton_is_setup_error() {
         "unsafe fn f<'a>(x: &'a i32) where { #[proctor(0)] return; }",
         "async unsafe fn f() { #[proctor(0)] return; }",
         "const unsafe fn f() { #[proctor(0)] return; }",
-        "unsafe extern \"C\" fn f(x: i32, mut args: ...) { #[proctor(0)] return; }",
         "unsafe fn f() { return; }",
         "unsafe fn f() { #[proctor(0)] #[allow(unused_variables)] let x = 1; }",
         "unsafe fn f() { #[proctor(0)] consume(loop { break 1; }); }",

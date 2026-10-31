@@ -51,6 +51,100 @@ fn metadata(
 }
 
 #[test]
+fn variadic_signatures_remain_fixed_while_bodies_and_va_list_forwarding_transform() {
+    let source = r#"
+#![feature(c_variadic)]
+extern "C" { fn vsink(fmt: *const i8, args: ::core::ffi::VaList) -> i32; }
+pub unsafe extern "C" fn emit(fmt: *const i8, mut args: ...) -> i32 {
+    let mut ap = args.clone();
+    return vsink(fmt, ap.as_va_list());
+}
+
+pub unsafe fn caller(fmt: *const i8) -> i32 { emit(fmt, 7i32, 8i32) }
+"#;
+    let frozen = freeze(source);
+    let emit = frozen
+        .functions
+        .iter()
+        .find(|function| function.record.name == "emit")
+        .unwrap();
+    assert_eq!(emit.record.source_signature, emit.record.target_signature);
+    assert!(emit.record.target_signature.contains("extern \"C\""));
+    assert!(emit.record.target_signature.contains("fmt: *const i8"));
+    assert!(emit.record.target_signature.contains("mut args: ..."));
+    assert!(emit.record.baseline.needs_transformation);
+    run_compiler_on_str(&frozen.target_source, |_| ()).unwrap();
+    let returned = emit
+        .record
+        .baseline
+        .skeleton
+        .replace("= todo!();", "= args.clone();")
+        .replace("return todo!();", "return vsink(fmt, ap.as_va_list()) + 1;");
+    assert!(!returned.contains("todo!"), "{returned}");
+    let request = request(emit, Some(&returned));
+    assert_eq!(
+        crate::validate(&crate::ValidationRequest {
+            expected_functions: vec![crate::ExpectedFunction {
+                id: emit.record.id,
+                name: emit.record.name.clone(),
+                view: emit.record.baseline.clone(),
+            }],
+            transformation: returned.clone(),
+        }),
+        crate::ValidationResponse::Valid
+    );
+    let output = transform_frozen_scc(&frozen, &request).unwrap().0;
+    run_compiler_on_str(&output.replacement.source, |_| ()).unwrap();
+    run_compiler_on_str(&output.observation_source, |_| ()).unwrap();
+    for (old, new) in [
+        ("*const i8", "*mut i8"),
+        ("-> i32", "-> i64"),
+        ("extern \"C\" ", ""),
+        (", mut args: ...", ""),
+        ("mut args", "mut other"),
+    ] {
+        let changed = ReplacementRequest {
+            transformation: returned.replace(old, new),
+            ..request.clone()
+        };
+        assert!(
+            transform_frozen_scc(&frozen, &changed).is_err(),
+            "{old} -> {new}"
+        );
+    }
+}
+
+#[test]
+fn unstructured_variadic_replacement_checks_the_returned_header_before_restoration() {
+    let frozen = freeze(
+        r#"#![feature(c_variadic)] pub unsafe extern "C" fn f(fmt: *const i8, mut args: ...) -> i32 { 0 }"#,
+    );
+    let function = &frozen.functions[0];
+    let returned = format!("{} {{ 7 }}", function.record.target_signature);
+    let request = UnstructuredReplacementRequest {
+        members: vec![function.record.id],
+        transformation: returned.clone(),
+    };
+    let output = replace_unstructured_scc(&frozen, &request).unwrap();
+    run_compiler_on_str(&output.source, |_| ()).unwrap();
+    for (old, new) in [
+        ("extern \"C\" ", ""),
+        ("\"C\"", "\"C-unwind\""),
+        (", mut args: ...", ""),
+        ("*const i8", "*mut i8"),
+    ] {
+        let changed = UnstructuredReplacementRequest {
+            members: request.members.clone(),
+            transformation: returned.replace(old, new),
+        };
+        assert!(
+            replace_unstructured_scc(&frozen, &changed).is_err(),
+            "{old} -> {new}"
+        );
+    }
+}
+
+#[test]
 fn template_retains_full_context_typed_headers_lifetimes_and_abi() {
     let source = r#"
 pub struct Context { pub value: i32 }

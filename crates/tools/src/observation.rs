@@ -550,6 +550,7 @@ struct PreparedFunction {
     local_pairs: Vec<(usize, usize)>,
 }
 
+#[derive(Clone)]
 struct PreparedLabel {
     label: u32,
     source_ordinal: usize,
@@ -713,6 +714,9 @@ fn wrap_print_arguments(
                 module_path.pop();
             }
             ItemKind::Fn(box function) if function.body.is_some() => {
+                if function.sig.decl.c_variadic() {
+                    continue;
+                }
                 let path = module_path
                     .iter()
                     .cloned()
@@ -1024,19 +1028,50 @@ fn extract_with_tcx(
                     prepared_function.target_path
                 ),
             })?;
+        if matches!(&source.item.kind, ItemKind::Fn(function) if function.sig.decl.c_variadic())
+            || matches!(&target.item.kind, ItemKind::Fn(function) if function.sig.decl.c_variadic())
+        {
+            continue;
+        }
         let source_statements = plain_statements(source.item);
         let target_statements = plain_statements(target.item);
+        let mut labels = vec![];
+        for label in &prepared_function.labels {
+            let source_statement =
+                source_statements
+                    .get(label.source_ordinal)
+                    .ok_or_else(|| ObservationError {
+                        code: "ast_hir_mapping",
+                        message: format!("source label {} ordinal disappeared", label.label),
+                    })?;
+            let mut excluded =
+                statement_mentions_variadic_function(source_statement, &ast_to_hir, tcx);
+            for ordinal in &label.target_ordinals {
+                let target_statement =
+                    target_statements
+                        .get(*ordinal)
+                        .ok_or_else(|| ObservationError {
+                            code: "ast_hir_mapping",
+                            message: format!("target label {} ordinal disappeared", label.label),
+                        })?;
+                excluded |=
+                    statement_mentions_variadic_function(target_statement, &ast_to_hir, tcx);
+            }
+            if !excluded {
+                labels.push(label.clone());
+            }
+        }
         let bindings = pair_bindings(
             source,
             target,
             &source_statements,
             &target_statements,
             &prepared_function.local_pairs,
-            &prepared_function.labels,
+            &labels,
             &ast_to_hir,
             tcx,
         )?;
-        for label in &prepared_function.labels {
+        for label in &labels {
             let Some(source_statement) = source_statements.get(label.source_ordinal) else {
                 return Err(ObservationError {
                     code: "ast_hir_mapping",
@@ -1226,6 +1261,12 @@ fn dump_printf_observations(
         recovery_failure,
     )?;
     if target_arguments.len() != printf.arguments.len() {
+        return None;
+    }
+    if target_arguments
+        .iter()
+        .any(|argument| expression_mentions_variadic_function(argument, target_ast_to_hir, tcx))
+    {
         return None;
     }
     collect_atomically(
@@ -2444,12 +2485,75 @@ pub(crate) fn printf_rule_argument(
     })
 }
 
+pub(crate) fn statement_mentions_variadic_function(
+    statement: &Stmt,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> bool {
+    let mut visitor = VariadicFunctionFinder {
+        ast_to_hir,
+        tcx,
+        found: false,
+    };
+    visitor.visit_stmt(statement);
+    visitor.found
+}
+
+fn expression_mentions_variadic_function(
+    expression: &Expr,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> bool {
+    let mut visitor = VariadicFunctionFinder {
+        ast_to_hir,
+        tcx,
+        found: false,
+    };
+    visitor.visit_expr(expression);
+    visitor.found
+}
+
+struct VariadicFunctionFinder<'a, 'tcx> {
+    ast_to_hir: &'a utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+    found: bool,
+}
+
+impl<'ast> Visitor<'ast> for VariadicFunctionFinder<'_, '_> {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if self.found {
+            return;
+        }
+        // A rule can turn a function value into a call, so references are excluded too.
+        if let Some(expression) = self.ast_to_hir.get_expr(expression.id, self.tcx)
+            && let Some(ty) = self
+                .tcx
+                .typeck(expression.hir_id.owner)
+                .expr_ty_opt(expression)
+        {
+            self.found = match ty.kind() {
+                ty::TyKind::FnDef(definition, _) => {
+                    definition.is_local()
+                        && !self.tcx.is_foreign_item(*definition)
+                        && self.tcx.fn_sig(*definition).skip_binder().c_variadic()
+                }
+                ty::TyKind::FnPtr(_, header) => header.c_variadic,
+                _ => false,
+            };
+        }
+        visit::walk_expr(self, expression);
+    }
+}
+
 pub(crate) fn select_rule_regions(
     statement: &Stmt,
     eligible: &HashMap<hir::HirId, TypeTree>,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
 ) -> Option<Vec<RuleRegion>> {
+    if statement_mentions_variadic_function(statement, ast_to_hir, tcx) {
+        return None;
+    }
     let Some(expression) = statement_expression(statement) else {
         return Some(vec![]);
     };
@@ -4843,6 +4947,183 @@ mod tests {
 
     fn extract(source: &str) -> Result<ObservationDocument, ObservationError> {
         extract_labels(source, vec![0])
+    }
+
+    #[test]
+    fn variadic_function_bodies_skip_learning_after_metadata_checks() {
+        let source = r#"
+#![feature(c_variadic)]
+unsafe extern "C" fn source_copy(pointer: *const i32, mut arguments: ...) -> i32 {
+    #[proctor(0)] *pointer
+}
+unsafe extern "C" fn target(pointer: *const i32, mut arguments: ...) -> i32 {
+    #[proctor(0)] *pointer
+}
+"#;
+        let metadata = case_metadata(source, "source_copy", "target", vec![0]);
+        assert_eq!(
+            extract_metadata(source, metadata.clone()).unwrap(),
+            ObservationDocument::default()
+        );
+        let mut missing = metadata.clone();
+        missing.current_items[0].source_copy_path = "absent".to_owned();
+        assert_eq!(
+            extract_metadata(source, missing).unwrap_err().code,
+            "metadata_function_mismatch"
+        );
+        let mut dangling = metadata;
+        dangling
+            .dependency_correspondence
+            .push(CallableCorrespondence {
+                item_id: 8,
+                logical_path: "absent".to_owned(),
+                implementation_path: "absent".to_owned(),
+                wrapper_path: None,
+            });
+        assert_eq!(
+            extract_metadata(source, dangling).unwrap_err().code,
+            "dangling_correspondence"
+        );
+    }
+
+    #[test]
+    fn variadic_calls_exclude_whole_source_and_target_regions() {
+        for (before, after) in [
+            ("variadic(pointer)", "variadic(pointer as *const i32)"),
+            ("variadic(pointer)", "ordinary(pointer as *const i32)"),
+            ("ordinary(pointer)", "variadic(pointer as *const i32)"),
+            (
+                "ordinary(variadic_pointer(pointer))",
+                "ordinary(pointer as *const i32)",
+            ),
+        ] {
+            let source = format!(
+                r#"
+#![feature(c_variadic)]
+unsafe extern "C" fn variadic(pointer: *const i32, mut arguments: ...) -> i32 {{ *pointer }}
+unsafe extern "C" fn variadic_pointer(pointer: *const i32, mut arguments: ...) -> *const i32 {{ pointer }}
+unsafe fn ordinary(pointer: *const i32) -> i32 {{ *pointer }}
+unsafe fn source_copy(pointer: *const i32) -> i32 {{
+    #[proctor(0)] {before};
+    #[proctor(1)] *pointer
+}}
+unsafe fn target(pointer: &i32) -> i32 {{
+    #[proctor(0)] {after};
+    #[proctor(1)] *pointer
+}}
+"#
+            );
+            let document = extract_case(&source, "source_copy", "target", vec![0, 1]).unwrap();
+            assert_eq!(
+                document.observations.len(),
+                1,
+                "{before} -> {after}: {document:?}"
+            );
+            assert!(matches!(
+                document.observations[0].source_expression,
+                Expression::Unary {
+                    operator: UnaryOperator::Deref,
+                    ..
+                }
+            ));
+            assert!(document.printf_observations.is_empty());
+        }
+    }
+
+    #[test]
+    fn earlier_expansion_statement_with_variadic_call_excludes_the_label() {
+        let source = r#"
+#![feature(c_variadic)]
+unsafe extern "C" fn variadic(pointer: *const i32, mut arguments: ...) -> i32 { *pointer }
+unsafe fn ordinary(pointer: *const i32) -> i32 { *pointer }
+unsafe fn source_copy(pointer: *const i32) -> i32 {
+    #[proctor(0)] ordinary(pointer);
+    #[proctor(1)] *pointer
+}
+unsafe fn target(pointer: &i32) -> i32 {
+    #[proctor(0)] let proctor_temp_var_0 = variadic(pointer as *const i32);
+    #[proctor(0)] ordinary(pointer as *const i32);
+    #[proctor(1)] *pointer
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![0, 1]).unwrap();
+        assert_eq!(document.observations.len(), 1, "{document:?}");
+    }
+
+    #[test]
+    fn resolved_variadic_call_predicate_covers_nested_closures_and_casts() {
+        let source = r#"
+#![feature(c_variadic)]
+unsafe extern "C" fn variadic(pointer: *const i32, mut arguments: ...) -> i32 { *pointer }
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+mod names { pub unsafe fn variadic(pointer: *const i32) -> i32 { *pointer } }
+unsafe fn wrap(value: i32) -> i32 { value }
+unsafe fn caller(pointer: *const i32) {
+    variadic(pointer);
+    wrap(variadic(pointer, 1i32));
+    (|| variadic(pointer, 2i32))();
+    (variadic as unsafe extern "C" fn(*const i32, ...) -> i32)(pointer);
+    names::variadic(pointer);
+    printf(b"%d\0" as *const u8 as *const i8, *pointer);
+    variadic;
+    &variadic;
+    variadic as unsafe extern "C" fn(*const i32, ...) -> i32;
+    (&variadic)(pointer);
+}
+"#;
+        utils::compilation::run_compiler_on_str(source, |tcx| {
+            let mut surface = utils::ast::parse_crate(source.to_owned());
+            let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+            mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+            let mut functions = HashMap::new();
+            collect_functions(&surface.items, &mut vec![], &mut functions);
+            let statements = plain_statements(functions["caller"]);
+            assert_eq!(
+                statements
+                    .iter()
+                    .map(|statement| statement_mentions_variadic_function(
+                        statement,
+                        &mapper.ast_to_hir,
+                        tcx
+                    ))
+                    .collect::<Vec<_>>(),
+                [true, true, true, true, false, false, true, true, true, true]
+            );
+            for statement in &statements[..4] {
+                assert!(
+                    select_rule_regions(statement, &HashMap::new(), &mapper.ast_to_hir, tcx)
+                        .is_none()
+                );
+            }
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn target_printf_argument_with_variadic_call_is_not_observed() {
+        let source = r#"
+#![feature(c_variadic)]
+unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
+unsafe extern "C" fn variadic(value: i32, mut arguments: ...) -> i32 { value }
+unsafe fn source_copy(value: i32) {
+    #[proctor(0)] printf(b"%d\0" as *const u8 as *const i8, value);
+}
+unsafe fn target(value: i32) {
+    #[proctor(0)] ::std::print!("{}", variadic(value));
+}
+"#;
+        assert_eq!(
+            extract_case(source, "source_copy", "target", vec![0]).unwrap(),
+            ObservationDocument::default()
+        );
+        let ordinary = source.replace("variadic(value)", "value");
+        assert_eq!(
+            extract_case(&ordinary, "source_copy", "target", vec![0])
+                .unwrap()
+                .printf_observations
+                .len(),
+            1
+        );
     }
 
     fn exact_optional_pointer_observations() -> serde_json::Value {
