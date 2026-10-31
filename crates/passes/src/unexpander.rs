@@ -763,6 +763,60 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cleanup_recompiles_expanded_eq_derive_and_restores_attributes() {
+        let code = r#"
+#[repr(u32)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Kind { Circle, Aabb }
+#[no_mangle]
+pub unsafe extern "C" fn compare(left: Kind, right: Kind) -> bool { left == right }
+"#;
+        let expanded = utils::compilation::run_compiler_on_str(code, |tcx| {
+            crate::expander::expand(crate::expander::Config::default(), tcx)
+        })
+        .unwrap();
+        assert!(expanded.contains("#[coverage(off)]"), "{expanded}");
+        assert!(
+            expanded.contains("#![feature(coverage_attribute)]"),
+            "{expanded}"
+        );
+
+        let c_exposed_fns = rustc_hash::FxHashSet::from_iter(["compare".to_owned()]);
+        let interfaces = utils::compilation::run_compiler_on_str(&expanded, |tcx| {
+            crate::interface_fixer::fix_interfaces(
+                &crate::interface_fixer::Config {
+                    c_exposed_fns: c_exposed_fns.clone(),
+                    ..Default::default()
+                },
+                tcx,
+            )
+        })
+        .unwrap();
+        let resolved = utils::compilation::run_compiler_on_str(&interfaces, |tcx| {
+            crate::unsafe_resolver::resolve_unsafe(
+                &crate::unsafe_resolver::Config {
+                    remove_unused: true,
+                    remove_no_mangle: true,
+                    remove_extern_c: true,
+                    replace_pub: true,
+                    c_exposed_fns,
+                },
+                tcx,
+            )
+        })
+        .unwrap();
+        run_test(
+            &resolved,
+            &["#[derive(Eq)]", "#[derive(PartialEq)]", "fn compare("],
+            &[
+                "#[coverage(off)]",
+                "coverage_attribute",
+                "assert_receiver_is_total_eq",
+            ],
+        );
+    }
+
     fn normalize_panic_source(code: &str) -> String {
         let expanded = utils::compilation::run_compiler_on_str(code, |tcx| {
             crate::expander::expand(crate::expander::Config { keep_allows: true }, tcx)
