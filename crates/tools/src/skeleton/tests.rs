@@ -89,6 +89,50 @@ fn synthesized_printf_rules(
     crate::synthesize_rules(&[document.clone(), document]).unwrap()
 }
 
+#[test]
+fn variadic_functions_and_call_regions_skip_otherwise_applicable_printf_rules() {
+    let literal = crate::Expression::Literal {
+        value: crate::Literal::Integer {
+            value: "7".into(),
+            ty: "i32".into(),
+        },
+    };
+    let rules = synthesized_printf_rules(
+        "%d",
+        literal.clone(),
+        literal,
+        vec![],
+        crate::TypeTree::Primitive { name: "i32".into() },
+    );
+    assert!(!rules.printf_rules.is_empty());
+    let source = r#"
+#![feature(c_variadic)]
+extern "C" { fn printf(fmt: *const i8, ...) -> i32; }
+pub unsafe extern "C" fn variadic(value: i32, mut args: ...) {
+    printf(b"%d\0" as *const u8 as *const i8, 7i32);
+}
+pub unsafe fn ordinary() {
+    printf(b"%d\0" as *const u8 as *const i8, 7i32);
+}
+pub unsafe fn caller() {
+    printf(b"%d\0" as *const u8 as *const i8, { variadic(0); 7i32 });
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_rules(source, Some(&rules), tcx).unwrap();
+        let variadic = function(&records, "variadic");
+        assert_eq!(variadic.baseline, variadic.applied);
+        assert!(variadic.baseline.needs_transformation);
+        assert!(
+            function(&records, "ordinary")
+                .applied
+                .has_rule_application()
+        );
+        assert!(!function(&records, "caller").applied.has_rule_application());
+    })
+    .unwrap();
+}
+
 fn apply_printf_rules_to_third(
     source: &str,
     target: &str,

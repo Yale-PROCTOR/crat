@@ -73,6 +73,33 @@ fn replacement_item(id: u64, path: impl Into<String>, name: impl Into<String>) -
     }
 }
 
+#[test]
+fn additive_variadic_replacement_preserves_headers_and_helper_abis() {
+    let source = r#"#![feature(c_variadic)] unsafe extern "C" fn f(fmt: *const i8, mut args: ...) -> i32 { 0 }"#;
+    let skeleton =
+        r#"unsafe extern "C" fn f(fmt: *const i8, mut args: ...) -> i32 { #[proctor(0)] todo!() }"#;
+    let item = preservation_item(7, "f", "f", skeleton, vec![0]);
+    let returned = skeleton.replace("todo!()", "7");
+    let request = ReplacementRequest {
+        items: vec![item],
+        transformation: returned.clone(),
+        accepted_correspondence: vec![],
+    };
+    let output = add_source(source, &request).unwrap();
+    compile(&output);
+    for (old, new) in [
+        ("*const i8", "*mut i8"),
+        ("extern \"C\" ", ""),
+        (", mut args: ...", ""),
+    ] {
+        let changed = ReplacementRequest {
+            transformation: returned.replace(old, new),
+            ..request.clone()
+        };
+        assert!(add_source(source, &changed).is_err(), "{old} -> {new}");
+    }
+}
+
 fn preservation_item(
     id: u64,
     path: &str,

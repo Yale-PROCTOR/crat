@@ -219,13 +219,33 @@ fn make_skeletons_with_preservation_overrides(
         .iter()
         .map(|item| (item.def_id.to_def_id(), item.id))
         .collect();
-    let decisions = initial_pointer_decisions(
+    let mut decisions = initial_pointer_decisions(
         &pointer_replacer::Config::default(),
         PointerDecisionOptions {
             assume_nonnegative_offsets: true,
         },
         tcx,
     );
+    for item in &raw_items {
+        let ItemKind::Fn(function) = &item.item.kind else { continue };
+        if !function.sig.decl.c_variadic() {
+            continue;
+        }
+        if let Some(signature) = decisions.signatures.data.get_mut(&item.def_id) {
+            signature.input_decs.fill(None);
+            signature.input_lifetimes.fill(None);
+            signature.output_dec = None;
+            signature.output_lifetime = None;
+            signature.signature_locked = true;
+        }
+        for parameter in &function.sig.decl.inputs {
+            if let Some(pattern) = ast_to_hir.get_pat(parameter.pat.id, tcx)
+                && let hir::PatKind::Binding(_, binding, _, _) = pattern.kind
+            {
+                decisions.bindings.remove(&binding);
+            }
+        }
+    }
 
     raw_items
         .into_iter()
@@ -1169,7 +1189,9 @@ fn sanitize_item(item: &mut Item) {
         };
         normal.item.path.segments.last().unwrap().ident.name != sym::no_mangle
     });
-    if let ItemKind::Fn(box function) = &mut item.kind {
+    if let ItemKind::Fn(box function) = &mut item.kind
+        && !function.sig.decl.c_variadic()
+    {
         function.sig.header.ext = Extern::None;
     }
 }
@@ -1436,6 +1458,18 @@ fn local_item_kind(item: &Item) -> &'static str {
 struct PresentationBindingNormalizer;
 
 impl MutVisitor for PresentationBindingNormalizer {
+    fn visit_item(&mut self, item: &mut Item) {
+        if let ItemKind::Fn(function) = &mut item.kind
+            && function.sig.decl.c_variadic()
+        {
+            if let Some(body) = &mut function.body {
+                self.visit_block(body);
+            }
+            return;
+        }
+        mut_visit::walk_item(self, item);
+    }
+
     fn visit_pat(&mut self, pat: &mut Pat) {
         if let PatKind::Ident(BindingMode(by_ref, mutability), ..) = &mut pat.kind
             && *by_ref == ByRef::No
@@ -3482,7 +3516,9 @@ fn apply_rule_set_with_binding_catalog(
         function_path: tcx.def_path_str(function.to_def_id()),
         message: format!("invalid rule document: {error}"),
     })?;
-    if loaded.rules().is_empty() && loaded.printf_rules().is_empty() {
+    if matches!(&source.kind, ItemKind::Fn(function) if function.sig.decl.c_variadic())
+        || (loaded.rules().is_empty() && loaded.printf_rules().is_empty())
+    {
         return Ok(BTreeSet::new());
     }
     let catalog = binding_catalog
@@ -3502,6 +3538,9 @@ fn apply_rule_set_with_binding_catalog(
         let Some(statement) = statements.get(label).copied() else {
             continue;
         };
+        if crate::observation::statement_mentions_variadic_function(statement, ast_to_hir, tcx) {
+            continue;
+        }
         if let Some(call) = eligible_printf_statement(statement, ast_to_hir, tcx) {
             let mut target_arguments = vec![];
             let mut complete = true;

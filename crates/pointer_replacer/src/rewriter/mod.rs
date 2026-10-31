@@ -464,9 +464,14 @@ pub(crate) fn find_param_aliases<'tcx>(
     for def_id in tcx.hir_body_owners() {
         let calls = some_or!(pre.call_args.get(&def_id), continue);
         let mut aliases: FxHashMap<_, FxHashSet<_>> = FxHashMap::default();
-        let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+        let input_count = tcx
+            .fn_sig(def_id)
+            .skip_binder()
+            .inputs()
+            .skip_binder()
+            .len();
         for call_args in calls {
-            for i in 0..body.arg_count {
+            for i in 0..input_count {
                 for j in 0..i {
                     let arg_i = some_or!(call_args[i], continue);
                     let arg_j = some_or!(call_args[j], continue);
@@ -777,4 +782,90 @@ fn slice_cursor_mod_str() -> &'static str {
     impl_readable_index!(SliceCursor, isize, usize, i32);
     impl_mutable_index!(isize, usize, i32);
 }"#
+}
+
+#[cfg(test)]
+mod parameter_alias_tests {
+    use super::*;
+
+    fn parameter_aliases(source: &str) -> Vec<(String, usize, usize)> {
+        ::utils::compilation::run_compiler_on_str(source, |tcx| {
+            let arena = typed_arena::Arena::new();
+            let tss = ::utils::ty_shape::get_ty_shapes(&arena, tcx, false);
+            let config = andersen::Config::default();
+            let pre = andersen::pre_analyze(&config, &tss, tcx);
+            let solutions = andersen::analyze(&config, &pre, &tss, tcx);
+            let mut result = vec![];
+            for (def_id, parameters) in find_param_aliases(&pre, &solutions, tcx) {
+                let name = tcx.item_name(def_id.to_def_id()).to_string();
+                for (parameter, aliases) in parameters {
+                    for alias in aliases {
+                        result.push((name.clone(), parameter.as_usize(), alias.as_usize()));
+                    }
+                }
+            }
+            result.sort();
+            result
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn variadic_calls_without_optional_arguments_have_no_synthetic_aliases() {
+        assert!(
+            parameter_aliases(
+                r#"
+#![feature(c_variadic)]
+unsafe extern "C" fn variadic(fixed: *mut i32, mut args: ...) {}
+unsafe fn caller(fixed: *mut i32) { variadic(fixed); }
+"#,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn optional_arguments_do_not_become_formal_parameter_aliases() {
+        assert!(
+            parameter_aliases(
+                r#"
+#![feature(c_variadic)]
+unsafe extern "C" fn variadic(fixed: *mut i32, mut args: ...) {}
+unsafe fn caller() {
+    let mut value = 1;
+    let pointer = &mut value as *mut i32;
+    variadic(pointer, pointer, 7i32, pointer);
+}
+"#,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn fixed_parameter_aliases_keep_their_mir_local_indices() {
+        let aliases = parameter_aliases(
+            r#"
+#![feature(c_variadic)]
+unsafe extern "C" fn variadic(left: *mut i32, right: *mut i32, mut args: ...) {}
+unsafe fn ordinary(left: *mut i32, right: *mut i32) {}
+unsafe fn caller() {
+    let mut value = 1;
+    let pointer = &mut value as *mut i32;
+    ordinary(pointer, pointer);
+    variadic(pointer, pointer);
+    variadic(pointer, pointer, pointer, 7i32);
+}
+"#,
+        );
+        assert_eq!(
+            aliases,
+            [
+                ("ordinary".to_owned(), 1, 2),
+                ("ordinary".to_owned(), 2, 1),
+                ("variadic".to_owned(), 1, 2),
+                ("variadic".to_owned(), 2, 1),
+            ]
+        );
+    }
 }
