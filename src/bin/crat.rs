@@ -139,6 +139,13 @@ struct Args {
     bo_env: Option<PathBuf>,
     #[arg(long, help = "Write the pointer pass's emission receipt to this file")]
     bo_receipt: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "SECS",
+        value_parser = clap::value_parser!(u32).range(1..=4_294_967),
+        help = "Per-query z3 budget of the pointer pass in seconds (default 600); outranks CRAT_BO_QUERY_TIMEOUT_MS and the --bo-env file"
+    )]
+    bo_query_timeout: Option<u32>,
 
     #[arg(long, help = "Enable in-place transformation of the input directory")]
     inplace: bool,
@@ -403,6 +410,7 @@ fn main() {
 
     let bo_env = args.bo_env;
     let bo_receipt = args.bo_receipt;
+    let bo_query_timeout = args.bo_query_timeout;
 
     let dir = if !config.passes.is_empty() {
         if config.analysis_output.is_some() {
@@ -652,6 +660,18 @@ fn main() {
                 }
             }
             Pass::Pointer => {
+                // Relay main/388 O2 (R1386-1): the flag's budget, set before the env file is read
+                // (which never overwrites a set variable): the flag > the variable > the file > 600 s.
+                if let Some(secs) = bo_query_timeout {
+                    let ms =
+                        pointer_replacer_bo::query_timeout_env_value(secs).unwrap_or_else(|e| {
+                            eprintln!("{e}");
+                            std::process::exit(2);
+                        });
+                    // Safety: the driver's main thread, before the analysis starts any thread; nothing
+                    // reads the environment concurrently.
+                    unsafe { std::env::set_var("CRAT_BO_QUERY_TIMEOUT_MS", ms) };
+                }
                 let env_file = bo_env.clone().or_else(|| {
                     let dir = PathBuf::from(std::env::var_os("DIR")?);
                     [
@@ -849,5 +869,31 @@ fn max_sensitivity_in_range(s: &str) -> Result<usize, String> {
         Err("max_loop_head_states must be greater than 0".to_string())
     } else {
         Ok(m)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Relay main/388 O2 (R1386-1, R3): `--bo-query-timeout` takes whole seconds 1..=4,294,967; 0, a
+    /// non-number and a value whose milliseconds would overflow a `u32` are refused at parse time.
+    #[test]
+    fn r1386_bo_query_timeout_parses_seconds_in_range() {
+        let parse =
+            |value: &str| Args::try_parse_from(["crat", "--bo-query-timeout", value, "input"]);
+        assert_eq!(parse("600").unwrap().bo_query_timeout, Some(600));
+        assert_eq!(parse("1").unwrap().bo_query_timeout, Some(1));
+        assert_eq!(parse("4294967").unwrap().bo_query_timeout, Some(4_294_967));
+        assert!(parse("0").is_err());
+        assert!(parse("ten").is_err());
+        assert!(parse("4294968").is_err());
+        assert_eq!(
+            Args::try_parse_from(["crat", "input"])
+                .unwrap()
+                .bo_query_timeout,
+            None,
+            "unset: the variable, the file or 600 s decide"
+        );
     }
 }

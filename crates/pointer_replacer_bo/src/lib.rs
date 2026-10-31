@@ -53,7 +53,9 @@ mod bo_rewriter;
 mod coverage_recon;
 mod phase_log;
 mod raw_boundary_census_schema;
-pub use bo_pipeline::{BoReceipt, Config, env_from_file as bo_env_from_file, rewrite_bo};
+pub use bo_pipeline::{
+    BoReceipt, Config, env_from_file as bo_env_from_file, query_timeout_env_value, rewrite_bo,
+};
 // The legacy crate's root items the moved measurement tests name as `crate::…`.
 #[cfg(test)]
 pub(crate) use pointer_replacer::replace_local_borrows;

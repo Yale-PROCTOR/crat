@@ -107,6 +107,24 @@ pub(crate) fn inbound_wrapper_unplaceable(box_param_receipts: &str) -> Vec<Strin
         .collect()
 }
 
+/// Relay main/388 O2 (R1386-1, the user's word): `--bo-query-timeout <SECS>`'s value as the
+/// milliseconds `CRAT_BO_QUERY_TIMEOUT_MS` carries -- 1 to 4,294,967 s, so `SECS x 1000` fits a `u32`.
+/// The driver sets the variable before [`env_from_file`] runs, which never overwrites a set variable,
+/// so the flag outranks the variable, which outranks the `--bo-env` file, which outranks 600 s.
+pub fn query_timeout_env_value(secs: u32) -> Result<String, String> {
+    if secs == 0 {
+        return Err("--bo-query-timeout must be at least 1 second".to_owned());
+    }
+    secs.checked_mul(1000)
+        .map(|ms| ms.to_string())
+        .ok_or_else(|| {
+            format!(
+                "--bo-query-timeout {secs} exceeds {} seconds (the budget is u32 milliseconds)",
+                u32::MAX / 1000
+            )
+        })
+}
+
 /// Sets every `export KEY=VALUE` line of a frame env file that is not already set in the
 /// process environment. Host-local names are skipped, so are values that expand a variable;
 /// an inline comment after the value is ignored.
@@ -700,6 +718,54 @@ fn persist_in_place(
             &capture.raw_boundary_artifacts.box_param_receipts,
         ),
     })
+}
+
+#[cfg(test)]
+mod query_timeout_flag_tests {
+    use super::*;
+
+    /// Relay main/388 O2 (R1386-1, R3): the flag's seconds become the variable's milliseconds; 0 and
+    /// a value whose milliseconds overflow a `u32` are refused.
+    #[test]
+    fn r1386_flag_seconds_become_the_millisecond_variable() {
+        assert_eq!(query_timeout_env_value(1).as_deref(), Ok("1000"));
+        assert_eq!(query_timeout_env_value(600).as_deref(), Ok("600000"));
+        assert_eq!(
+            query_timeout_env_value(4_294_967).as_deref(),
+            Ok("4294967000")
+        );
+        assert!(query_timeout_env_value(0).is_err());
+        assert!(query_timeout_env_value(4_294_968).is_err());
+    }
+
+    /// Relay main/388 O2 (R1386-1): a variable already set -- the flag's, or the caller's -- outranks
+    /// the `--bo-env` file, which sets it only when unset. A variable of this test's own is used, so
+    /// the process's `CRAT_BO_QUERY_TIMEOUT_MS` (read once by the solver) is never touched.
+    #[test]
+    fn r1386_a_set_variable_outranks_the_bo_env_file() {
+        const KEY: &str = "CRAT_BO_R1386_PRECEDENCE_TEST";
+        let file = std::env::temp_dir().join(format!("r1386-precedence-{}.sh", std::process::id()));
+        std::fs::write(&file, format!("export {KEY}=from-file\n")).unwrap();
+        // Safety: a variable no other code or test reads; set and removed on this test's thread.
+        unsafe { std::env::set_var(KEY, "from-flag") };
+        env_from_file(&file).unwrap();
+        assert_eq!(
+            std::env::var(KEY).as_deref(),
+            Ok("from-flag"),
+            "the set variable wins"
+        );
+        // Safety: as above.
+        unsafe { std::env::remove_var(KEY) };
+        env_from_file(&file).unwrap();
+        assert_eq!(
+            std::env::var(KEY).as_deref(),
+            Ok("from-file"),
+            "unset, the file sets it"
+        );
+        // Safety: as above.
+        unsafe { std::env::remove_var(KEY) };
+        let _ = std::fs::remove_file(&file);
+    }
 }
 
 #[cfg(test)]
