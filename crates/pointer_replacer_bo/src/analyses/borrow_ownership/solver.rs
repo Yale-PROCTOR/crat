@@ -571,6 +571,9 @@ pub struct KindSolver {
     return_port_kept: RefCell<Vec<usize>>,
     mandatory_scope_lengths: RefCell<Vec<usize>>,
     round_model_failure: RefCell<Option<RoundModelFailure>>,
+    /// Relay main/388 O2: optimize incumbents accepted / refused (hard-eval failed) by this solver.
+    incumbent_accepted: Cell<usize>,
+    incumbent_refused: Cell<usize>,
     demand_capture: RefCell<Option<DemandCapture>>,
     ownership_facts: RefCell<Option<Rc<super::licensing::facts::Facts>>>,
     original_cell_model: RefCell<Option<Rc<super::licensing::model_selection::Selection>>>,
@@ -905,6 +908,8 @@ impl KindSolver {
             return_port_kept: RefCell::new(Vec::new()),
             mandatory_scope_lengths: RefCell::new(Vec::new()),
             round_model_failure: RefCell::new(None),
+            incumbent_accepted: Cell::new(0),
+            incumbent_refused: Cell::new(0),
             demand_capture: RefCell::new(None),
             ownership_facts: RefCell::new(None),
             original_cell_model: RefCell::new(None),
@@ -2783,6 +2788,85 @@ impl KindSolver {
         self.round_model_failure.borrow().clone()
     }
 
+    /// Relay main/388 O2: (accepted, refused) optimize incumbents so far, for the round's stats.
+    pub(crate) fn incumbent_counts(&self) -> (usize, usize) {
+        (self.incumbent_accepted.get(), self.incumbent_refused.get())
+    }
+
+    /// Relay main/388 O2 (R1382-1 / R1383-1): after an Unknown optimize, the round's model is z3's
+    /// incumbent -- the best found within the budget -- when [`incumbent_verdict`] accepts it: the
+    /// check's own wall reached the budget in force, z3 still yields a model, and that model satisfies
+    /// every hard assertion now asserted (`Optimize::get_assertions`: the construction's, the round's
+    /// bundle and its return-port rows). Model completion is on for the hard evaluation, the version
+    /// owns and the kinds alike, on the one model object (R1). Otherwise the round has no model, as
+    /// before, and the refusal is returned for its typed reason. The `z3:unknown optimize` line
+    /// (phase log on) records either way.
+    fn incumbent_at_budget(
+        &self,
+        wall: Duration,
+        reason: Option<&str>,
+    ) -> Result<FxHashMap<SlotRef, SlotKind>, IncumbentRefusal> {
+        let hit = execution_guard::budget_hit(wall);
+        let model = if hit { self.solver.get_model() } else { None };
+        let eval_started = Instant::now();
+        let assertions = if model.is_some() {
+            self.solver.get_assertions()
+        } else {
+            Vec::new()
+        };
+        let verdict = incumbent_verdict(hit, model.as_ref(), &assertions);
+        let hard_eval_wall = eval_started.elapsed().as_secs_f64();
+        let kinds = match (&verdict, &model) {
+            (Ok(()), Some(model)) => {
+                self.read_version_owns(model);
+                Some(self.read_kinds(model))
+            }
+            _ => None,
+        };
+        match &verdict {
+            Ok(()) => {
+                self.incumbent_accepted
+                    .set(self.incumbent_accepted.get().saturating_add(1));
+                execution_guard::note_incumbent_accepted();
+            }
+            Err(IncumbentRefusal::HardEvalFailed) => {
+                self.incumbent_refused
+                    .set(self.incumbent_refused.get().saturating_add(1));
+            }
+            Err(_) => {}
+        }
+        if crate::phase_log::on() {
+            let counts = match &kinds {
+                Some(kinds) => kind_counts_detail(reason, kinds),
+                None => unknown_incumbent_detail(
+                    &self.solver,
+                    self.vars.values().map(|vars| (&vars.ref_, &vars.own)),
+                    reason,
+                ),
+            };
+            let (accepted, refusal) = match &verdict {
+                Ok(()) => ("yes", "-"),
+                Err(refusal) => ("no", refusal.label()),
+            };
+            crate::phase_log::mark(
+                "z3:unknown",
+                "optimize",
+                &format!(
+                    "{counts} accepted={accepted} refusal={refusal} budget_ms={} wall={:.1}s hard_eval={} assertions={} hard_eval_wall={hard_eval_wall:.1}s",
+                    execution_guard::query_timeout_ms(),
+                    wall.as_secs_f64(),
+                    match &verdict {
+                        Ok(()) => "ok",
+                        Err(IncumbentRefusal::HardEvalFailed) => "failed",
+                        Err(_) => "-",
+                    },
+                    assertions.len(),
+                ),
+            );
+        }
+        verdict.map(|()| kinds.expect("an accepted incumbent has its kinds"))
+    }
+
     #[cfg(test)]
     pub(crate) fn hard_check_elapsed(&self) -> Duration {
         self.hard_check_elapsed.get()
@@ -2945,6 +3029,9 @@ impl KindSolver {
         self.solver.set_params(&params);
     }
 
+    /// The sealed cap this asserts is the DEFAULT per-query budget, not the only value: a run may set
+    /// another through `CRAT_BO_QUERY_TIMEOUT_MS` (relay main/388 O2, R1383-1); a diagnostic setter
+    /// still cannot change it.
     #[cfg(test)]
     pub(crate) fn set_query_timeout(&self, timeout: Duration) {
         assert_eq!(
@@ -3230,7 +3317,10 @@ impl KindSolver {
         }
         self.assert_return_port_rows(&rows);
         self.prepare_demand_query(QueryPhase::Materialization, None);
+        // Relay main/388 O2: the deciding check's own wall, for the budget predicate.
+        let check_started = Instant::now();
         let mut outcome = crate::phase_log::z3_query("optimize", || self.solver.check(&[]));
+        let mut check_wall = check_started.elapsed();
         if outcome == SatResult::Unsat && !rows.is_empty() {
             self.solver.pop();
             rows = self.return_port_admissible_subset(&rows, &bundle);
@@ -3242,7 +3332,9 @@ impl KindSolver {
             self.prepare_demand_query(QueryPhase::Materialization, None);
             self.check_sat_count
                 .set(self.check_sat_count.get().saturating_add(1));
+            let check_started = Instant::now();
             outcome = crate::phase_log::z3_query("optimize-subset", || self.solver.check(&[]));
+            check_wall = check_started.elapsed();
         }
         self.return_port_kept.borrow_mut().push(rows.len());
         *self.return_port_last_rows.borrow_mut() = rows.iter().map(|(_, slot)| *slot).collect();
@@ -3284,27 +3376,34 @@ impl KindSolver {
                 }
             }
         } else {
-            // Relay main/388 (R1371-1): what z3 still holds after an Unknown, logged only; the round
-            // returns `None` as before and the model is dropped unread by anything else.
-            if outcome == SatResult::Unknown && crate::phase_log::on() {
-                let detail = unknown_incumbent_detail(
-                    &self.solver,
-                    self.vars.values().map(|vars| (&vars.ref_, &vars.own)),
-                    unknown_reason.as_deref(),
-                );
-                crate::phase_log::mark("z3:unknown", "optimize", &detail);
+            // Relay main/388 O2 (R1382-1 / R1383-1): an Unknown at the budget whose incumbent passes
+            // the hard evaluation is the round's model; anything else is no model, as before, with
+            // the refusal in the typed reason.
+            let incumbent = (outcome == SatResult::Unknown)
+                .then(|| self.incumbent_at_budget(check_wall, unknown_reason.as_deref()));
+            match incumbent {
+                Some(Ok(kinds)) => Some(kinds),
+                refused => {
+                    let refusal = refused
+                        .and_then(Result::err)
+                        .map(|refusal| format!("; incumbent {}", refusal.label()))
+                        .unwrap_or_default();
+                    self.record_round_model_failure(match outcome {
+                        SatResult::Unsat => RoundModelFailure::OptimizeUnsat {
+                            active_endpoint_retraction: relaxed.assumptions.len(),
+                        },
+                        SatResult::Unknown => RoundModelFailure::OptimizeUnknown {
+                            active_endpoint_retraction: relaxed.assumptions.len(),
+                            reason: format!(
+                                "{}{refusal}",
+                                unknown_reason.unwrap_or_else(|| "-".to_owned())
+                            ),
+                        },
+                        SatResult::Sat => unreachable!(),
+                    });
+                    None
+                }
             }
-            self.record_round_model_failure(match outcome {
-                SatResult::Unsat => RoundModelFailure::OptimizeUnsat {
-                    active_endpoint_retraction: relaxed.assumptions.len(),
-                },
-                SatResult::Unknown => RoundModelFailure::OptimizeUnknown {
-                    active_endpoint_retraction: relaxed.assumptions.len(),
-                    reason: unknown_reason.unwrap_or_else(|| "-".to_owned()),
-                },
-                SatResult::Sat => unreachable!(),
-            });
-            None
         };
         self.solver.pop();
         self.optimize_materialization_elapsed.set(
@@ -3828,9 +3927,74 @@ fn unknown_incumbent_detail<'a>(
     )
 }
 
+/// Relay main/388 O2: why an Unknown optimize's incumbent was not taken as the round's model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IncumbentRefusal {
+    /// The check ended before its budget: an Unknown for another reason.
+    BeforeBudget,
+    /// z3 yields no model.
+    NoModel,
+    /// Some hard assertion is not true under the model (with completion).
+    HardEvalFailed,
+}
+
+impl IncumbentRefusal {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::BeforeBudget => "before-budget",
+            Self::NoModel => "no-model",
+            Self::HardEvalFailed => "hard-eval-failed",
+        }
+    }
+}
+
+/// Relay main/388 O2 (R1382-1 / R1383-1): the verdict on an Unknown optimize's model -- taken only
+/// when the budget was hit, a model exists, and every one of `assertions` is true under it with model
+/// completion (R1: the same completion the kinds are read under, so an atom the model leaves
+/// uninterpreted is judged by its completed value in both). No z3 statement says a model after
+/// `Z3_L_UNDEF` satisfies the hard assertions, so this checks them (design record §2 (a)).
+pub(crate) fn incumbent_verdict(
+    budget_hit: bool,
+    model: Option<&Model>,
+    assertions: &[Bool],
+) -> Result<(), IncumbentRefusal> {
+    if !budget_hit {
+        return Err(IncumbentRefusal::BeforeBudget);
+    }
+    let model = model.ok_or(IncumbentRefusal::NoModel)?;
+    if assertions.iter().all(|assertion| is_true(model, assertion)) {
+        Ok(())
+    } else {
+        Err(IncumbentRefusal::HardEvalFailed)
+    }
+}
+
+/// [`unknown_incumbent_detail`]'s line from kinds already read (an accepted incumbent's), so the
+/// slots are not evaluated twice.
+fn kind_counts_detail(reason: Option<&str>, kinds: &FxHashMap<SlotRef, SlotKind>) -> String {
+    let reason = reason.unwrap_or("-");
+    let owning = kinds
+        .values()
+        .filter(|kind| **kind == SlotKind::Owning)
+        .count();
+    let reference = kinds
+        .values()
+        .filter(|kind| **kind == SlotKind::Ref)
+        .count();
+    format!(
+        "reason={reason:?} model=some slots={} owning={owning} ref={reference} raw={}",
+        kinds.len(),
+        kinds.len() - owning - reference
+    )
+}
+
 #[cfg(test)]
 #[path = "solver_unknown_tests.rs"]
 mod unknown_tests;
+
+#[cfg(test)]
+#[path = "solver_incumbent_tests.rs"]
+mod incumbent_tests;
 
 fn is_true(model: &Model, b: &Bool) -> bool {
     model

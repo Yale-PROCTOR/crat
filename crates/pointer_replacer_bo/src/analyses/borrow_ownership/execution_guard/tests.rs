@@ -18,6 +18,8 @@ fn e5_i_guard_model_entries_are_actual_entries_not_builds_or_memo_materializatio
 
 #[test]
 fn e5_i_guard_fixed_query_cap_and_typed_unknown_do_not_invent_outcomes() {
+    // The sealed I12 budget is the DEFAULT per-query budget, not the only value (relay main/388 O2,
+    // R1383-1): `CRAT_BO_QUERY_TIMEOUT_MS` sets another for a named run.
     assert_eq!(QUERY_TIMEOUT_MS, 600_000, "sealed I12 query budget");
     for stage in [
         QueryStage::HardCheck,
@@ -121,4 +123,42 @@ fn r1370_the_query_timeout_is_the_sealed_cap_unset_and_the_switch_value_when_set
             "the gate's process sets nothing"
         );
     }
+}
+
+/// Relay main/388 O2 (R1383-1): the budget predicate is the wall against 0.99 of the budget in force.
+#[test]
+fn r1383_o2_the_budget_is_hit_at_ninety_nine_percent_of_the_wall_budget() {
+    assert!(budget_hit_at(600_100.0, 600_000));
+    assert!(budget_hit_at(594_000.0, 600_000));
+    assert!(!budget_hit_at(593_999.0, 600_000));
+    assert!(
+        !budget_hit_at(5_600.0, 600_000),
+        "the 376's slowest stage is nowhere near it"
+    );
+}
+
+/// Relay main/388 O2 (R1383-1 R2): the cache gate is the solve's -- a solve in which any round, in any
+/// verification, accepted an incumbent writes nothing; one in which none did writes as before.
+#[test]
+fn r1383_o2_a_solve_that_took_an_incumbent_in_any_round_is_not_cached() {
+    let ((), writes) = solve_then_cacheable(true, || {});
+    assert!(writes, "no incumbent: the cacheable solve writes");
+    let ((), writes) = solve_then_cacheable(false, || {});
+    assert!(!writes, "an uncacheable solve never writes");
+    let (rounds, writes) = solve_then_cacheable(true, || {
+        // Round 1 Sat, round 2 an incumbent, round 3 Sat: the final model came from round 3.
+        let mut taken = 0;
+        for round in 1..=3 {
+            if round == 2 {
+                note_incumbent_accepted();
+                taken += 1;
+            }
+        }
+        taken
+    });
+    assert_eq!(rounds, 1);
+    assert!(
+        !writes,
+        "an incumbent in any round of the solve keeps its final model out of the cache"
+    );
 }

@@ -7801,9 +7801,21 @@ fn decide_table_perturbed_config<'tcx>(
     let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
     crate::phase_log::mark("decide:origins", "end", "");
     crate::phase_log::mark("decide:solve", "start", "");
-    let (verified, _export) = with_bo_export(|| {
-        solve_bo_overlap_config(&program, &slots, &origins, &mut_facts, a5_mode, attestation)
-    });
+    // Relay main/388 O2 (R1383-1 R2): a solve any of whose rounds took an optimize incumbent writes
+    // its final model to neither the memo nor the on-disk cache.
+    let ((verified, _export), cacheable) =
+        crate::analyses::borrow_ownership::execution_guard::solve_then_cacheable(cacheable, || {
+            with_bo_export(|| {
+                solve_bo_overlap_config(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    a5_mode,
+                    attestation,
+                )
+            })
+        });
     crate::phase_log::mark("decide:solve", "end", "");
     let Some(verified) = verified else {
         // Relay main/375 §3: a solve the budget ended is that, typed.

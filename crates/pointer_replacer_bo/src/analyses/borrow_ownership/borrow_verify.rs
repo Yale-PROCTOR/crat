@@ -790,6 +790,10 @@ pub(crate) fn verify_to_fixpoint_with_flows(
 pub(crate) struct RoundStats {
     /// Validate rounds run, INCLUDING the accepting round (accept-first-model ⇒ `rounds == 1`).
     pub rounds: usize,
+    /// Relay main/388 O2: rounds whose model is an optimize incumbent at the budget, and incumbents
+    /// refused by the hard evaluation.
+    pub incumbent_rounds: usize,
+    pub hard_eval_failed: usize,
     /// Every commit is a conflict commit (the `¬ref(source)` invariant is emitted eagerly).
     pub commits_conflict: usize,
     pub commits_per_round: Vec<usize>,
@@ -989,6 +993,23 @@ fn solve_guarded_round_model(
 /// One round's solve. The plain repair and Lemmas solve directly; `Guarded` solves the
 /// same system through the typed twin, so a solver decline is recorded in the planner's taxonomy.
 fn solve_round(
+    solver: &KindSolver,
+    selectors: &Selectors,
+    backend: LoopBackend,
+    hard: Option<&HardLoopSolver>,
+    planner: Option<&Planner>,
+    stats: &mut RoundStats,
+) -> Option<(FxHashMap<SlotRef, SlotKind>, Vec<Bool>)> {
+    // Relay main/388 O2: the round's incumbent acceptances / refusals, from the solver's counts.
+    let (accepted, refused) = solver.incumbent_counts();
+    let solved = solve_round_counted(solver, selectors, backend, hard, planner, stats);
+    let (accepted_after, refused_after) = solver.incumbent_counts();
+    stats.incumbent_rounds += accepted_after - accepted;
+    stats.hard_eval_failed += refused_after - refused;
+    solved
+}
+
+fn solve_round_counted(
     solver: &KindSolver,
     selectors: &Selectors,
     backend: LoopBackend,

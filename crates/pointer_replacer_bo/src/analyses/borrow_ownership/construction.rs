@@ -292,6 +292,21 @@ impl OverlapPreledgerDeclineReason {
     }
 }
 
+/// Relay main/388 O2 (R1383-1 R4): the receipt's incumbent lines -- rounds whose model is an optimize
+/// incumbent at the budget, incumbents the hard evaluation refused, and the budget in force -- written
+/// only when the solve met one, so a receipt without one is byte for byte what it was.
+pub(crate) fn incumbent_keys(stats: &[&super::borrow_verify::RoundStats]) -> String {
+    let accepted: usize = stats.iter().map(|stats| stats.incumbent_rounds).sum();
+    let refused: usize = stats.iter().map(|stats| stats.hard_eval_failed).sum();
+    if accepted + refused == 0 {
+        return String::new();
+    }
+    format!(
+        "incumbent_rounds={accepted}\nhard_eval_failed={refused}\nquery_budget_ms={}\n",
+        super::execution_guard::query_timeout_ms()
+    )
+}
+
 /// Name which of `verify_to_fixpoint`'s `None` exits fired, from the stats it
 /// fills on the way out.
 fn precise_verification_cause(stats: &super::borrow_verify::RoundStats) -> String {
@@ -639,6 +654,7 @@ fn canonical_receipt(input: String) -> String {
 /// receipt is byte-identical. `repair=guarded->mode-a` when any guarded run declined and its
 /// program fell back to the plain repair; the fallbacks are counted and their reasons named.
 fn repair_keys(stats: &[&super::borrow_verify::RoundStats], receipt: String) -> String {
+    let receipt = format!("{receipt}{}", incumbent_keys(stats));
     let guarded = stats
         .iter()
         .filter(|stats| stats.repair == super::borrow_verify::RepairMode::Guarded)
@@ -1930,7 +1946,7 @@ fn solve_bo_overlap_config_with_source_events(
         OverlapPreledgerDecline::with_detail(
             OverlapPreledgerDeclineReason::BaselineVerification,
             format!(
-                "expected=accepted-model got={first} rounds={} commits={} selected_copy_lends={} dropped_sources={} dropped_sinks={} field_conflict={:?} field_kind={:?} cap_exhausted={} l2_decline={:?} source_retirement={:?}",
+                "expected=accepted-model got={first} rounds={} commits={} selected_copy_lends={} dropped_sources={} dropped_sinks={} field_conflict={:?} field_kind={:?} cap_exhausted={} l2_decline={:?} source_retirement={:?}{}",
                 baseline_round_stats.rounds,
                 baseline_round_stats.commits_conflict,
                 baseline_round_stats.copy_lend_replay_selections,
@@ -1941,6 +1957,10 @@ fn solve_bo_overlap_config_with_source_events(
                 baseline_round_stats.cap_exhausted,
                 baseline_round_stats.guarded_decline,
                 baseline_round_stats.source_retirement_decline,
+                incumbent_keys(&[&baseline_round_stats])
+                    .lines()
+                    .map(|line| format!(" {line}"))
+                    .collect::<String>(),
             ),
         )
     })?;
