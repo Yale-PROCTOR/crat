@@ -486,7 +486,9 @@ pub fn add_functions_with_observations(
             })?;
         let ItemKind::Fn(box function) = &mut copy.kind else { unreachable!() };
         function.ident = parsed_ident(&plan.source_copy_name);
-        function.sig.header.ext = Extern::None;
+        if !function.sig.decl.c_variadic() {
+            function.sig.header.ext = Extern::None;
+        }
         ProctorLabelRemover.visit_block(function.body.as_mut().unwrap());
         annotate_function(&mut copy, &opaque);
         insert_item_at_path(
@@ -505,7 +507,9 @@ pub fn add_functions_with_observations(
         item.vis = crate_visible();
         let ItemKind::Fn(box function) = &mut item.kind else { unreachable!() };
         function.ident = parsed_ident(&name);
-        function.sig.header.ext = Extern::None;
+        if !function.sig.decl.c_variadic() {
+            function.sig.header.ext = Extern::None;
+        }
         function.body = Some(parse_body("{ todo!() }")?);
         insert_item_at_path(&mut observation.items, &original.module_path, item)?;
         source_stubs.push(stub);
@@ -697,6 +701,14 @@ fn prepare_transformations(
         let returned = returned_transformations
             .get(&requested.name)
             .expect("request validation established the function set");
+        let (ItemKind::Fn(expected_fn), ItemKind::Fn(returned_fn)) =
+            (&expected.kind, &returned.kind)
+        else {
+            unreachable!()
+        };
+        if expected_fn.sig.decl.c_variadic() || returned_fn.sig.decl.c_variadic() {
+            validate_transformed_header(expected_fn, returned_fn, requested)?;
+        }
         let canonical = canonicalize_function_with_view(&expected, returned, &requested.view, true)
             .map_err(|problem| {
                 item_error(
@@ -1048,13 +1060,6 @@ fn validate_supported_transformation(
             "returned async functions are unsupported".to_owned(),
         ));
     }
-    if function.sig.decl.c_variadic() {
-        return Err(item_error(
-            ReplacementErrorKind::InvalidTransformation,
-            requested,
-            "returned variadic functions are unsupported".to_owned(),
-        ));
-    }
     if function
         .sig
         .decl
@@ -1251,13 +1256,6 @@ fn validate_current_target(
             "current async functions are unsupported replacement targets".to_owned(),
         ));
     }
-    if function.sig.decl.c_variadic() {
-        return Err(item_error(
-            ReplacementErrorKind::TargetResolution,
-            requested,
-            "current variadic functions are unsupported replacement targets".to_owned(),
-        ));
-    }
     if has_attr(&current.item.attrs, sym::no_mangle)
         && has_attr(&current.item.attrs, sym::export_name)
     {
@@ -1276,6 +1274,18 @@ fn validate_transformed_header(
     transformed: &rustc_ast::Fn,
     requested: &ReplacementItem,
 ) -> Result<(), ReplacementError> {
+    if current.sig.decl.c_variadic() || transformed.sig.decl.c_variadic() {
+        if crate::preservation::function_signature(current)
+            != crate::preservation::function_signature(transformed)
+        {
+            return Err(item_error(
+                ReplacementErrorKind::InvalidTransformation,
+                requested,
+                "preserve the complete variadic function signature".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
     if current.sig.decl.inputs.len() != transformed.sig.decl.inputs.len() {
         return Err(item_error(
             ReplacementErrorKind::InvalidTransformation,

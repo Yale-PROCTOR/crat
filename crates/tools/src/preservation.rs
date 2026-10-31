@@ -22,6 +22,14 @@ pub(crate) struct PreservationError {
     pub message: String,
 }
 
+pub(crate) fn function_signature(function: &rustc_ast::Fn) -> String {
+    let mut item = utils::item!("fn signature() {{}}");
+    let ItemKind::Fn(body) = &mut item.kind else { unreachable!() };
+    **body = function.clone();
+    body.body = None;
+    pprust::item_to_string(&item)
+}
+
 pub(crate) fn make_disposition_forest(
     item: &Item,
     transformed: &HashSet<u32>,

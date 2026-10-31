@@ -149,6 +149,12 @@ pub fn replace_unstructured_scc(
             }
             let expected = one_item(&function.record.baseline.skeleton)?;
             let mut header = compose_implementation(&expected, transformed, requested)?;
+            let (ItemKind::Fn(expected_fn), ItemKind::Fn(transformed_fn)) =
+                (&expected.kind, &transformed.kind)
+            else {
+                unreachable!()
+            };
+            validate_transformed_header(expected_fn, transformed_fn, requested)?;
             let mut expected_header = expected.clone();
             for item in [&mut header, &mut expected_header] {
                 let ItemKind::Fn(box body) = &mut item.kind else { unreachable!() };
