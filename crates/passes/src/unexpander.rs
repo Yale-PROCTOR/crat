@@ -246,10 +246,13 @@ impl MutVisitor for AstVisitor<'_> {
     }
 
     fn visit_expr(&mut self, expr: &mut Expr) {
-        if let Some(mut panic) = self.unexpanded_panic(expr) {
-            panic.attrs = expr.attrs.clone();
-            panic.span = expr.span;
-            *expr = panic;
+        if let Some(mut unexpanded) = self
+            .unexpanded_panic(expr)
+            .or_else(|| self.unexpanded_print(expr))
+        {
+            unexpanded.attrs = expr.attrs.clone();
+            unexpanded.span = expr.span;
+            *expr = unexpanded;
             return;
         }
         if let ExprKind::Call(callee, args) = &expr.kind
@@ -368,6 +371,37 @@ impl AstVisitor<'_> {
             return None;
         }
         Some((self.tcx.item_name(def_id), arguments))
+    }
+
+    fn unexpanded_print(&mut self, expression: &Expr) -> Option<Expr> {
+        let expression = if let ExprKind::Block(block, None) = &expression.kind
+            && matches!(block.rules, BlockCheckMode::Default)
+            && let [statement] = block.stmts.as_slice()
+            && let StmtKind::Semi(inner) = &statement.kind
+            && inner.attrs.is_empty()
+        {
+            inner
+        } else {
+            expression
+        };
+        let (def_id, arguments) = self.resolved_call(expression)?;
+        if def_id.is_local() || self.tcx.def_path_str(self.tcx.parent(def_id)) != "std::io::stdio" {
+            return None;
+        }
+        let name = match self.tcx.item_name(def_id).as_str() {
+            "_print" => "print",
+            "_eprint" => "eprint",
+            _ => return None,
+        };
+        let [format] = arguments else { return None };
+        let mut format = unwrap_paren(format).clone();
+        if !matches!(format.kind, ExprKind::FormatArgs(_)) {
+            return None;
+        }
+        self.visit_expr(&mut format);
+        let format = pprust::expr_to_string(&format);
+        let arguments = format.strip_prefix("format_args!(")?.strip_suffix(')')?;
+        Some(expr!("{name}!({arguments})"))
     }
 
     fn unexpanded_panic(&mut self, expression: &Expr) -> Option<Expr> {
@@ -996,6 +1030,179 @@ fn f() {
             &["eprint!"],
             &["stdout", "write_fmt", "format_args"],
         )
+    }
+
+    fn normalize_print_source(code: &str, use_print: bool) -> String {
+        let expanded = utils::compilation::run_compiler_on_str(code, |tcx| {
+            crate::expander::expand(crate::expander::Config { keep_allows: true }, tcx)
+        })
+        .unwrap();
+        let normalized = utils::compilation::run_compiler_on_str(&expanded, |tcx| {
+            super::unexpand(super::Config { use_print }, tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&normalized, utils::type_check).expect(&normalized);
+        normalized
+    }
+
+    #[test]
+    fn print_macros_survive_repeated_normalization() {
+        let code = r#"
+fn next_value() -> i32 { 7 }
+pub fn f(value: i32) {
+    ::std::print!("Hello World!\n");
+    ::std::println!();
+    ::std::println!("stdout: {value}");
+    ::std::eprint!("stderr: {}", next_value());
+    ::std::eprintln!();
+    ::std::eprintln!("{captured} {named}", named = value, captured = next_value());
+}
+"#;
+        for use_print in [false, true] {
+            let first = normalize_print_source(code, use_print);
+            let second = normalize_print_source(&first, use_print);
+            assert_eq!(first, second);
+            for expected in [
+                "print!(\"Hello World!\\n\")",
+                "print!(\"\\n\")",
+                "print!(\"stdout: {0}\\n\", value)",
+                "eprint!(\"stderr: {0}\", next_value())",
+                "eprint!(\"\\n\")",
+                "eprint!(\"{1} {0}\\n\", value, next_value())",
+            ] {
+                let statement = format!("{expected};");
+                assert!(
+                    second.lines().any(|line| line.trim() == statement),
+                    "{second}"
+                );
+            }
+            assert_eq!(second.matches("next_value()").count(), 3);
+            for unexpected in [
+                "_print",
+                "_eprint",
+                "format_args!",
+                "print_internals",
+                "std::print!",
+                "std::eprint!",
+            ] {
+                assert!(!second.contains(unexpected), "{second}");
+            }
+        }
+    }
+
+    #[test]
+    fn print_format_arguments_are_normalized_before_reconstruction() {
+        let source = normalize_print_source(
+            r#"
+#[repr(C)] struct Pair { left: i32, right: i32 }
+pub fn f(flag: bool) {
+    ::std::print!("offset: {}", if flag {
+        core::mem::offset_of!(Pair, right)
+    } else {
+        ::std::eprint!("nested print");
+        0
+    });
+}
+"#,
+            false,
+        );
+        assert!(
+            source.contains("core::mem::offset_of!(Pair, right)"),
+            "{source}"
+        );
+        assert!(source.contains("eprint!(\"nested print\")"), "{source}");
+        assert!(!source.contains("builtin # offset_of"), "{source}");
+        assert!(!source.contains("::_print"), "{source}");
+        assert!(!source.contains("::_eprint"), "{source}");
+    }
+
+    #[test]
+    fn print_reconstruction_uses_resolved_std_identity() {
+        run_test(
+            r#"
+mod io {
+    pub fn _print(_: std::fmt::Arguments<'_>) {}
+    pub fn _eprint(_: std::fmt::Arguments<'_>) {}
+}
+pub fn f() {
+    io::_print(format_args!("user stdout"));
+    io::_eprint(format_args!("user stderr"));
+    ::std::io::_print(format_args!("real stdout"));
+    ::std::io::_eprint(format_args!("real stderr"));
+}
+"#,
+            &[
+                "io::_print(format_args!(\"user stdout\"))",
+                "io::_eprint(format_args!(\"user stderr\"))",
+                "print!(\"real stdout\")",
+                "eprint!(\"real stderr\")",
+            ],
+            &["::std::io::_print", "::std::io::_eprint"],
+        );
+    }
+
+    #[test]
+    fn print_reconstruction_preserves_blocks_and_attributes() {
+        run_test(
+            r#"
+pub fn f() {
+    'kept: { ::std::io::_print(format_args!("labeled")); }
+    unsafe { ::std::io::_eprint(format_args!("unsafe")); }
+    {
+        #[allow(unused_must_use)]
+        ::std::io::_print(format_args!("attributed"));
+    }
+}
+"#,
+            &[
+                "'kept:",
+                "unsafe { eprint!(\"unsafe\"); }",
+                "#[allow(unused_must_use)]",
+                "print!(\"attributed\")",
+            ],
+            &["::_print", "::_eprint"],
+        );
+    }
+
+    #[test]
+    fn cleanup_restores_print_macros() {
+        let code = r#"
+unsafe fn main_0() -> i32 {
+    ::std::print!("Hello World!\n");
+    ::std::eprintln!("status: {}", 0);
+    0
+}
+pub fn main() { unsafe { ::std::process::exit(main_0()) } }
+"#;
+        let expanded = utils::compilation::run_compiler_on_str(code, |tcx| {
+            crate::expander::expand(crate::expander::Config::default(), tcx)
+        })
+        .unwrap();
+        let interfaces = utils::compilation::run_compiler_on_str(&expanded, |tcx| {
+            crate::interface_fixer::fix_interfaces(&crate::interface_fixer::Config::default(), tcx)
+        })
+        .unwrap();
+        let resolved = utils::compilation::run_compiler_on_str(&interfaces, |tcx| {
+            crate::unsafe_resolver::resolve_unsafe(
+                &crate::unsafe_resolver::Config {
+                    remove_unused: true,
+                    remove_no_mangle: true,
+                    remove_extern_c: true,
+                    replace_pub: true,
+                    ..Default::default()
+                },
+                tcx,
+            )
+        })
+        .unwrap();
+        run_test(
+            &resolved,
+            &[
+                "print!(\"Hello World!\\n\")",
+                "eprint!(\"status: {0}\\n\", 0)",
+            ],
+            &["::_print", "::_eprint", "print_internals"],
+        );
     }
 
     #[test]
