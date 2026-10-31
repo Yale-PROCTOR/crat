@@ -43,6 +43,12 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    WrapperBounds {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     NormalizeSafety {
         #[arg(long)]
         output: PathBuf,
@@ -587,6 +593,21 @@ fn main() {
             let request = std::fs::read_to_string(input).unwrap();
             let response = tools::validate_json(&request);
             std::fs::write(output, response).unwrap();
+        }
+        Command::WrapperBounds { input, output } => {
+            validate_output_input_paths(&[&output], &[&input])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            let request: tools::WrapperBoundsRequest = serde_json::from_str(
+                &std::fs::read_to_string(input).unwrap_or_else(|error| fail("request_io", error)),
+            )
+            .unwrap_or_else(|error| fail("invalid_request", error));
+            let response = tools::process_wrapper_bounds(&request)
+                .unwrap_or_else(|error| fail("invalid_wrapper_bounds", error));
+            let json = serde_json::to_string_pretty(&response).unwrap();
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
         }
         Command::NormalizeSafety { output, input } => {
             let source = std::fs::read_to_string(input).unwrap();
