@@ -380,7 +380,7 @@ impl Context {
         let (visited, leak) = directed_closure(holder, &self.directed_copies, &self.copy_graph);
         let chain = visited
             .into_iter()
-            .filter(|slot| self.safe_holders.iter().any(|(safe, _, _)| safe == slot))
+            .filter(|slot| self.safe_holder_set.contains(slot))
             .map(|slot| (self.keys[&slot].clone(), slot))
             .collect::<BTreeMap<_, _>>();
         // R1352-1 (b): a fallback names the first leak its walk met, and the slots it pins (log only).

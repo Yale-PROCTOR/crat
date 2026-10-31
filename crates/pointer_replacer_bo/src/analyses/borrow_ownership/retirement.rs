@@ -326,6 +326,9 @@ struct Context {
     known_stack_entries: Vec<super::licensing::stack_entry::KnownStackEntry>,
     function_names: BTreeMap<String, LocalDefId>,
     safe_holders: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
+    /// Relay main/388 review-set (R1394-1): `safe_holders`' slots, for an O(1) membership test in
+    /// `demote`'s chain filter; built once when `safe_holders` is complete, never changed after.
+    safe_holder_set: FxHashSet<SlotRef>,
     copy_graph: FxHashMap<SlotRef, Vec<SlotRef>>,
     directed_copies: local_outcome::DirectedCopies,
     exact_kinds: bool,
@@ -422,6 +425,7 @@ pub(crate) fn begin(
         known_stack_entries,
         function_names,
         safe_holders: Vec::new(),
+        safe_holder_set: FxHashSet::default(),
         copy_graph: local_outcome::copy_graph(program, slots),
         directed_copies: local_outcome::directed_copies(program, slots),
         exact_kinds: exact.is_some(),
@@ -512,6 +516,11 @@ pub(crate) fn begin(
             }
         }
     }
+    context.safe_holder_set = context
+        .safe_holders
+        .iter()
+        .map(|&(slot, _, _)| slot)
+        .collect();
     RetirementScope {
         previous: CURRENT.with(|current| current.replace(Some(context))),
         source_scope: Some(source_scope),
@@ -1428,6 +1437,9 @@ mod tests_library_drop;
 
 #[cfg(test)]
 mod tests_owner_guards;
+
+#[cfg(test)]
+mod tests_review_set;
 
 #[cfg(test)]
 mod tests_object_scope;
