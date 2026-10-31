@@ -22,6 +22,7 @@ mod rule;
 mod skeleton;
 mod validator;
 mod view;
+mod wrapper_bounds;
 
 pub use item_replacer::*;
 pub use observation::*;
@@ -29,3 +30,4 @@ pub use rule::*;
 pub use skeleton::*;
 pub use validator::*;
 pub use view::*;
+pub use wrapper_bounds::*;
