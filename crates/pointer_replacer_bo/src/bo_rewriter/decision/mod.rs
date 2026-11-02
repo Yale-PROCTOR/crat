@@ -153,9 +153,6 @@ pub(crate) mod retained_access;
 pub(crate) mod retained_access_hold;
 #[cfg(test)]
 mod retained_access_tests;
-pub(crate) mod retained_alias_observed;
-#[cfg(test)]
-mod retained_alias_observed_tests;
 pub(crate) mod return_alias;
 pub(crate) mod return_certificate;
 pub(crate) mod return_interface;
@@ -947,10 +944,10 @@ pub(crate) enum DegradeReason {
     AliasedStorageWithdrawn {
         seams: String,
     },
-    /// Wave-6o relay 146 (R796-1, USER): the retained-alias stop-gap. A formal
-    /// whose Tree Borrows report a Miri run has shown (the program also reaches
-    /// its pointee through a pointer it keeps in memory) is held raw. `detail` is
-    /// `observed:<run>` ([`retained_alias_observed`]).
+    /// Wave-6o relay 146 (R796-1, USER): a retained-alias hold. A formal the program also reaches
+    /// through a pointer it keeps in memory is held raw. The stop-gap's table of Miri-observed
+    /// formals (`observed:<run>`) is gone (S6a, D5); the retained-access rule and the plan give the
+    /// hold its `detail`.
     RetainedAlias {
         detail: String,
     },
@@ -2737,19 +2734,6 @@ fn forced_option_withdrawal(subject: &Subject) -> bool {
 
 fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let decision = decide_one_ladder(ctx, subject);
-    // Wave-6o relay 146 (R796-1): the retained-alias stop-gap. A listed formal
-    // the ladder would deliver (or leaves at the gate mode's
-    // `call-site-not-adapted`) is held raw. So is one the ladder leaves raw
-    // (R800-2, slicecursor 103): a pass that degrades it `ptr-comparison` or
-    // `opt-use-unsupported` is one the cursor family selects, so a formal that
-    // kept its own reason came back as a cursor (bzip2 `BZ2_bzDecompress::strm`).
-    if let Some(detail) = retained_alias_observed::held(ctx.tcx, subject) {
-        return degrade(
-            subject,
-            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
-            DegradeReason::RetainedAlias { detail },
-        );
-    }
     // R824-2 (§29, R819-1): with the Option stage withdrawn, a subject whose
     // OWN evidence is nullable is never delivered in a non-optional safe form
     // (reference, slice, cursor or owner), whichever promotion produced it; it

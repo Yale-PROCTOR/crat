@@ -1,15 +1,18 @@
 //! ESC-GAP ②-minimal exact-site selector.
 
-use std::{cell::RefCell, sync::OnceLock};
+use std::cell::RefCell;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_middle::{
-    mir::{Body, Local, Location, Operand, Place, PlaceElem, RETURN_PLACE, Rvalue, StatementKind},
-    ty::TyCtxt,
+use rustc_middle::mir::{
+    Body, Local, Location, Operand, Place, PlaceElem, RETURN_PLACE, Rvalue, StatementKind,
 };
+#[cfg(test)]
+use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::Analysis;
 use rustc_span::def_id::LocalDefId;
 
+#[cfg(test)]
+use super::slot_key::{field_key, local_key};
 use super::{
     coherence::{SelectedCopyLendLoan, SelectedCopyLendLoans},
     crate_slots::CrateSlots,
@@ -17,7 +20,6 @@ use super::{
     export::{BorrowerKind, OwnerKey, PlaceKey},
     guarded_repair::MirLocationKey,
     resolve::{ResolvedSlot, resolve_place},
-    slot_key::{field_key, local_key},
     slots::SlotOwner,
     solver::SlotRef,
 };
@@ -31,52 +33,6 @@ use crate::{
 };
 
 const ORIGIN_CHASE_LIMIT: usize = 8;
-const ALLOWLIST: &str = include_str!("esc_minimal_allowlist.tsv");
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ArtifactKey {
-    program: &'static str,
-    function: &'static str,
-    location: MirLocationKey,
-    resolved_origin_slot: &'static str,
-    destination_place: &'static str,
-}
-
-fn artifact_keys() -> &'static [ArtifactKey] {
-    static KEYS: OnceLock<Vec<ArtifactKey>> = OnceLock::new();
-    KEYS.get_or_init(|| {
-        let mut lines = ALLOWLIST.lines();
-        assert_eq!(
-            lines.next(),
-            Some(
-                "program\tfunction\tblock\tstatement_index\tresolved_origin_slot\tdestination_place"
-            )
-        );
-        let keys = lines
-            .filter(|line| !line.is_empty())
-            .map(|line| {
-                let fields = line.split('\t').collect::<Vec<_>>();
-                assert_eq!(fields.len(), 6, "short ESC allowlist row: {line}");
-                ArtifactKey {
-                    program: fields[0],
-                    function: fields[1],
-                    location: MirLocationKey::new(
-                        fields[2].parse().expect("ESC allowlist block"),
-                        fields[3].parse().expect("ESC allowlist statement"),
-                    ),
-                    resolved_origin_slot: fields[4],
-                    destination_place: fields[5],
-                }
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            keys.len(),
-            36,
-            "escape-minimal allowlist must contain 36 rows"
-        );
-        keys
-    })
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg(test)]
@@ -104,16 +60,6 @@ pub(crate) struct EscRuntimeSite {
 #[cfg(test)]
 pub(crate) enum EscExclusionReason {
     FieldIssuerOutOfScope,
-}
-
-#[cfg(test)]
-impl EscExclusionReason {
-    #[cfg(test)]
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::FieldIssuerOutOfScope => "field-issuer-out-of-scope",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -329,15 +275,19 @@ fn fixture_selection_enabled() -> bool {
 
 #[derive(Clone, Debug)]
 struct Site {
+    #[cfg(test)]
     function: String,
     fn_did: LocalDefId,
+    #[cfg(test)]
     location: MirLocationKey,
     loan_location: MirLocationKey,
     loan_borrowed: PlaceKey,
     lhs: SlotRef,
     rhs: SlotRef,
     borrower: BorrowerKind,
+    #[cfg(test)]
     resolved_origin_slot: String,
+    #[cfg(test)]
     destination_place: String,
     #[cfg(test)]
     escaping: bool,
@@ -404,6 +354,7 @@ fn slot_ref(fn_did: LocalDefId, resolved: ResolvedSlot) -> SlotRef {
     }
 }
 
+#[cfg(test)]
 fn slot_key(tcx: TyCtxt<'_>, slots: &CrateSlots, slot: SlotRef) -> String {
     match slot {
         SlotRef::Local(fn_did, slot) => {
@@ -451,22 +402,12 @@ fn presentation_owner(slots: &CrateSlots, slot: SlotRef) -> ProvenanceOwner {
     }
 }
 
-fn collect_sites(
-    program: &RustProgram<'_>,
-    slots: &CrateSlots,
-    restrict_to_allowlist_functions: bool,
-) -> Vec<Site> {
-    let allowed_functions = artifact_keys()
-        .iter()
-        .map(|key| key.function)
-        .collect::<FxHashSet<_>>();
+fn collect_sites(program: &RustProgram<'_>, slots: &CrateSlots) -> Vec<Site> {
     let mut sites = Vec::new();
 
     for &fn_did in &program.functions {
+        #[cfg(test)]
         let function = program.tcx.def_path_str(fn_did.to_def_id());
-        if restrict_to_allowlist_functions && !allowed_functions.contains(function.as_str()) {
-            continue;
-        }
         let body = program
             .tcx
             .mir_drops_elaborated_and_const_checked(fn_did)
@@ -586,28 +527,16 @@ fn collect_sites(
             #[cfg(test)]
             let live_after_syntactic = live.contains(row.source.local);
             let is_escaping = escaping(&body, row.destination);
+            #[cfg(test)]
             let origin_key = slot_key(program.tcx, slots, row.rhs);
+            #[cfg(test)]
             let destination_place = format!("{:?}", row.destination);
-            let artifact = artifact_keys().iter().find(|key| {
-                key.function == function
-                    && key.location
-                        == MirLocationKey::new(
-                            row.location.block.as_u32(),
-                            row.location.statement_index,
-                        )
-                    && key.resolved_origin_slot == origin_key
-                    && key.destination_place == destination_place
-            });
-            let selected = is_escaping
-                && live_after
-                && if restrict_to_allowlist_functions {
-                    artifact.is_some()
-                } else {
-                    true
-                };
+            let selected = is_escaping && live_after;
             sites.push(Site {
+                #[cfg(test)]
                 function: function.clone(),
                 fn_did,
+                #[cfg(test)]
                 location: MirLocationKey::new(
                     row.location.block.as_u32(),
                     row.location.statement_index,
@@ -623,7 +552,9 @@ fn collect_sites(
                 lhs: row.lhs,
                 rhs: row.rhs,
                 borrower: row.loan_borrower,
+                #[cfg(test)]
                 resolved_origin_slot: origin_key,
+                #[cfg(test)]
                 destination_place,
                 #[cfg(test)]
                 escaping: is_escaping,
@@ -641,49 +572,20 @@ fn collect_sites(
 }
 
 pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinimalSelection {
-    let fixture_selection = fixture_selection_enabled();
-    let rows = collect_sites(program, slots, !fixture_selection);
-    let present_functions = program
-        .functions
-        .iter()
-        .map(|did| program.tcx.def_path_str(did.to_def_id()))
-        .collect::<FxHashSet<_>>();
-    let expected = if fixture_selection {
-        Vec::new()
-    } else {
-        artifact_keys()
-            .iter()
-            .filter(|key| present_functions.contains(key.function))
-            .collect::<Vec<_>>()
-    };
-    let selected = rows.iter().filter(|row| row.selected).collect::<Vec<_>>();
-    if !fixture_selection {
-        assert_eq!(
-            selected.len(),
-            expected.len(),
-            "escape-minimal exact allowlist did not join one-to-one in this crate"
-        );
+    // The exact-site allowlist (36 rs-crown sites, D5) is gone (S6b, the user's word in main's
+    // session 11-02): outside a test's fixture selection nothing is selected.
+    if !fixture_selection_enabled() {
+        let answer = EscMinimalSelection::default();
+        answer.cross_stage_counts();
+        return answer;
     }
-
+    let rows = collect_sites(program, slots);
+    let selected = rows.iter().filter(|row| row.selected).collect::<Vec<_>>();
     let mut answer = EscMinimalSelection::default();
     for row in selected {
-        let artifact = (!fixture_selection).then(|| {
-            artifact_keys()
-                .iter()
-                .find(|key| {
-                    key.function == row.function
-                        && key.location == row.location
-                        && key.resolved_origin_slot == row.resolved_origin_slot
-                        && key.destination_place == row.destination_place
-                })
-                .expect("selected row has artifact key")
-        });
-        // Outside tests only the `expect` above is wanted: every selected row is an allowlist row.
-        #[cfg(not(test))]
-        let _ = artifact;
         #[cfg(test)]
         let key = EscCopySiteKey {
-            program: artifact.map_or("fixture", |key| key.program).to_owned(),
+            program: "fixture".to_owned(),
             function: row.function.clone(),
             location: row.location,
             resolved_origin_slot: row.resolved_origin_slot.clone(),
@@ -749,22 +651,6 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
             loan,
         });
     }
-    if !fixture_selection {
-        let expected_field_issuers = expected
-            .iter()
-            .filter(|key| key.resolved_origin_slot.contains("::field"))
-            .count();
-        assert_eq!(
-            answer.sites.len() + answer.excluded_sites.len(),
-            expected.len(),
-            "escape-minimal allowlist keys must partition into selected plus typed-excluded"
-        );
-        assert_eq!(
-            answer.excluded_sites.len(),
-            expected_field_issuers,
-            "escape-minimal field-issuer exclusions must match the exact joined allowlist rows"
-        );
-    }
     answer.cross_stage_counts();
     answer
 }
@@ -795,7 +681,7 @@ fn fixture_sites(code: &str) -> Vec<Site> {
             structs,
         };
         let slots = CrateSlots::build(&program);
-        answer = Some(collect_sites(&program, &slots, false));
+        answer = Some(collect_sites(&program, &slots));
     })
     .unwrap_or_else(|error| error.raise());
     answer.expect("fixture compiler callback")
@@ -805,7 +691,7 @@ fn fixture_sites(code: &str) -> Vec<Site> {
 mod tests {
     use rustc_middle::mir::Local;
 
-    use super::{EscExclusionReason, artifact_keys, demotion_exemption, fixture_sites};
+    use super::{demotion_exemption, fixture_sites};
     use crate::analyses::borrow_ownership::{
         coherence::SelectedCopyLendLoan,
         export::{BorrowerKind, OwnerKey, PlaceKey},
@@ -841,19 +727,6 @@ unsafe fn caller() -> i32 {
     *slot
 }
 "#;
-
-    #[test]
-    fn field_issuer_allowlist_residual_is_exact_and_typed() {
-        let rows = artifact_keys()
-            .iter()
-            .filter(|key| key.program == "brotli" && key.resolved_origin_slot.contains("::field"))
-            .collect::<Vec<_>>();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(
-            EscExclusionReason::FieldIssuerOutOfScope.label(),
-            "field-issuer-out-of-scope"
-        );
-    }
 
     #[test]
     fn one_effective_loan_has_one_exact_pruning_exemption() {

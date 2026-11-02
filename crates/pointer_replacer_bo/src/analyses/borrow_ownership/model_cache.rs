@@ -915,8 +915,8 @@ mod tests {
     }
 
     /// The build's covered list names the legacy modules the analysis runs on
-    /// (borrow and the variable grouping since the legacy-copy stage), BO's
-    /// analyses, and the escape-minimal allowlist.
+    /// (borrow and the variable grouping since the legacy-copy stage) and BO's
+    /// analyses.
     #[test]
     fn s2_t_fp_2_the_covered_list_names_every_analysis_input() {
         let list = option_env!("OUT_DIR")
@@ -927,7 +927,6 @@ mod tests {
             "legacy/analyses/borrow/",
             "legacy/analyses/mir_variable_grouping.rs",
             "bo/borrow_ownership/",
-            "bo/borrow_ownership/esc_minimal_allowlist.tsv",
             "legacy/analyses/type_qualifier/foster/",
             "legacy/analyses/mir/",
             "legacy/analyses/offset_sign/",
