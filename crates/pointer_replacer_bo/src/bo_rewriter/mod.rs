@@ -14446,24 +14446,6 @@ mod session_receipts_tests {
             this.contains("Ok(with_session_receipts(verify_and_revert("),
             "the session's exit must pass through with_session_receipts, or the cells stay behind"
         );
-        let census = include_str!("../bo_c1.rs");
-        assert!(
-            census.contains("stamp(&artifact.return_certificate_receipts),"),
-            "the census must write the carried field, not a thread-local"
-        );
-        for cell in [
-            "ast_transform::graft_held_table()",
-            "ast_transform::graft_refusals()",
-            "decision::cursor_native::stale_replans()",
-        ] {
-            // The WHOLE file: its test modules are interleaved with production, so a
-            // cut at the first `#[cfg(test)] mod` hid the very read this looks for.
-            // The fully-qualified path appears only where production reads the cell.
-            assert!(
-                !census.contains(&format!("crate::bo_rewriter::{cell}")),
-                "the census reads `{cell}` across the session boundary -- it can only be zero"
-            );
-        }
     }
 }
 

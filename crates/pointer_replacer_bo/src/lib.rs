@@ -56,20 +56,11 @@ mod raw_boundary_census_schema;
 pub use bo_pipeline::{
     BoReceipt, Config, env_from_file as bo_env_from_file, query_timeout_env_value, rewrite_bo,
 };
-// The legacy crate's root items the moved measurement tests name as `crate::…`.
-#[cfg(test)]
-pub(crate) use pointer_replacer::replace_local_borrows;
 pub use pointer_replacer::{rewriter, utils};
 
-#[cfg(test)]
-mod bo_c1;
-#[cfg(test)]
-mod box_census_schema;
 #[cfg(test)]
 mod r1312_fixtures;
 #[cfg(test)]
 mod r1314_p12_tests;
-#[cfg(test)]
-mod recon_fixtures;
 #[cfg(test)]
 mod tests;

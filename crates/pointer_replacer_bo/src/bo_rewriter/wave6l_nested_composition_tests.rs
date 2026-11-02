@@ -191,30 +191,3 @@ fn w6l_graft_held_table_is_empty_for_a_program_that_composes() {
     assert!(super::ast_transform::graft_held_receipts().is_empty());
     assert!(super::ast_transform::graft_held_classes().is_empty());
 }
-
-/// **The census writes the table for EVERY program, held or not.**
-///
-/// The property the artifact exists for is the unconditional write: a file that
-/// appears only when something was held reintroduces exactly the ambiguity
-/// report 039 hit, one directory further down. The write needs a census program
-/// to exercise, so what is pinned here is that it is not guarded.
-#[test]
-fn w6l_graft_held_table_is_written_for_every_census_program() {
-    let source = include_str!("../bo_c1.rs");
-    let start = source
-        .find("{name}.graft-held.tsv")
-        .expect("the census writes the graft-held table");
-    let head = &source[..start];
-    let statement = head
-        .rfind("std::fs::write(")
-        .expect("the write is an fs::write");
-    let preamble = &head[statement.saturating_sub(400)..statement];
-    assert!(
-        !preamble.contains("if !"),
-        "the graft-held table must be written even when it is empty: {preamble}"
-    );
-    assert!(
-        source.contains("ast_transform::reset_graft_held();"),
-        "the receipts are reset per program, as the graft refusals are"
-    );
-}

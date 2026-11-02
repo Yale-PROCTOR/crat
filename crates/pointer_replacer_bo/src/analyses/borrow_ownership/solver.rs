@@ -3876,18 +3876,6 @@ fn assert_hard(
     label: impl FnOnce() -> String,
     constraint: &Bool,
 ) {
-    #[cfg(test)]
-    if crate::bo_c1::ownership_diagnostic_package::removal_filter_active() {
-        assert!(
-            tracker.is_none(),
-            "family-removal diagnosis must remain untracked"
-        );
-        if crate::bo_c1::ownership_diagnostic_package::suppresses_label(label) {
-            return;
-        }
-        solver.assert(constraint);
-        return;
-    }
     match tracker {
         None => solver.assert(constraint),
         Some(tracker) => {

@@ -129,12 +129,6 @@ mod tests {
             "src/analyses/borrow_ownership/mod.rs",
             "emit_crate_ownership_constraints_with_copy_lends",
         ),
-        ("src/bo_c1.rs", "verify_to_fixpoint_is_thin_wrapper"),
-        ("src/bo_c1.rs", "nb5f2_field_conflict_restores::run"),
-        ("src/bo_c1.rs", "s23_owning_blocker_probe"),
-        ("src/bo_c1.rs", "r385_forced_assignment_probe"),
-        ("src/bo_c1.rs", "nbf_sink_retractable_delete_node"),
-        ("src/bo_c1.rs", "nb5l2_anchor"),
     ];
 
     const LEGACY_PRIMITIVE_PREFIXES: &[&str] = &[

@@ -317,43 +317,6 @@ fn e5c_w7_the_arm_emits_null_join_rows_at_the_free_and_null_arms() {
     assert!(text.contains("E5C_NULL_JOIN_ROWS="), "{text}");
 }
 
-const BST: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../benchmarks/rs-crown-derived/bst/lib.rs"
-);
-const BST_TARGETS: &str = "src::bst::node::field1@d0=own,src::bst::node::field2@d0=own,\
-src::bst::newNode::_0@d0=own,src::bst::newNode::_3@d0=own,src::bst::insert::_0@d0=own,\
-src::bst::insert::_1@d0=own,src::bst::deleteNode::_0@d0=own,src::bst::deleteNode::_1@d0=own,\
-src::bst::minValueNode::_0@d0=ref,src::bst::minValueNode::_1@d0=ref,src::bst::inorder::_1@d0=ref";
-
-fn bst_probe() -> String {
-    let dir = std::env::var("DIR")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../..").to_owned());
-    child(
-        "bo_c1::r385_forced_assignment_probe",
-        &[
-            ("CRAT_R385_PROGRAM", BST),
-            ("CRAT_R385_TARGETS", BST_TARGETS),
-            ("CRAT_R385_GRANULARITY", "assertion"),
-            ("CRAT_R385_WORLD", "closed"),
-            ("DIR", dir.as_str()),
-        ],
-    )
-}
-
-/// bst's all-safe assignment (fields own, producers own, the readers ref) is
-/// SAT under the arm in the attested closed world.
-#[test]
-fn e5c_w8_bst_all_safe_is_sat_under_the_arm() {
-    if !std::path::Path::new(BST).is_file() {
-        eprintln!("corpus absent; skipping");
-        return;
-    }
-    let text = bst_probe();
-    assert!(text.contains("R385 VERDICT=SAT"), "{text}");
-    assert!(!text.contains("E5C traversal-pending"), "{text}");
-}
-
 /// bst's four pointer functions verbatim (the derived substrate's `lib.rs`
 /// minus the crate attributes), run through the FULL solve — the joint pass
 /// with borrow verification, retirement and the relax loop — the way the
