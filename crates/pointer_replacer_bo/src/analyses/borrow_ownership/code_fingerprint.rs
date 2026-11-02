@@ -32,6 +32,7 @@ pub(crate) const LEGACY_FILES: &[&str] = &[
     "analyses/mir/mod.rs",
     "analyses/mir/terminator.rs",
     "analyses/mir/ty.rs",
+    "analyses/mir_variable_grouping.rs",
     "analyses/offset_sign/sign.rs",
     "analyses/output_params/eliminable_temporaries.rs",
     "analyses/output_params/mod.rs",

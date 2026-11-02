@@ -914,8 +914,9 @@ mod tests {
         assert!(option_env!("BO_ANALYSIS_FINGERPRINT").is_some());
     }
 
-    /// The build's covered list names the seven legacy modules the analysis
-    /// runs on, BO's analyses, and the escape-minimal allowlist.
+    /// The build's covered list names the legacy modules the analysis runs on
+    /// (borrow and the variable grouping since the legacy-copy stage), BO's
+    /// analyses, and the escape-minimal allowlist.
     #[test]
     fn s2_t_fp_2_the_covered_list_names_every_analysis_input() {
         let list = option_env!("OUT_DIR")
@@ -923,7 +924,8 @@ mod tests {
             .and_then(|path| std::fs::read_to_string(path).ok())
             .unwrap_or_default();
         let missing: Vec<_> = [
-            "bo/borrow/",
+            "legacy/analyses/borrow/",
+            "legacy/analyses/mir_variable_grouping.rs",
             "bo/borrow_ownership/",
             "bo/borrow_ownership/esc_minimal_allowlist.tsv",
             "legacy/analyses/type_qualifier/foster/",

@@ -10,7 +10,9 @@
 //! - the conflict-edge verifiers BO added ([`borrow_conflicts`], [`borrow_conflicts_replaying`],
 //!   [`collect_invalid_loan_demotions`]) and [`LoanLocation`].
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
+#[cfg(test)]
+use rustc_hash::FxHashSet;
 use rustc_index::{
     IndexVec,
     bit_set::{DenseBitSet, SparseBitMatrix},
@@ -25,20 +27,18 @@ use rustc_middle::{
 use rustc_mir_dataflow::points::DenseLocationMap;
 use rustc_span::def_id::LocalDefId;
 
-use crate::{
-    analyses::{
-        borrow::{
-            BorrowData, BorrowInferenceResults, BorrowSet, Borrower, GBorrowInferCtxt, Loan,
-            Provenance, ProvenanceConstraintGraph, ProvenanceOwner, ProvenanceSet,
-            errors::compute_errors, invalidates::compute_invalidates, is_borrowing_method,
-            killed::compute_killed, loan_liveness::compute_loan_liveness,
-            provenance_liveness::compute_provenance_liveness, requires::compute_requires,
-            subset_closure::compute_subset_closure,
-        },
-        mir::{CallKind, TerminatorExt},
+use crate::analyses::{
+    borrow::{
+        BorrowData, BorrowInferenceResults, BorrowSet, Borrower, GBorrowInferCtxt, Loan,
+        ProvenanceConstraintGraph, ProvenanceOwner, ProvenanceSet, errors::compute_errors,
+        invalidates::compute_invalidates, is_borrowing_method, killed::compute_killed,
+        loan_liveness::compute_loan_liveness, provenance_liveness::compute_provenance_liveness,
+        requires::compute_requires, subset_closure::compute_subset_closure,
     },
-    utils::rustc::RustProgram,
+    mir::{CallKind, TerminatorExt},
 };
+#[cfg(test)]
+use crate::{analyses::borrow::Provenance, utils::rustc::RustProgram};
 
 /// A loan's location (the legacy `BorrowData` keeps the field without an accessor).
 pub(crate) trait LoanLocation {
@@ -315,6 +315,7 @@ pub struct ConflictEdge {
 /// it is faithful for a Round-0 (all-candidate) set; a *partial* candidacy that
 /// represents demotions would also need the `tree_borrow_local` union replay the
 /// demotion loop performs (the caller's concern).
+#[cfg(test)]
 pub fn borrow_conflicts<I, J, K, L>(
     program: &RustProgram,
     is_candidate: I,
@@ -344,6 +345,7 @@ where
 }
 
 /// The set of invalid loans (live ∧ invalidated) across all error points.
+#[cfg(test)]
 fn invalid_loan_set(inference: &BorrowInferenceResults<'_>) -> DenseBitSet<Loan> {
     let mut invalid_loans = DenseBitSet::new_empty(inference.borrow_set.loans.len());
     for row in inference.errors.rows() {
@@ -357,6 +359,7 @@ fn invalid_loan_set(inference: &BorrowInferenceResults<'_>) -> DenseBitSet<Loan>
 /// Attribute each invalid loan to its issuer (`assigned`) and the live provenances
 /// that required it — the `ConflictEdge` shape consumed by the §8 guard encoder.
 /// Shared by `borrow_conflicts` (round-0) and `borrow_conflicts_replaying` (CEGAR).
+#[cfg(test)]
 fn extract_conflict_edges(
     inference: &BorrowInferenceResults<'_>,
     provenance_set: &ProvenanceSet,
@@ -438,6 +441,7 @@ fn extract_conflict_edges(
 /// What stays DEFERRED to BB3 is the separate *under-report*: an `Owning` slot issues no
 /// loan, so a conflict *caused by* an `Owning` pointer's exclusivity is invisible to the
 /// replay. BO output is unconsumed by codegen (the §8 guardrail) until that lands.
+#[cfg(test)]
 pub fn borrow_conflicts_replaying<I, J, M, N, K, L>(
     program: &RustProgram,
     is_ref: I,
