@@ -27,6 +27,7 @@ use thin_vec::thin_vec;
 
 #[cfg(test)]
 mod tests;
+mod unsafe_blocks;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrepareError {
@@ -35,6 +36,9 @@ pub enum PrepareError {
     },
     UnsupportedPrelude {
         construct: String,
+    },
+    UnsafeFunctionLint {
+        function_name: String,
     },
     ScopedDependency {
         static_def_id: LocalDefId,
@@ -57,6 +61,10 @@ impl fmt::Display for PrepareError {
             Self::UnsupportedPrelude { construct } => {
                 write!(formatter, "unsupported prelude configuration: {construct}")
             }
+            Self::UnsafeFunctionLint { function_name } => write!(
+                formatter,
+                "cannot remove unsafe blocks from `{function_name}` while `unsafe_op_in_unsafe_fn` is denied or forbidden"
+            ),
             Self::ScopedDependency {
                 static_name,
                 dependency_name,
@@ -1253,6 +1261,8 @@ pub fn prepare(tcx: TyCtxt<'_>) -> Result<PreparationResult, PrepareError> {
 
     let mut ctype_rewriter = CtypeRewriteVisitor::default();
     ctype_rewriter.visit_crate(&mut krate);
+
+    unsafe_blocks::normalize(&mut krate, &ast_to_hir, tcx)?;
 
     Ok(PreparationResult {
         code: pprust::crate_to_string_for_macros(&krate),

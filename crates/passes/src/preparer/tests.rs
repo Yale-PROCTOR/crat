@@ -190,6 +190,113 @@ fn count(code: &str, needle: &str) -> usize {
 }
 
 #[test]
+fn removes_unsafe_block_rules_without_flattening_scopes() {
+    assert_prepares_to(
+        r#"
+unsafe fn read(p: *const i32) -> i32 {
+    let value = unsafe { let first = *p; first + 1 };
+    unsafe { value }
+}
+fn harmless() -> i32 { unsafe { 3 } }
+"#,
+        r#"
+unsafe fn read(p: *const i32) -> i32 {
+    let value = { let first = *p; first + 1 };
+    { value }
+}
+fn harmless() -> i32 { { 3 } }
+"#,
+    );
+}
+
+#[test]
+fn propagates_unsafe_promotions_through_safe_calls_and_recursion() {
+    let prepared = transform_and_compile(
+        r#"
+fn read(p: *const i32) -> i32 { unsafe { *p } }
+fn caller(p: *const i32) -> i32 { read(p) }
+fn first(p: *const i32, n: usize) -> i32 {
+    if n == 0 { caller(p) } else { second(p, n - 1) }
+}
+fn second(p: *const i32, n: usize) -> i32 { first(p, n) }
+fn pure() -> i32 { 1 }
+fn main() { let value = 1; caller(&value); }
+"#,
+    );
+    for name in ["read", "caller", "first", "second"] {
+        assert!(
+            prepared.contains(&format!("unsafe fn {name}(")),
+            "{prepared}"
+        );
+    }
+    assert!(prepared.contains("fn pure()"));
+    assert!(!prepared.contains("unsafe fn pure"));
+    assert!(prepared.contains("fn main()"));
+    assert!(!prepared.contains("unsafe fn main"));
+    let second = utils::compilation::run_compiler_on_str(&prepared, prepare)
+        .unwrap()
+        .unwrap()
+        .code;
+    utils::compilation::run_compiler_on_str(&second, utils::type_check).unwrap();
+    assert_eq!(compact(&prepared), compact(&second));
+}
+
+#[test]
+fn normalizes_closures_and_async_blocks_but_preserves_item_contexts() {
+    let prepared = transform_and_compile(
+        r#"
+const fn value() -> i32 { unsafe { core::ptr::read(&7) } }
+static VALUE: i32 = unsafe { core::ptr::read(&9) };
+fn array_type() { let _: [u8; unsafe { core::ptr::read(&1usize) }] = [0]; }
+fn repeat() { let _ = [0u8; unsafe { core::ptr::read(&1usize) }]; }
+fn generic<const N: usize>() {}
+fn argument() { generic::<{ unsafe { core::ptr::read(&1usize) } }>(); }
+fn inline() -> usize { const { unsafe { core::ptr::read(&1usize) } } }
+fn read(p: *const i32) -> i32 { unsafe { *p } }
+fn capture(p: *const i32) -> i32 { let closure = || unsafe { *p }; closure() }
+fn future(p: *const i32) { let _ = async { unsafe { *p } }; }
+struct S;
+impl S { fn method(p: *const i32) -> i32 { read(p) } }
+"#,
+    );
+    assert!(prepared.contains("unsafe fn capture("));
+    assert!(prepared.contains("unsafe fn future("));
+    assert!(compact(&prepared).contains("const fn value() -> i32 { unsafe"));
+    assert!(compact(&prepared).contains("static VALUE: i32 = unsafe"));
+    assert!(!prepared.contains("unsafe fn array_type"));
+    assert!(!prepared.contains("unsafe fn repeat"));
+    assert!(!prepared.contains("unsafe fn argument"));
+    assert!(prepared.contains("unsafe fn inline"));
+    assert!(compact(&prepared).contains("fn method(p: *const i32) -> i32 { unsafe"));
+}
+
+#[test]
+fn preserves_strict_unsafe_operation_lints_with_a_preparation_error() {
+    for level in ["deny", "forbid"] {
+        let code = format!(
+            "#[{level}(unsafe_op_in_unsafe_fn)] fn read(p: *const i32) -> i32 {{ unsafe {{ *p }} }}"
+        );
+        assert_eq!(
+            transform(&code).unwrap_err(),
+            PrepareError::UnsafeFunctionLint {
+                function_name: "read".into()
+            }
+        );
+    }
+}
+
+#[test]
+fn formatted_macros_and_safe_async_blocks_stay_safe() {
+    let prepared = transform_and_compile(
+        r#"
+fn message(n: i32) { let _ = format_args!("{:x}", n); }
+fn future() { let _ = async { core::future::ready(1).await }; }
+"#,
+    );
+    assert!(!prepared.contains("unsafe fn"), "{prepared}");
+}
+
+#[test]
 fn wraps_non_block_match_arms_recursively_and_preserves_blocks() {
     assert_prepares_to(
         r#"
@@ -202,11 +309,11 @@ fn choose(x: i32, y: i32) -> i32 {
 }
 "#,
         r#"
-fn choose(x: i32, y: i32) -> i32 {
+unsafe fn choose(x: i32, y: i32) -> i32 {
     match x {
         0 => { match y { 0 => { 1 }, _ => { 2 } } },
         1 => { let z = y + 1; z },
-        _ => unsafe { core::ptr::read(&y) },
+        _ => { core::ptr::read(&y) },
     }
 }
 "#,
@@ -442,7 +549,7 @@ fn f() -> u32 {
 #[used]
 #[link_section = ".data.demo"]
 static mut CELL: u32 = 7;
-fn f() -> u32 { unsafe { CELL += 1; CELL } }
+unsafe fn f() -> u32 { { CELL += 1; CELL } }
 "#,
     );
 }
@@ -915,8 +1022,8 @@ fn f() {
         r#"
 fn reserve(CELL: i32) { let _ = CELL; }
 static mut CELL_0: i32 = 0;
-fn f() {
-    unsafe {
+unsafe fn f() {
+    {
         let read = CELL_0;
         CELL_0 = read + 1;
         let raw_const = &raw const CELL_0;

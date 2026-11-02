@@ -139,6 +139,7 @@ impl ItemRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GenerationErrorKind {
     EmptyStatement,
+    ExplicitUnsafeBlock,
     FunctionLocalItem,
     NonBlockMatchArm,
     NestedControlPayload,
@@ -1300,7 +1301,15 @@ fn validate_function_body(item: &Item, path: &str) -> Result<(), GenerationError
     };
     let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
     validator.visit_block(function.body.as_ref().unwrap());
-    validator.error.map_or(Ok(()), Err)
+    validator.error.map_or(Ok(()), Err)?;
+    if crate::validator::has_explicit_unsafe_blocks(function.body.as_ref().unwrap()) {
+        return Err(GenerationError {
+            kind: GenerationErrorKind::ExplicitUnsafeBlock,
+            function_path: path.to_owned(),
+            message: "explicit unsafe blocks must be normalized by the prepare pass before skeleton generation".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 struct Labeler<'a> {

@@ -204,6 +204,86 @@ fn installed_candidate_type_checks(candidate: &str) -> bool {
 }
 
 #[test]
+fn rejects_explicit_unsafe_blocks_before_publishing_skeletons() {
+    for source in [
+        "pub unsafe fn f(p: *const i32) -> i32 { unsafe { *p } }",
+        "pub unsafe fn f(p: *const i32) { let closure = || unsafe { *p }; }",
+        "pub unsafe fn f(p: *const i32, flag: bool) { let value = Some(if flag { unsafe { *p } } else { 0 }); }",
+        "pub unsafe fn f(p: *const i8) { let (a, b) = unsafe { (std::ffi::CStr::from_ptr(p), 0) }; }",
+    ] {
+        let error = generate_error(source);
+        assert_eq!(error.kind, GenerationErrorKind::ExplicitUnsafeBlock);
+        assert_eq!(error.function_path, "f");
+        assert!(error.message.contains("prepare"));
+    }
+}
+
+#[test]
+fn required_unsafe_blocks_in_local_type_constants_are_outside_body_validation() {
+    let source = "pub fn f() { let value: [u8; unsafe { core::ptr::read(&1usize) }] = [0]; }";
+    run_compiler_on_str(source, |tcx| {
+        utils::type_check(tcx);
+        let parsed = utils::ast::parse_crate(source.to_owned());
+        validate_function_body(&parsed.items[0], "f").unwrap();
+    })
+    .unwrap();
+}
+
+#[test]
+fn preparation_removes_search_and_replace_unsafe_blocks_before_validation() {
+    let source = r#"
+pub unsafe extern "C" fn searchAndReplace(orig: *const i8, search: *const i8, value: *const i8) -> *mut i8 {
+    let (orig, search, value) = unsafe {
+        (std::ffi::CStr::from_ptr(orig).to_bytes(),
+         std::ffi::CStr::from_ptr(search).to_bytes(),
+         std::ffi::CStr::from_ptr(value).to_bytes())
+    };
+    let mut replacement = Vec::new();
+    let mut from = 0;
+    while !search.is_empty() && from <= orig.len() {
+        let Some(offset) = orig[from..].windows(search.len()).position(|part| part == search)
+            else { break; };
+        let start = from + offset;
+        replacement.extend_from_slice(&orig[from..start]);
+        replacement.extend_from_slice(value);
+        from = start + search.len();
+    }
+    replacement.extend_from_slice(&orig[from..]);
+    replacement.push(0);
+    let output = replacement.as_mut_ptr().cast();
+    std::mem::forget(replacement);
+    output
+}
+"#;
+    let prepared = run_compiler_on_str(source, passes::preparer::prepare)
+        .unwrap()
+        .unwrap()
+        .code;
+    run_compiler_on_str(&prepared, utils::type_check).unwrap();
+    let unexpanded = run_compiler_on_str(&prepared, |tcx| {
+        passes::unexpander::unexpand(passes::unexpander::Config { use_print: true }, tcx)
+    })
+    .unwrap();
+    run_compiler_on_str(&unexpanded, |tcx| {
+        let records = make_skeletons(&unexpanded, tcx).unwrap();
+        let record = function(&records, "searchAndReplace");
+        for view in [&record.baseline, &record.applied] {
+            let response = crate::validate(&crate::ValidationRequest {
+                expected_functions: vec![crate::ExpectedFunction {
+                    id: record.id,
+                    name: record.name.clone(),
+                    view: view.clone(),
+                }],
+                transformation: view.skeleton.clone(),
+            });
+            assert!(response.is_valid(), "{response:?}");
+        }
+        crate::freeze_project(&unexpanded, &records, tcx).unwrap();
+    })
+    .unwrap();
+}
+
+#[test]
 fn hash_map_assertions_generate_skeleton() {
     let source = r#"
 pub mod src {

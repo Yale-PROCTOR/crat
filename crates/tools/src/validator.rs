@@ -1310,6 +1310,12 @@ struct BodyScanner {
     opaque_depth: usize,
 }
 
+pub(crate) fn has_explicit_unsafe_blocks(body: &rustc_ast::Block) -> bool {
+    let mut scanner = BodyScanner::new(false);
+    scanner.visit_block(body);
+    !scanner.unsafe_blocks.is_empty()
+}
+
 impl BodyScanner {
     fn new(expected: bool) -> Self {
         Self {
