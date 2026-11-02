@@ -1885,9 +1885,6 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
     ) -> Vec<String> {
         let mut paths = vec![];
         for (root_name, root_def_id) in &self.external_roots {
-            if root_def_id.krate != target.krate {
-                continue;
-            }
             let mut queue = VecDeque::from([(*root_def_id, Vec::<String>::new())]);
             let mut best_modules = FxHashMap::<DefId, (usize, String)>::default();
             while let Some((module, prefix)) = queue.pop_front() {

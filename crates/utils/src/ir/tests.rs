@@ -89,6 +89,121 @@ fn run_test(code: &str) {
 }
 
 #[test]
+fn test_source_valid_trailing_generic_defaults() {
+    let definitions = r#"
+        pub struct Pair<T, U = T>(T, U);
+        pub struct Defaults<T = i32, U = T>(T, U);
+        pub struct Count<T, const N: usize = 3>([T; N]);
+        pub struct Required<T, const N: usize>([T; N]);
+        pub struct Borrowed<'a, T = &'static i32>(&'a i32, T);
+        pub struct Nested<T, U = (T, [u8; 3])>(T, U);
+        pub struct ConstDefault<const N: usize = { 1 + 2 }>([u8; N]);
+        pub struct DependentConst<const N: usize, const M: usize = N>([[u8; N]; M]);
+    "#;
+    let originals = [
+        "Pair<i32>",
+        "Pair<i32, u64>",
+        "Defaults",
+        "Defaults<u8>",
+        "Defaults<i32, u8>",
+        "Count<u8>",
+        "Count<u8, 5>",
+        "Required<u8, 3>",
+        "Borrowed<'static>",
+        "Borrowed<'static, &'static mut i32>",
+        "Nested<i32>",
+        "ConstDefault",
+        "DependentConst<3>",
+        "DependentConst<3, 5>",
+        "Borrowed<'a, &'a i32>",
+        "Borrowed<'a>",
+    ];
+    let legacy = [
+        "Pair<i32, i32>",
+        "Pair<i32, u64>",
+        "Defaults<i32, i32>",
+        "Defaults<u8, u8>",
+        "Defaults<i32, u8>",
+        "Count<u8, 3>",
+        "Count<u8, 5>",
+        "Required<u8, 3>",
+        "Borrowed<'_, &i32>",
+        "Borrowed<'_, &mut i32>",
+        "Nested<i32, (i32, [u8; 3])>",
+        "ConstDefault<{ 1 + 2 }>",
+        "DependentConst<3, 3>",
+        "DependentConst<3, 5>",
+        "Borrowed<'_, &i32>",
+        "Borrowed<'_, &i32>",
+    ];
+    let source = format!(
+        "{definitions} fn cases<'a>({}) {{}}",
+        originals
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("arg{i}: {ty}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let rendered = compilation::run_compiler_on_str(&source, |tcx| {
+        let function = tcx
+            .hir_free_items()
+            .find_map(|item_id| {
+                matches!(tcx.hir_item(item_id).kind, hir::ItemKind::Fn { ident, .. }
+                if ident.as_str() == "cases")
+                .then_some(item_id.owner_id.def_id)
+            })
+            .unwrap();
+        let signature =
+            tcx.instantiate_bound_regions_with_erased(tcx.fn_sig(function).instantiate_identity());
+        signature
+            .inputs()
+            .iter()
+            .zip(legacy)
+            .map(|(ty, expected_legacy)| {
+                let mut rendered = String::new();
+                let mut nominal = |def_id| Ok(tcx.item_name(def_id).to_string());
+                let mut legacy = String::new();
+                format_mir_ty_with_policy(
+                    &mut legacy,
+                    *ty,
+                    tcx,
+                    &mut nominal,
+                    MirTypeFormatPolicy::Legacy,
+                )
+                .unwrap();
+                assert_eq!(legacy, expected_legacy);
+                format_mir_ty_with_policy(
+                    &mut rendered,
+                    *ty,
+                    tcx,
+                    &mut nominal,
+                    MirTypeFormatPolicy::SourceValid,
+                )
+                .unwrap();
+                rendered
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap();
+    let expected = originals
+        .iter()
+        .map(|original| match *original {
+            "Borrowed<'a, &'a i32>" => "Borrowed<'_, &i32>",
+            "Borrowed<'a>" => "Borrowed<'_>",
+            other => other,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rendered, expected);
+    for (original, rendered) in originals.iter().zip(&rendered) {
+        let source = format!(
+            "{definitions} fn check<'a>(value: {original}) -> {original} {{ let restored: {rendered} = value; restored }}"
+        );
+        compilation::run_compiler_on_str(&source, crate::type_check).unwrap();
+    }
+}
+
+#[test]
 fn test_item_use() {
     run_test("use std::path::Path;")
 }

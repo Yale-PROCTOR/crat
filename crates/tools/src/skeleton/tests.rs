@@ -15,6 +15,7 @@ fn type_spelling_source(name: &str) -> &'static str {
         "reexports" => type_spelling_sources::REEXPORTS,
         "local-fallback-routes" => type_spelling_sources::LOCAL_FALLBACK_ROUTES,
         "external-root-alias" => type_spelling_sources::EXTERNAL_ROOT_ALIAS,
+        "inferred-vectors" => type_spelling_sources::INFERRED_VECTORS,
         "source-paths" => type_spelling_sources::SOURCE_PATHS,
         "source-hint-edges" => type_spelling_sources::SOURCE_HINT_EDGES,
         "direct-hints" => type_spelling_sources::DIRECT_HINTS,
@@ -1618,6 +1619,7 @@ fn every_type_spelling_source_fixture_compiles_independently() {
         "reexports",
         "local-fallback-routes",
         "external-root-alias",
+        "inferred-vectors",
         "source-paths",
         "source-hint-edges",
         "direct-hints",
@@ -2485,6 +2487,117 @@ fn local_visible_fallback_uses_public_reexport_not_private_definition_path() {
         "value".into(),
         "crate::alpha::T".into()
     )));
+}
+
+#[test]
+fn inferred_vec_locals_omit_the_default_allocator_and_type_check() {
+    let source = type_spelling_source("inferred-vectors");
+    let locals = simple_local_types(source);
+    for (name, binding, expected) in [
+        ("arr_del", "arr", "::std::vec::Vec<i32>"),
+        ("arr_ins", "arr", "::std::vec::Vec<i32>"),
+        ("helxo", "order", "::std::vec::Vec<&str>"),
+        ("search_and_replace", "replacement", "::std::vec::Vec<u8>"),
+        ("utf8_filter", "copy", "::std::vec::Vec<u8>"),
+    ] {
+        let path = format!("src::lib::{name}");
+        let (_, _, annotation) = locals
+            .iter()
+            .find(|(function, name, _)| function == &path && name == binding)
+            .unwrap();
+        assert_eq!(annotation, expected);
+        let source =
+            format!("fn check(value: {expected}) {{ let restored: {annotation} = value; }}");
+        run_compiler_on_str(&source, utils::type_check).unwrap();
+    }
+}
+
+#[test]
+fn inferred_vec_types_preserve_nondefault_allocators_and_avoid_shadowed_names() {
+    for (source, prefix, expected) in [
+        (
+            r#"
+        #![feature(allocator_api)]
+        pub unsafe fn inferred() {
+            let values = ::std::vec::Vec::<i32, _>::new_in(::std::alloc::System);
+        }
+        "#,
+            "#![feature(allocator_api)]",
+            "::std::vec::Vec<i32, ::std::alloc::System>",
+        ),
+        (
+            r#"
+        pub struct Vec;
+        pub mod std {}
+        pub unsafe fn inferred() {
+            let values = ::std::vec::Vec::from([1i32]);
+        }
+        "#,
+            "pub struct Vec; pub mod std {}",
+            "::std::vec::Vec<i32>",
+        ),
+    ] {
+        let locals = simple_local_types(source);
+        assert!(
+            locals.contains(&("inferred".into(), "values".into(), expected.into())),
+            "{locals:?}"
+        );
+        let records = generate(source);
+        let skeleton = &function(&records, "inferred").baseline.skeleton;
+        let body = skeleton
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("#[proctor("))
+            .collect::<Vec<_>>()
+            .join("\n");
+        run_compiler_on_str(&format!("{prefix}\n{body}"), utils::type_check).unwrap();
+    }
+}
+
+#[test]
+fn external_reexports_can_name_definitions_from_other_crates() {
+    let source = r#"
+        #![no_std]
+        extern crate std as renamed;
+        pub unsafe fn inferred() {
+            let values = renamed::vec::Vec::<i32>::new();
+            let text = renamed::string::String::new();
+        }
+    "#;
+    run_compiler_on_str(source, |tcx| {
+        let function = local_def("inferred", tcx);
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let mut speller = TypeSpeller::new(function, &mapper.ast_to_hir, tcx);
+        speller.external_roots.retain(|(name, _)| name == "renamed");
+        for (binding, expected) in [
+            ("values", "::renamed::vec::Vec"),
+            ("text", "::renamed::string::String"),
+        ] {
+            let target = local_binding_ty(function, binding, tcx)
+                .ty_adt_def()
+                .unwrap()
+                .did();
+            assert_eq!(tcx.crate_name(target.krate).as_str(), "alloc");
+            let rendered = speller.nominal_path(target).unwrap();
+            assert_eq!(rendered, expected);
+            assert_eq!(
+                resolve_emitted_type_path(&rendered, function, &speller, tcx),
+                target
+            );
+        }
+        let drop = speller
+            .resolve_external_identity("core", &["mem".into(), "drop".into()], Namespace::ValueNS)
+            .unwrap();
+        assert_eq!(speller.value_path(drop).unwrap(), "::renamed::mem::drop");
+        speller.external_roots = vec![("core".into(), drop.krate.as_def_id())];
+        let vector = local_binding_ty(function, "values", tcx)
+            .ty_adt_def()
+            .unwrap()
+            .did();
+        assert!(speller.nominal_path(vector).is_err());
+    })
+    .unwrap();
 }
 
 #[test]
