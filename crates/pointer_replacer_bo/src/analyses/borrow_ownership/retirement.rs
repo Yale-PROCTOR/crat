@@ -1044,6 +1044,27 @@ impl RetirementScope {
             .with(|current| current.replace(self.previous.take()))
             .expect("active retirement scope");
         self.active = false;
+        // Relay main/388 finish-set (R1403-1): the review loop's end and `finish`'s start (log
+        // only). The row counts are the per-function rows `finish` is about to merge.
+        let started = crate::phase_log::on().then(|| {
+            let rows = |count: fn(&RetirementReview) -> usize| -> usize {
+                context.latest.values().map(count).sum()
+            };
+            crate::phase_log::mark(
+                "retirement:finish",
+                "start",
+                &format!(
+                    "sources={} unresolved={} conflicts={} demotions={} coverage={} functions={}",
+                    context.source.retirements.len(),
+                    rows(|latest| latest.unresolved.len()),
+                    rows(|latest| latest.conflicts.len()),
+                    rows(|latest| latest.demotions.len()),
+                    rows(|latest| latest.coverage.len()),
+                    context.latest.len()
+                ),
+            );
+            std::time::Instant::now()
+        });
         let mut review = RetirementReview::default();
         if !context.entry_consistent {
             review.unresolved.push(RetirementUnresolved {
@@ -1156,29 +1177,97 @@ impl RetirementScope {
                 });
             }
         }
-        for source in context.source.retirements.keys() {
-            let disposition =
-                if review
-                    .unresolved
-                    .iter()
-                    .any(|row| row.source.as_ref().is_none_or(|key| key == source))
-                {
-                    EventDisposition::Unresolved
-                } else if review.conflicts.iter().any(|row| &row.source == source)
-                    || review.demotions.iter().any(|row| &row.source == source)
-                {
-                    EventDisposition::Conflict
-                } else if review.coverage.iter().any(|row| {
-                    &row.source == source && row.disposition == CoverageDisposition::Checked
-                }) {
-                    EventDisposition::CheckedWithoutConflict
-                } else {
-                    EventDisposition::Irrelevant
-                };
-            review.terminal.insert(source.clone(), disposition);
+        let terminal = terminal_dispositions(&review, context.source.retirements.keys());
+        review.terminal.extend(terminal);
+        if let Some(started) = started {
+            crate::phase_log::mark(
+                "retirement:finish",
+                "end",
+                &format!(
+                    "wall={:.1}s unresolved={} terminal={}",
+                    started.elapsed().as_secs_f64(),
+                    review.unresolved.len(),
+                    review.terminal.len()
+                ),
+            );
         }
         review
     }
+}
+
+/// Relay main/388 finish-set (R1403-1): each retirement source's terminal disposition, read from
+/// membership sets built once over the review's rows instead of four scans of the rows per source
+/// (run 285: >= 14.48 M demotion rows). The order of the tests is the scan's, and each set holds
+/// exactly the sources its scan's `any` would find, so every source's disposition is the scan's.
+fn terminal_dispositions<'a>(
+    review: &RetirementReview,
+    sources: impl Iterator<Item = &'a SourceEventKey>,
+) -> BTreeMap<SourceEventKey, EventDisposition> {
+    // `is_none_or`: a row without a source makes every source unresolved.
+    let unresolved_without_source = review.unresolved.iter().any(|row| row.source.is_none());
+    let unresolved: BTreeSet<&SourceEventKey> = review
+        .unresolved
+        .iter()
+        .filter_map(|row| row.source.as_ref())
+        .collect();
+    let conflicted: BTreeSet<&SourceEventKey> = review
+        .conflicts
+        .iter()
+        .map(|row| &row.source)
+        .chain(review.demotions.iter().map(|row| &row.source))
+        .collect();
+    let checked: BTreeSet<&SourceEventKey> = review
+        .coverage
+        .iter()
+        .filter(|row| row.disposition == CoverageDisposition::Checked)
+        .map(|row| &row.source)
+        .collect();
+    sources
+        .map(|source| {
+            let disposition = if unresolved_without_source || unresolved.contains(source) {
+                EventDisposition::Unresolved
+            } else if conflicted.contains(source) {
+                EventDisposition::Conflict
+            } else if checked.contains(source) {
+                EventDisposition::CheckedWithoutConflict
+            } else {
+                EventDisposition::Irrelevant
+            };
+            (source.clone(), disposition)
+        })
+        .collect()
+}
+
+/// The scan [`terminal_dispositions`] replaced, kept as the witness's oracle.
+#[cfg(test)]
+fn terminal_dispositions_by_scan<'a>(
+    review: &RetirementReview,
+    sources: impl Iterator<Item = &'a SourceEventKey>,
+) -> BTreeMap<SourceEventKey, EventDisposition> {
+    let mut terminal = BTreeMap::new();
+    for source in sources {
+        let disposition = if review
+            .unresolved
+            .iter()
+            .any(|row| row.source.as_ref().is_none_or(|key| key == source))
+        {
+            EventDisposition::Unresolved
+        } else if review.conflicts.iter().any(|row| &row.source == source)
+            || review.demotions.iter().any(|row| &row.source == source)
+        {
+            EventDisposition::Conflict
+        } else if review
+            .coverage
+            .iter()
+            .any(|row| &row.source == source && row.disposition == CoverageDisposition::Checked)
+        {
+            EventDisposition::CheckedWithoutConflict
+        } else {
+            EventDisposition::Irrelevant
+        };
+        terminal.insert(source.clone(), disposition);
+    }
+    terminal
 }
 
 #[cfg(test)]
@@ -1440,6 +1529,9 @@ mod tests_owner_guards;
 
 #[cfg(test)]
 mod tests_review_set;
+
+#[cfg(test)]
+mod tests_finish_set;
 
 #[cfg(test)]
 mod tests_object_scope;
