@@ -1657,18 +1657,6 @@ impl BoxOwnershipFacts {
         facts
     }
 
-    pub(crate) fn endpoints(&self) -> &[EndpointFact] {
-        &self.endpoints
-    }
-
-    pub(crate) fn canonical_sha256(&self) -> &str {
-        &self.canonical_sha256
-    }
-
-    pub(crate) fn replay_error(&self) -> Option<&str> {
-        self.replay_error.as_deref()
-    }
-
     fn construction_bridge_for(
         &self,
         endpoint: &EndpointFact,
@@ -2537,51 +2525,6 @@ impl BoxOwnershipFacts {
             retained_sink,
             implicit_scope_close: !retained_sink,
         })
-    }
-
-    pub(crate) fn equations_tsv(&self) -> String {
-        let mut rows = self
-            .equations
-            .iter()
-            .map(|equation| match *equation {
-                RecordedEquation::Linear {
-                    left,
-                    right,
-                    result,
-                } => format!(
-                    "linear\t{}\t{}\t{}\t-",
-                    left.as_u32(),
-                    right.as_u32(),
-                    result.as_u32()
-                ),
-                RecordedEquation::Assume { var, value } => {
-                    format!("assume\t{}\t-\t-\t{}", var.as_u32(), u8::from(value))
-                }
-                RecordedEquation::Equal { left, right } => {
-                    format!("equal\t{}\t{}\t-\t-", left.as_u32(), right.as_u32())
-                }
-                RecordedEquation::LessEqual { left, right } => {
-                    format!("less-equal\t{}\t{}\t-\t-", left.as_u32(), right.as_u32())
-                }
-                RecordedEquation::EqMin {
-                    result,
-                    left,
-                    right,
-                } => format!(
-                    "eq-min\t{}\t{}\t{}\t-",
-                    result.as_u32(),
-                    left.as_u32(),
-                    right.as_u32()
-                ),
-            })
-            .collect::<Vec<_>>();
-        rows.sort();
-        let mut output = String::from("relation\tx\ty\tz\tvalue\n");
-        for row in rows {
-            output.push_str(&row);
-            output.push('\n');
-        }
-        output
     }
 
     fn canonical_bytes(&self) -> Vec<u8> {

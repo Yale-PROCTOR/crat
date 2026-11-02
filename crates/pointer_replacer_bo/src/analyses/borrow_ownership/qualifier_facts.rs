@@ -127,17 +127,6 @@ pub(crate) fn collect(
     collect_impl(program, slots, Some(mutability), nullability)
 }
 
-/// Diagnostic constructions without a supplied replay provider must not
-/// manufacture an inferred or forced mutability fact.
-#[cfg(test)]
-pub(crate) fn collect_without_mutability(
-    program: &RustProgram<'_>,
-    slots: &CrateSlots,
-    nullability: &NullabilityFacts,
-) -> QualifierFacts {
-    collect_impl(program, slots, None, nullability)
-}
-
 fn collect_impl(
     program: &RustProgram<'_>,
     slots: &CrateSlots,

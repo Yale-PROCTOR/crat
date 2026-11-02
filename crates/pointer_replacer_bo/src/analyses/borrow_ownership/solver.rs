@@ -100,16 +100,6 @@ impl CoreTracker {
         }
     }
 
-    #[cfg(test)]
-    fn new_family() -> Self {
-        CoreTracker {
-            entries: RefCell::new(Vec::new()),
-            context: RefCell::new(String::from("init")),
-            granularity: CoreTrackingGranularity::Family,
-            purpose: CoreTrackingPurpose::Diagnostic,
-        }
-    }
-
     fn is_mandatory(&self) -> bool {
         self.purpose == CoreTrackingPurpose::ProductionMandatory
     }
@@ -707,14 +697,6 @@ impl KindSolver {
         Self::build(slots, Some(CoreTracker::new()), true)
     }
 
-    /// Corpus selector-leak diagnostic constructor: all hard constraints in
-    /// one `CORE_LABEL_FAMILIES` family share a single assumption marker.
-    /// This preserves family membership while avoiding per-assertion tracking.
-    #[cfg(test)]
-    pub(crate) fn new_family_tracked(slots: &CrateSlots) -> Self {
-        Self::build(slots, Some(CoreTracker::new_family()), true)
-    }
-
     /// Measurement-only hard-SAT constructor. It emits the exact production
     /// hard universe but omits soft kind preferences, so per-assumption funnel
     /// queries answer achievability without repeatedly optimizing an irrelevant
@@ -722,12 +704,6 @@ impl KindSolver {
     #[cfg(test)]
     pub(crate) fn new_hard_only(slots: &CrateSlots) -> Self {
         Self::build(slots, Some(CoreTracker::new_mandatory()), false)
-    }
-
-    /// Family-core twin of [`Self::new_hard_only`].
-    #[cfg(test)]
-    pub(crate) fn new_family_tracked_hard_only(slots: &CrateSlots) -> Self {
-        Self::build(slots, Some(CoreTracker::new_family()), false)
     }
 
     pub(crate) fn tracker(&self) -> Option<&CoreTracker> {
@@ -2698,41 +2674,6 @@ impl KindSolver {
             self.tracker.as_ref(),
             || format!("own-exclusion({slot:?})"),
             &!&vars.own,
-        );
-    }
-
-    /// DIAGNOSTIC PROBE (compute-only, no production caller). FORCE a slot `Owning` and let the
-    /// caller `check()`: SAT ⇒ `own(slot)` is achievable under the hard constraints, so a zero yield in
-    /// the optimized model is a SOFT (objective/retention) blocker, not a mechanism gap; UNSAT (best via
-    /// `new_tracked`) ⇒ a hard constraint family forbids it and the core names it. Symmetric to
-    /// `add_owning_exclusion`. Kept warm by `s23_owning_blocker_probe`.
-    #[cfg(test)]
-    pub(crate) fn assert_owning(&self, slot: SlotRef) {
-        let vars = self
-            .vars
-            .get(&slot)
-            .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
-        assert_hard(
-            &self.solver,
-            self.tracker.as_ref(),
-            || format!("s23-force-own({slot:?})"),
-            &vars.own,
-        );
-    }
-
-    /// Companion to `assert_owning`: FORCE a slot `Ref` for the
-    /// forced-assignment core probe. Compute-only, no production caller.
-    #[cfg(test)]
-    pub(crate) fn assert_ref(&self, slot: SlotRef) {
-        let vars = self
-            .vars
-            .get(&slot)
-            .unwrap_or_else(|| panic!("unknown slot: {slot:?}"));
-        assert_hard(
-            &self.solver,
-            self.tracker.as_ref(),
-            || format!("r385-force-ref({slot:?})"),
-            &vars.ref_,
         );
     }
 

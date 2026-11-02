@@ -480,16 +480,6 @@ pub(crate) fn add_coherence_removal_only<'tcx>(
     add_coherence_impl(solver, slots, fn_did, body, false, None, true);
 }
 
-#[cfg(test)]
-pub(crate) fn add_coherence_tagging_uses<'tcx>(
-    solver: &KindSolver,
-    slots: &CrateSlots,
-    fn_did: LocalDefId,
-    body: &Body<'tcx>,
-) {
-    add_coherence_impl(solver, slots, fn_did, body, true, None, false);
-}
-
 /// The crate-wide field-ownership constraint. A struct field slot is ONE crate-wide slot
 /// that (flow-insensitively) holds EVERY value stored into that field across the crate. The
 /// per-store depth-0 `equate` is SKIPPED in `add_coherence` for field stores/aggregates (it is
@@ -972,22 +962,4 @@ fn scan_field_stores(
         |field| !matches!(field, SlotRef::Field(id) if slots.field_slots.is_array_slot(*id)),
     );
     (owned_stores, blocked)
-}
-
-/// Owning-candidate fields (≥1 owned store and no blocking non-owned store) and the blocked
-/// set, for the source-only field-yield histogram. This caller has no normative
-/// SSA null evidence, so its syntactic candidates are an upper bound, not the
-/// refined production field-and constraint set or a measured Owning verdict.
-#[cfg(test)]
-pub(crate) fn field_ownership_candidates(
-    slots: &CrateSlots,
-    program: &RustProgram<'_>,
-) -> (FxHashSet<SlotRef>, FxHashSet<SlotRef>) {
-    let (owned_stores, blocked) = scan_field_stores(slots, program, &[]);
-    let candidates = owned_stores
-        .keys()
-        .copied()
-        .filter(|f| !blocked.contains(f))
-        .collect();
-    (candidates, blocked)
 }

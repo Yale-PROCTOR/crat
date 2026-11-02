@@ -5041,7 +5041,6 @@ pub(crate) const RAW_BOUNDARY_RETENTION_WAIVER_TEXT: &str = "Tier-2 retention wa
 
 pub(crate) const RAW_BOUNDARY_WAIVER_ID: &str =
     "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01";
-pub(crate) const RAW_BOUNDARY_WAIVER_TEXT: &str = "C-aliasing semantics at unsafe bridges. At a receipted T2 site, crat may expose a raw pointer derived from a safe reference to a boundary whose retention behavior is unknown, in order to preserve the source program's C calling convention. Current Rust aliasing models can invalidate a retained raw alias when the originating mutable reference remains live or is later reused. The conditional soundness claim therefore excludes an execution that retains and later uses that raw alias unless no-retention is independently established. This waiver licenses only the recorded safe-to-raw view at that call. It licenses no integer-to-pointer round trip, ownership transfer, unchecked null dereference, positive-retention site, or unreceipted reuse.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BridgeTemplate {

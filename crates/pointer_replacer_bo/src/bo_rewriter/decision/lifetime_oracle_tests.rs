@@ -21,13 +21,6 @@ pub(crate) struct FrozenPbControl {
 }
 
 impl FrozenPbControl {
-    pub(crate) fn for_program(&self, program: &str) -> (BTreeSet<String>, BTreeSet<String>) {
-        (
-            self.roots.get(program).cloned().unwrap_or_default(),
-            self.members.get(program).cloned().unwrap_or_default(),
-        )
-    }
-
     fn total_roots(&self) -> usize {
         self.roots.values().map(BTreeSet::len).sum()
     }

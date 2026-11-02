@@ -34,11 +34,6 @@ use super::{
 };
 use crate::utils::rustc::RustProgram;
 
-/// The frozen analysis semantics consumed by Item E. Rewriter/cache-only
-/// changes after this commit do not advance this identity.
-#[cfg(test)]
-pub(crate) const ANALYSIS_FRAME: &str = "era5c-l01p14-v1";
-
 #[cfg(test)]
 fn program_identity(
     crate_name: &str,
@@ -1358,28 +1353,6 @@ pub(crate) fn record_solve(p: SolveProvenance) {
 /// exists to prevent.
 pub(crate) fn last_solve() -> Option<SolveProvenance> {
     LAST_SOLVE.with(|c| c.borrow().clone())
-}
-
-/// Render for a report row: `real` or `cache@<first 12 hex>`.
-#[cfg(test)]
-pub(crate) fn render_provenance() -> String {
-    match last_solve() {
-        None => "none".to_owned(),
-        Some(p) if p.source == "cache" => {
-            format!("cache@{}", &p.fingerprint[..12.min(p.fingerprint.len())])
-        }
-        Some(_) => "real".to_owned(),
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn render_cache_status() -> &'static str {
-    last_solve().map_or("none", |provenance| provenance.cache_status)
-}
-
-#[cfg(test)]
-pub(crate) fn render_model_sha256() -> String {
-    last_solve().map_or_else(|| "none".to_owned(), |provenance| provenance.model_sha256)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

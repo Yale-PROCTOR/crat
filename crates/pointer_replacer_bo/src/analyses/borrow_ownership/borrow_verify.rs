@@ -82,14 +82,6 @@ impl RepairMode {
         RepairMode::Guarded
     }
 
-    #[cfg(test)]
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            RepairMode::Plain => "mode_a",
-            RepairMode::Guarded => "guarded",
-        }
-    }
-
     /// Run `f` with `mode` forced on this thread, restoring the prior override on
     /// exit INCLUDING on panic (a drop-guard, not a manual reset: a panicking test must not leak its
     /// mode onto the thread for the next test). Test/sweep-only; production resolves via `current()`.
@@ -128,27 +120,6 @@ pub(crate) struct PlainCommitTrace {
     pub round: usize,
     #[cfg(test)]
     pub conflict: SlotConflict,
-}
-
-/// Run `f` while CAPTURING the plain repair's `(slot, round)` commit events, returning
-/// `(f's result, the captured events in commit order)`. Panic-safe drop-guard (like
-/// `RepairMode::with_override`): the prior capture state is restored on exit including on unwind, so a
-/// panicking anchor run never leaks a live buffer onto the thread. The event order is the loop's
-/// natural commit order; the audit dedups to the distinct commit SET itself.
-#[cfg(test)]
-pub(crate) fn with_capture<T>(f: impl FnOnce() -> T) -> (T, Vec<(SlotRef, usize)>) {
-    struct Restore(Option<Vec<(SlotRef, usize)>>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            AUDIT_CAPTURE.with(|c| *c.borrow_mut() = self.0.take());
-        }
-    }
-    let _restore = Restore(AUDIT_CAPTURE.with(|c| c.replace(Some(Vec::new()))));
-    let out = f();
-    let captured = AUDIT_CAPTURE
-        .with(|c| c.borrow_mut().take())
-        .unwrap_or_default();
-    (out, captured)
 }
 
 /// Diagnosis-only detailed twin of `with_capture`. It records the originating
@@ -326,29 +297,6 @@ pub(crate) fn revalidate_replaying(
         None,
         None,
         None,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn revalidate_replaying_with_parameter_overlap(
-    program: &RustProgram,
-    slots: &CrateSlots,
-    is_ref: impl Fn(SlotRef) -> bool,
-    is_raw: impl Fn(SlotRef) -> bool,
-    is_mutable: impl MutProvider + Copy,
-    parameter_overlaps: &FxHashMap<LocalDefId, super::borrow_engine::ParameterOverlap>,
-) -> FxHashMap<LocalDefId, Vec<SlotConflict>> {
-    let origin_flows = super::origin_flow::analyze_program_origin_flow(program);
-    revalidate_replaying_with_flows(
-        program,
-        slots,
-        &origin_flows,
-        is_ref,
-        is_raw,
-        is_mutable,
-        None,
-        None,
-        Some(parameter_overlaps),
     )
 }
 

@@ -62,8 +62,6 @@ pub(crate) use conflicts::{demotion_witness_census, loan_liveness_census};
 pub(crate) use invalidates::{RoutedCompose, route_compose};
 #[cfg(test)]
 pub(crate) use loan_liveness::with_escaped_extension_trace;
-#[cfg(test)]
-pub(crate) use origin_replay::selected_copy_lend_contains;
 pub(crate) use overlap_places_conflict::ParameterOverlap;
 pub(crate) use places_conflict::{AccessDepth, PlaceConflictBias, places_conflict};
 

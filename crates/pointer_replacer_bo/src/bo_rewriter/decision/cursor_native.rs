@@ -155,10 +155,6 @@ thread_local! {
     static STALE_REPLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-pub(crate) fn reset_stale_replans() {
-    STALE_REPLANS.with(|cell| cell.set(0));
-}
-
 pub(crate) fn stale_replans() -> usize {
     STALE_REPLANS.with(std::cell::Cell::get)
 }

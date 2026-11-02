@@ -365,15 +365,7 @@ pub(crate) enum PairClass {
     NotProvenDisjoint,
 }
 
-impl PairClass {
-    #[cfg(test)]
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::ProvenDisjoint => "proven-disjoint",
-            Self::NotProvenDisjoint => "not-proven-disjoint",
-        }
-    }
-}
+impl PairClass {}
 
 pub(crate) fn classify_pair<T: Ord>(facts: &PairFacts<T>) -> PairClass {
     if facts.storage_alias {

@@ -3853,38 +3853,6 @@ fn collect_local_subjects(
 // `cfg(test)` rather than `allow(dead_code)`: the only consumer is `bo_c1`'s
 // corpus harness, which is itself `cfg(test)`. Saying so is more honest than
 // silencing the lint, and it keeps the lint working here.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct CollectorCensus {
-    /// Subjects the shipping (resolved-type) collector produces.
-    pub resolved: usize,
-    /// What the retired syntactic `TyKind::Ptr` predicate would have produced.
-    pub syntactic_ptr: usize,
-    /// Resolved-only, declared through a path — **the C2Rust alias class**.
-    pub resolved_only_alias: usize,
-    /// Resolved-only, already a reference in source.
-    pub resolved_only_reference: usize,
-    /// Resolved-only, some other declaration form.
-    pub resolved_only_other: usize,
-}
-
-/// Run the shipping collector over `tcx` and count what it sees.
-#[cfg(test)]
-pub(crate) fn census(tcx: TyCtxt<'_>) -> CollectorCensus {
-    let program = collect_program(tcx);
-    let mut_facts = MutFacts::from_program(&program);
-    let mut census = CollectorCensus::default();
-    for subject in collect_subjects(tcx, &program, &mut_facts) {
-        census.resolved += 1;
-        match subject.decl_shape {
-            decision::DeclShape::RawPtr => census.syntactic_ptr += 1,
-            decision::DeclShape::Alias => census.resolved_only_alias += 1,
-            decision::DeclShape::Reference => census.resolved_only_reference += 1,
-            decision::DeclShape::Other => census.resolved_only_other += 1,
-        }
-    }
-    census
-}
 
 /// Source name of a parameter binding.
 ///
@@ -11816,70 +11784,6 @@ impl DecideCtx {
     }
 }
 
-pub(crate) struct BoxFactArtifacts {
-    pub(crate) endpoints: String,
-    pub(crate) version_sites: String,
-    pub(crate) equations: String,
-    pub(crate) subjects: String,
-    pub(crate) receipt: String,
-}
-
-/// Render the production derive-on-load Box facts for external differential
-/// controls. The derivation itself runs unconditionally in `finish_decide`;
-/// this accessor does not create a second MIR walk.
-pub(crate) fn box_fact_artifacts(tcx: TyCtxt<'_>) -> Result<BoxFactArtifacts, String> {
-    let (_table, ctx) = decide_table_with_ctx(tcx)?;
-    let mut subject_rows = ctx
-        .subjects
-        .iter()
-        .filter(|subject| e1_subject_model_kind(&ctx, subject) == Some(SlotKind::Owning))
-        .map(|subject| {
-            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
-            let slot = ctx.slots.fn_local_slots[&subject.fn_did]
-                .slot_for_local_depth(subject.local, 0)
-                .expect("Owning subject has a depth-0 slot");
-            let slot = decision::box_facts::slot_label(SlotRef::Local(subject.fn_did, slot));
-            let arg_index = match subject.kind {
-                decision::SubjectKind::Param { hir_index } => (hir_index + 1).to_string(),
-                decision::SubjectKind::Local => "-".to_owned(),
-            };
-            (
-                subject.identity_key(&owner),
-                format!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    subject.identity_key(&owner),
-                    owner,
-                    subject.local.as_u32(),
-                    arg_index,
-                    subject.ptr_depth,
-                    slot,
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-    subject_rows.sort_by(|left, right| left.0.cmp(&right.0));
-    let mut subjects =
-        String::from("subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tslot\n");
-    for (_, row) in subject_rows {
-        subjects.push_str(&row);
-        subjects.push('\n');
-    }
-    let receipt = format!(
-        "box_fact_schema=box-facts-v1\nbox_fact_sha256={}\nbox_replay_error={}\nbox_endpoints={}\nbox_owning_subjects={}\n",
-        ctx.box_facts.canonical_sha256(),
-        ctx.box_facts.replay_error().unwrap_or("none"),
-        ctx.box_facts.endpoints().len(),
-        subjects.lines().skip(1).count(),
-    );
-    Ok(BoxFactArtifacts {
-        endpoints: ctx.box_facts.endpoints_tsv(),
-        version_sites: ctx.box_facts.version_sites_tsv(),
-        equations: ctx.box_facts.equations_tsv(),
-        subjects,
-        receipt,
-    })
-}
-
 pub(crate) struct BoxPlanArtifact {
     pub(crate) tsv: String,
     pub(crate) bridges: String,
@@ -13455,142 +13359,6 @@ fn deallocator_pointer_call(
                     if dealloc_statics.contains(&did)))
 }
 
-/// **The unresolved-overlap check.** Does any M1 subject hide inside a free
-/// whose argument the census could not resolve?
-///
-/// The freed-slot gate keys on [`FreeSites::resolved`], so its completeness over
-/// the free population is exactly the question of whether the *unresolved* arm
-/// hides a subject. `free((*s).buf)` frees a struct field, not `s` — but if `s`
-/// is itself a subject, a reader of the census cannot tell from the outside
-/// whether the gate missed something, because the unresolved rows carry only a
-/// cause and a span.
-///
-/// So this reports the join: every subject referenced **anywhere inside** an
-/// unresolved free argument, with the site that referenced it. That is the
-/// **broad** reading deliberately — the strict one ("the argument IS a subject")
-/// is vacuously zero, since such an argument would have resolved and landed in
-/// the other arm. A check that cannot fail is not a check.
-///
-/// Runs **no BO solve**: subject collection needs the program and `MutFacts`
-/// only, so this is affordable in the recon worker beside the census.
-pub(crate) struct FreeOverlap {
-    /// One entry per (unresolved site × referenced subject) pair.
-    pub(crate) hits: Vec<FreeOverlapHit>,
-    /// Unresolved sites examined — the denominator, so a zero can be told apart
-    /// from a walk that found nothing to examine.
-    pub(crate) sites: usize,
-}
-
-pub(crate) struct FreeOverlapHit {
-    pub(crate) cause: &'static str,
-    pub(crate) site: String,
-    pub(crate) fn_path: String,
-    pub(crate) mir_local: u32,
-    pub(crate) is_param: bool,
-}
-
-pub(crate) fn free_overlap(tcx: TyCtxt<'_>) -> FreeOverlap {
-    let program = collect_program(tcx);
-    let mut_facts = MutFacts::from_program(&program);
-    let mut subjects = collect_subjects(tcx, &program, &mut_facts);
-    subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
-    let by_binding: rustc_hash::FxHashMap<_, _> =
-        subjects.iter().map(|s| ((s.fn_did, s.hir_id), s)).collect();
-
-    let sites = free_sites(tcx, &program.functions);
-    let mut hits = Vec::new();
-    for u in &sites.unresolved {
-        for key in &u.locals {
-            let Some(s) = by_binding.get(key) else {
-                continue;
-            };
-            hits.push(FreeOverlapHit {
-                cause: u.cause,
-                site: u.site.clone(),
-                fn_path: tcx.def_path_str(s.fn_did.to_def_id()),
-                mir_local: s.local.as_u32(),
-                is_param: matches!(s.kind, decision::SubjectKind::Param { .. }),
-            });
-        }
-    }
-    FreeOverlap {
-        hits,
-        sites: sites.unresolved.len(),
-    }
-}
-
-/// §2's recognizer populations, from HIR alone.
-///
-/// `extern_resolver` rewrites `extern` items into `use` declarations, and the
-/// callee-name recognizers key on the resolved path's last segment. A silent
-/// collapse there is the migration's most dangerous failure mode, because every
-/// downstream census would still run and would simply report fewer sites — a
-/// number that looks like a finding rather than like a broken recognizer.
-///
-/// So this asks the production recognizers themselves: `free_sites` for the
-/// deallocator family and `construction::collect` for the allocator family. It
-/// deliberately does not restate either name table.
-///
-/// No solve — which is the point: the answer is needed BEFORE anything is
-/// re-pinned, on both substrates, for all 20 programs.
-pub(crate) struct SubstrateSanity {
-    pub(crate) functions: usize,
-    pub(crate) free_resolved: usize,
-    pub(crate) free_unresolved: usize,
-    pub(crate) alloc_bindings: usize,
-    pub(crate) alloc_by_callee: Vec<(String, usize)>,
-    pub(crate) ctor_bindings: usize,
-    pub(crate) fn_paths: Vec<String>,
-    pub(crate) referenced_fns: usize,
-    pub(crate) referenced_paths: Vec<String>,
-}
-
-pub(crate) fn substrate_sanity(tcx: TyCtxt<'_>) -> SubstrateSanity {
-    let program = collect_program(tcx);
-    let sites = free_sites(tcx, &program.functions);
-    let ctors = decision::construction::collect(tcx, &program.functions);
-    // A1's `referenced` set: any path reference to a local fn, from ANY body
-    // including static initializers. This is what gates CallSiteNotAdapted.
-    let emit = decision::emitability::collect(tcx, &program.functions);
-
-    let mut by_callee: std::collections::BTreeMap<String, usize> = Default::default();
-    let mut alloc_bindings = 0;
-    for c in ctors.by_binding.values() {
-        if let decision::construction::Construction::Alloc { callee, .. } = c {
-            alloc_bindings += 1;
-            *by_callee.entry(callee.clone()).or_default() += 1;
-        }
-    }
-
-    SubstrateSanity {
-        functions: program.functions.len(),
-        free_resolved: sites.resolved.len(),
-        free_unresolved: sites.unresolved.len(),
-        alloc_bindings,
-        alloc_by_callee: by_callee.into_iter().collect(),
-        ctor_bindings: ctors.by_binding.len(),
-        referenced_fns: emit.referenced.len(),
-        referenced_paths: {
-            let mut v: Vec<_> = emit
-                .referenced
-                .keys()
-                .map(|&f| tcx.def_path_str(f.to_def_id()))
-                .collect();
-            v.sort();
-            v
-        },
-        fn_paths: {
-            let mut v: Vec<_> = program
-                .functions
-                .iter()
-                .map(|&f| tcx.def_path_str(f.to_def_id()))
-                .collect();
-            v.sort();
-            v
-        },
-    }
-}
-
 fn freed_slots_tsv_from(
     tcx: TyCtxt<'_>,
     table: decision::DecisionTable,
@@ -13677,42 +13445,6 @@ fn freed_slots_tsv_from(
     Ok(out)
 }
 
-/// **R2 — the fatness measurement, as its OWN pass.**
-///
-/// Split out for a reason measured the hard way: when fatness rode inside the
-/// facts join, `fatness_analysis` panicking on one program took down the whole
-/// invariant sweep, and three more programs timed out behind it. **One
-/// program's analysis failure must not be able to void twenty programs of
-/// invariant evidence.**
-///
-/// It runs **no BO solve** — fatness needs only the program — so it is far
-/// cheaper than the pass it was extracted from, and its failure is now
-/// recoverable at the call site rather than fatal to the sweep.
-///
-/// The raw lookup is reported, `None` included (`-`): ruling A-1′ maps `None`
-/// to thin **at the decision layer**, never at measurement time. Instruments
-/// measure the capture.
-pub(crate) fn fatness_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
-    let program = collect_program(tcx);
-    let mut_facts = MutFacts::from_program(&program);
-    let fat = fat_facts::FatFacts::from_program(&program);
-
-    let mut subjects = collect_subjects(tcx, &program, &mut_facts);
-    subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
-
-    let mut out = String::from("fn_path\tmir_local\tis_param\tfatness\n");
-    for s in &subjects {
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\n",
-            tcx.def_path_str(s.fn_did.to_def_id()),
-            s.local.as_u32(),
-            u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),
-            fat.render(s.fn_did, s.local),
-        ));
-    }
-    Ok(out)
-}
-
 /// **S3.2′-3 task 0 — the use-class census, as its own pass.**
 ///
 /// Runs **no BO solve** (the `fatness_tsv` precedent): the subject universe
@@ -13770,29 +13502,6 @@ pub(crate) fn use_census_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
 #[cfg(test)]
 pub(crate) fn goldens_for_reconciliation() -> Vec<(&'static str, &'static str)> {
     goldens::GOLDENS.iter().map(|g| (g.name, g.input)).collect()
-}
-
-/// The item-axis census, for the corpus harness (C.6's owed exclusion numbers).
-#[cfg(test)]
-pub(crate) fn classify_universe(tcx: TyCtxt<'_>) -> decision::universe::UniverseReport {
-    decision::universe::classify(tcx)
-}
-
-/// Producer A's artifact with the span association SWAPPED between the first two
-/// subjects of the crate — injected at the phase boundary, on the collector's
-/// real `Subject` type, then driven through the real pipeline.
-#[cfg(test)]
-pub(crate) fn artifact_rows_span_swapped(
-    tcx: TyCtxt<'_>,
-) -> Result<Vec<crate::coverage_recon::schema::Row>, String> {
-    decide_table_perturbed(tcx, |subjects| {
-        if subjects.len() >= 2 {
-            let (lo, hi) = (subjects[0].ty_span, subjects[1].ty_span);
-            subjects[0].ty_span = hi;
-            subjects[1].ty_span = lo;
-        }
-    })
-    .map(|(table, _ctx)| artifact::rows(tcx, &table))
 }
 
 /// Every subject's decision with `ty_span` ERASED on the collector's real

@@ -18,10 +18,6 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 use super::borrow_verify::verify_guarded_to_fixpoint_counting_impl;
 #[cfg(test)]
-use super::borrow_verify::verify_to_fixpoint_counting_with_flows;
-#[cfg(test)]
-use super::coherence::add_coherence_tagging_uses;
-#[cfg(test)]
 use super::{BoOwnEmissionStats, param_overlap::CopyMarkKey};
 use super::{
     CrateCtxt, SlotKind,
@@ -71,18 +67,6 @@ impl CopyLendMode {
             return mode;
         }
         Self::LendArm
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_override<T>(self, f: impl FnOnce() -> T) -> T {
-        struct Restore(Option<CopyLendMode>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                COPY_LEND_MODE_OVERRIDE.with(|slot| slot.set(self.0));
-            }
-        }
-        let _restore = Restore(COPY_LEND_MODE_OVERRIDE.with(|slot| slot.replace(Some(self))));
-        f()
     }
 
     #[cfg(test)]
@@ -1446,66 +1430,6 @@ fn construct_bo_into_a16_refined_with_esc(
     Ok((construction, links))
 }
 
-/// Shared construction for the parked tracking harness: baseline mode, with the harness's
-/// existing Use-family tracking preserved exactly. No eligibility or lend behavior is reachable.
-#[cfg(test)]
-pub(crate) fn construct_tracked_census_baseline(
-    program: &RustProgram<'_>,
-    slots: &CrateSlots,
-    origins: &OriginSummaries,
-    solver: &KindSolver,
-) -> anyhow::Result<BoConstruction> {
-    let source_events = super::source_events::for_construction(program);
-    super::export::record(|export| export.source_events = Some(source_events.clone()));
-    super::comparison::record_sites(program, slots);
-    let crate_ctxt = CrateCtxt::new(program);
-    let t = Instant::now();
-    let (stats, selectors) = super::source_events::with_inventory(&source_events, || {
-        emit_crate_ownership_constraints(&crate_ctxt, slots, origins, solver)
-    })?;
-    let emit_elapsed = t.elapsed();
-    let t = Instant::now();
-    solver
-        .tracker()
-        .expect("tracked census construction")
-        .set_context("coherence");
-    for &fn_did in &program.functions {
-        let body = program
-            .tcx
-            .mir_drops_elaborated_and_const_checked(fn_did)
-            .borrow();
-        add_coherence_tagging_uses(solver, slots, fn_did, &body);
-    }
-    let mut nullability = super::nullability::NullabilityFacts::default();
-    let array_fields = super::array_fields::constrain(program, slots, solver, &mut nullability);
-    super::export::record(|export| export.array_fields = Some(array_fields.clone()));
-    let qualifier_facts =
-        super::qualifier_facts::collect_without_mutability(program, slots, &nullability);
-    super::export::record(|export| export.qualifier_facts = Some(qualifier_facts.clone()));
-    solver.set_demand_capture(super::demand_evidence::begin_construction(
-        program,
-        slots,
-        selectors.keys(),
-    ));
-    Ok(BoConstruction {
-        source_events,
-        qualifier_facts,
-        array_fields,
-        mode: CopyLendMode::Baseline,
-        nullability,
-        field_ref_plan: FieldRefPlan::default(),
-        a2_killed_memberships: 0,
-        a2_opaque_result_guards: 0,
-        selectors,
-        eligibility: CopyLendEligibility::default(),
-        esc_minimal: super::esc_minimal::select(program, slots),
-        stats,
-        eligibility_elapsed: Duration::ZERO,
-        emit_elapsed,
-        coherence_elapsed: t.elapsed(),
-    })
-}
-
 #[cfg(test)]
 pub(crate) fn construct_bo_into_a2(
     program: &RustProgram<'_>,
@@ -1545,36 +1469,6 @@ pub(crate) fn verify_bo_construction(
     mut_facts: &MutFacts,
 ) -> Option<FxHashMap<SlotRef, SlotKind>> {
     verify_bo_construction_counting(program, slots, origins, solver, construction, mut_facts).0
-}
-
-/// Verify a shared construction against an explicitly supplied flow graph. This is reserved for
-/// diagnostic constructions that deliberately substitute the origin summaries while replaying the
-/// production flow facts; the construction mode still owns emission/coherence selection.
-#[cfg(test)]
-pub(crate) fn verify_bo_construction_with_flows(
-    program: &RustProgram<'_>,
-    slots: &CrateSlots,
-    origin_flows: &OriginFlowResults,
-    solver: &KindSolver,
-    construction: &BoConstruction,
-    mut_facts: &MutFacts,
-) -> Option<FxHashMap<SlotRef, SlotKind>> {
-    assert_ne!(
-        construction.mode,
-        CopyLendMode::LendArm,
-        "a lend-arm construction must replay the same native flows that produced eligibility"
-    );
-    super::source_events::with_inventory(&construction.source_events, || {
-        verify_to_fixpoint_counting_with_flows(
-            program,
-            slots,
-            origin_flows,
-            solver,
-            &construction.selectors,
-            mut_facts,
-        )
-        .0
-    })
 }
 
 fn with_construction_replay<T>(construction: &BoConstruction, f: impl FnOnce() -> T) -> T {
