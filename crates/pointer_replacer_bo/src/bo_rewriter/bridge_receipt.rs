@@ -95,7 +95,7 @@ impl BridgeExtentKind {
             // R641-3: the extent this run emits.
             Self::Fallback => format!(
                 "fallback(FALLBACK_SLICE_EXTENT={})",
-                super::decision::seam::fallback_slice_extent()
+                super::decision::seam::FALLBACK_SLICE_EXTENT
             ),
             Self::MaskPlusOne(source) => {
                 format!("fallback(mask+1@addendum-77:{source})")

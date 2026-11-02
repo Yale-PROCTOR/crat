@@ -921,39 +921,3 @@ pub(crate) fn promote(
     }
     changed
 }
-
-/// Only terminal decision data is serialized; the observer grants nothing.
-pub(crate) fn observe(tcx: TyCtxt<'_>, table: &DecisionTable) {
-    let Some(root) = std::env::var_os("CRAT_NESTED_ADMISSION_OUTPUT") else { return };
-    assert_eq!(
-        std::env::var("CRAT_ERA5_EXECUTION_ROLE").as_deref(),
-        Ok("cache-only")
-    );
-    let program = std::env::var("CRAT_ERA5_PROGRAM").expect("nested receipt program identity");
-    assert!(
-        !program.is_empty()
-            && program
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-    );
-    let rows = table.nested_receipts.iter().map(|receipt| {
-        let owner = tcx.def_path_str(receipt.owner.to_def_id());
-        match &receipt.result {
-            Ok(plan) => serde_json::json!({"owner":owner, "status":"planned", "inherited_pair":"not-required", "arm": if plan.count_guard { "pair" } else { "per-parameter" }, "count_hir":plan.count.local_id.as_u32(), "count":plan.count_name, "scalar_accumulator_hir":plan.accumulator.map(|h|h.local_id.as_u32()), "conditional_updates":plan.conditional_updates.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
-                "parameters":plan.parameters.iter().map(|p|serde_json::json!({"hir":p.hir.local_id.as_u32(),"argument":p.index,"name":p.name,"inner_depth":1,"outer_mutable":p.mutable,"inner_mutable":p.mutable})).collect::<Vec<_>>(),
-                "stood_off":plan.stood_off.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
-                "rebased":plan.rebased.iter().map(|h|h.local_id.as_u32()).collect::<Vec<_>>(),
-                "rebase_refused":plan.rebase_refused.iter().map(|(h,hold)|serde_json::json!({"hir":h.local_id.as_u32(),"hold":format!("{hold:?}")})).collect::<Vec<_>>(),
-                "rows":plan.rows.iter().map(|r|serde_json::json!({"source_local_hir":r.local.local_id.as_u32(),"source_formation_hir":r.init.local_id.as_u32(),"table_hir":r.parameter.local_id.as_u32(),"projection":r.index,"destination":r.view_name,"inner_depth":1,"fabricated_before":r.was_fallback,"fabricated_after": !plan.count_guard && r.was_fallback})).collect::<Vec<_>>() }),
-            Err(hold) => serde_json::json!({"owner":owner,"status":"held","hold":format!("{hold:?}")}),
-        }
-    }).collect::<Vec<_>>();
-    let root = std::path::Path::new(&root);
-    std::fs::create_dir_all(root).expect("nested receipt directory");
-    let value = serde_json::json!({"program":program,"source":std::env::var("CRAT_RAW_BOUNDARY_CODE_FRAME").ok(),"pid":std::process::id(),"rows":rows,"custody":"planned-not-delivered"});
-    std::fs::write(
-        root.join(format!("{program}.json")),
-        serde_json::to_vec_pretty(&value).unwrap(),
-    )
-    .expect("nested receipt write");
-}

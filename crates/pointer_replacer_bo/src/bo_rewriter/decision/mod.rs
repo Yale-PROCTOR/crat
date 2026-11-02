@@ -1914,7 +1914,6 @@ pub(crate) fn decide_with_raw_fallbacks(
             );
         }
     }
-    cursor_native::observe(ctx, &entries, &cursor_receipts);
     let contract_extent_promotions = entries
         .iter()
         .filter_map(|(subject, decision)| {
@@ -3903,7 +3902,9 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
                         // the premise stops holding.
                         None => {
                             // Relay main/371 step 5 (A4): say why it is reached.
-                            if std::env::var("CRAT_BO_CSNA_DEBUG").as_deref() == Ok("on") {
+                            if cfg!(test)
+                                && std::env::var("CRAT_BO_CSNA_DEBUG").as_deref() == Ok("on")
+                            {
                                 eprintln!(
                                     "[call-site-not-adapted] {}: not a co-conversion node (no class, no node block); the hypothetical decided {}",
                                     subject.label,

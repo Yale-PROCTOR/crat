@@ -4522,16 +4522,6 @@ fn apply_surface_plans(
             Some((plan.owner, plan))
         })
         .collect::<FxHashMap<_, _>>();
-    if !nested_dropped.is_empty()
-        && let Some(dir) = std::env::var_os("CRAT_NESTED_DROP_DIAGNOSTIC")
-    {
-        nested_dropped.sort();
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::write(
-            std::path::PathBuf::from(dir).join("nested-dropped.tsv"),
-            format!("owner\treason\n{}\n", nested_dropped.join("\n")),
-        );
-    }
     let mut surface_arguments =
         FxHashMap::<LocalDefId, std::collections::BTreeMap<usize, String>>::default();
     for argument in &table.seams.surface_arguments {

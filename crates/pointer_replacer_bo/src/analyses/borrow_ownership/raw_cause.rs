@@ -44,6 +44,9 @@ use super::{
 /// `CRAT_ERA5C_RAW_CAUSE_BUDGET_S`: the probes' wall budget per ledger; past
 /// it a row keeps its direct commit and says `unprobed`. Unset: no budget.
 fn budget() -> Option<std::time::Duration> {
+    if !cfg!(test) {
+        return None;
+    }
     std::env::var("CRAT_ERA5C_RAW_CAUSE_BUDGET_S")
         .ok()
         .map(|value| {
@@ -63,6 +66,11 @@ pub(crate) fn enabled() -> bool {
     // W67 fault (test builds only): the ledger is silenced.
     #[cfg(test)]
     if std::env::var("CRAT_E5C_W67_FAULT").as_deref() == Ok("no-ledger") {
+        return false;
+    }
+    // The ledger is a test-build instrument: a release build never reads its switch (the
+    // master-merge cleanup S3, the user's word in main's session 11-02).
+    if !cfg!(test) {
         return false;
     }
     match std::env::var("CRAT_ERA5C_RAW_CAUSE_LEDGER").as_deref() {

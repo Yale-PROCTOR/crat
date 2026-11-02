@@ -123,16 +123,6 @@ fn r855_1_h1_a_pending_formal_is_decided_raw() {
     assert!(caller.contains("holder: &Holder"), "untouched: {caller}");
 }
 
-/// The switch is strict: a value other than `on` / `off` is a mistake, never "on".
-#[test]
-fn r855_1_the_switch_rejects_an_unknown_value() {
-    assert_eq!(super::decision::pending_hold::parse(None), Ok(true));
-    assert_eq!(super::decision::pending_hold::parse(Some("on")), Ok(true));
-    assert_eq!(super::decision::pending_hold::parse(Some("off")), Ok(false));
-    assert!(super::decision::pending_hold::parse(Some("OFF")).is_err());
-    assert!(super::decision::pending_hold::parse(Some("0")).is_err());
-}
-
 /// **H3** (R857-1, main 184a option (a)): the frame-binding premise is one
 /// predicate in both places. `lstat(name, &mut statBuf)` hands a formal beside the
 /// address of a binding of the caller's own frame, which did not exist when the

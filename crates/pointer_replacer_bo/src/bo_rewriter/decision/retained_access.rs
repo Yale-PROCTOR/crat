@@ -818,7 +818,7 @@ impl<'tcx> Relation<'tcx> {
         this.find_addr_taken();
         this.find_allocators();
         this.seed_statics();
-        let trace = std::env::var("CRAT_E5C_HOLD_TRACE").is_ok();
+        let trace = cfg!(test) && std::env::var("CRAT_E5C_HOLD_TRACE").is_ok();
         let started = std::time::Instant::now();
         let mark = |what: &str| {
             if trace {
@@ -3112,7 +3112,7 @@ impl<'tcx> Relation<'tcx> {
                     .insert(i);
             }
         }
-        let trace = std::env::var("CRAT_E5C_HOLD_TRACE").is_ok();
+        let trace = cfg!(test) && std::env::var("CRAT_E5C_HOLD_TRACE").is_ok();
         let mut round = 0usize;
         loop {
             let mut changed = false;
@@ -3499,7 +3499,7 @@ impl<'tcx> Relation<'tcx> {
                     if (output && holds_pointers) || printed {
                         self.exposed_output = true;
                         changed = true;
-                        if std::env::var("CRAT_E5C_HOLD_TRACE").is_ok() {
+                        if cfg!(test) && std::env::var("CRAT_E5C_HOLD_TRACE").is_ok() {
                             eprintln!(
                                 "E5C_HOLD_TRACE exposure {name} arg {j} in {} (output {output}, printed {printed})",
                                 tcx.def_path_str(f.to_def_id())

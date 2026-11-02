@@ -71,51 +71,23 @@ impl ProvenanceKind {
 /// Unknown root, and R934-1 holds the pair unless a structural certificate
 /// clears it); integer-made pointers stay outside the claim under both scopes
 /// (R936-1). **R959-1 (USER, relay 203/204): globals are inside the claim, so
-/// `integers-only` is the default;** `globals-and-integers` is the named
-/// alternative (the price line).
+/// `integers-only` is the scope.** The switch `CRAT_P11_SCOPE` that also allowed
+/// `globals-and-integers` (the price line) is fixed at `integers-only` (the master-merge
+/// cleanup S3, the user's word in main's session 11-02).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum P11Scope {
-    GlobalsAndIntegers,
     IntegersOnly,
 }
 
-/// The marker a test fixture carries to select the named `globals-and-integers`
-/// mode (the compiler runs its callback on its own thread and fixtures run
-/// concurrently, so a process-wide switch cannot be flipped per test).
-#[cfg(test)]
-pub(crate) const TEST_GLOBALS_AND_INTEGERS_MARKER: &str =
-    "crat-test-p11-scope: globals-and-integers";
-
 impl P11Scope {
-    /// `CRAT_P11_SCOPE` (fail-loud; absent = `integers-only`, R959-1).
-    pub(crate) fn of(tcx: TyCtxt<'_>) -> Self {
-        // The environment first, always validated (fail-loud), so the default
-        // never rests on a source scan (the switch review's MED-1: the census
-        // of record is a test build).
-        let scope = match std::env::var("CRAT_P11_SCOPE") {
-            Err(std::env::VarError::NotPresent) => Self::IntegersOnly,
-            Ok(value) if value == "globals-and-integers" => Self::GlobalsAndIntegers,
-            Ok(value) if value == "integers-only" => Self::IntegersOnly,
-            other => panic!(
-                "CRAT_P11_SCOPE={other:?}: expected globals-and-integers or integers-only (R944-1)"
-            ),
-        };
-        #[cfg(test)]
-        if tcx.sess.source_map().files().iter().any(|file| {
-            file.src
-                .as_ref()
-                .is_some_and(|src| src.contains(TEST_GLOBALS_AND_INTEGERS_MARKER))
-        }) {
-            return Self::GlobalsAndIntegers;
-        }
-        let _ = tcx;
-        scope
+    /// The scope (R959-1).
+    pub(crate) fn of(_tcx: TyCtxt<'_>) -> Self {
+        Self::IntegersOnly
     }
 
     /// The table's `scope` column.
     pub(crate) fn key(self) -> &'static str {
         match self {
-            Self::GlobalsAndIntegers => "globals-and-integers",
             Self::IntegersOnly => "integers-only",
         }
     }
@@ -127,7 +99,7 @@ impl P11Scope {
                 Self::IntegersOnly,
                 Some(Provenance::GlobalValue(_) | Provenance::GlobalStorage(_)),
             ) => None,
-            (_, provenance) => provenance,
+            (Self::IntegersOnly, provenance) => provenance,
         }
     }
 }

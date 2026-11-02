@@ -402,26 +402,13 @@ impl SeamLen {
     }
 }
 
-/// The one ruled fallback slice extent (§39 addendum 77). This is the numeric
-/// source of truth for call-site adapters and the existing borrowed-slice
-/// emission path alike.
-pub(crate) const FALLBACK_SLICE_EXTENT: usize = 1024;
-
-/// **R641-3 — N for a census build.** `CRAT_FALLBACK_SLICE_EXTENT` overrides
-/// the ruled extent for the run that sets it (R693-1, USER: N = 2^28 of record
-/// from the final frame's census); unset, it is [`FALLBACK_SLICE_EXTENT`]. Read
-/// once: every emitted declaration, receipt and extent claim in one process
-/// agrees. (Taken stand-alone from main's `0a40583c1`, R738-1 / main 141a.)
-pub(crate) fn fallback_slice_extent() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("CRAT_FALLBACK_SLICE_EXTENT")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(FALLBACK_SLICE_EXTENT)
-    })
-}
+/// The one fallback slice extent (§39 addendum 77): N = 2^28, the census's N of record (R693-1)
+/// and the value the twenty and the TRACTOR 376 were measured at. The switch
+/// `CRAT_FALLBACK_SLICE_EXTENT` that set it per run (unset = 1,024) is fixed at that value (the
+/// master-merge cleanup S3, the user's word in main's session 11-02). This is the numeric
+/// source of truth for call-site adapters, the borrowed-slice emission path, every emitted
+/// declaration and every receipt.
+pub(crate) const FALLBACK_SLICE_EXTENT: usize = 268_435_456;
 
 /// The const's name in the emitted crate (marker ruling, 2026-08-15).
 pub(crate) const SEAM_LEN_CONST: &str = "FALLBACK_SLICE_EXTENT";
@@ -447,7 +434,7 @@ pub(crate) const FABRICATED_LEN_PATH: &str = "crate::FALLBACK_SLICE_EXTENT";
 /// One producer, two consumers: the span layer splices this string and the AST
 /// layer appends it, so the two emitters cannot disagree about the const's text.
 pub(crate) fn fabricated_len_item() -> String {
-    let extent = fallback_slice_extent();
+    let extent = FALLBACK_SLICE_EXTENT;
     let item = ::utils::item!("const {SEAM_LEN_CONST}: usize = {extent};");
     rustc_ast_pretty::pprust::item_to_string(&item)
 }
@@ -8969,20 +8956,14 @@ fn inventory_expression_bridge_declines_when_doubly_passed() -> bool {
     gate < matrix
 }
 
-/// **R738-1 (main 141a) — the census build's N reaches the emitted const.** Run
-/// once without the variable (the ruled 1,024) and once with
-/// `CRAT_FALLBACK_SLICE_EXTENT=268435456` (R693-1): the emitted declaration, the
-/// mechanical receipt and the bridge receipt's fallback text all carry the same N.
+/// **R738-1 (main 141a) — the census's N reaches the emitted const.** The emitted declaration,
+/// the mechanical receipt and the bridge receipt's fallback text all carry N = 2^28.
 #[cfg(test)]
 mod r738_1_census_n_override {
     #[test]
     fn r738_1_the_emitted_const_and_the_receipts_carry_the_census_n() {
-        let expected = std::env::var("CRAT_FALLBACK_SLICE_EXTENT")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(super::FALLBACK_SLICE_EXTENT);
-        assert_eq!(super::fallback_slice_extent(), expected);
+        let expected = 268_435_456;
+        assert_eq!(super::FALLBACK_SLICE_EXTENT, expected);
         let item = rustc_span::create_session_globals_then(
             rustc_span::edition::Edition::Edition2021,
             &[],

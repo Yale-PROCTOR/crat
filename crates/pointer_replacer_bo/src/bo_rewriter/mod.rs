@@ -2297,8 +2297,7 @@ fn verify_and_revert(
         original_files,
         verify_started: Some(std::time::Instant::now()),
         signature_class_count: emission_plan.class_finalization.classes.len(),
-        emit_budget_s: std::env::var("CRAT_BOC1_EMIT_TIMEOUT_SECS")
-            .unwrap_or_else(|_| "900".to_owned()),
+        emit_budget_s: EMIT_BUDGET_S.to_string(),
         degradations,
         excluded,
         emitted_count,
@@ -2554,6 +2553,7 @@ fn verify_and_revert(
                 .raw_boundary_artifacts
                 .first_failing_verify_tree
                 .is_empty()
+            && cfg!(test)
             && std::env::var_os("CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE").is_some()
         {
             // `TempCrate::root()` is the crate ROOT FILE, not its directory
@@ -2945,7 +2945,7 @@ fn verify_and_revert(
             // R829-1 / R855-1, the post-condition (main 184): with the hold on, the
             // pending table the census publishes reads 0, or the program does not emit.
             let pending_left = facts.raw_boundary_artifacts.pending_sibling_receipts.len();
-            if pending_left > 0 && decision::pending_hold::enabled() {
+            if pending_left > 0 {
                 return facts.degraded(format!(
                     "pending-hold-incomplete: {pending_left} pending site(s) remain at the emitted revert state"
                 ));
@@ -3222,10 +3222,7 @@ fn verify_and_revert(
     // silently truncated — a truncated bisect returns a wrong answer
     // that looks like a right one.
     let projected = candidates.len().saturating_mul(3).saturating_add(1) as f64;
-    let budget_secs = std::env::var("CRAT_BOC1_EMIT_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .unwrap_or(900.0);
+    let budget_secs = EMIT_BUDGET_S as f64;
     if recovery_budget_deferred(projected, probe_secs, budget_secs) {
         facts.files_touched = files_edited;
         facts.reverted_count = recovery_base.len();
@@ -3443,7 +3440,7 @@ fn verify_and_revert(
                 &reverted_atoms,
             );
             let pending_left = facts.raw_boundary_artifacts.pending_sibling_receipts.len();
-            if pending_left > 0 && decision::pending_hold::enabled() {
+            if pending_left > 0 {
                 return facts.degraded(format!(
                     "pending-hold-incomplete: {pending_left} pending site(s) remain after the bisect"
                 ));
@@ -4510,6 +4507,10 @@ impl OutcomeFacts {
 /// Hard ceiling on revert rounds. Paired with the no-progress detector, never
 /// relied on alone: a cap that fires is a loop that stopped being understood.
 const MAX_REVERT_ROUNDS: usize = 8;
+/// The verify loop's recovery budget in seconds: a class recovery projected past it is deferred
+/// and the program degrades. Fixed at the record's 900 s (the switch `CRAT_BOC1_EMIT_TIMEOUT_SECS`,
+/// the master-merge cleanup S3, the user's word in main's session 11-02).
+const EMIT_BUDGET_S: u32 = 900;
 const MAX_CLASS_ATTEMPTS: usize = 3;
 /// Raw-boundary atom mode is one bounded retry, never a repair loop.
 const MAX_ATOM_REVERIFIES: usize = 1;
@@ -8974,50 +8975,42 @@ fn finish_decide<'tcx>(
         if retained_held.0 != Some(family_policy.stage) {
             retained_held = (Some(family_policy.stage), Default::default());
         }
-        let pending_coverage = if decision::pending_hold::enabled() {
-            decision::sibling_overlap::collect_inventory_from(
-                tcx,
-                &decision::sibling_overlap::SiblingInputs {
-                    slots: &slots,
-                    model: &model,
-                    mut_facts: &mut_facts,
-                    facts: &facts,
-                    subjects: &subjects,
-                    a5_site_proofs: &a5_site_proofs,
-                    raw_boundary_sites: &raw_boundary_sites,
-                    retention: &retention,
-                    origins: analysis.origins.as_ref(),
-                },
-                &decision::outbound_expression::OutboundExpressionPlans::default(),
-            )
-            .coverage
-        } else {
-            Vec::new()
-        };
-        let mut carried = if decision::pending_hold::enabled() {
-            pending_held
-                .1
-                .iter()
-                .filter(|(node, _)| {
-                    table.entries.iter().any(|(subject, decision)| {
-                        (subject.fn_did, subject.hir_id) == **node
-                            && match decision {
-                                decision::Decision::Degraded(_) => true,
-                                decision::Decision::Ref { .. }
-                                | decision::Decision::InferredRef { .. }
-                                | decision::Decision::Slice { .. }
-                                | decision::Decision::NestedSlice { .. }
-                                | decision::Decision::Cursor { .. }
-                                | decision::Decision::Opt { .. }
-                                | decision::Decision::Box(_) => false,
-                            }
-                    })
+        let pending_coverage = decision::sibling_overlap::collect_inventory_from(
+            tcx,
+            &decision::sibling_overlap::SiblingInputs {
+                slots: &slots,
+                model: &model,
+                mut_facts: &mut_facts,
+                facts: &facts,
+                subjects: &subjects,
+                a5_site_proofs: &a5_site_proofs,
+                raw_boundary_sites: &raw_boundary_sites,
+                retention: &retention,
+                origins: analysis.origins.as_ref(),
+            },
+            &decision::outbound_expression::OutboundExpressionPlans::default(),
+        )
+        .coverage;
+        let mut carried = pending_held
+            .1
+            .iter()
+            .filter(|(node, _)| {
+                table.entries.iter().any(|(subject, decision)| {
+                    (subject.fn_did, subject.hir_id) == **node
+                        && match decision {
+                            decision::Decision::Degraded(_) => true,
+                            decision::Decision::Ref { .. }
+                            | decision::Decision::InferredRef { .. }
+                            | decision::Decision::Slice { .. }
+                            | decision::Decision::NestedSlice { .. }
+                            | decision::Decision::Cursor { .. }
+                            | decision::Decision::Opt { .. }
+                            | decision::Decision::Box(_) => false,
+                        }
                 })
-                .map(|(node, reason)| (*node, reason.clone()))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+            })
+            .map(|(node, reason)| (*node, reason.clone()))
+            .collect::<Vec<_>>();
         let mut forced = rustc_hash::FxHashMap::default();
         // Every predicate that names a subject, in the pass it names it: a subject
         // two predicates hold carries both receipts (relay 297), though its
@@ -9050,9 +9043,7 @@ fn finish_decide<'tcx>(
                     new.insert(*node, reason.clone());
                 }
             }
-            if decision::pending_hold::enabled()
-                && family_policy.stage >= additive::FamilyStage::Declaration
-            {
+            if family_policy.stage >= additive::FamilyStage::Declaration {
                 // R864-1 (relay 299): the pairs the pair pass drops, a delivered
                 // reference formal beside a raw one at an in-program call, held by
                 // the same rule (R833-1) and carried as the pending holds are.
@@ -9814,9 +9805,7 @@ fn finish_decide<'tcx>(
         // set; the planning-time feedback below read an empty list. With the
         // hold on, the in-loop plan carries the inventory the emission will read
         // (receipt and audit readers only: no edit reads it).
-        if decision::pending_hold::enabled()
-            && family_policy.stage >= additive::FamilyStage::Declaration
-        {
+        if family_policy.stage >= additive::FamilyStage::Declaration {
             table.sibling_overlap_inventory = decision::sibling_overlap::collect_inventory_from(
                 tcx,
                 &decision::sibling_overlap::SiblingInputs {
@@ -9928,9 +9917,7 @@ fn finish_decide<'tcx>(
         // settled-table holds for the rest of the stage and the stage is decided
         // again (the map only grows within a stage). The post-condition stays the
         // tripwire for a site only a verify revert creates.
-        if decision::pending_hold::enabled()
-            && family_policy.stage >= additive::FamilyStage::Declaration
-        {
+        if family_policy.stage >= additive::FamilyStage::Declaration {
             // The terminal's state before any verify revert: the classes the plan
             // itself withholds (binn's `binn_object_get_value` is class-held at
             // planning), as the post-condition reads them.
@@ -10344,8 +10331,6 @@ fn finish_decide<'tcx>(
                 &context,
                 &table.seams.outbound_expressions,
             );
-        decision::overlapping_pairs::publish(tcx, &table, &context)?;
-        decision::nested_slice::observe(tcx, &table);
         crate::phase_log::mark("finish_decide", "end", &format!("rounds={phase_round}"));
         return Ok((table, context));
     }

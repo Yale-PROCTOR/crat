@@ -26,24 +26,9 @@ use super::{
     sibling_overlap::{self, SourceBridgeCoverage, SourceBridgeEvidence, TerminalSiteState},
 };
 
-/// The switch `CRAT_RAW_BOUNDARY_PENDING_HOLD`, read strictly: unset or `on` holds,
-/// `off` keeps the ended waiver (the price census reads both), anything else is a
-/// mistake, never "on".
-pub(crate) fn parse(value: Option<&str>) -> Result<bool, String> {
-    match value {
-        None | Some("on") => Ok(true),
-        Some("off") => Ok(false),
-        Some(other) => Err(format!(
-            "CRAT_RAW_BOUNDARY_PENDING_HOLD must be `on` or `off`, got `{other}`"
-        )),
-    }
-}
-
-/// The switch, from the environment.
-pub(crate) fn enabled() -> bool {
-    let value = std::env::var("CRAT_RAW_BOUNDARY_PENDING_HOLD").ok();
-    parse(value.as_deref()).unwrap_or_else(|why| panic!("{why}"))
-}
+// The hold always applies: the switch `CRAT_RAW_BOUNDARY_PENDING_HOLD` that could turn it off
+// (`off` kept the ended waiver) is fixed at `on` (the master-merge cleanup S3, the user's word in
+// main's session 11-02).
 
 /// The sources the pending sites name on this table, each with the hold's reason.
 /// Only the coverage rows the terminal receipts read (the plan's filter on the

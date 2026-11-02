@@ -20,7 +20,7 @@ pub(crate) const SLICE_EXTENT_WAIVER_ID: &str = "slice-extent-out-of-scope@adden
 pub(crate) fn fallback_extent_receipt() -> String {
     format!(
         "fabricated-extent:slice-extent-out-of-scope@addendum-77:FALLBACK_SLICE_EXTENT={}",
-        super::decision::seam::fallback_slice_extent()
+        super::decision::seam::FALLBACK_SLICE_EXTENT
     )
 }
 

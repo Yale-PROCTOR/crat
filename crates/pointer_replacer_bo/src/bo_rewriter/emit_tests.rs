@@ -5579,7 +5579,7 @@ fn e_adapt_w1_slice_uses_licensed_then_named_fallback_extent() {
     );
     assert_eq!(
         emitted
-            .matches("const FALLBACK_SLICE_EXTENT: usize = 1024;")
+            .matches("const FALLBACK_SLICE_EXTENT: usize = 268435456;")
             .count(),
         1,
         "one or many fallback sites produce exactly one survivor-derived const"
@@ -7288,7 +7288,7 @@ fn br_w3_raw_slice_inbound_extents_and_nullable_twins_are_exact() {
     );
     assert_eq!(
         source
-            .matches("const FALLBACK_SLICE_EXTENT: usize = 1024;")
+            .matches("const FALLBACK_SLICE_EXTENT: usize = 268435456;")
             .count(),
         1,
         "{source}"
@@ -10816,7 +10816,7 @@ fn e_adapt_w3_n7_clear_site_receipts_named_fallback_extent() {
     assert!(placed.iter().all(|row| row[len_arm] == "len-fabricated"));
     assert_eq!(
         e2_root_text(&attempt)
-            .matches("const FALLBACK_SLICE_EXTENT: usize = 1024;")
+            .matches("const FALLBACK_SLICE_EXTENT: usize = 268435456;")
             .count(),
         1
     );
@@ -11033,7 +11033,7 @@ fn render_outside_a_compiler_session_omits_an_unused_const() {
     let n: usize = files
         .values()
         .map(|t| {
-            t.matches("const FALLBACK_SLICE_EXTENT: usize = 1024;")
+            t.matches("const FALLBACK_SLICE_EXTENT: usize = 268435456;")
                 .count()
         })
         .sum();
@@ -11193,7 +11193,7 @@ fn both_layers_omit_the_const_when_safe_glue_needs_no_extent() {
                        \x20   s\n\
                        }\n\
                        pub unsafe fn fab_one(d: *mut i32) -> i32 { fab_total(d) }\n";
-    let decl = "const FALLBACK_SLICE_EXTENT: usize = 1024;";
+    let decl = "const FALLBACK_SLICE_EXTENT: usize = 268435456;";
 
     // RESTATED for 56 (main 173a): `fab_one::d` is handed bare to
     // `fab_total`'s array formal, which reads four elements, so the

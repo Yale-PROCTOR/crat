@@ -393,7 +393,7 @@ fn assert_named_lifetime_wrapper_consumer(borrowed_type: &str, mutable: bool) {
             // this constant is not asserted to be observed length evidence.
             format!(
                 "#![allow(dead_code, unused_unsafe)]\n\
-                 const FALLBACK_SLICE_EXTENT: usize = 1024;\n\
+                 const FALLBACK_SLICE_EXTENT: usize = 268435456;\n\
                  {inner_source}\n{}\n",
                 rustc_ast_pretty::pprust::item_to_string(&wrapper_crate.items[0]),
             )

@@ -149,33 +149,6 @@ pub unsafe fn both() -> u8 { let mut tmp = malloc(64); set_g(tmp); cp2(G, tmp); 
 pub unsafe fn raw_side() -> u8 { let mut tmp = malloc(64); set_g(tmp); cp(G.offset(32), tmp); *tmp }
 "#;
 
-/// wave-5d 148b: a pointer static's VALUE is not the static's storage, so no
-/// structural certificate reads `G` as a root. **R936-1 (P11, the USER with
-/// the advisor)** puts aliasing through a global outside the claim: the pair is
-/// cleared by the premise arm, receipted, and nothing is held for it (R930-1's
-/// hold is withdrawn; `G = tmp` makes this fixture an input outside the claim).
-///
-/// R959-1 (USER): globals are inside the claim by default; this witness runs
-/// under the named `globals-and-integers` mode (the default's hold is
-/// `r944_1_integers_only_holds_a_statics_value`).
-#[test]
-fn r148b_a_pointer_statics_value_is_not_its_storage() {
-    let named = globals_and_integers(STATIC_VALUE);
-    let rows = held(&named);
-    assert!(
-        !is_held(&rows, "cp2::d") && !is_held(&rows, "cp2::s") && !is_held(&rows, "cp::s"),
-        "{rows:?}"
-    );
-    assert_eq!(
-        verdict_at(&named, "both", "cp2", 0, 1),
-        Ok(
-            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
-                super::decision::global_or_integer::ProvenanceKind::GlobalValue
-            )
-        )
-    );
-}
-
 const INTEGER_CAST: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut)]
 unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
@@ -332,25 +305,6 @@ unsafe fn set_s(t: *mut u8) {{ S.buf = t; }}
 }
 
 /// R936-1 (P11): the premise arm clears it, receipted; nothing is held.
-/// (R959-1: under the named `globals-and-integers` mode.)
-#[test]
-fn r149g_a_statics_value_through_a_local_may_point_anywhere() {
-    let source = globals_and_integers(&anywhere_shape(
-        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_g(tmp); let mut p = G; cp(p.offset(32), tmp); *tmp }",
-    ));
-    let rows = held(&source);
-    assert!(!is_held(&rows, "cp::s"), "{rows:?}");
-    assert_eq!(
-        verdict_at(&source, "a", "cp", 0, 1),
-        Ok(
-            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
-                super::decision::global_or_integer::ProvenanceKind::GlobalValue
-            )
-        )
-    );
-}
-
-/// R936-1 (P11): the premise arm clears it, receipted; nothing is held.
 #[test]
 fn r149g_an_integer_cast_held_in_a_local_may_point_anywhere() {
     let source = anywhere_shape(
@@ -363,25 +317,6 @@ fn r149g_an_integer_cast_held_in_a_local_may_point_anywhere() {
         Ok(
             super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
                 super::decision::global_or_integer::ProvenanceKind::Integer
-            )
-        )
-    );
-}
-
-/// R936-1 (P11): the premise arm clears it, receipted; nothing is held.
-/// (R959-1: under the named `globals-and-integers` mode.)
-#[test]
-fn r149g_a_pointer_field_of_a_static_may_point_anywhere() {
-    let source = globals_and_integers(&anywhere_shape(
-        "pub unsafe fn c() -> u8 { let mut tmp = malloc(64); set_s(tmp); cp(S.buf.offset(32), tmp); *tmp }",
-    ));
-    let rows = held(&source);
-    assert!(!is_held(&rows, "cp::s"), "{rows:?}");
-    assert_eq!(
-        verdict_at(&source, "c", "cp", 0, 1),
-        Ok(
-            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
-                super::decision::global_or_integer::ProvenanceKind::GlobalValue
             )
         )
     );
@@ -431,29 +366,6 @@ pub unsafe fn top() -> u8 { let mut x = 0u8; f(&mut x) }
 #[test]
 fn r149g_control_a_static_beside_a_formal_every_call_separates_is_certified() {
     assert!(verdict_at(STATIC_VS_FORMAL, "f", "cp2", 0, 1).is_ok());
-}
-
-/// wave-5d 149g (the stand-in review's HIGH-2): `f` reached through a fn
-/// pointer may be handed `G` itself; the static-vs-formal chain (R483-3 (f))
-/// certifies nothing about an address-taken function, as (e) does not.
-#[test]
-fn r149g_an_address_taken_function_is_not_certified_static_vs_formal() {
-    let input = globals_and_integers(&format!(
-        "{STATIC_VS_FORMAL}pub static FP: unsafe fn(*mut u8) -> u8 = f;\n\
-         pub unsafe fn through() -> u8 {{ FP(G.as_mut_ptr()) }}\n"
-    ));
-    // R936-1 (P11): no structural certificate (the address-taken guard
-    // holds); `G.as_ptr()` is a pointer to a static's storage, so the premise
-    // arm clears the pair, receipted (R959-1: under the named mode; the
-    // default's hold is r944_1's).
-    assert_eq!(
-        verdict_at(&input, "f", "cp2", 0, 1),
-        Ok(
-            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
-                super::decision::global_or_integer::ProvenanceKind::GlobalStorage
-            )
-        )
-    );
 }
 
 /// wave-5d 149g (the stand-in review's MED-2): a call inside a closure is a
@@ -579,26 +491,6 @@ fn residual(body: &str) -> Vec<(String, bool, bool)> {
     held(&residual_source(body))
 }
 
-/// R936-1 (P11, relay 197 item 2): a global's value reaches the call, so the
-/// premise arm clears the pair, receipted; nothing is held.
-#[test]
-fn r149h_a_getter_of_a_statics_value_is_a_receipted_premise() {
-    // R959-1: under the named `globals-and-integers` mode.
-    let source = globals_and_integers(&residual_source(
-        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_g(tmp); cp(get_g().offset(32), tmp); *tmp }",
-    ));
-    let rows = held(&source);
-    assert!(!is_held(&rows, "cp::s"), "{rows:?}");
-    assert_eq!(
-        verdict_at(&source, "a", "cp", 0, 1),
-        Ok(
-            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
-                super::decision::global_or_integer::ProvenanceKind::GlobalValue
-            )
-        )
-    );
-}
-
 /// R936-1 (P11): a conditional is a premise only when EVERY branch's
 /// provenance passes through a global or an integer; here the `else` branch
 /// (`buf`, an entry formal) does not, so no premise and the pair stays held
@@ -630,26 +522,6 @@ fn r149h_a_local_aggregate_slot_holding_a_statics_value_is_held() {
         "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); G = tmp; let mut c: C = core::mem::zeroed(); c.buf = G; cp(c.buf.offset(32), tmp); *tmp }",
     );
     assert!(is_raw(&rows, "cp::s"), "{rows:?}");
-}
-
-/// R936-1 (P11, relay 197 item 2): a global's value reaches the call, so the
-/// premise arm clears the pair, receipted; nothing is held.
-#[test]
-fn r149h_a_pointer_to_a_static_struct_is_a_receipted_premise() {
-    // R959-1: under the named `globals-and-integers` mode.
-    let source = globals_and_integers(&residual_source(
-        "pub unsafe fn a() -> u8 { let mut tmp = malloc(64); set_s(tmp); let s: *const C = &S; cp((*s).buf.offset(32), tmp); *tmp }",
-    ));
-    let rows = held(&source);
-    assert!(!is_held(&rows, "cp::s"), "{rows:?}");
-    assert_eq!(
-        verdict_at(&source, "a", "cp", 0, 1),
-        Ok(
-            super::decision::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(
-                super::decision::global_or_integer::ProvenanceKind::GlobalValue
-            )
-        )
-    );
 }
 
 /// Control: a fresh block beside a stack array at the same call is certified
@@ -705,55 +577,6 @@ pub unsafe fn shift() { cp2(ST.pos, ST.buf.as_ptr()); }
     assert!(verdict_at(input, "shift", "cp2", 0, 1).is_err());
 }
 
-/// wave-5d 150d (the round-4 review's MED-3): two premise clears at two calls
-/// of one caller to one callee are two rows of the P11 table, each at its own
-/// call.
-#[test]
-fn r150d_two_premise_calls_are_two_rows() {
-    let input = r#"
-#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
-pub static mut G1: *mut u8 = 0 as *mut u8;
-pub static mut G2: *mut u8 = 0 as *mut u8;
-unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
-pub unsafe fn c(q: *mut u8) {
-    cp2(G1, q);
-    cp2(G2, q);
-}
-"#;
-    // R959-1: global rows exist only under the named `globals-and-integers` mode.
-    let input = globals_and_integers(input);
-    let table = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
-        let (_, ctx) = super::decide_table_with_ctx_config(
-            tcx,
-            Some((
-                super::OverlapMode::PreciseReplay,
-                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
-            )),
-        )
-        .expect("decisions");
-        let certificates = ctx
-            .a5_site_proofs
-            .pair_certificates()
-            .expect("certificates");
-        // What the rules themselves asked (the census's table), before the
-        // helper asks at every recorded call (round-5 MED-A).
-        let asked = certificates.premise_receipts_tsv(tcx);
-        let _ = certificates.certify_recorded_all(tcx, "c", "cp2", 0, 1);
-        (asked, certificates.premise_receipts_tsv(tcx))
-    })
-    .expect("fixture compiles");
-    let (asked, table) = table;
-    // The census's own table already has both rows: the rules ask at each call.
-    assert_eq!(asked, table, "the rules asked at both calls");
-    let rows: Vec<&str> = table.lines().skip(1).collect();
-    assert_eq!(rows.len(), 2, "{table}");
-    assert_ne!(
-        rows[0].split('\t').nth(2),
-        rows[1].split('\t').nth(2),
-        "each row names its own call: {table}"
-    );
-}
-
 /// wave-5d 150e (the round-5 review's MED-B): a containment the text shows
 /// (`br` inside `*s`, through an integer round trip of `s`) is held though a
 /// premise clears the pair: the premise answers an unresolved pair only.
@@ -778,39 +601,6 @@ pub unsafe fn c(s: *mut S) {
     );
 }
 
-/// R939-1 (the seat on 150d's MED-2): P11 covers unknown provenance only. Where
-/// the caller's own text relates the two arguments (`G = p; upd(G, p)`), the
-/// premise is not asked and the pair is held as any shown overlap is.
-const SHOWN_THROUGH_A_GLOBAL: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
-pub static mut G: *mut i32 = 0 as *mut i32;
-unsafe fn upd(a: *mut i32, b: *mut i32) { *a += *b; }
-pub unsafe fn c(p: *mut i32) {
-    G = p;
-    upd(G, p);
-}
-"#;
-
-#[test]
-fn r939_1_a_relation_the_callers_text_shows_refuses_the_premise() {
-    // R959-1: the refusal is of the global premise, asked under the named mode.
-    assert_eq!(
-        verdict_at(
-            &globals_and_integers(SHOWN_THROUGH_A_GLOBAL),
-            "c",
-            "upd",
-            0,
-            1
-        ),
-        Err(super::decision::pair_disjointness::Unproved::PremiseShownRelation)
-    );
-    let rows = held(SHOWN_THROUGH_A_GLOBAL);
-    assert!(
-        is_raw(&rows, "upd::a") && is_raw(&rows, "upd::b"),
-        "{rows:?}"
-    );
-}
-
 /// R939-1 at a foreign callee: `G = p; strncpy(G, p, 2)` (the pending hold's
 /// local proof, `certify_call_arguments`).
 #[test]
@@ -829,53 +619,6 @@ pub unsafe fn c(p: *mut i8) -> i8 {
 "#;
     let rows = held(input);
     assert!(is_held(&rows, "c::p"), "{rows:?}");
-}
-
-/// Control (R939-1): with no relation in the caller's text the premise stays
-/// literal.
-#[test]
-fn r939_1_control_an_unrelated_global_keeps_the_premise() {
-    let input = SHOWN_THROUGH_A_GLOBAL.replace("    G = p;\n", "");
-    // R959-1: the global premise exists under the named mode only; by default
-    // the pair is held (the global is inside the claim).
-    assert!(verdict_at(&globals_and_integers(&input), "c", "upd", 0, 1).is_ok());
-    assert!(verdict_at(&input, "c", "upd", 0, 1).is_err());
-}
-
-/// The round-6 review's MED-1 / MED-2 / MED-3 (wave-5d 150h): relations the
-/// caller's text shows that the first R939-1 walk did not reach.
-fn refusal(src: &str, caller: &'static str, callee: &'static str) -> bool {
-    // R959-1: the refusals of the global premise are asked under the named mode.
-    verdict_at(&globals_and_integers(src), caller, callee, 0, 1)
-        == Err(super::decision::pair_disjointness::Unproved::PremiseShownRelation)
-}
-
-const R939_SHAPES: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_mut, static_mut_refs)]
-pub static mut G: *mut i32 = 0 as *mut i32;
-#[repr(C)]
-pub struct C { pub buf: *mut i32, pub n: usize }
-pub static mut S: C = C { buf: 0 as *mut i32, n: 0 };
-unsafe fn upd(a: *mut i32, b: *mut i32) { *a += *b; }
-unsafe fn get_g() -> *mut i32 { G }
-pub unsafe fn getter(p: *mut i32) { G = p; upd(get_g(), p); }
-pub unsafe fn through_a_pointer(p: *mut i32) { let s: *mut C = &mut S; (*s).buf = p; upd((*s).buf, p); }
-pub unsafe fn aggregate(p: *mut i32) { let mut c = C { buf: 0 as *mut i32, n: 0 }; c.n = p as usize; upd(c.n as *mut i32, p); }
-"#;
-
-#[test]
-fn r150h_the_getters_static_is_where_the_refusal_starts() {
-    assert!(refusal(R939_SHAPES, "getter", "upd"));
-}
-
-#[test]
-fn r150h_a_store_through_a_pointer_to_the_static_refuses() {
-    assert!(refusal(R939_SHAPES, "through_a_pointer", "upd"));
-}
-
-#[test]
-fn r150h_a_store_into_a_local_aggregate_refuses() {
-    assert!(refusal(R939_SHAPES, "aggregate", "upd"));
 }
 
 /// Relay 200 (the seat on the P5 option): every pair AllocatorContractFree
@@ -922,16 +665,9 @@ pub unsafe fn cleanup(mut m: *mut MemoryManager, mut s: *mut Model) {
     );
 }
 
-/// R944-1 (relay 201) / R959-1 (USER, relay 204): under `integers-only`, THE
-/// DEFAULT, a global's value or storage is no premise: the pair stays with the
-/// structural certificates, and R934-1 holds it where they fail. Integer-made
-/// pointers stay premises under both scopes. A fixture selects the named
-/// `globals-and-integers` mode with the marker below.
-const GLOBALS_AND_INTEGERS: &str = "// crat-test-p11-scope: globals-and-integers\n";
-
-fn globals_and_integers(src: &str) -> String {
-    format!("{GLOBALS_AND_INTEGERS}{src}")
-}
+/// R944-1 (relay 201) / R959-1 (USER, relay 204): under `integers-only` a global's value or
+/// storage is no premise: the pair stays with the structural certificates, and R934-1 holds it
+/// where they fail. Integer-made pointers stay premises.
 
 fn premise_of(
     kind: super::decision::global_or_integer::ProvenanceKind,
@@ -948,8 +684,6 @@ fn r944_1_integers_only_holds_a_statics_value() {
     // (the switch review's MED-2).
     let rows = held(&src);
     assert!(is_held(&rows, "cp::s"), "{rows:?}");
-    let named = held(&globals_and_integers(STATIC_VALUE));
-    assert!(!is_held(&named, "cp::s"), "{named:?}");
 }
 
 #[test]
@@ -986,34 +720,24 @@ fn r944_1_integers_only_holds_the_global_shapes() {
 }
 
 #[test]
-fn r944_1_integer_made_pointers_stay_premises_under_both_scopes() {
+fn r944_1_integer_made_pointers_stay_premises() {
     use super::decision::global_or_integer::ProvenanceKind;
-    for src in [INTEGER_CAST.to_owned(), globals_and_integers(INTEGER_CAST)] {
-        assert_eq!(
-            verdict_at(&src, "caller", "cp2", 0, 1),
-            Ok(premise_of(ProvenanceKind::Integer))
-        );
-    }
+    assert_eq!(
+        verdict_at(INTEGER_CAST, "caller", "cp2", 0, 1),
+        Ok(premise_of(ProvenanceKind::Integer))
+    );
     let body =
         "pub unsafe fn b(buf: *mut u8, n: usize) -> u8 { let q = n as *mut u8; cp2(q, buf); *buf }";
-    for src in [
-        anywhere_shape(body),
-        globals_and_integers(&anywhere_shape(body)),
-    ] {
-        assert_eq!(
-            verdict_at(&src, "b", "cp2", 0, 1),
-            Ok(premise_of(ProvenanceKind::Integer))
-        );
-    }
+    assert_eq!(
+        verdict_at(&anywhere_shape(body), "b", "cp2", 0, 1),
+        Ok(premise_of(ProvenanceKind::Integer))
+    );
     let round = held(&integer_round_trip());
     assert!(!is_raw(&round, "update::src"), "{round:?}");
 }
 
 /// R944-1, the mixed case: a global beside an integer-made pointer. Under
-/// `integers-only` (the default, R959-1) the integer side alone gives the
-/// premise; under the named `globals-and-integers` mode the receipt names the
-/// left side's kind (so a price that filters the table
-/// on `global-*` must check the other side: the switch review's LOW).
+/// `integers-only` (R959-1) the integer side alone gives the premise.
 #[test]
 fn r944_1_a_global_beside_an_integer_is_the_integers_premise() {
     use super::decision::global_or_integer::ProvenanceKind;
@@ -1023,10 +747,6 @@ pub static mut G: *mut u8 = 0 as *mut u8;
 unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
 pub unsafe fn mixed(n: usize) -> u8 { cp2(G, n as *const u8); 0 }
 "#;
-    assert_eq!(
-        verdict_at(&globals_and_integers(src), "mixed", "cp2", 0, 1),
-        Ok(premise_of(ProvenanceKind::GlobalValue))
-    );
     assert_eq!(
         verdict_at(src, "mixed", "cp2", 0, 1),
         Ok(premise_of(ProvenanceKind::Integer))

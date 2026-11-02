@@ -1,10 +1,7 @@
-//! Read-only native evidence export for the approved diagnostic census.
+//! Read-only native evidence snapshot (test builds; the census export that wrote it to
+//! `CRAT_WAVE5P_DIAGNOSTIC_DIR` is gone, the master-merge cleanup S3).
 
-use std::{
-    fmt::Write as _,
-    io::Write as _,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::fmt::Write as _;
 
 use rustc_middle::ty::{TyCtxt, TyKind};
 
@@ -80,43 +77,4 @@ pub(super) fn snapshot(
         }
     }
     (positions, formals)
-}
-
-pub(crate) fn publish(
-    tcx: TyCtxt<'_>,
-    table: &DecisionTable,
-    ctx: &DecideCtx,
-) -> Result<(), String> {
-    let Some(root) = std::env::var_os("CRAT_WAVE5P_DIAGNOSTIC_DIR") else { return Ok(()) };
-    let program = std::env::var("CRAT_ERA5_PROGRAM")
-        .map_err(|error| format!("wave5p-observer-program:{error}"))?;
-    if program.is_empty()
-        || !program
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
-    {
-        return Err("wave5p-observer-invalid-program".into());
-    }
-    let root = std::path::PathBuf::from(root);
-    std::fs::create_dir_all(&root).map_err(|error| format!("wave5p-observer-directory:{error}"))?;
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let prefix = format!(
-        "{program}.{}.{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    );
-    let (positions, formals) = snapshot(tcx, table, ctx);
-    // Retain every callback separately. Repeated snapshots can be reconciled
-    // by identity without overwriting evidence or altering the decision table.
-    for (suffix, text) in [("positions", positions), ("formals", formals)] {
-        let path = root.join(format!("{prefix}.{suffix}.tsv"));
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(|error| format!("wave5p-observer-create:{error}"))?;
-        file.write_all(text.as_bytes())
-            .map_err(|error| format!("wave5p-observer-write:{error}"))?;
-    }
-    Ok(())
 }
