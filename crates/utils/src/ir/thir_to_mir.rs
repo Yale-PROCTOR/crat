@@ -12,7 +12,7 @@ use rustc_middle::{
     },
     ty::{Ty, TyCtxt, TyKind},
 };
-use rustc_span::{BytePos, Span};
+use rustc_span::{BytePos, Span, SyntaxContext};
 use smallvec::{SmallVec, smallvec};
 
 /// `Thir` of THIR to `Body` of MIR
@@ -122,8 +122,8 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
         }
     }
 
-    let mut stmt_span_to_locs: FxHashMap<LoHi, Locations> = FxHashMap::default();
-    let mut term_span_to_locs: FxHashMap<LoHi, Locations> = FxHashMap::default();
+    let mut stmt_span_to_locs: FxHashMap<SpanKey, Locations> = FxHashMap::default();
+    let mut term_span_to_locs: FxHashMap<SpanKey, Locations> = FxHashMap::default();
 
     for bb in body.basic_blocks.reverse_postorder() {
         let bbd = &body.basic_blocks[*bb];
@@ -219,67 +219,62 @@ pub fn map_thir_to_mir(def_id: LocalDefId, verbose: bool, tcx: TyCtxt<'_>) -> Th
                 else_opt,
                 ..
             } => {
-                let cond_unwrapped = unwrap_expr(cond, &thir);
+                let conds = cond_dest(cond, &thir, &mut ctx.nested_logical_exprs);
+                let mut true_targets = vec![];
+                let mut false_targets = vec![];
+                for cond in &conds {
+                    let (when_true, when_false) = ctx.find_condition_targets(cond.expr_id);
+                    match cond.when_true {
+                        None => {}
+                        Some(true) => true_targets.push(when_true),
+                        Some(false) => false_targets.push(when_true),
+                    }
+                    match cond.when_false {
+                        None => {}
+                        Some(true) => true_targets.push(when_false),
+                        Some(false) => false_targets.push(when_false),
+                    }
+                }
+                let find_target = |targets: &[BasicBlock]| match targets {
+                    [] => ctx.mapping_error("missing MIR branch targets", expr.span.into()),
+                    [bb] => *bb,
+                    _ => {
+                        let mut targets: Vec<_> = targets
+                            .iter()
+                            .map(|bb| {
+                                let mut path = vec![];
+                                let mut seen = FxHashSet::default();
+                                let mut bb = *bb;
+                                // Failed let chains can drop bindings before reaching else.
+                                while seen.insert(bb) {
+                                    path.push(bb);
+                                    let term = body.basic_blocks[bb].terminator();
+                                    match term.kind {
+                                        TerminatorKind::Goto { target }
+                                        | TerminatorKind::Drop { target, .. } => bb = target,
+                                        _ => break,
+                                    }
+                                }
+                                path
+                            })
+                            .collect();
+                        let mut target = targets.pop().unwrap();
+                        for target1 in targets {
+                            target.retain(|bb| target1.contains(bb));
+                        }
+                        *target.first().unwrap_or_else(|| {
+                            ctx.mapping_error(
+                                "MIR branch targets have no common entry",
+                                expr.span.into(),
+                            )
+                        })
+                    }
+                };
                 let (true_target, false_target) =
-                    if let ExprKind::Let { pat, .. } = &thir[cond_unwrapped].kind {
-                        // For `if let`, the SwitchInt span matches the pattern span,
-                        // not the Let expression span. Find the SwitchInt by pattern span.
-                        let pat_span: LoHi = pat.span.into();
-                        if let Some(targets) = ctx.find_switch_int_by_span(pat_span) {
-                            let true_target = targets.iter().next().unwrap().1;
-                            let false_target = targets.otherwise();
-                            (true_target, false_target)
-                        } else {
-                            ctx.print_debug("If let", pat_span);
-                            continue;
-                        }
-                    } else {
-                        let conds = cond_dest(cond, &thir, &mut ctx.nested_logical_exprs);
-                        let mut true_targets = vec![];
-                        let mut false_targets = vec![];
-                        for cond in &conds {
-                            if let Some(targets) = ctx.find_switch_int(cond.expr_id) {
-                                let when_true = targets.otherwise();
-                                let when_false = targets.target_for_value(0);
-                                match cond.when_true {
-                                    None => {}
-                                    Some(true) => true_targets.push(when_true),
-                                    Some(false) => false_targets.push(when_true),
-                                }
-                                match cond.when_false {
-                                    None => {}
-                                    Some(true) => true_targets.push(when_false),
-                                    Some(false) => false_targets.push(when_false),
-                                }
-                            } else {
-                                ctx.print_debug("If", thir[cond.expr_id].span.into());
-                            }
-                        }
-                        let find_target = |targets: &[BasicBlock]| match targets {
-                            [] => panic!(),
-                            [bb] => *bb,
-                            _ => {
-                                let mut targets: Vec<_> = targets
-                                    .iter()
-                                    .map(|bb| {
-                                        let term = body.basic_blocks[*bb].terminator();
-                                        if let TerminatorKind::Goto { target } = term.kind {
-                                            vec![*bb, target]
-                                        } else {
-                                            vec![*bb]
-                                        }
-                                    })
-                                    .collect();
-                                let mut target = targets.pop().unwrap();
-                                for target1 in targets {
-                                    target.retain(|bb| target1.contains(bb));
-                                }
-                                target[0]
-                            }
-                        };
-                        (find_target(&true_targets), find_target(&false_targets))
-                    };
-                assert_ne!(true_target, false_target);
+                    (find_target(&true_targets), find_target(&false_targets));
+                if true_target == false_target {
+                    ctx.mapping_error("MIR branch entries are identical", expr.span.into());
+                }
                 let if_blocks = IfBlocks {
                     true_entry: true_target,
                     false_entry: false_target,
@@ -756,7 +751,7 @@ struct Assign<'a, 'tcx> {
     ty: Ty<'tcx>,
     rvalue: &'a Rvalue<'tcx>,
     loc: Location,
-    span: LoHi,
+    span: SpanKey,
 }
 
 struct Ctx<'a, 'tcx> {
@@ -764,8 +759,8 @@ struct Ctx<'a, 'tcx> {
     thir: &'a Thir<'tcx>,
     body: &'a Body<'tcx>,
     verbose: bool,
-    stmt_span_to_locs: FxHashMap<LoHi, Locations>,
-    term_span_to_locs: FxHashMap<LoHi, Locations>,
+    stmt_span_to_locs: FxHashMap<SpanKey, Locations>,
+    term_span_to_locs: FxHashMap<SpanKey, Locations>,
 
     /// Rhs expression to the corresponding MIR assignment statement.
     rhs_to_assigns: FxHashMap<ExprId, Assign<'a, 'tcx>>,
@@ -793,7 +788,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
     fn find_locations<P: Fn(Location) -> bool>(
         &self,
         expr_id: ExprId,
-        span_to_locs: &FxHashMap<LoHi, Locations>,
+        span_to_locs: &FxHashMap<SpanKey, Locations>,
         pred: P,
     ) -> Option<Locations> {
         let expr = &self.thir[expr_id];
@@ -857,16 +852,33 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         }
     }
 
-    fn find_switch_int(&self, expr_id: ExprId) -> Option<&'a SwitchTargets> {
-        let loc = self.find_term_location(expr_id, true, |k| {
-            matches!(k, TerminatorKind::SwitchInt { .. })
-        })?;
-        let term = self.get_terminator(loc);
+    fn find_condition_targets(&self, expr_id: ExprId) -> (BasicBlock, BasicBlock) {
+        if let ExprKind::Let { pat, .. } = &self.thir[expr_id].kind {
+            // Pattern tests use the pattern span, including inside let chains.
+            let span = pat.span.into();
+            let targets = self.find_switch_int_by_span(span).unwrap_or_else(|| {
+                self.mapping_error("missing MIR SwitchInt for if-let pattern", span)
+            });
+            return (targets.iter().next().unwrap().1, targets.otherwise());
+        }
+        let locs = self
+            .find_term_locations(expr_id, |k| matches!(k, TerminatorKind::SwitchInt { .. }))
+            .unwrap_or_default();
+        let [loc] = &locs[..] else {
+            self.mapping_error(
+                &format!(
+                    "expected one MIR SwitchInt for if condition, found {}",
+                    locs.len()
+                ),
+                self.thir[expr_id].span.into(),
+            );
+        };
+        let term = self.get_terminator(*loc);
         let TerminatorKind::SwitchInt { targets, .. } = &term.kind else { panic!() };
-        Some(targets)
+        (targets.otherwise(), targets.target_for_value(0))
     }
 
-    fn find_switch_int_by_span(&self, span: LoHi) -> Option<&'a SwitchTargets> {
+    fn find_switch_int_by_span(&self, span: SpanKey) -> Option<&'a SwitchTargets> {
         let locs = self.term_span_to_locs.get(&span)?;
         for loc in locs {
             let term = self.get_terminator(*loc);
@@ -931,7 +943,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         &mut self,
         expr_id: ExprId,
         pred: P,
-    ) -> Result<(), LoHi> {
+    ) -> Result<(), SpanKey> {
         let expr = &self.thir[expr_id];
         if let Some(loc) = self.find_rvalue_location(expr_id, &pred) {
             self.thir_to_mir
@@ -961,7 +973,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
     fn find_assign_location(
         &self,
         ty: Ty<'tcx>,
-        span: LoHi,
+        span: SpanKey,
         allow_checks: bool,
     ) -> Option<Assign<'a, 'tcx>> {
         let locs = self.stmt_span_to_locs.get(&span)?;
@@ -1012,7 +1024,7 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
         bbs
     }
 
-    fn write_debug<W: std::io::Write>(&self, mut w: W, msg: &str, span: LoHi) {
+    fn write_debug<W: std::io::Write>(&self, mut w: W, msg: &str, span: SpanKey) {
         writeln!(w, "{msg} {span:?}").unwrap();
         if let Some(locs) = self.stmt_span_to_locs.get(&span) {
             for loc in locs {
@@ -1029,18 +1041,23 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
     }
 
     #[inline]
-    fn print_debug(&self, msg: &str, span: LoHi) {
+    fn print_debug(&self, msg: &str, span: SpanKey) {
         if self.verbose {
             self.write_debug(std::io::stdout(), msg, span);
         }
     }
 
-    #[allow(unused)]
-    #[inline]
-    fn mk_debug_str(&self, msg: &str, span: LoHi) -> String {
+    fn mapping_error(&self, msg: &str, span: SpanKey) -> ! {
         let mut v = vec![];
-        self.write_debug(&mut v, msg, span);
-        String::from_utf8(v).unwrap()
+        self.write_debug(&mut v, "MIR candidates", span);
+        self.tcx.dcx().span_fatal(
+            Span::from(span),
+            format!(
+                "THIR-to-MIR mapping failed in `{}`: {msg}\n{}",
+                self.tcx.def_path_str(self.body.source.def_id()),
+                String::from_utf8(v).unwrap(),
+            ),
+        )
     }
 }
 
@@ -1095,30 +1112,33 @@ impl<'a, 'tcx> TVisitor<'a, 'tcx> for ExprVisitor<'a, 'tcx> {
     }
 }
 
+// Separate macro expansions can share byte positions but have different contexts.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct LoHi {
+struct SpanKey {
     lo: BytePos,
     hi: BytePos,
+    ctxt: SyntaxContext,
 }
 
-impl From<Span> for LoHi {
+impl From<Span> for SpanKey {
     #[inline]
     fn from(span: Span) -> Self {
         Self {
             lo: span.lo(),
             hi: span.hi(),
+            ctxt: span.ctxt(),
         }
     }
 }
 
-impl From<LoHi> for Span {
+impl From<SpanKey> for Span {
     #[inline]
-    fn from(lohi: LoHi) -> Self {
-        Self::with_root_ctxt(lohi.lo, lohi.hi)
+    fn from(span: SpanKey) -> Self {
+        Self::with_root_ctxt(span.lo, span.hi).with_ctxt(span.ctxt)
     }
 }
 
-impl std::fmt::Debug for LoHi {
+impl std::fmt::Debug for SpanKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let span: Span = (*self).into();
         span.fmt(f)
