@@ -366,6 +366,187 @@ fn test_thir_to_mir_valued_break() {
 }
 
 #[test]
+fn test_thir_to_mir_repeated_assertions() {
+    for assertion in [
+        "::core::assert_eq!(x, y)",
+        "::core::assert_ne!(x, y)",
+        "::core::assert_eq!(x, y, \"values: {x} and {y}\")",
+    ] {
+        let code = format!("fn f(x: i32, y: i32) {{ {assertion}; {assertion}; }}");
+        compilation::run_compiler_on_str(&code, |tcx| {
+            let def_id = tcx
+                .hir_body_owners()
+                .find(|def_id| tcx.item_name(def_id.to_def_id()).as_str() == "f")
+                .unwrap();
+            let (thir, _) = tcx.thir_body(def_id).unwrap();
+            let thir = thir.borrow();
+            let spans = thir
+                .exprs
+                .iter()
+                .filter(|expr| matches!(expr.kind, rustc_middle::thir::ExprKind::If { .. }))
+                .map(|expr| expr.span)
+                .collect::<Vec<_>>();
+            assert_eq!(spans.len(), 2);
+            assert_eq!(
+                (spans[0].lo(), spans[0].hi()),
+                (spans[1].lo(), spans[1].hi())
+            );
+            assert_ne!(spans[0].ctxt(), spans[1].ctxt());
+            let mapping = map_thir_to_mir(def_id, false, tcx);
+            let branches = mapping.if_to_bbs.values().collect::<Vec<_>>();
+            assert_eq!(branches.len(), 2);
+            assert_ne!(branches[0].true_entry, branches[1].true_entry);
+            assert_ne!(branches[0].false_entry, branches[1].false_entry);
+            let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+            for branch in branches {
+                assert!(branch.true_blocks.iter().any(|bb| {
+                    let terminator = body.basic_blocks[*bb].terminator();
+                    let rustc_middle::mir::TerminatorKind::Call { func, .. } = &terminator.kind
+                    else {
+                        return false;
+                    };
+                    let rustc_middle::ty::FnDef(callee, _) = func.ty(&body.local_decls, tcx).kind()
+                    else {
+                        return false;
+                    };
+                    tcx.item_name(*callee).as_str() == "assert_failed"
+                }));
+            }
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn test_thir_to_mir_repeated_macro_branches() {
+    for code in [
+        r#"
+        macro_rules! choose {
+            ($x:expr, $y:expr, $z:expr) => {{
+                let (x, y, z) = ($x, $y, $z);
+                if !x && (y || z) { 1 } else { 2 }
+            }};
+        }
+        fn f(x: bool, y: bool, z: bool) -> i32 { choose!(x, y, z) + choose!(x, y, z) }
+        "#,
+        r#"
+        macro_rules! choose {
+            ($x:expr, $y:expr) => {{
+                let (x, y) = ($x, $y);
+                if x && y { 1 } else { loop {} }
+            }};
+        }
+        fn f(x: bool, y: bool) -> i32 { choose!(x, y) + choose!(x, y) }
+        "#,
+        r#"
+        macro_rules! choose {
+            ($value:expr) => {{
+                if let Some(value) = $value { value } else { 0 }
+            }};
+        }
+        fn f(value: Option<i32>) -> i32 { choose!(value) + choose!(value) }
+        "#,
+        r#"
+        #![feature(let_chains)]
+        macro_rules! choose {
+            ($value:expr) => {{
+                if let Some(value) = $value && !value.is_empty() { value.len() } else { 0 }
+            }};
+        }
+        fn f(value: Option<String>) -> usize { choose!(value.clone()) + choose!(value) }
+        "#,
+        r#"
+        #![feature(let_chains)]
+        macro_rules! choose {
+            ($first:expr, $second:expr) => {{
+                if let Some(first) = $first && let Some(second) = $second {
+                    first.len() + second.len()
+                } else { 0 }
+            }};
+        }
+        fn f(first: Option<String>, second: Option<String>) -> usize {
+            choose!(first.clone(), second.clone()) + choose!(first, second)
+        }
+        "#,
+        r#"
+        macro_rules! choose {
+            ($value:expr) => {{
+                if let Some((true, value)) = $value { value } else { 0 }
+            }};
+        }
+        fn f(value: Option<(bool, i32)>) -> i32 { choose!(value) + choose!(value) }
+        "#,
+        r#"
+        #![feature(let_chains)]
+        macro_rules! choose {
+            ($value:expr) => {{
+                if let Some(value) = $value && value > 0 { value } else { 0 }
+            }};
+        }
+        fn f(value: Option<i32>) -> i32 { choose!(value) + choose!(value) }
+        "#,
+    ] {
+        compilation::run_compiler_on_str(code, |tcx| {
+            let def_id = tcx
+                .hir_body_owners()
+                .find(|def_id| tcx.item_name(def_id.to_def_id()).as_str() == "f")
+                .unwrap();
+            let mapping = map_thir_to_mir(def_id, false, tcx);
+            let branches = mapping.if_to_bbs.values().collect::<Vec<_>>();
+            assert_eq!(branches.len(), 2);
+            assert_ne!(branches[0].true_entry, branches[1].true_entry);
+            assert_ne!(branches[0].false_entry, branches[1].false_entry);
+            for branch in branches {
+                assert_ne!(branch.true_entry, branch.false_entry);
+                assert!(branch.true_blocks.is_disjoint(&branch.false_blocks));
+            }
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn test_thir_to_mir_unresolved_condition_is_compiler_error() {
+    for (code, expected_switches) in [
+        (
+            r#"
+        macro_rules! twice {
+            ($flag:expr) => {{ if $flag { 1 } else { 2 }; if $flag { 3 } else { 4 }; }};
+        }
+        fn f(flag: bool) { twice!(flag); }
+        "#,
+            2,
+        ),
+        ("fn f() -> i32 { if { return 1; } { 2 } else { 3 } }", 0),
+    ] {
+        let result = compilation::run_compiler_on_str(code, |tcx| {
+            let def_id = tcx
+                .hir_body_owners()
+                .find(|def_id| tcx.item_name(def_id.to_def_id()).as_str() == "f")
+                .unwrap();
+            let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+            let switches = body
+                .basic_blocks
+                .iter()
+                .filter(|data| {
+                    matches!(
+                        data.terminator().kind,
+                        rustc_middle::mir::TerminatorKind::SwitchInt { .. }
+                    )
+                })
+                .map(|data| data.terminator().source_info.span)
+                .collect::<Vec<_>>();
+            assert_eq!(switches.len(), expected_switches);
+            if let [first, second] = &switches[..] {
+                assert_eq!(first, second);
+            }
+            map_thir_to_mir(def_id, false, tcx);
+        });
+        assert!(result.is_err());
+    }
+}
+
+#[test]
 fn test_expr_match() {
     run_test(
         "

@@ -203,6 +203,61 @@ fn installed_candidate_type_checks(candidate: &str) -> bool {
 }
 
 #[test]
+fn hash_map_assertions_generate_skeleton() {
+    let source = r#"
+pub mod src {
+    pub mod lib {
+        use std::collections::HashMap;
+        #[no_mangle]
+        pub unsafe extern "C" fn hm_geti(num: i32) {
+            let mut intmap = HashMap::new();
+            ::core::assert_eq!(intmap.get(&1).copied().unwrap_or(-2), -2);
+            ::core::assert_eq!(intmap.get(&1).copied().unwrap_or(-2), -2);
+            let mut i = 0;
+            while i < num { intmap.insert(i, i * 5); i += 2; }
+            i = 0;
+            while i < num {
+                ::core::assert_eq!(intmap.get(&i).copied().unwrap_or(-2),
+                    if i & 1 != 0 { -2 } else { i * 5 });
+                i += 1;
+            }
+            i = 0;
+            while i < num { intmap.insert(i, i * 3); i += 2; }
+            i = 0;
+            while i < num {
+                ::core::assert_eq!(intmap.get(&i).copied().unwrap_or(-2),
+                    if i & 1 != 0 { -2 } else { i * 3 });
+                i += 1;
+            }
+            i = 2;
+            while i < num { intmap.remove(&i); i += 4; }
+            i = 0;
+            while i < num {
+                ::core::assert_eq!(intmap.get(&i).copied().unwrap_or(-2),
+                    if i & 3 != 0 { -2 } else { i * 3 });
+                i += 1;
+            }
+            i = 0;
+            while i < num { intmap.remove(&i); i += 1; }
+            i = 0;
+            while i < num {
+                ::core::assert_eq!(intmap.get(&i).copied().unwrap_or(-2), -2);
+                i += 1;
+            }
+            let mut intmap = HashMap::new();
+            i = 0;
+            while i < num { intmap.insert(i, i * 3); i += 2; }
+        }
+    }
+}
+"#;
+    let records = generate(source);
+    let record = function(&records, "src::lib::hm_geti");
+    assert!(record.annotated_source.contains("assert_eq!"));
+    assert!(!record.baseline.skeleton.is_empty());
+}
+
+#[test]
 fn supported_printf_builds_mechanical_and_rule_complete_views() {
     let no_arguments = r#"
 unsafe extern "C" { fn printf(format: *const i8, ...) -> i32; }
