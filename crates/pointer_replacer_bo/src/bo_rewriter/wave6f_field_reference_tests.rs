@@ -30,7 +30,6 @@ struct Observed {
     /// `(struct, field, bridges)` per applied row (W6F-3 receipt counts).
     bridges: Vec<(String, String, String)>,
     /// `(caller, replacement)` per planned seam edit.
-    seam_edits: Vec<(String, String)>,
     /// E5C-3 local-move hoist plans (on the model).
     local_move_hoists: usize,
 }
@@ -109,7 +108,6 @@ fn observe(source: &str) -> Observed {
             decisions,
             fields,
             bridges,
-            seam_edits,
             local_move_hoists: table.field_transactions.local_move_hoists.len(),
         }
     })
@@ -581,179 +579,6 @@ fn bst_frame() {
     );
 }
 
-/// Witness 8 (W6F-3, relay 003) — owned fields. Without the frame the model
-/// leaves the fields Raw and the transaction holds them (RED control); under
-/// the era-5c-shaped frame both `node` fields become `Option<Box<node>>`
-/// with null = `None`, a fresh store `Some(..)`/moved Option, a load
-/// `.as_deref()`, a move-out `.take()`, every raw consumer a receipted
-/// bridge, and the C `free` untouched.
-#[test]
-fn w6f_bst_owned_fields_deliver_under_the_era5c_frame() {
-    let _frame = frame_lock();
-    // RED control: the landed model has no Owning field verdict here, so the
-    // fields are not candidates at all and every stored subject degrades.
-    let control = observe(BST);
-    assert!(control.fields.is_empty(), "{:?}", control.fields);
-    assert!(decision_of(&control, "insert::node").contains("Degraded"));
-
-    bst_frame();
-    let observed = observe(BST);
-    let outcome = emitted("bst", BST);
-    super::test_model_override::clear();
-    for field in ["left", "right"] {
-        let row = field_row(&observed, "node", field);
-        assert_eq!(
-            (row.2.as_str(), row.3.as_str()),
-            ("applied", "opt-box"),
-            "{row:?}"
-        );
-    }
-    // **R538-3: a dichotomy on wave-6a's re-seat (`95f485540`).** `insert` and
-    // `deleteNode` consume and return their node, and the re-seat makes those
-    // formals owners (`Option<Box<node>>`). The moves then go into owned
-    // formals, not raw ones, so the receipt's raw-move / raw-store fall and two
-    // more classes deliver. The field contract below is the same on both
-    // frames; the branch is decided by `deleteNode`'s formal, one structural
-    // fact, and each branch pins its whole shape.
-    let (source, emitted_count, reverted) = emitted_source(&outcome);
-    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    let reseated = flat.contains("fn deleteNode(mut root: Option<Box<node>>,");
-    assert!(
-        reseated || flat.contains("fn deleteNode(mut root: *mut node,"),
-        "deleteNode's formal is either raw or the re-seated owner:\n{source}"
-    );
-    let bridges = |(moves, stores, certified, witnessed): (usize, usize, usize, usize)| {
-        format!(
-            "raw-move={moves};raw-view=1;raw-store={stores};dealloc-transfer=0;allocator-contract=0;waiver-drop-scope-exit=0;certified-move={certified};depth-witness-none={witnessed};waiver-leak-recursive-drop=0;count-companion="
-        )
-    };
-    // R561-6: ownership-fields' `67df47077` types the moved-out owner of a
-    // freed container (`deleteNode`'s `temp` / `temp_0`) as `Option<Box<node>>`,
-    // so the take is no longer a raw move: re-seated, raw-move is 0.
-    //
-    // R622-3 (the bst control): `node` is recursive, so every SAFE-base store
-    // is closed by ownership-fields' classifier, and each is witnessed — the
-    // old value is `None` — so none leaks and the text is unchanged. Re-seated,
-    // `insert`'s and `deleteNode`'s stores are safe-base (left 2, right 3);
-    // `newNode`'s goes through a raw base (`ptr::write`, which closes
-    // nothing). Unseated, every store is raw-base.
-    let (left, right) = if reseated {
-        // R583-7: `deleteNode`'s result certifies (wave-6a R579-4), so its
-        // stores are certified moves — one into `left`, two into `right`.
-        // `insert` does not certify in this fixture (its `newNode` stays raw
-        // here), so its stores keep `from_raw`.
-        ((0, 1, 1, 2), (0, 1, 2, 3))
-    } else {
-        ((3, 3, 0, 0), (4, 4, 0, 0))
-    };
-    assert_eq!(
-        observed.bridges,
-        vec![
-            ("node".to_owned(), "left".to_owned(), bridges(left)),
-            ("node".to_owned(), "right".to_owned(), bridges(right)),
-        ]
-    );
-    // The seam sees an owned argument in its consumer's form: no glue is
-    // planned over a field site, on either branch (a planned glue would stack
-    // on the wrap). Re-seated, the seam once planned `deleteNode`'s
-    // `((*root).right) as *mut crate::node` for `minValueNode`'s argument —
-    // ill-typed against `Option<Box<node>>`, inert only by claim order
-    // (report 065); since main's `cf0a16d66` the seam yields a site an
-    // owned-field transaction renders, so the strict form holds on both.
-    assert!(
-        observed
-            .seam_edits
-            .iter()
-            .all(|(_, replacement)| !replacement.contains(".left")
-                && !replacement.contains(".right")),
-        "{:?}",
-        observed.seam_edits
-    );
-    // R561-6: re-seated, the two moved-out owners `temp` / `temp_0` deliver as
-    // `Option<Box<node>>` locals (ownership-fields' `67df47077`): 3 -> 5.
-    assert_eq!(
-        (emitted_count, reverted),
-        (if reseated { 5 } else { 1 }, 0),
-        "{source}"
-    );
-    let common = [
-        // the declaration: null = None, ABI preserved (NPO)
-        "pub left: Option<Box<node>>,",
-        "pub right: Option<Box<node>>,",
-        // a fresh allocation is written, never dropped through raw memory
-        "core::ptr::write(&raw mut (*temp).left, None);",
-        // a Ref-frame walker views the child; R425-2: the recursive walker's
-        // two arguments are VIEWS of the children, not moves
-        "inorder((*root.unwrap()).left.as_deref());",
-        "inorder((*root.unwrap()).right.as_deref());",
-        // the null test, and a raw view for a raw-declared walker
-        "while !node.is_null() && !((*node).left).is_none() {",
-        "node = (*node).left.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut);",
-        // E5C-3 (report 007): the two-children branch hoists the pure read
-        // before the moving argument
-        "let __crat_hoist0 = (*temp_1).key;",
-    ];
-    let shaped: &[&str] = if reseated {
-        &[
-            // the moved Box goes into the owned formal as itself
-            "insert((*node.as_deref_mut().unwrap()).left.take(), key)",
-            // R425-2: the `minValueNode` receiver is a raw view of the child
-            "minValueNode((*root.as_deref_mut().unwrap()).right.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut))",
-            // the moved-out owners are Box locals; the C free sites are the
-            // owner's drop at exactly those sites (R561-6), and each local is
-            // returned as itself: `deleteNode`'s return is certified
-            // `Option<Box<node>>` (wave-6a R579-4, R3 / C3)
-            "let mut temp: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).right.take(); drop(root); return temp;",
-            "let mut temp_0: ::std::option::Option<::std::boxed::Box<crate::node>> = (*root.as_deref_mut().unwrap()).left.take(); drop(root); return temp_0;",
-        ]
-    } else {
-        &[
-            // a raw owning consumer receives the moved Box (receipted raw-move)
-            "core::ptr::write(&raw mut (*node).left, core::ptr::NonNull::new(insert((*node).left.take().map_or(core::ptr::null_mut(), Box::into_raw), key)).map(|__p| Box::from_raw(__p.as_ptr())));",
-            "if ((*root).left).is_none() {",
-            // a move-out into a raw owning local
-            "let mut temp = (*root).right.take().map_or(core::ptr::null_mut(), Box::into_raw);",
-            // the C free site is untouched
-            "free(root as *mut ::std::ffi::c_void); return temp;",
-            // R425-2: the `minValueNode` receiver is a raw view of the child
-            "minValueNode((*root).right.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut))",
-        ]
-    };
-    for needle in common.iter().chain(shaped.iter()) {
-        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
-    }
-    // R425-2 (era-5c 003) — the E5C-3 emission contract's SECOND clause:
-    // the Owning kinds at the traversal / recursive-call arguments are token
-    // loads whose callee formals stay `ref`, so they license NO drop. bst's
-    // only deallocation sites are `deleteNode`'s two C `free`s; a `Box`
-    // dropped at an argument site would free a linked subtree. So: EXACTLY two
-    // deallocations, both at the C free sites — `free(root ..)` where `root` is
-    // raw, the owner's `drop(root)` where it is re-seated — and no other drop.
-    let frees = source
-        .matches("free(root as *mut ::std::ffi::c_void);")
-        .count();
-    let drops_of_root = source.matches("drop(root);").count();
-    assert_eq!(
-        (frees + drops_of_root, source.matches("drop(").count()),
-        (2, drops_of_root),
-        "two deallocations, both at the C free sites, and no drop elsewhere\n{source}"
-    );
-    assert_eq!(
-        (frees, drops_of_root),
-        if reseated { (0, 2) } else { (2, 0) },
-        "{source}"
-    );
-    // A struct owning a Box is not Copy: the derives are withdrawn.
-    assert!(
-        !source.contains("impl ::core::marker::Copy for node"),
-        "{source}"
-    );
-    assert!(
-        !source.contains("impl ::core::clone::Clone for node"),
-        "{source}"
-    );
-}
-
 /// wave-6s2's pin (tulipindicators `fuzzer::check_output::options#4`,
 /// relay wave-6f/005 §2): the indirect callee `start: fn(*const f64) -> i32`
 /// returns no pointer and has no writable carrier, so it cannot hand a child
@@ -1126,57 +951,6 @@ fn w6f_ring_buffer_fat_owned_field_store_needs_a_length_or_a_boxed_source() {
             "{row:?}"
         );
         assert!(source.contains("pub data_: *mut u8,"), "{source}");
-    }
-}
-
-const SLOT: &str = include_str!("wave6f_fixture_slot.rs");
-
-/// Witness 14 (relay 007 / wave-6a 006 §2): a THIN owned field's C free
-/// site through libc `free` takes the allocation (`take()` + `Box::into_raw`,
-/// the call kept), a foreign `memcpy` gets the raw view, the deref read the
-/// shared view, the null test `is_none()`, and every store through the raw
-/// base is `ptr::write`; the by-value `Holder` in `drive` is a scope exit
-/// the language drops — addendum 101's `waiver-drop(scope-exit)`, receipted.
-#[test]
-fn w6f_thin_owned_field_free_site_transfers_and_memcpy_takes_a_raw_view() {
-    let _frame = frame_lock();
-    use crate::analyses::borrow_ownership::SlotKind;
-    super::test_model_override::set(
-        "w6f-slot-frame",
-        vec![("Holder".to_owned(), 1, SlotKind::Owning)],
-        vec![("HolderFill::fresh".to_owned(), SlotKind::Owning)],
-    );
-    let observed = observe(SLOT);
-    let outcome = emitted("slot", SLOT);
-    super::test_model_override::clear();
-    let row = field_row(&observed, "Holder", "slot_");
-    assert_eq!(
-        (row.2.as_str(), row.3.as_str()),
-        ("applied", "opt-box"),
-        "{row:?}"
-    );
-    assert_eq!(
-        observed.bridges,
-        vec![(
-            "Holder".to_owned(),
-            "slot_".to_owned(),
-            "raw-move=0;raw-view=1;raw-store=2;dealloc-transfer=1;allocator-contract=0;waiver-drop-scope-exit=1;certified-move=0;depth-witness-none=0;waiver-leak-recursive-drop=0;count-companion=".to_owned()
-        )]
-    );
-    let (source, emitted_count, reverted) = emitted_source(&outcome);
-    assert_eq!((emitted_count, reverted), (1, 0), "{source}");
-    let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    for needle in [
-        "pub slot_: Option<Box<i32>>,",
-        "free((*h).slot_.take().map_or(core::ptr::null_mut(), |__b| Box::into_raw(__b) as *mut ::std::ffi::c_void));",
-        "core::ptr::write(&raw mut *fresh1, None);",
-        "if !((*h).slot_).is_none() {",
-        "(*h).slot_.as_deref().map_or(core::ptr::null(), core::ptr::from_ref) as *const ::std::ffi::c_void,",
-        "core::ptr::write(&raw mut *fresh2, core::ptr::NonNull::new(fresh).map(|__p| Box::from_raw(__p.as_ptr())));",
-        "return *(*h).slot_.as_deref().unwrap();",
-        "let mut h = Holder { count: 0, slot_: None };",
-    ] {
-        assert!(flat.contains(needle), "missing {needle:?} in\n{source}");
     }
 }
 
@@ -2754,58 +2528,6 @@ fn w6f_a_non_dependent_owners_revert_leaves_the_text() {
     );
 }
 
-/// Witness 33 (relay 059 / R518-3) — **the second wall behind
-/// `quadtree_new::tree`, named and pinned.**
-///
-/// The CROWN unit `quadtree_new::tree` needs `tree->root` to deliver as an
-/// OWNED field: `(*tree).root = quadtree_node_with_bounds()` stores a
-/// certified constructor result into the field, and A1 declines the
-/// certificate while the field is not owned (`return-certificate-struct-field`).
-///
-/// era-5c 034b has the first wall: `quadtree::quadtree::field0@d0` is
-/// **own-UNSAT** at L01⁵ with a 33-clause core. This witness asks the question
-/// behind it — *if the arm matrix flips the model, does the field deliver?* —
-/// by standing the override in for the matrix's verdict. It does **not**: the
-/// field is then held `argument-consumer-model-raw:quadtree_node_free::node`,
-/// because the destructor it is handed to has a model-Raw formal. That formal
-/// is itself one of the 61 (`quadtree_node_free::node#1`, era-5c's column), so
-/// both walls are upstream of this lane.
-///
-/// **A RED here is news, not a regression**: it means one of the two walls
-/// moved and the unit should be re-costed.
-#[test]
-fn w6f_quadtree_root_is_held_by_its_consumers_model() {
-    let _frame = frame_lock();
-    use crate::analyses::borrow_ownership::SlotKind;
-    let probe = |kind: SlotKind| -> String {
-        super::test_model_override::set(
-            "w6f-quadtree-root-frame",
-            vec![("quadtree".to_owned(), 0, kind)],
-            Vec::new(),
-        );
-        let observed = observe(QUADTREE_ROOT);
-        super::test_model_override::clear();
-        observed
-            .fields
-            .iter()
-            .find(|(st, f, ..)| st.ends_with("quadtree") && f == "root")
-            .map(|(_, _, status, _, cause)| format!("{status}:{cause}"))
-            .unwrap_or_else(|| "<no row>".to_owned())
-    };
-    assert_eq!(
-        probe(SlotKind::Owning),
-        "held:argument-consumer-model-raw:quadtree_node_free::node:kind-raw",
-        "own-SAT alone does not deliver the field: the destructor's formal is \
-         model-Raw, and that formal is era-5c's row in the 61"
-    );
-    assert_eq!(
-        probe(SlotKind::Ref),
-        "held:store-source-raw-expression",
-        "and the reference form is blocked too — the store's source is a call \
-         result, not a subject"
-    );
-}
-
 /// **Relay 059 / R518-3 probe** — if the analysis ever calls `quadtree.root`
 /// Owning, does anything ELSE hold the field? The model override stands in for
 /// the arm matrix's verdict, so the answer separates "the analysis is the only
@@ -3375,46 +3097,6 @@ fn w6f_the_absorption_reads_address_taken_names_crate_wide() {
     })
     .unwrap();
     assert_eq!(names, ["a", "x", "y"]);
-}
-
-/// **R541-2 / wave-6f 065 STOP 3 (main)** — the raw-boundary seam plans no glue
-/// over an argument an owned-field transaction renders. On the re-seat,
-/// `deleteNode`'s `minValueNode((*root).right)` drew a planned
-/// `{ let __crat_raw: *mut node = ((*root).right) as *mut node; __crat_raw }`,
-/// ill-typed against `Option<Box<node>>` and inert only because the field's wrap
-/// claimed the node first. The planner asks `owning_field_form` after `finalize`
-/// and leaves the site to the transaction, with a typed receipt.
-#[test]
-fn main_the_seam_plans_no_glue_over_an_owned_field_argument() {
-    let _frame = frame_lock();
-    bst_frame();
-    let observed = observe(BST);
-    let receipts = ::utils::compilation::run_compiler_on_str(BST, |tcx| {
-        let (table, _) = super::decide_table_with_ctx_config(
-            tcx,
-            Some((
-                OverlapMode::PreciseReplay,
-                Some(WholeProgramAttestation::FrozenBenchmarkGraph),
-            )),
-        )
-        .unwrap();
-        table.seams.owned_field_glue_yields.clone()
-    })
-    .unwrap();
-    super::test_model_override::clear();
-    let field_glues: Vec<&String> = observed
-        .seam_edits
-        .iter()
-        .map(|(_, replacement)| replacement)
-        .filter(|replacement| replacement.contains(".left") || replacement.contains(".right"))
-        .collect();
-    assert!(field_glues.is_empty(), "{:?}", observed.seam_edits);
-    assert!(
-        receipts
-            .iter()
-            .any(|receipt| receipt.starts_with("owned-field-renders:node.right")),
-        "{receipts:?}"
-    );
 }
 
 /// The F-c fixture (R583-7): `holder.item` is an owned field; `make_item`

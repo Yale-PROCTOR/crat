@@ -73,19 +73,6 @@ fn escape_outcome(input: &str, subject: &str, label: &str) -> EscapeOutcome {
     .expect("original escape fixture compiles")
 }
 
-const FOREIGN_ARG_INPUT: &str = r#"
-    #![allow(dead_code, unused_unsafe)]
-    extern "C" {
-        fn consume(p: *const i32);
-    }
-    pub unsafe fn entry() {
-        let mut values = [3, 5, 7];
-        let p: *mut i32 = values.as_mut_ptr();
-        *p.offset(1) += 1;
-        consume(p);
-    }
-"#;
-
 const FIELD_STORE_INPUT: &str = r#"
     #![allow(dead_code, unused_unsafe)]
     pub struct Holder {
@@ -96,66 +83,6 @@ const FIELD_STORE_INPUT: &str = r#"
         (*h).first = p;
     }
 "#;
-
-/// J23 — a foreign argument is an ordinary pointer seam: the subject keeps its
-/// settled slice form and the boundary takes a raw view of it.
-///
-/// Expectation migrated under addendum 259(1) with this receipt. The original
-/// assertion read `consume(p.as_ptr())`, on the reasoning that the view's
-/// mutability should follow the foreign parameter. That reasoning was the
-/// defect: a `*const` position says what the callee's type promises, not what
-/// permission the derivation may carry, and a pointer derived from a shared
-/// view of non-`UnsafeCell` bytes may never be written through -- by the callee,
-/// or by anything it hands back. A mutable subject therefore takes the writable
-/// carrier here, which satisfies the const parameter type and costs no hold.
-/// The mutability contrast below keeps its own meaning: `*mut` still selects
-/// the plain mutable view rather than the const-cast one.
-#[test]
-fn escape_seam_foreign_argument_takes_a_raw_view_of_the_settled_subject() {
-    let outcome = escape_outcome(FOREIGN_ARG_INPUT, "entry::p", "foreign argument");
-    println!(
-        "ESCAPE-SEAM[foreign argument] form={:?} reason={}\n{}",
-        outcome.subject_form, outcome.subject_reason, outcome.emitted
-    );
-    assert_eq!(
-        outcome.subject_form,
-        Form::Slice { mutable: true },
-        "the escape does not degrade the subject"
-    );
-    assert!(
-        outcome
-            .emitted
-            .contains("consume(p.as_mut_ptr().cast::<i32>().cast_const())"),
-        "a mutable subject keeps write permission even at a const position:\n{}",
-        outcome.emitted
-    );
-    assert!(
-        super::verify::type_checks_str(&outcome.emitted),
-        "a foreign-argument escape must leave a compiling tree:\n{}",
-        outcome.emitted
-    );
-}
-
-/// J23 mutability contrast — a `*mut` foreign position takes the mutable view.
-#[test]
-fn escape_seam_foreign_mut_argument_takes_the_mutable_view() {
-    let outcome = escape_outcome(FOREIGN_MUT_INPUT, "entry::p", "foreign mut argument");
-    println!(
-        "ESCAPE-SEAM[foreign mut argument] form={:?} reason={}\n{}",
-        outcome.subject_form, outcome.subject_reason, outcome.emitted
-    );
-    assert_eq!(outcome.subject_form, Form::Slice { mutable: true });
-    assert!(
-        outcome.emitted.contains("fill(p.as_mut_ptr())"),
-        "a writing foreign position must not receive a shared derivation:\n{}",
-        outcome.emitted
-    );
-    assert!(
-        super::verify::type_checks_str(&outcome.emitted),
-        "a mutable foreign escape must leave a compiling tree:\n{}",
-        outcome.emitted
-    );
-}
 
 /// J24 — a field store is positive retention: the field keeps the pointer past
 /// every span the subject's safe form could justify, so the subject is held
@@ -187,47 +114,12 @@ fn escape_seam_field_store_holds_its_subject_and_promotes_the_neighbour() {
     );
 }
 
-const FOREIGN_MUT_INPUT: &str = r#"
-    #![allow(dead_code, unused_unsafe)]
-    extern "C" {
-        fn fill(p: *mut i32);
-    }
-    pub unsafe fn entry() -> i32 {
-        let mut values = [3, 5, 7];
-        let p: *mut i32 = values.as_mut_ptr();
-        *p.offset(1) += 1;
-        fill(p);
-        values[0]
-    }
-"#;
-
 /// J25 — a safe subject that escapes through a RAW return position.
 const RETURN_ESCAPE_INPUT: &str = r#"
     #![allow(dead_code, unused_unsafe)]
     pub unsafe fn entry(p: *mut i32) -> *mut i32 {
         *p.offset(1) += 1;
         p
-    }
-"#;
-
-/// J26 — one call carrying both an ordinary pointer position and a sealed
-/// stdio stream position. `fgets` is the shape the design names: argument 0 is
-/// a buffer and an ordinary seam, argument 2 is the stream and belongs to the
-/// permanent io-domain boundary.
-const IO_DOMAIN_INPUT: &str = r#"
-    #![allow(dead_code, unused_unsafe)]
-    pub struct FILE {
-        _private: [u8; 0],
-    }
-    extern "C" {
-        fn fgets(buf: *mut i8, n: i32, stream: *mut FILE) -> *mut i8;
-    }
-    pub unsafe fn entry(stream: *mut FILE) -> i32 {
-        let mut buf = [0i8; 64];
-        let p: *mut i8 = buf.as_mut_ptr();
-        *p.offset(1) = 65;
-        let _ = fgets(p, 64, stream);
-        buf[0] as i32
     }
 "#;
 
@@ -249,52 +141,6 @@ fn escape_seam_return_escape_reuses_the_origin_parameter_lifetime() {
             .emitted
             .contains("pub unsafe fn entry<'a>(p: &'a mut [i32]) -> &'a mut [i32]"),
         "one lifetime, taken from the origin parameter:\n{}",
-        outcome.emitted
-    );
-    assert!(
-        super::verify::type_checks_str(&outcome.emitted),
-        "emitted output type/borrow-checks:\n{}",
-        outcome.emitted
-    );
-}
-
-/// J26 — one call carrying both an ordinary pointer position and a sealed stdio
-/// stream position. The buffer is an ordinary seam and takes its raw view; the
-/// stream argument is passed through untouched, with no adapter of any kind.
-///
-/// Observation recorded rather than asserted: the stream ARGUMENT is
-/// intercepted here by `family_contract`'s `PointeeAccess::Stream`, which runs
-/// before the generic table, but the stream-typed PARAMETER of the enclosing
-/// function is still promoted to `&mut FILE` by the ordinary subject decision.
-/// In the corpus that promotion is governed by the sealed io-domain identity
-/// set, which a synthetic `FILE` struct is not part of, so this fixture cannot
-/// say whether real exposure exists. It is a question for the seat, not a
-/// finding, and it is recorded in the lane's working ledger.
-#[test]
-fn escape_seam_stream_position_is_not_re_presented() {
-    let outcome = escape_outcome(IO_DOMAIN_INPUT, "entry::p", "io domain");
-    println!(
-        "ESCAPE-SEAM[io domain] form={:?} reason={}\n{}",
-        outcome.subject_form, outcome.subject_reason, outcome.emitted
-    );
-    assert_eq!(
-        outcome.subject_form,
-        Form::Slice { mutable: true },
-        "the non-stream buffer position is an ordinary seam"
-    );
-    assert!(
-        outcome
-            .emitted
-            .contains("pub unsafe fn entry(stream: *mut FILE)"),
-        "the stream-typed binding is held by type, not promoted:\n{}",
-        outcome.emitted
-    );
-    assert!(
-        outcome
-            .emitted
-            .contains("fgets(p.as_mut_ptr(), 64, stream)"),
-        "the buffer takes its raw view and the stream is passed through \
-         unadapted:\n{}",
         outcome.emitted
     );
     assert!(

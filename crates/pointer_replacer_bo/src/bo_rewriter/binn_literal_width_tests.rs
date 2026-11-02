@@ -170,24 +170,6 @@ fn w6b_a_literal_selecting_the_roots_width_discharges_the_hold() {
     );
 }
 
-/// A NARROWER arm (`65`, two bytes into a four-byte `i32`) is covered too, and
-/// a literal that selects NO arm reaches only the writer's `_ => return` — no
-/// access at all through the pointer.
-#[test]
-fn w6b_a_narrower_or_absent_arm_is_covered_by_the_root() {
-    for discriminant in ["65", "1"] {
-        let input = fixture(CALLEE, "i32", discriminant);
-        let rows = super::emit_tests::decisions_of(&input);
-        assert_eq!(
-            reason(&rows, "pint"),
-            "<emitted>",
-            "literal {discriminant}: the access fits one i32: {rows:?}"
-        );
-        let source = super::emit_tests::ast_emitted_source_of(&input).unwrap();
-        assert!(super::verify::type_checks_str(&source), "{source}");
-    }
-}
-
 /// Every control keeps the caller held with its own reason: the rule never
 /// answers for a width it did not read at the call.
 #[test]

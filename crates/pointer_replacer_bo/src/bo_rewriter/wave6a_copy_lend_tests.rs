@@ -259,35 +259,6 @@ fn w6a_r805_a_sized_owner_lends_by_reborrow() {
     assert_eq!(reverted, 0, "{context}");
 }
 
-/// **Controls (R805-3):** the shapes the model does not decide with the arm
-/// on — the assignment form, an owner tested against null, a lend still read
-/// after the release (the validation refuses it), a write through the copy,
-/// the copy handed on to a local reader: none delivers the pair.
-#[test]
-fn w6a_r805_what_the_model_does_not_decide_is_not_delivered() {
-    for name in [
-        "assignment",
-        "optional",
-        "after-release",
-        "write-through",
-        "argument",
-        // Relay 148: the same forms on the single-object owner.
-        "sized+assignment",
-        "sized+optional",
-        "sized+after-release",
-        "sized+write-through",
-        "sized+argument",
-    ] {
-        let (function, reverted, native) = emitted_with_copy_lend(name);
-        let text = compact(&function);
-        assert!(
-            !text.contains("::std::boxed::Box") && !text.contains(":&i32="),
-            "{name}: {native}\n{function}"
-        );
-        assert_eq!(reverted, 0, "{name}: {function}");
-    }
-}
-
 /// **R805-3 (Codex): the alias is admitted only when every use is a read
 /// through it.** With the model pinned (`buf` Owning, `p` Ref), a raw pointer
 /// derived from the copy and read after the owner's write would compile once

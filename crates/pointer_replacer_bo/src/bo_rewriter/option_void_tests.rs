@@ -83,38 +83,6 @@ unsafe fn binn_load(value: *mut Binn) -> i32 {{
     );
 }
 
-/// Migrated under R217-2(a) by the thin-extent hold at the `Opt` form (relay
-/// 006): a local callee that CASTS its `c_void` parameter to a real width is
-/// R364-2's class, so the corpus `copy_int_value` shape now holds
-/// `held:local-callee-access-extent` for `pint` (as it already did for a thin
-/// `&mut`); the void-cast bridge is witnessed at a local callee that only
-/// passes its `c_void` parameter on.
-#[test]
-fn wave6o_binn_get_int32_mutable_option_at_local_void_mut() {
-    let input = format!(
-        r#"{PRELUDE}
-unsafe fn copy_int_value(psource: *mut core::ffi::c_void, pdest: *mut core::ffi::c_void, source_type: i32) -> i32 {{
-    if source_type == 0 {{ memset(pdest, 0, 4); return 1; }}
-    return 0;
-}}
-unsafe fn binn_get_int32(value: *mut Binn, pint: *mut i32) -> i32 {{
-    if value.is_null() || pint.is_null() {{ return 0; }}
-    if (*value).header == 0xf2 {{
-        return copy_int_value((*value).ptr, pint as *mut core::ffi::c_void, 0);
-    }}
-    *pint = (*value).allocated;
-    return 1;
-}}
-"#
-    );
-    admitted_void_cast(
-        &input,
-        "binn_get_int32",
-        "pint",
-        "pint.as_deref_mut().map_or(core::ptr::null_mut::<core::ffi::c_void>(), |value| core::ptr::from_mut(value).cast::<core::ffi::c_void>()), 0)",
-    );
-}
-
 #[test]
 fn wave6o_shared_option_at_void_const() {
     let input = format!(

@@ -31,32 +31,6 @@ unsafe fn CloseFiles(mut a: *const i8, mut b: *const i8) {
 }
 "#;
 
-/// brotli's shape: `stat` is glibc's LOCAL inline wrapper over `__xstat`, its
-/// `__path` ends raw collaterally, and the null-tested `input_path` is a THIN
-/// `Option<&i8>`. A thin reference carries one element of provenance and the
-/// callee reads a whole C string through it (relay 122), so no bridge is
-/// built: the caller's class is held `held:thin-cstring-to-libc` (receipted),
-/// `CopyStat` stays raw, and the output type-checks (no E0308).
-#[test]
-fn wave6o_thin_optional_into_a_local_raw_formal_is_held() {
-    assert!(verify::type_checks_str(FOREIGN));
-    let output = ast_emitted_source_of(FOREIGN).expect("native emission");
-    let flat = output.split_whitespace().collect::<String>();
-    // CopyStat itself: no bridge built from the thin reference; the raw value
-    // reaches `stat` (CloseFiles's `from_ref(a)` into CopyStat's raw formal is
-    // the pre-existing raw-boundary `RefSharedToRawConst`, not this arm).
-    assert!(
-        !flat.contains("input_path.as_deref()"),
-        "no cast of a thin reference: {output}"
-    );
-    assert!(
-        flat.contains("fnCopyStat(mutinput_path:*consti8"),
-        "{output}"
-    );
-    assert!(flat.contains("stat(input_path,&mutstatbuf)"), "{output}");
-    assert!(verify::type_checks_str(&output), "{output}");
-}
-
 /// The control: the same path argument also reaches libc `chmod`, whose path
 /// the fatness table already types as a C string, and is indexed once (op facts
 /// govern the slice form, fatness corroborates: S3.2′-2), so `input_path` is

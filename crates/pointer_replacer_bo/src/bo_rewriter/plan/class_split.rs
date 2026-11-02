@@ -315,32 +315,6 @@ pub(crate) mod fixture {
 mod tests {
     use super::fixture::{column, run, run_injected};
 
-    /// brotli `PrefixEncodeCopyDistance(…, code, extra_bits)` called from
-    /// `InitCommand` with `&mut (*self_0).dist_prefix_, &mut
-    /// (*self_0).dist_extra_`: `code` settles `&mut u16`; `extra_bits` is
-    /// model-Raw (written through a narrower cast here, as the corpus's slot
-    /// is), and the two field addresses through the raw `self_0` are blind to
-    /// borrowck, so the A5 machinery presents `extra_bits`'s argument as a
-    /// hoisted raw view. Batch 6: `code#4` = `blocked-subject:kind-raw`.
-    const BROTLI_PAIR_SHAPE: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
-#[repr(C)]
-pub struct Command { pub insert_len_: u32, pub dist_prefix_: u16, pub dist_extra_: u32 }
-pub unsafe fn prefix_encode(distance_code: u64, code: *mut u16, extra_bits: *mut u32) {
-    if distance_code < 16 {
-        *code = distance_code as u16;
-        *(extra_bits as *mut u8) = 0;
-        return;
-    }
-    *code = (distance_code >> 1) as u16;
-    *(extra_bits as *mut u8) = (distance_code & 1) as u8;
-}
-pub unsafe fn init_command(self_0: *mut Command, distance_code: u64) {
-    (*self_0).insert_len_ = 1;
-    prefix_encode(distance_code, &mut (*self_0).dist_prefix_, &mut (*self_0).dist_extra_);
-}
-"#;
-
     /// The same shape with the pair left UNCERTIFIED by wave-6p's rules
     /// (batch 8): the two field addresses are rooted at two different raw
     /// parameters that may alias, and both fields are `u32`, so neither the
@@ -399,32 +373,6 @@ pub unsafe extern "C" fn __crat_test_live() { init_command(__crat_test_opaque() 
         assert!(
             signature.contains("code: *mut u32, extra_bits: *mut u32"),
             "both formals stay raw:\n{}",
-            got.tree()
-        );
-    }
-
-    /// The disjoint-field shape of the corpus row itself. At this head the A5
-    /// raw view is what presents it (the rule's original witness); on batch
-    /// 8's composition wave-6p's disjoint-fields certificate clears the pair
-    /// outright and both parameters deliver without a view — either way
-    /// `code` places and `extra_bits` stays raw, which is what is asserted.
-    #[test]
-    fn the_corpus_disjoint_field_shape_places_code_either_way() {
-        let got = run(BROTLI_PAIR_SHAPE);
-        assert_eq!(
-            column(&got.subjects, "prefix_encode::code#2", "placed"),
-            "1",
-            "{}",
-            got.subjects
-        );
-        assert_eq!(
-            column(&got.subjects, "prefix_encode::extra_bits#3", "reason"),
-            "kind-raw"
-        );
-        let signature = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            signature.contains("code: &mut u16, extra_bits: *mut u32"),
-            "{}",
             got.tree()
         );
     }

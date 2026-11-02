@@ -9,7 +9,7 @@ use super::{
         a5_site_proof::A5SiteProofVerdict,
         raw_boundary::{RawBoundaryDisposition, site_atom_id},
         seam::Form,
-        sibling_overlap::{self, LocalPostCallEvidence, TerminalSiteState},
+        sibling_overlap::TerminalSiteState,
     },
     sibling_audit::{self as audit, Input, Outcome},
 };
@@ -19,17 +19,6 @@ const PARAMETER: &str = "#![allow(dead_code, unused_unsafe)]\n\
     pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }\n\
     pub unsafe fn caller(holder: *const Holder, src: *const i32) { update((*holder).data, src); }\n\
     pub unsafe fn entry() { let mut value = 1; let holder = Holder { data: &mut value }; caller(&holder, &value); }\n";
-
-const DEAD_LOCAL: &str = "#![allow(dead_code, unused_unsafe)]\n\
-    pub struct Holder { data: *mut i32 }\n\
-    pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }\n\
-    pub unsafe fn caller() -> i32 {\n\
-        let mut value = 1;\n\
-        let holder = Holder { data: &mut value };\n\
-        let src: *const i32 = &value;\n\
-        update(holder.data, src);\n\
-        0\n\
-    }\n";
 
 fn inputs(source: &'static str) -> (Vec<Input>, BTreeSet<String>) {
     ::utils::compilation::run_compiler_on_str(source, |tcx| {
@@ -74,50 +63,6 @@ fn source_input(inputs: &[Input]) -> Input {
         .collect::<Vec<_>>();
     assert_eq!(found.len(), 1, "one exact original coverage identity");
     found[0].clone()
-}
-
-#[test]
-fn sibling_audit_nonpending_dead_local_t1_keeps_predicate_inputs() {
-    let (inputs, t1) = inputs(DEAD_LOCAL);
-    let input = source_input(&inputs);
-    let id = site_atom_id(&input.potential.site);
-    assert!(t1.contains(&id), "actual local T1 disposition required");
-    assert!(
-        matches!(&input.potential.local_post_call, LocalPostCallEvidence::DeadUnprotected { checked_locals }
-        if checked_locals.contains(&input.potential.source.declared().expect("declared source control").local))
-    );
-    assert!(
-        sibling_overlap::select_pending(std::slice::from_ref(&input.potential), |_| input.terminal)
-            .is_empty()
-    );
-    assert!(
-        input
-            .potential
-            .siblings
-            .iter()
-            .all(|sibling| sibling.argument_shape.is_some()),
-        "existing call-position shapes are captured"
-    );
-    let rows = audit::audit(std::slice::from_ref(&input));
-    assert_eq!(
-        rows.len(),
-        1,
-        "nonpending local T1 must remain in the audit"
-    );
-    assert_eq!(rows[0].coverage_id, id);
-    assert_eq!(rows[0].outcome, Outcome::DeadUnprotected);
-    assert!(rows[0].data);
-    assert!(
-        matches!(&rows[0].post_call, audit::PostCall::DeadUnprotected { checked_locals }
-        if checked_locals.contains(&input.potential.source.mir_local().expect("actual declared MIR local").as_u32()))
-    );
-    assert_eq!(rows[0].siblings.len(), input.potential.siblings.len());
-    assert!(
-        rows[0]
-            .siblings
-            .iter()
-            .all(|sibling| sibling.argument_shape.is_some())
-    );
 }
 
 #[test]

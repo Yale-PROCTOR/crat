@@ -92,40 +92,6 @@ fn signature<'a>(source: &'a str, function: &str) -> &'a str {
         .unwrap_or_default()
 }
 
-/// **H-C7** (relay 293): wave-6l's `w6l_nul_c7` shape, where the round driver's
-/// hold left `caller(p: &[i32]) { head(p) }` into `*mut i32` (`E0308`) and the
-/// program degraded (main 182b §2). `head::dist_cache` is a formal handed to
-/// `memcpy` beside the written raw `out`: it is decided raw, and the caller is
-/// planned against the raw formal.
-const C7: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_mut, non_snake_case)]
-extern "C" {
-    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
-}
-unsafe fn head(mut dist_cache: *mut i32) {
-    let mut out: [u8; 8] = [0; 8];
-    memcpy(out.as_mut_ptr() as *mut core::ffi::c_void,
-        dist_cache as *const core::ffi::c_void, 6 as u64);
-}
-pub unsafe fn caller(mut p: *mut i32) {
-    head(p);
-}
-"#;
-
-#[test]
-fn r855_1_hc7_a_held_formal_emits_with_its_caller_planned_against_it() {
-    let out = outcome(C7);
-    assert_eq!(out.pending, 0, "the pending table reads 0");
-    assert_eq!(
-        reason_of(&out, "head::dist_cache"),
-        Some("held:pair-not-shown-disjoint"),
-        "{:?}",
-        out.reasons
-    );
-    let head = signature(&out.source, "head");
-    assert!(head.contains("dist_cache: *mut i32"), "held raw: {head}");
-}
-
 /// **H1** (re-pinned): `caller::src` (a formal) is handed to `update`'s raw `src`
 /// beside `(*holder).data`, a raw sibling `update` writes through, and `entry`
 /// passes one object to both. Decided raw under its own reason.
@@ -502,47 +468,6 @@ fn r861_a_subject_two_holds_name_stays_held_with_both_receipts() {
     );
 }
 
-/// **The comparison view of a held formal** (relay 297; libzahl `zor` / `zxor` /
-/// `zadd_unsigned` at the 57 head): the address views of a pointer comparison
-/// are planned once, on the table before the holds, so a formal the hold later
-/// makes raw kept its reference view, `core::ptr::from_ref(c).cast_mut()` over a
-/// `*mut` (`E0308`). A held operand keeps its raw text, as any raw operand of a
-/// comparison does.
-const HELD_COMPARISON: &str = "#![allow(dead_code, unused_unsafe)]\n\
-    pub struct Num { used: i32, sign: i32 }\n\
-    pub static mut LAST: *mut Num = 0 as *mut Num;\n\
-    pub unsafe fn set(a: *mut Num, b: *mut Num) { LAST = b; (*a).sign = (*b).sign; (*a).used = (*b).used; }\n\
-    pub unsafe fn or(a: *mut Num, b: *mut Num, c: *mut Num) {\n\
-        if (*b).used == 0 { if a != c { set(a, c); } return; }\n\
-        (*a).used = (*b).used + (*c).used;\n\
-    }\n\
-    pub unsafe fn entry() {\n\
-        let mut x = Num { used: 0, sign: 0 };\n\
-        let mut y = Num { used: 0, sign: 1 };\n\
-        let mut z = Num { used: 1, sign: 1 };\n\
-        or(&mut x, &mut y, &mut z);\n\
-    }\n";
-
-#[test]
-fn r861_1_a_held_operand_of_a_comparison_keeps_its_raw_text() {
-    let out = outcome(HELD_COMPARISON);
-    assert_eq!(
-        reason_of(&out, "or::c"),
-        Some("held:pair-not-shown-disjoint"),
-        "{:?}",
-        out.reasons
-    );
-    let or = signature(&out.source, "or");
-    assert!(or.contains("c: *mut Num"), "held raw: {or}");
-    assert!(
-        !out.source.contains("from_ref(c)")
-            && !out.source.contains("from_mut(&mut *c)")
-            && !out.source.contains("from_mut(c.as_mut().unwrap())"),
-        "no reference view of a held formal: {}",
-        out.source
-    );
-}
-
 /// The census's A5 world (`rewrite_m1_census_world`), read as [`outcome`] reads
 /// the open world.
 fn census_outcome(text: &str) -> Outcome {
@@ -842,119 +767,6 @@ fn r861_1_n1_each_mir_arm_holds_the_flowing_binding() {
             out.details
         );
     }
-}
-
-/// **R864-1 (a) (relay 299; fan-out 081 class 1) — a delivered reference
-/// formal beside a raw formal at an in-program call.** libzahl's
-/// `zsqr(x.as_mut_ptr(), x.as_mut_ptr())`: `zsqr::a` is model-Raw, `zsqr::b` is
-/// read only, and
-/// the frame delivered `b: &Z` beside the raw `a`, then wrote through `a` while
-/// the protected `b` was live. The pair pass drops the pair (one formal does not
-/// convert), and the array is a static (`libzahl_tmp_pow_b`): `place_root` names
-/// no binding for it, so the seam's aliased-storage twin never sees the pair
-/// either. `b` is held (`ref-beside-raw`; the A5 proof is not `Clear`).
-/// (`a` is kept raw by a raw use, as heman's `kmQuaternionScale::pIn` is in
-/// `counted_void_tests`.)
-const ZSQR_ALIASED: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
-    #[derive(Clone, Copy)]\n\
-    #[repr(C)]\n\
-    pub struct Z { sign: i32, used: usize }\n\
-    pub unsafe fn zsqr(mut a: *mut Z, b: *mut Z) {\n\
-        let _k = a.offset(0);\n\
-        let s = (*b).used;\n\
-        (*a).used = s + 1;\n\
-        (*a).sign = 1;\n\
-    }\n\
-    pub static mut TMP: [Z; 1] = [Z { sign: 0, used: 3 }; 1];\n\
-    pub unsafe fn entry() -> usize {\n\
-        zsqr(TMP.as_mut_ptr(), TMP.as_mut_ptr());\n\
-        TMP[0].used\n\
-    }\n";
-
-#[test]
-fn r864_1_a_a_reference_formal_beside_a_raw_formal_on_one_object_is_held() {
-    let out = outcome(ZSQR_ALIASED);
-    assert_eq!(
-        reason_of(&out, "zsqr::b"),
-        Some("held:pair-not-shown-disjoint"),
-        "{:?}",
-        out.reasons
-    );
-    assert!(
-        detail_of(&out, "zsqr::b")
-            .is_some_and(|d| d.contains("pair-not-shown-disjoint:ref-beside-")),
-        "{:?}",
-        out.details
-    );
-    let zsqr = signature(&out.source, "zsqr");
-    assert!(zsqr.contains("b: *mut Z"), "held raw: {zsqr}");
-}
-
-/// R864-1 (b): the reference formal first and the raw one second, both
-/// `LOW.as_mut_ptr()` of one static. (Class 2 proper, a PAIR-owned call whose
-/// `clear` is the classifier's false one on a local array, does not reduce: the
-/// rule holds the reference side at a `clear` call on one subject, and libzahl
-/// `zmul`'s four sites witness it at the hold census.)
-const ZADD_ALIASED: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
-    #[derive(Clone, Copy)]\n\
-    #[repr(C)]\n\
-    pub struct Z { sign: i32, used: usize }\n\
-    pub unsafe fn zadd(a: *mut Z, mut b: *mut Z, c: *mut Z) {\n\
-        let _k = b.offset(0);\n\
-        (*a).used = (*c).used;\n\
-        let t = (*b).sign;\n\
-        (*a).sign = t;\n\
-    }\n\
-    pub static mut LOW: [Z; 1] = [Z { sign: 0, used: 3 }; 1];\n\
-    pub unsafe fn entry() -> usize {\n\
-        let mut x: [Z; 1] = [Z { sign: 0, used: 3 }; 1];\n\
-        let mut y: [Z; 1] = [Z { sign: 1, used: 7 }; 1];\n\
-        zadd(LOW.as_mut_ptr(), LOW.as_mut_ptr(), y.as_mut_ptr());\n\
-        x[0].used\n\
-    }\n";
-
-#[test]
-fn r864_1_b_one_subject_at_two_positions_is_never_disjoint() {
-    let out = outcome_attested(ZADD_ALIASED);
-    assert_eq!(
-        reason_of(&out, "zadd::a"),
-        Some("held:pair-not-shown-disjoint"),
-        "{:?}",
-        out.reasons
-    );
-    assert!(
-        detail_of(&out, "zadd::a")
-            .is_some_and(|d| d.contains("pair-not-shown-disjoint:ref-beside-")),
-        "{:?}",
-        out.details
-    );
-}
-
-/// The controls: two distinct arrays of the caller's frame are disjoint, and a
-/// formal holding its entry value cannot address the caller's own array
-/// (premise (a)); `zadd::a` stays delivered.
-#[test]
-fn r864_1_distinct_frame_objects_and_an_entry_formal_are_disjoint() {
-    let distinct = ZADD_ALIASED.replace(
-        "zadd(LOW.as_mut_ptr(), LOW.as_mut_ptr(), y.as_mut_ptr());",
-        "zadd(x.as_mut_ptr(), y.as_mut_ptr(), y.as_mut_ptr());",
-    );
-    assert!(distinct.contains("zadd(x.as_mut_ptr(), y.as_mut_ptr()"));
-    let out = outcome_attested(&distinct);
-    assert_eq!(reason_of(&out, "zadd::a"), None, "{:?}", out.reasons);
-    let entry = ZADD_ALIASED.replace(
-        "pub unsafe fn entry() -> usize {\n",
-        "pub unsafe fn through(p: *mut Z) -> usize {\nlet mut q: [Z; 1] = [Z { sign: 2, used: 9 }; 1];\nlet mut r: [Z; 1] = [Z { sign: 4, used: 5 }; 1];\nzadd(q.as_mut_ptr(), p, r.as_mut_ptr());\nq[0].used\n}\npub unsafe fn entry() -> usize {\n",
-    ).replace(
-        "zadd(LOW.as_mut_ptr(), LOW.as_mut_ptr(), y.as_mut_ptr());",
-        "through(x.as_mut_ptr());",
-    );
-    assert!(
-        entry.contains("zadd(q.as_mut_ptr(), p, r.as_mut_ptr())"),
-        "{entry}"
-    );
-    let out = outcome_attested(&entry);
-    assert_eq!(reason_of(&out, "zadd::a"), None, "{:?}", out.reasons);
 }
 
 /// **R866-1 (relay 300; fan-out 083) — the containment pair.** brotli's

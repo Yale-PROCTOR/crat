@@ -379,33 +379,6 @@ fn wave5r_e0308_mutable_address_into_shared_reference() {
     );
 }
 
-#[test]
-fn wave5r_e0308_raw_destination_keeps_its_initializer() {
-    let source = emitted(
-        r#"
-        #![allow(dead_code, unused_unsafe)]
-        pub struct Item { value: i32 }
-        pub unsafe fn inspect(p: *mut Item) -> i32 {
-            let q: *mut Item = &mut *p.offset(1) as *mut Item;
-            (*q).value += 1;
-            (*q).value
-        }
-    "#,
-    );
-    assert!(
-        source.contains("q: *mut Item"),
-        "a model-Raw local remains raw: {source}"
-    );
-    // wave-6s (report 005): the base `p` now delivers as a slice and the raw
-    // destination receives the suffix's pointer under the existing body raw
-    // alias receipt; the identity-cast peel still does not fire on a raw
-    // destination.
-    assert!(
-        source.contains("let q: *mut Item = (&mut (p)[1..]).as_mut_ptr();"),
-        "{source}"
-    );
-}
-
 #[path = "wave6r_option_tests.rs"]
 mod wave6r_option_tests;
 

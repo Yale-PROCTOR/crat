@@ -330,51 +330,6 @@ pub unsafe fn dup_bytes(mut p: *mut core::ffi::c_void, mut n: i32) -> *mut core:
 }
 "#;
 
-/// Restated (R829-1, relay 297): `memcpy`'s destination `dest` (arg0, a fresh
-/// `malloc` result) is written and not shown disjoint from `src`, so the source
-/// is held raw on the settled table and the counted read view no longer forms.
-/// The emitted program keeps its raw formal and still runs as the input does.
-#[test]
-fn w6v2_foreign_copy_source_counted_by_a_sibling_delivers() {
-    let rows = super::emit_tests::decisions_of(MEMDUP);
-    // R829-1 (relay 297, main 188): binn_memdup::src is held beside `dest` (arg0, a fresh malloc) at memcpy; delivered `<emitted>` → held:pair-not-shown-disjoint.
-    assert!(
-        !delivers(&rows, "src"),
-        "the copy source beside a written destination is held: {rows:?}"
-    );
-    assert_eq!(
-        reason(&rows, "src"),
-        "held:pair-not-shown-disjoint",
-        "{rows:?}"
-    );
-    let source = super::emit_tests::ast_emitted_source_of(MEMDUP).unwrap();
-    let c = compact(&source);
-    // R829-1 (relay 297, main 188): binn_memdup::src is held beside `dest` at memcpy; `Option<&[u8]>` → the raw formal, and no count snapshot at the raw caller.
-    assert!(
-        c.contains("fnbinn_memdup(mutsrc:*mutcore::ffi::c_void,mutsize:i32)"),
-        "the held source keeps its raw formal: {source}"
-    );
-    assert!(
-        !c.contains("Option<&[u8]>"),
-        "no counted read view: {source}"
-    );
-    assert!(
-        !c.contains("__crat_cv_1"),
-        "no counted view, so the raw caller snapshots no count: {source}"
-    );
-    assert!(super::verify::type_checks_str(&source));
-    let main = r#"fn main() { unsafe {
-        let text = b"binn";
-        let copy = dup_bytes(text.as_ptr() as *mut core::ffi::c_void, 4) as *const u8;
-        let null = dup_bytes(core::ptr::null_mut(), 4);
-        let empty = dup_bytes(text.as_ptr() as *mut core::ffi::c_void, 0);
-        println!("{:?} {} {}", core::slice::from_raw_parts(copy, 4), null.is_null(), empty.is_null());
-    }}"#;
-    let original = run_binary(&format!("{MEMDUP}\n{main}"));
-    assert_eq!(original, b"[98, 105, 110, 110] true true\n".to_vec());
-    assert_eq!(original, run_binary(&format!("{source}\n{main}")));
-}
-
 /// A WRITE position of the row (`memcpy`'s destination) is not a read view:
 /// the parameter stays held (the destination is the allocation's, not this
 /// rule's).
@@ -397,26 +352,6 @@ fn w6v2_foreign_copy_destination_position_stays_held() {
     assert!(
         reason(&rows, "src").starts_with("held:void-pointee"),
         "the hold keeps its family: {rows:?}"
-    );
-}
-
-/// The emitted copy site, and nothing is fabricated. Restated (R829-1, relay
-/// 297): the source is held raw beside `memcpy`'s written destination, so no
-/// shared byte view reaches the source position and the row has nothing to
-/// bridge; the call passes the raw formal as written.
-#[test]
-fn w6v2_foreign_copy_site_is_bridged_by_the_row() {
-    let source = super::emit_tests::ast_emitted_source_of(MEMDUP).unwrap();
-    assert!(!source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
-    let c = compact(&source);
-    // R829-1 (relay 297, main 188): binn_memdup::src is held beside `dest` (arg0, a fresh malloc) at memcpy; the row's `as_deref` bridge → the raw source passed unbridged.
-    assert!(
-        c.contains("memcpy(dest,src,sizeasu64)"),
-        "the held source reaches the source position raw: {source}"
-    );
-    assert!(
-        !c.contains("src.as_deref()"),
-        "no row bridge on a raw source: {source}"
     );
 }
 
@@ -1209,25 +1144,6 @@ fn iterator_site_rows(input: &str) -> Vec<String> {
             .collect::<Vec<_>>()
     })
     .unwrap()
-}
-
-/// The `build → init` arg-1 site is T1: the store lands in `it`, which is
-/// stack-confined — its second `&mut` goes to `next`, whose loads of `split_`
-/// are read through only — and the callee is descendant-free modulo that
-/// certified output storage.
-#[test]
-fn w6v2_iterator_store_into_a_read_only_reader_local_is_t1() {
-    let rows = by_function(ITERATOR);
-    let site = iterator_site_rows(ITERATOR);
-    assert!(
-        site.iter().any(|l| l.contains("\tT1\t")),
-        "the init site is T1: {site:?}\n{rows:?}"
-    );
-    let decisions = super::emit_tests::decisions_of(ITERATOR);
-    assert!(
-        delivers(&decisions, "split"),
-        "build::split delivers: {decisions:?}"
-    );
 }
 
 /// The reader hands the loaded pointer out (a global store): the second

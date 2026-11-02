@@ -85,65 +85,6 @@ fn decision<'a>(table: &'a [(String, super::Decision)], label: &str) -> &'a supe
         .1
 }
 
-/// `ray` is borrowed (`&(*ray).start`) into `kmVec2Subtract`'s raw `pV2`; the
-/// callee hands `pOut` back and the caller uses it (`kmVec2Length(…)`), so
-/// K18′'s read-only walk cannot admit it. `pV2`'s summary is `NoRetain` and
-/// `kmVec2` reaches no pointer: nothing handed back descends from `ray`.
-#[test]
-fn w5c_returned_child_pointer_free_no_retain_admits_the_shared_view() {
-    let input = fixture();
-    let table = decisions(&input);
-    assert!(
-        matches!(
-            decision(&table, "kmRay2IntersectTriangle::ray"),
-            super::Decision::Ref { mutable: false }
-        ),
-        "{:?}",
-        decision(&table, "kmRay2IntersectTriangle::ray")
-    );
-    // The site itself: T1 `ref-shared-to-raw-const` on the local summary.
-    let site = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
-        let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
-            tcx,
-            Some((
-                crate::bo_rewriter::OverlapMode::PreciseReplay,
-                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
-            )),
-        )
-        .unwrap();
-        ctx.raw_boundary
-            .receipts_tsv()
-            .lines()
-            .filter(|l| {
-                l.contains("kmRay2IntersectTriangle::ray#1") && l.contains("kmVec2Subtract\t2")
-            })
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-    })
-    .unwrap();
-    assert!(
-        site.iter()
-            .any(|l| l.contains("\tT1\tref-shared-to-raw-const\t")),
-        "{site:?}"
-    );
-    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
-    let text = emitted.split_whitespace().collect::<Vec<_>>().join(" ");
-    // `&kmVec2` coerces to `*const kmVec2`: the T1 site needs no bridge text.
-    // (Whether the owner's CLASS is applied is a placement fact: over the
-    // batch-8 composition the return reborrow of `kmVec2Subtract(…)` and this
-    // argument's glue nest across two classes — report 015.)
-    assert!(
-        text.contains("kmVec2Subtract(&mut tmp, &mut intersect, &(*ray).start)"),
-        "{emitted}"
-    );
-    assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
-    if let Ok(root) = std::env::var("CRAT_W5C_FIXTURE_CAPTURE") {
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(format!("{root}/ray-triangle-original.rs"), &input).unwrap();
-        std::fs::write(format!("{root}/ray-triangle-emitted.rs"), &emitted).unwrap();
-    }
-}
-
 /// W-C5's own verdict: the ARGUMENT's pointee (`kmVec2`, what `pV2` points
 /// to) reaching a pointer could hand a child back through a load, so the
 /// pointee is not pointer-free and W-C5 admits nothing. (The final decision

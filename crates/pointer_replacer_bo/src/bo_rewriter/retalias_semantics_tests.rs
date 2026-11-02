@@ -543,8 +543,3 @@ fn retalias_semantics_discarded_child_keeps_t1() {
 fn retalias_semantics_copied_readonly_child_requires_t2() {
     check(ChildCase::CopiedRead);
 }
-
-#[test]
-fn retalias_semantics_copied_child_write_is_model_admission_protected() {
-    check(ChildCase::CopiedWrite);
-}

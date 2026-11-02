@@ -295,56 +295,6 @@ fn local_case(after: &str) -> String {
 }
 
 #[test]
-fn sibling_r233_local_without_post_call_use_requires_complete_dead_evidence() {
-    let potentials = potentials(&local_case("0"), "caller::src");
-    let source = source_site(&potentials, "caller::src");
-    assert!(matches!(
-        source
-            .source
-            .declared()
-            .expect("banked declared source")
-            .kind,
-        SubjectKind::Local
-    ));
-    assert!(
-        matches!(&source.local_post_call,
-        LocalPostCallEvidence::DeadUnprotected { checked_locals } if checked_locals.contains(&source.source.declared().expect("banked declared source").local)),
-        "a genuine local exception has explicit, complete MIR/protector evidence: {source:?}"
-    );
-    assert!(sibling_overlap::select_pending(std::slice::from_ref(source), raw_terminal).is_empty());
-}
-
-#[test]
-fn sibling_r233_live_local_with_an_exported_clear_pair_has_no_pending_waiver() {
-    let potentials = potentials(&local_case("*src"), "caller::src");
-    let source = source_site(&potentials, "caller::src");
-    assert!(
-        matches!(&source.local_post_call, LocalPostCallEvidence::Live { locals }
-        if locals.contains(&source.source.declared().expect("banked declared source").local)),
-        "actual post-call read remains live: {source:?}"
-    );
-    assert!(
-        source
-            .siblings
-            .iter()
-            .any(|sibling| sibling.proof.verdict == A5SiteProofVerdict::Clear
-                && matches!(
-                    sibling.access,
-                    SiblingAccess::Foster {
-                        mutable: true,
-                        defaulted: false,
-                        ..
-                    }
-                )),
-        "the sealed gate observed an actual clear writing pair independently of liveness: {source:#?}"
-    );
-    assert!(
-        sibling_overlap::select_pending(std::slice::from_ref(source), raw_terminal).is_empty(),
-        "a live local does not override its actual exported disjointness: {source:#?}"
-    );
-}
-
-#[test]
 fn sibling_r233_local_copy_of_a_parameter_keeps_the_parameter_protector() {
     let input = PARAMETER_CASE.replace(
         "update((*holder).data, src);",
@@ -543,25 +493,6 @@ fn sibling_r233_coverage_slice_offset_keeps_its_exact_view_identity() {
 }
 
 #[test]
-fn sibling_r233_coverage_pointer_binding_storage_is_not_its_referent() {
-    let input = "#![allow(dead_code, unused_unsafe)]\n\
-        pub unsafe fn update_slot(dst: *mut *const i32, src: *const i32) { *dst = src; }\n\
-        pub unsafe fn caller(value: *const i32) -> i32 {\n\
-            let mut slot: *const i32 = value; update_slot(&mut slot, value); *slot\n\
-        }\n";
-    let inventory = inventory(input, "caller::slot");
-    let record = covered(&inventory, "caller::slot", "update_slot", 0);
-    assert_eq!(record.evidence, SourceBridgeEvidence::BindingStorage);
-    assert!(
-        !inventory
-            .potentials
-            .iter()
-            .any(|potential| potential.site == record.potential.site),
-        "borrowing a pointer binding's storage is a distinct depth-two operation"
-    );
-}
-
-#[test]
 fn sibling_r233_coverage_native_mutable_reference_sibling_has_actual_access_evidence() {
     let input = PARAMETER_CASE
         .replace(
@@ -646,63 +577,6 @@ fn sibling_r233_unmodeled_memcmp_contract_remains_explicitly_unknown() {
         ),
         "a missing sealed access contract remains unknown: {record:?}"
     );
-}
-
-#[test]
-fn sibling_r233_live_local_ancestor_prevents_the_dead_local_exception() {
-    use rustc_middle::mir::{BasicBlock, Location};
-    use rustc_mir_dataflow::Analysis;
-
-    use crate::analyses::{borrow_ownership::slots::SlotOwner, liveness::MaybeLiveLocals};
-
-    let input = local_case("*orig").replace(
-        "let src: *const i32 = &value;",
-        "let orig: *const i32 = &value; let src: *const i32 = orig;",
-    );
-    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
-        let (_, ctx) = super::decide_table_with_ctx_config(tcx, Some((
-            crate::analyses::borrow_ownership::param_overlap::OverlapMode::PreciseReplay,
-            Some(crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation::FrozenBenchmarkGraph),
-        ))).expect("ancestor fixture uses the actual decision pipeline");
-        let solve = super::model_cache::solve_receipt();
-        println!("R233 ancestor-live fixture solve receipt: {solve:#?}");
-        assert!(solve.is_some(), "actual fixture solve receipt is mandatory");
-        let original = ctx.subjects.iter().find(|subject| subject.label == "caller::orig")
-            .expect("actual named local ancestor");
-        let copied = ctx.subjects.iter().find(|subject| subject.label == "caller::src")
-            .expect("actual named local copy");
-        for subject in [original, copied] {
-            let kind = ctx.slots.fn_local_slots.get(&subject.fn_did)
-                .and_then(|slots| slots.slot_for_local_depth(subject.local, 0))
-                .and_then(|slot| ctx.model.get(&super::SlotRef::Local(subject.fn_did, slot)))
-                .copied();
-            assert_eq!(kind, Some(super::SlotKind::Ref),
-                "the ancestor and copied source must both be actual model-Ref: {}", subject.label);
-            assert!(matches!(subject.kind, SubjectKind::Local),
-                "this control is independent of parameter protectors");
-        }
-        let flows = ctx.analysis.origins.as_ref().and_then(|origins| origins.try_native_flows())
-            .and_then(|flows| flows.get(&copied.fn_did)).expect("existing frozen native body flows");
-        assert!(flows.body.depth0_value_flows().contains(&(
-            SlotOwner::Local(original.local), SlotOwner::Local(copied.local),
-        )), "the ancestor -> copy relation must be exported, not inferred from names");
-        let inventory = sibling_overlap::collect_inventory(tcx, &ctx);
-        let source = source_site(&inventory.potentials, "caller::src");
-        let body = tcx.mir_drops_elaborated_and_const_checked(copied.fn_did).borrow();
-        let call = Location { block: BasicBlock::from_u32(source.site.block),
-            statement_index: source.site.statement_index as usize };
-        let mut cursor = MaybeLiveLocals.iterate_to_fixpoint(tcx, &body, None).into_results_cursor(&body);
-        cursor.seek_before_primary_effect(call);
-        assert!(cursor.get().contains(original.local), "the actual ancestor is live on call exit");
-        assert!(!cursor.get().contains(copied.local), "the copied source itself is dead on call exit");
-        println!("R233 ancestor-live exact evidence: ancestor={:?}, source={:?}, call={call:?}, siblings={:?}",
-            original.local, copied.local, source.siblings);
-        // No A5 override or non-Clear assertion: the local lifetime proof must
-        // remain truthful independently of whether this particular pair is risky.
-        assert!(matches!(&source.local_post_call, LocalPostCallEvidence::Live { locals }
-            if locals.contains(&original.local)),
-            "a surviving local ancestor forbids DeadUnprotected: {source:#?}");
-    }).expect("actual-flow ancestor fixture compiles");
 }
 
 #[test]

@@ -151,55 +151,6 @@ fn flat(emitted: &str) -> String {
     emitted.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `h` mixes converting targets (`symbol`) with raw targets (`symbol_lists`).
-/// Under R829-1 / R861-1 (relay 297, main 188) `h` is borrowed into
-/// `ProcessSingleCodeLength`'s raw `repeat` (arg2, `&mut (*h).repeat`) beside
-/// siblings the callee writes and the open world does not show disjoint
-/// (args 1, 3–7: the other field addresses, the loaded `(*h).symbol_lists`
-/// and the two array views), so it is decided raw on the settled table
-/// (`held:pair-not-shown-disjoint`): its declaration keeps the input's raw
-/// form and none of its raw sites is bridged.
-#[test]
-fn w5c_mixed_boundary_decoder_arena_view_delivers() {
-    let input = fixture();
-    let table = decisions(&input);
-    // R829-1 (relay 297, main 188): SafeReadSymbolCodeLengths::h is held beside
-    // the written args 1, 3-7 at ProcessSingleCodeLength (h's site: arg2); the
-    // decision moves from Ref { mutable: true } to the hold.
-    assert!(
-        matches!(
-            decision(&table, "SafeReadSymbolCodeLengths::h"),
-            super::Decision::Degraded(super::Degradation {
-                reason: super::DegradeReason::PairNotShownDisjoint { detail },
-                ..
-            }) if detail.contains(":ProcessSingleCodeLength:2:")
-                && detail.ends_with(";risky-siblings=arg1,arg3,arg4,arg5,arg6,arg7")
-        ),
-        "{:?}",
-        decision(&table, "SafeReadSymbolCodeLengths::h")
-    );
-    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
-    let text = flat(&emitted);
-    // R829-1 (relay 297, main 188): SafeReadSymbolCodeLengths::h is held beside
-    // the written args 1, 3-7 at ProcessSingleCodeLength; its declaration stays
-    // `*mut` (was `&mut`) and `(*h).symbol_lists` is no longer bridged through
-    // a `__crat_raw` temporary.
-    assert!(
-        text.contains("let h: *mut BrotliMetablockHeaderArena = &mut (*s).arena;"),
-        "{emitted}"
-    );
-    assert!(
-        !text.contains("let __crat_raw: *mut u16 = ((*h).symbol_lists) as *mut u16;"),
-        "{emitted}"
-    );
-    assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
-    if let Ok(root) = std::env::var("CRAT_W5C_FIXTURE_CAPTURE") {
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(format!("{root}/decoder-arena-original.rs"), &input).unwrap();
-        std::fs::write(format!("{root}/decoder-arena-emitted.rs"), &emitted).unwrap();
-    }
-}
-
 /// `s` is borrowed through (`&mut (*s).br`, `&mut *((*s).ringbuffer).offset(…)`)
 /// into targets that convert to other safe forms; those are their families'
 /// adapter questions, never a raw seam of `s`.

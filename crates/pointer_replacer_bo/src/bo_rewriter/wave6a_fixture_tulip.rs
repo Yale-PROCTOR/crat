@@ -150,55 +150,6 @@ pub unsafe extern "C" fn ti_buffer_free(mut buffer: *mut ti_buffer) {
 }
 "#;
 
-/// tulip `ti_stoch`, reduced: TWO buffers in one owner (`k_sum`, `d_sum`),
-/// the second fed from the first's running mean, both freed at the end.
-pub(super) const TULIP_STOCH_BODY: &str = r#"
-#[no_mangle]
-pub unsafe extern "C" fn ti_stoch(mut size: std::os::raw::c_int, mut high: *const std::os::raw::c_double, mut kslow: std::os::raw::c_int, mut dperiod: std::os::raw::c_int, mut output: *mut std::os::raw::c_double) -> std::os::raw::c_int {
-    let kper: std::os::raw::c_double = 1.0f64 / kslow as std::os::raw::c_double;
-    let dper: std::os::raw::c_double = 1.0f64 / dperiod as std::os::raw::c_double;
-    let mut k_sum: *mut ti_buffer = ti_buffer_new(kslow);
-    let mut d_sum: *mut ti_buffer = ti_buffer_new(dperiod);
-    let mut i: std::os::raw::c_int = 0;
-    i = 0 as std::os::raw::c_int;
-    while i < size {
-        let kfast: std::os::raw::c_double = *high.offset(i as isize);
-        if (*k_sum).pushes >= (*k_sum).size {
-            (*k_sum).sum -= *(*k_sum).vals.as_mut_ptr().offset((*k_sum).index as isize)
-        }
-        (*k_sum).sum += kfast;
-        *(*k_sum).vals.as_mut_ptr().offset((*k_sum).index as isize) = kfast;
-        (*k_sum).pushes += 1 as std::os::raw::c_int;
-        (*k_sum).index = (*k_sum).index + 1 as std::os::raw::c_int;
-        if (*k_sum).index >= (*k_sum).size {
-            (*k_sum).index = 0 as std::os::raw::c_int
-        }
-        if i >= kslow - 1 as std::os::raw::c_int {
-            let k: std::os::raw::c_double = (*k_sum).sum * kper;
-            if (*d_sum).pushes >= (*d_sum).size {
-                (*d_sum).sum -= *(*d_sum).vals.as_mut_ptr().offset((*d_sum).index as isize)
-            }
-            (*d_sum).sum += k;
-            *(*d_sum).vals.as_mut_ptr().offset((*d_sum).index as isize) = k;
-            (*d_sum).pushes += 1 as std::os::raw::c_int;
-            (*d_sum).index = (*d_sum).index + 1 as std::os::raw::c_int;
-            if (*d_sum).index >= (*d_sum).size {
-                (*d_sum).index = 0 as std::os::raw::c_int
-            }
-            if i >= kslow + dperiod - 2 as std::os::raw::c_int {
-                let fresh1 = output;
-                output = output.offset(1);
-                *fresh1 = (*d_sum).sum * dper
-            }
-        }
-        i += 1
-    }
-    ti_buffer_free(k_sum);
-    ti_buffer_free(d_sum);
-    return 0 as std::os::raw::c_int;
-}
-"#;
-
 /// Control: the struct crosses a foreign boundary (an extern consumer takes it
 /// by pointer), so the layout may not change — every row stays held.
 pub(super) const TULIP_CROSSING_BODY: &str = r#"

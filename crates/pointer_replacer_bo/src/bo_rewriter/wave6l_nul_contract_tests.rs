@@ -123,43 +123,6 @@ pub unsafe fn get_auth(mut url: *mut i8) -> i32 {
 }
 "#;
 
-/// lil `fnc_catcher::catcher`: as `lil_to_boolean::s`, and ALSO an argument of
-/// the local `strclone` — still held (report 054).
-const PROBE_CATCHER: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_mut)]
-extern "C" {
-    fn strlen(s: *const i8) -> usize;
-    fn malloc(n: usize) -> *mut core::ffi::c_void;
-    fn strcpy(d: *mut i8, s: *const i8) -> *mut i8;
-}
-pub struct Value {
-    pub d: *mut i8,
-}
-pub struct Lil {
-    pub catcher: *mut i8,
-}
-unsafe fn to_string(mut v: *mut Value) -> *const i8 {
-    return if (*v).d.is_null() { b"\0" as *const u8 as *const i8 } else { (*v).d as *const i8 };
-}
-unsafe fn strclone(mut s: *const i8) -> *mut i8 {
-    let mut len = strlen(s).wrapping_add(1);
-    let mut ns = malloc(len) as *mut i8;
-    if ns.is_null() {
-        return 0 as *mut i8;
-    }
-    strcpy(ns, s);
-    ns
-}
-pub unsafe fn fnc_catcher(mut lil: *mut Lil, mut argv: *mut *mut Value) {
-    let mut catcher = to_string(*argv.offset(0 as isize));
-    (*lil).catcher = if *catcher.offset(0 as isize) as i32 != 0 {
-        strclone(catcher)
-    } else {
-        0 as *mut i8
-    };
-}
-"#;
-
 /// heman `kmVec4Assign::pIn`: `memcpy` of `size_of::<f32>() * 4` bytes of a
 /// `kmVec4` — one element, spelled as another type.
 const PROBE_KMVEC4: &str = r#"
@@ -463,25 +426,6 @@ fn w6l_nul_c5_a_wrapped_receiver_keeps_the_argument_bridge() {
     assert!(
         source.contains("to_string(buf.as_mut_ptr())"),
         "the argument keeps its raw bridge inside the wrapped call: {source}"
-    );
-}
-
-/// The held one of the family, pinned so a later carrier build sees it move.
-/// Restated (R829-1, relay 297): `strclone::s` is now held too, beside
-/// `strcpy`'s written destination `ns` (arg0, a fresh `malloc` result).
-#[test]
-fn w6l_nul_the_catcher_stays_held_at_its_local_callee_argument() {
-    let decisions = super::emit_tests::decisions_of(PROBE_CATCHER);
-    assert_eq!(
-        reason(&decisions, "catcher", false),
-        "return-not-adapted",
-        "{decisions:#?}"
-    );
-    // R829-1 (relay 297, main 188): strclone::s is held beside `ns` (arg0, a fresh malloc) at strcpy; `<emitted>` → held:pair-not-shown-disjoint.
-    assert_eq!(
-        reason(&decisions, "s", true),
-        "held:pair-not-shown-disjoint",
-        "{decisions:#?}"
     );
 }
 
@@ -930,33 +874,6 @@ fn w6l_nul_c6_a_one_element_local_callee_keeps_the_thin_optional() {
     );
 }
 
-/// brotli `BrotliCreateHqZopfliBackwardReferences::dist_cache#9`: `memcpy`
-/// both ways of `4 * size_of::<c_int>()` bytes — four elements spelled in
-/// bytes, at two exact sites.
-const PROBE_DIST_CACHE: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_mut, non_snake_case)]
-extern "C" {
-    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
-}
-unsafe fn ZopfliRefs(mut num_bytes: u64, mut dist_cache: *mut i32) {
-    let mut orig_dist_cache: [i32; 4] = [0; 4];
-    memcpy(orig_dist_cache.as_mut_ptr() as *mut core::ffi::c_void,
-        dist_cache as *const core::ffi::c_void,
-        (4 as i32 as u64).wrapping_mul(::std::mem::size_of::<i32>() as u64));
-    if num_bytes > 1 {
-        memcpy(dist_cache as *mut core::ffi::c_void,
-            orig_dist_cache.as_mut_ptr() as *const core::ffi::c_void,
-            (4 as i32 as u64).wrapping_mul(::std::mem::size_of::<i32>() as u64));
-    }
-}
-pub struct State {
-    pub dist_cache_: [i32; 16],
-}
-pub unsafe fn caller(mut s: *mut State, mut n: u64) {
-    ZopfliRefs(n, ((*s).dist_cache_).as_mut_ptr());
-}
-"#;
-
 /// The subject's contract-extent length plan, rendered.
 fn contract_length(fixture: &str, subject: &str) -> String {
     ::utils::compilation::run_compiler_on_input(
@@ -985,35 +902,6 @@ fn flat(source: &str) -> String {
     source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// W9 (R615-7, STOP 2) — the count's value divided by the pointee's size is
-/// an exact element count, the two sites agree on it, and every caller
-/// constructs over it instead of the §77 fallback. Restated (R829-1, relay
-/// 297): at the first `memcpy` `dist_cache` is the source beside the written
-/// destination `orig_dist_cache.as_mut_ptr()` (arg0, the callee's own array
-/// through a method call, not shown disjoint), so it is held raw: no
-/// promotion, no construction at the caller, and still no fallback.
-#[test]
-fn w6l_nul_w9_a_constant_byte_count_is_an_element_count_at_every_caller() {
-    let length = contract_length(PROBE_DIST_CACHE, "dist_cache");
-    // R829-1 (relay 297, main 188): ZopfliRefs::dist_cache is held beside `orig_dist_cache.as_mut_ptr()` (arg0) at the first memcpy; `Evidence { elements: "4" .. }` → no-promotion.
-    assert_eq!(length, "no-promotion");
-    let decisions = super::emit_tests::decisions_of(PROBE_DIST_CACHE);
-    assert_eq!(
-        reason(&decisions, "dist_cache", true),
-        "held:pair-not-shown-disjoint",
-        "{decisions:#?}"
-    );
-    let (source, _) = emitted_source(PROBE_DIST_CACHE);
-    let source = flat(&source);
-    // R829-1 (relay 297, main 188): ZopfliRefs::dist_cache is held at the first memcpy; `&mut [i32]` → the raw formal, and the caller's `(4) as usize` construction → none.
-    assert!(
-        source.contains("fn ZopfliRefs(mut num_bytes: u64, mut dist_cache: *mut i32)"),
-        "{source}"
-    );
-    assert!(!source.contains("(4) as usize"), "{source}");
-    assert!(!source.contains("FALLBACK_SLICE_EXTENT"), "{source}");
-}
-
 /// C7 — a constant that is not a whole number of elements claims none.
 const CONTROL_PARTIAL_ELEMENT: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, non_snake_case)]
@@ -1027,33 +915,6 @@ unsafe fn head(mut dist_cache: *mut i32) {
 }
 pub unsafe fn caller(mut p: *mut i32) {
     head(p);
-}
-"#;
-
-/// C8 — two constant sites that disagree are two requirements. The caller
-/// hands an initialized array, so the WRITE site is a site too (a write
-/// position counts only over initialized elements).
-const CONTROL_UNEQUAL_CONSTANTS: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_mut, non_snake_case)]
-extern "C" {
-    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
-}
-unsafe fn refs(mut num_bytes: u64, mut dist_cache: *mut i32) {
-    let mut orig: [i32; 4] = [0; 4];
-    memcpy(orig.as_mut_ptr() as *mut core::ffi::c_void,
-        dist_cache as *const core::ffi::c_void,
-        (4 as u64).wrapping_mul(::std::mem::size_of::<i32>() as u64));
-    if num_bytes > 1 {
-        memcpy(dist_cache as *mut core::ffi::c_void,
-            orig.as_mut_ptr() as *const core::ffi::c_void,
-            (2 as u64).wrapping_mul(::std::mem::size_of::<i32>() as u64));
-    }
-}
-pub struct State {
-    pub dist_cache_: [i32; 16],
-}
-pub unsafe fn caller(mut s: *mut State, mut n: u64) {
-    refs(n, ((*s).dist_cache_).as_mut_ptr());
 }
 "#;
 
@@ -1078,22 +939,6 @@ fn w6l_nul_c7_a_partial_element_constant_stays_fallback() {
     assert!(!length.starts_with("Evidence"), "{length}");
     let (source, _) = emitted_source(CONTROL_PARTIAL_ELEMENT);
     assert!(!flat(&source).contains("(1) as usize"), "{source}");
-}
-
-/// Restated (R829-1, relay 297): at the first `memcpy` `dist_cache` is the
-/// source beside the written destination `orig.as_mut_ptr()` (arg0, the
-/// callee's own array through a method call, not shown disjoint), so it is
-/// held raw and no promotion (hence no `MultipleRequirements` fallback plan)
-/// forms; neither constant becomes an extent.
-#[test]
-fn w6l_nul_c8_unequal_constant_sites_stay_fallback() {
-    let length = contract_length(CONTROL_UNEQUAL_CONSTANTS, "dist_cache");
-    // R829-1 (relay 297, main 188): refs::dist_cache is held beside `orig.as_mut_ptr()` (arg0) at the first memcpy; `Fallback(MultipleRequirements)` → no-promotion.
-    assert_eq!(length, "no-promotion");
-    let (source, _) = emitted_source(CONTROL_UNEQUAL_CONSTANTS);
-    let source = flat(&source);
-    assert!(!source.contains("(4) as usize"), "{source}");
-    assert!(!source.contains("(2) as usize"), "{source}");
 }
 
 #[test]

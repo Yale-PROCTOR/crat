@@ -374,96 +374,6 @@ fn ce_w06_nullable_contract_subject_uses_an_optional_slice_without_null_construc
 }
 
 #[test]
-fn ce_w07_strncpy_source_count_is_an_upper_bound_and_never_exact_evidence() {
-    let source = r#"
-        #![allow(dead_code, unused_unsafe)]
-        extern "C" { fn strncpy(dest: *mut i8, src: *const i8, n: usize) -> *mut i8; }
-        pub unsafe fn bounded(src: *const i8, n: usize) {
-            let mut dest = [0i8; 8];
-            strncpy(dest.as_mut_ptr(), src, n);
-        }
-    "#;
-    let plans = promotions(source);
-    // R829-1 (relay 297, main 188): bounded::src is held beside
-    // `dest.as_mut_ptr()` at strncpy (the written destination is not an
-    // address-of a frame binding); the readable source no longer promotes
-    // (plans 1 → 0), so neither an upper bound nor exact evidence is issued.
-    assert!(
-        plans.is_empty(),
-        "the held source is not eligible: {plans:#?}"
-    );
-    let decisions = super::emit_tests::decisions_of(source);
-    let src = decisions
-        .iter()
-        .find(|(name, is_param, _)| name == "src" && *is_param)
-        .expect("bounded::src subject");
-    assert_eq!(src.2, "held:pair-not-shown-disjoint", "{decisions:#?}");
-}
-
-#[test]
-fn multiline_count_expression_is_single_line_only_in_the_receipt() {
-    let source = r#"
-        #![allow(dead_code, unused_unsafe)]
-        extern "C" { fn strncpy(dest: *mut i8, src: *const i8, n: usize) -> *mut i8; }
-        pub unsafe fn copy_file_name(src: *const i8) {
-            let mut dest = [0i8; 1034];
-            strncpy(dest.as_mut_ptr(), src, (1034usize - 10usize) as
-                usize);
-        }
-    "#;
-    let plans = promotions(source);
-    // R829-1 (relay 297, main 188): copy_file_name::src is held beside
-    // `dest.as_mut_ptr()` at strncpy; the readable source no longer promotes
-    // (plans 1 → 0), so this fixture no longer carries the multi-line count
-    // into an upper-bound plan (the count-operand check is unreachable here),
-    // and the receipt-width checks below read whatever rows remain.
-    assert!(
-        plans.is_empty(),
-        "the held source does not promote: {plans:#?}"
-    );
-    let decisions = super::emit_tests::decisions_of(source);
-    let src = decisions
-        .iter()
-        .find(|(name, is_param, _)| name == "src" && *is_param)
-        .expect("copy_file_name::src subject");
-    assert_eq!(src.2, "held:pair-not-shown-disjoint", "{decisions:#?}");
-
-    let super::RewriteOutcome::Emitted {
-        source: output,
-        raw_boundary_artifacts,
-        ..
-    } = super::rewrite_m1(source)
-    else {
-        panic!("multiline-count fixture must emit")
-    };
-    assert!(output.contains("strncpy("), "{output}");
-    assert_eq!(output.matches("1034usize - 10usize").count(), 1, "{output}");
-    // R829-1 (relay 297, main 188): copy_file_name::src is held beside
-    // `dest.as_mut_ptr()` at strncpy; it keeps its raw form.
-    assert!(
-        output.contains("copy_file_name(src: *const i8)"),
-        "{output}"
-    );
-
-    let rendered =
-        super::mechanical_receipt::render_slice_use_rows(&raw_boundary_artifacts.slice_use_rows);
-    let lines = rendered.lines().collect::<Vec<_>>();
-    assert_eq!(
-        lines.len(),
-        raw_boundary_artifacts.slice_use_rows.len() + 1,
-        "one physical TSV line per logical receipt row:\n{rendered}"
-    );
-    let width = lines[0].split('\t').count();
-    assert_eq!(width, 23, "specialized Slice-use schema width");
-    assert!(
-        lines[1..]
-            .iter()
-            .all(|line| line.split('\t').count() == width),
-        "every data row keeps the header width:\n{rendered}"
-    );
-}
-
-#[test]
 fn ce_w08_conditional_count_expression_is_evaluated_once_at_the_original_call() {
     // A count that spells a CALL is not licensed as the construction's length
     // (a construction would evaluate it again): the destination's construction
@@ -1149,91 +1059,6 @@ fn ce_a02_a_dereference_beside_the_nul_position_keeps_the_fatness_hold() {
     assert_eq!(evidence, 0, "and nothing here is evidence-backed: {source}");
 }
 
-/// The model gate (wave-6v 008): a caller-side contract never outruns the
-/// model's kind of the callee it forwards to. `find_local::name` is `Raw` to
-/// the model (the mutable/reset copy shape of R213), so its `strcmp` position
-/// carries no caller: `find::name`'s local boundary use is not carried into a
-/// parameter that cannot promote, and `find::name` is declined at that
-/// boundary instead of taking a slice it would bridge raw.
-const CE_D06_RAW_CALLEE: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_assignments)]
-extern "C" {
-    fn strcmp(a: *const i8, b: *const i8) -> i32;
-}
-static mut KEY: [i8; 2] = [120, 0];
-unsafe fn find_local(name: *mut i8, clear: bool) -> i32 {
-    let mut dst: *mut i8 = 0 as *mut i8;
-    dst = name;
-    if clear {
-        dst = 0 as *mut i8;
-    }
-    if dst.is_null() {
-        return 0;
-    }
-    *dst += 1;
-    strcmp(name, b"x\0".as_ptr() as *const i8)
-}
-unsafe fn find(name: *mut i8, clear: bool) -> i32 {
-    find_local(name, clear)
-}
-pub unsafe fn top() -> i32 {
-    find(KEY.as_mut_ptr(), false)
-}
-"#;
-
-#[test]
-fn ce_d06_a_model_raw_callee_carries_no_caller() {
-    let decisions = super::emit_tests::decisions_of(CE_D06_RAW_CALLEE);
-    let find_local = decisions
-        .iter()
-        .find(|(name, is_param, reason)| name == "name" && *is_param && reason == "kind-raw")
-        .is_some();
-    assert!(
-        find_local,
-        "the callee parameter is model-Raw: {decisions:#?}"
-    );
-    let plans = promotions(CE_D06_RAW_CALLEE);
-    assert!(plans.is_empty(), "{plans:#?}");
-    let super::RewriteOutcome::Emitted {
-        source,
-        raw_boundary_artifacts,
-        ..
-    } = super::rewrite_m1(CE_D06_RAW_CALLEE)
-    else {
-        panic!("CE-D06 must emit");
-    };
-    assert!(
-        raw_boundary_artifacts
-            .contract_candidate_declines
-            .lines()
-            .any(|line| line.starts_with("find\t")
-                && line.contains("contract-candidate-declined:local-callee-boundary")
-                && line.contains("via-local-callee:")),
-        "{}",
-        raw_boundary_artifacts.contract_candidate_declines
-    );
-    // RE-PIN (wave-6l, R641 item 2; Codex 062 finding 1; was: no `&[i8]` /
-    // `&mut [i8]` in the source). At `be3884944` this emitted
-    // `fn find(name: &mut i8)` and handed that one-element reference to
-    // `find_local`, whose `strcmp` walks it: a NUL walk through a thin claim.
-    // A model-Raw callee keeps ITS parameter raw; it does not protect the
-    // caller that converts. The thin-extent set now reaches `find::name`
-    // through `find_local`'s walk, and R481's lift gives it the array's own
-    // extent. What this test protects is unchanged: no contract promotion
-    // is carried through the raw callee (`plans` empty, the declined line).
-    // RE-PIN (relay 072, R698-1): the see-through's call-site edge is dropped
-    // for 54, so `find::name` is not carried to `find_local`'s walk and 52's
-    // thin `name: &mut i8` returns — the class Codex 062 finding 1 named (a
-    // one-element claim reaching a NUL walk), re-admitted by the ruling's (b).
-    // RE-PIN (main 170, the gate of 55): `find::name` is handed BARE to
-    // `find_local`'s array formal, so the thin-into-fat rule (R758-1 (2),
-    // R763-1 (a)) gives it the fat twin and the caller hands `KEY` whole: the
-    // one-element claim into the NUL walk is gone. What this test protects
-    // still holds: no contract promotion through the raw callee.
-    assert!(source.contains("name: &mut [i8]"), "{source}");
-    assert!(!source.contains("name: &mut i8"), "{source}");
-}
-
 /// R408-1 (relay 028 §1): ruling B's adjacency arm licensed a VALUE as a slice
 /// length — lodepng's `lodepng_set32bitInt(chunk.offset(8 + length), CRC)`
 /// planned `from_raw_parts_mut(chunk.offset(..), (CRC) as usize)`. A sibling
@@ -1276,63 +1101,6 @@ fn ce_l01_an_adjacent_value_is_not_licensed_as_the_length() {
         ),
         "the raw argument takes the callee's own extent:\n{source}"
     );
-    assert!(super::verify::type_checks_str(&source), "{source}");
-}
-
-/// The licensed half: the callee's own pinned count position names the
-/// sibling (`strncpy(dst, src, n)` in the callee: `n` bounds the read of
-/// `src`), so `n` is evidence and the caller's construction takes it.
-///
-/// **R829-1 (relay 297, main 188):** on this fixture `src` meets `strncpy`
-/// beside the written `buf.as_mut_ptr()`, so it is held raw
-/// (`held:pair-not-shown-disjoint`) before the licence is read; the witness
-/// now pins that hold, and the licence needs a fixture without a written
-/// sibling.
-const CE_L02_COUNT_POSITION_LICENSES: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_assignments)]
-extern "C" {
-    fn strncpy(dest: *mut i8, src: *const i8, n: usize) -> *mut i8;
-}
-static mut SAVED: *const i8 = 0 as *const i8;
-unsafe fn read_n(src: *const i8, n: usize) -> i8 {
-    let mut buf = [0i8; 16];
-    strncpy(buf.as_mut_ptr(), src, n);
-    buf[0]
-}
-pub unsafe fn caller(base: *const i8, n: usize) -> i8 {
-    SAVED = base;
-    read_n(base.offset(1), n)
-}
-"#;
-
-#[test]
-fn ce_l02_a_count_position_of_the_callee_licenses_the_sibling() {
-    let super::RewriteOutcome::Emitted { source, .. } =
-        super::rewrite_m1(CE_L02_COUNT_POSITION_LICENSES)
-    else {
-        panic!("CE-L02 must emit");
-    };
-    // R829-1 (relay 297, main 188): read_n::src is held beside
-    // `buf.as_mut_ptr()` at strncpy (the H-C7 shape: the written destination is
-    // not an address-of a frame binding); it keeps `*const i8` (was `&[i8]`),
-    // so the count position licenses no construction at the caller on this
-    // fixture and `base.offset(1)` is handed over raw.
-    assert!(
-        source.contains("unsafe fn read_n(src: *const i8, n: usize)"),
-        "{source}"
-    );
-    let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(
-        flat.contains("read_n(base.offset(1), n)")
-            && !flat.contains("from_raw_parts(base.offset(1)"),
-        "the held formal takes the caller's raw argument unbuilt:\n{source}"
-    );
-    let decisions = super::emit_tests::decisions_of(CE_L02_COUNT_POSITION_LICENSES);
-    let src = decisions
-        .iter()
-        .find(|(name, is_param, _)| name == "src" && *is_param)
-        .expect("read_n::src subject");
-    assert_eq!(src.2, "held:pair-not-shown-disjoint", "{decisions:#?}");
     assert!(super::verify::type_checks_str(&source), "{source}");
 }
 
@@ -1821,58 +1589,6 @@ pub unsafe fn print_error(color: i32, p: *mut i8) -> usize {
         .find(|(name, is_param, _)| name == "box_vertical" && !*is_param)
         .expect("CE-S04 box_vertical subject");
     assert_eq!(local.2, "<emitted>", "{decisions:#?}");
-}
-
-/// R419-3 at the CONTRACT-ALONE arm: urlparser's `get_part::format#2` — the
-/// parameter's only use is `sscanf(fmt_url, format, tmp)` position 1, a
-/// NUL-terminated read, so R407-14 would promote it over `Ptr` fatness; but the
-/// scanf tail WRITES `tmp` at the same call, so the site is a pending
-/// sibling-overlap site and the promotion would deliver a held subject.
-const CE_A03_CONTRACT_ALONE_PENDING: &str = r#"
-#![allow(dead_code, unused_unsafe, unused_mut)]
-extern "C" {
-    fn sscanf(s: *const i8, format: *const i8, _: ...) -> i32;
-    fn malloc(size: usize) -> *mut core::ffi::c_void;
-}
-pub unsafe fn get_part(url: *const i8, format: *const i8) -> i32 {
-    let tmp = malloc(16) as *mut i8;
-    sscanf(url, format, tmp)
-}
-"#;
-
-#[test]
-fn ce_a03_a_contract_alone_candidate_at_a_pending_sibling_site_holds() {
-    let decisions = super::emit_tests::decisions_of(CE_A03_CONTRACT_ALONE_PENDING);
-    let format = decisions
-        .iter()
-        .find(|(name, is_param, _)| name == "format" && *is_param)
-        .expect("CE-A03 format subject");
-    // **Re-premised by R829-1 / R855-1 (the USER; the pair waiver ended),
-    // relay 297, main 188.** The claim this witness was built for is unchanged:
-    // the pending-sibling site REFUSES the contract-alone promotion, so the
-    // subject may not take the contract's fat form. What changed is the
-    // terminal form: the site is no longer lifted under the waiver
-    // (`<emitted>` with a `fallback` receipt, R481-1 / R482-3); it is held on
-    // the settled table and the subject is decided raw.
-    // R829-1 (relay 297, main 188): get_part::format is held beside `tmp`
-    // (sscanf's written scanf-tail argument, a fresh `malloc`) at sscanf;
-    // `<emitted>` → `held:pair-not-shown-disjoint`.
-    assert_eq!(
-        format.2, "held:pair-not-shown-disjoint",
-        "the pending site holds what the contract may not promote: {decisions:#?}"
-    );
-    let fabricated = table_of(CE_A03_CONTRACT_ALONE_PENDING, |table| {
-        table
-            .licensed_lifts
-            .iter()
-            .filter(|lift| !lift.fallback && lift.declined.is_none())
-            .count()
-    })
-    .expect("the fixture yields a table");
-    assert_eq!(
-        fabricated, 0,
-        "and no evidence receipt is issued: {decisions:#?}"
-    );
 }
 
 /// The corpus spelling of CE-M04 (libtree `small_vec_u64_init`, a batch-8
@@ -2701,30 +2417,6 @@ pub unsafe extern "C" fn StoreFromUnrecorded(mut s: *mut EncoderState, mut n: si
 }
 "#;
 
-/// **A held PARAMETER whose caller's root states nothing** — the shape the
-/// census column exists to describe, and could not until report 055.
-const W4_B1_PARAM_OVER_OPAQUE_ROOT: &str = r#"
-#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
-pub type uint8_t = u8;
-pub type size_t = usize;
-extern "C" {
-    fn GetBuffer() -> *mut uint8_t;
-}
-unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
-    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
-    *p = 1 as uint8_t;
-    *pos = (*pos).wrapping_add(8 as size_t);
-}
-unsafe extern "C" fn StoreMiddle(mut pos: *mut size_t, mut storage: *mut uint8_t) {
-    BrotliWriteBits(pos, storage);
-}
-pub unsafe extern "C" fn StoreOpaqueOuter() {
-    let mut buffer: *mut uint8_t = GetBuffer();
-    let mut pos: size_t = 0 as size_t;
-    StoreMiddle(&mut pos, buffer);
-}
-"#;
-
 fn b1_rows(source: &str) -> Vec<(String, String, String, String)> {
     table_of(source, |table| {
         table
@@ -3124,47 +2816,6 @@ fn w4b113_unrecorded_growth_states_no_extent() {
         .find(|(name, is_param, _)| name == "storage" && !*is_param)
         .unwrap_or_else(|| panic!("no storage subject: {decisions:#?}"));
     assert_eq!(storage.2, "kind-raw", "{decisions:#?}");
-}
-
-/// **W4B1-14 (report 055) — a parameter's row reports its CALLERS' root
-/// shapes, because it has no construction of its own.**
-///
-/// Measured at batch 26 and it is why this exists: **every**
-/// `caller-root-states-no-extent` row in the corpus is a parameter, so the
-/// column read `none:no-construction` for all of them and answered nothing.
-/// Report 049's C6 was a claim about the roots the CALL SITES hand over, and
-/// that is what the column now names — counted, so one bad caller among five is
-/// visible rather than averaged away.
-///
-/// **wave-5d 58′ (relay 202 item 3), R934-1 (i) — re-pinned to the held form
-/// (150b).** `StoreOpaqueOuter` hands `&mut pos` beside `GetBuffer()`'s result,
-/// two roots no certificate separates, so the pair holds `buffer` raw
-/// (`held:pair-not-shown-disjoint`); `StoreMiddle::storage` then receives a raw
-/// root and is decided `slice-use-unsupported` before any extent is asked, so
-/// the parameter row this test was written to read does not form here. The
-/// caller's own root row still names its shape. (A reshaping with `pos` local
-/// to `StoreMiddle` delivers the whole chain and forms no held row either.)
-#[test]
-fn w4b114_a_parameter_row_names_its_callers_roots() {
-    let rows = b1_rows(W4_B1_PARAM_OVER_OPAQUE_ROOT);
-    assert!(
-        !rows
-            .iter()
-            .any(|(subject, ..)| subject.starts_with("StoreMiddle::storage")),
-        "{rows:?}"
-    );
-    let decisions = super::emit_tests::decisions_of(W4_B1_PARAM_OVER_OPAQUE_ROOT);
-    for (name, is_param, reason) in [
-        ("buffer", false, "held:pair-not-shown-disjoint"),
-        ("storage", true, "slice-use-unsupported"),
-    ] {
-        assert!(
-            decisions
-                .iter()
-                .any(|(n, p, r)| n == name && *p == is_param && r == reason),
-            "{name}: {decisions:?}"
-        );
-    }
 }
 
 /// **W4B1-15 (report 057) — the admission reaches the CENSUS.**

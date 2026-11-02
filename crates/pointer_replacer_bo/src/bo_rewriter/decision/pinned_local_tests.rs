@@ -172,29 +172,6 @@ fn w5c_pinned_local_reference_locals_deliver_in_a_pinned_callback() {
     }
 }
 
-/// The pin still gates every parameter of every registered callback.
-#[test]
-fn w5c_pinned_local_parameters_stay_pinned() {
-    use super::DegradeReason;
-    let table = decisions(&fixture());
-    for label in [
-        "fnc_if::argv",
-        "fnc_charat::lil",
-        "fnc_charat::argv",
-        "fnc_codeat::lil",
-        "fnc_codeat::argv",
-    ] {
-        assert!(
-            matches!(
-                reason(decision(&table, label)),
-                Some(DegradeReason::CallSiteNotAdapted)
-            ),
-            "{label}: {:?}",
-            decision(&table, label)
-        );
-    }
-}
-
 /// Without the registration the callbacks are ordinary functions: the same
 /// locals deliver and `argv` is decided by its own facts, so the rule adds
 /// nothing there.

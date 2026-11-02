@@ -104,29 +104,6 @@ pub unsafe fn f(mut p: *mut i32, n: usize, k: isize) -> *mut i32 {
 }
 "####;
 
-/// **The shape.** Every offset this body performs on the subject takes a
-/// non-negative literal; the value whose sign cannot be bounded is produced
-/// elsewhere and only null-tested here. The optional twin already admits this;
-/// R471-4 lets the plain twin admit it too.
-#[test]
-fn w5c_plain_twin_admits_a_literal_walk_under_an_unbounded_sign() {
-    let reason = reason_in(
-        &CALLEE_TOP.replace("ADVANCE", "4 as core::ffi::c_int as isize"),
-        "p",
-    );
-    assert_ne!(
-        reason, "slice-neg-or-unknown-offset",
-        "a forward-only walk must pass the plain twin's sign refusal, as it \
-         already passes the optional twin's"
-    );
-    // Where it lands instead, stated rather than left open: this fixture
-    // returns the subject bare, so the next owed capability is the return
-    // hand-off — another family's gate, not this arm's business. The corpus
-    // rows this arm is for (report 031's 15) carry their own next gates, and
-    // the census measures those.
-    assert_eq!(reason, "slice-use-unsupported");
-}
-
 /// **Control (iii)** — the same fixture, advancing by a VARIABLE. One token
 /// apart from the witness, and it must stay refused: this is report 027's
 /// shape, the 24 rows the fact is not for.

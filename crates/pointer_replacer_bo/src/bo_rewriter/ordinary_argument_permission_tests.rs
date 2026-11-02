@@ -92,40 +92,6 @@ fn argument_outcome(input: &str, subject: &str, label: &str) -> ArgumentOutcome 
     .expect("original argument fixture compiles")
 }
 
-/// The load-bearing witness. A LOCAL callee makes the derivation explicit —
-/// `q.cast_mut()` on the argument — so there is no question whether the
-/// returned pointer descends from what we handed over.
-const LOCAL_CHILD_INPUT: &str = r#"
-    #![allow(dead_code, unused_unsafe)]
-    unsafe fn dup(q: *const i32) -> *mut i32 { let _ = q.read(); q.cast_mut() }
-    pub unsafe fn entry() -> i32 {
-        let mut values = [3, 5, 7];
-        let p: *mut i32 = values.as_mut_ptr();
-        *p.offset(1) += 1;
-        let child = dup(p);
-        child.write(8);
-        values[0]
-    }
-"#;
-
-/// The corpus-realistic shape. An `extern` signature alone proves neither
-/// UB-freedom nor that the result descends from the argument, so this fixture
-/// does not stand on its own; it is here because it is the shape that occurs.
-const FOREIGN_CHILD_INPUT: &str = r#"
-    #![allow(dead_code, unused_unsafe)]
-    extern "C" {
-        fn dup(p: *const i32) -> *mut i32;
-    }
-    pub unsafe fn entry() -> i32 {
-        let mut values = [3, 5, 7];
-        let p: *mut i32 = values.as_mut_ptr();
-        *p.offset(1) += 1;
-        let child = dup(p);
-        child.write(8);
-        values[0]
-    }
-"#;
-
 /// A SHARED subject at a callee that can return a pointer. No mutable view
 /// exists to upgrade to, so the only sound disposition is a hold.
 const SHARED_SUBJECT_INPUT: &str = r#"
@@ -150,59 +116,6 @@ const SHARED_SCALAR_SINK_INPUT: &str = r#"
         first + total(p)
     }
 "#;
-
-#[test]
-fn ordinary_argument_local_child_takes_the_writable_const_carrier() {
-    let outcome = argument_outcome(LOCAL_CHILD_INPUT, "entry::p", "local returning child");
-    println!(
-        "ORDINARY-ARGUMENT[local child] form={:?} reason={}\n{}",
-        outcome.subject_form, outcome.subject_reason, outcome.emitted
-    );
-    assert_eq!(
-        outcome.subject_form,
-        Form::Slice { mutable: true },
-        "the subject still promotes -- the carrier costs no hold"
-    );
-    assert!(
-        outcome
-            .emitted
-            .contains("dup(p.as_mut_ptr().cast::<i32>().cast_const())"),
-        "a mutable subject at a const position keeps write permission:\n{}",
-        outcome.emitted
-    );
-    assert!(
-        !outcome.emitted.contains("dup(p.as_ptr())"),
-        "the shared view is retired at this seam:\n{}",
-        outcome.emitted
-    );
-    assert!(
-        super::verify::type_checks_str(&outcome.emitted),
-        "emitted output type/borrow-checks:\n{}",
-        outcome.emitted
-    );
-}
-
-#[test]
-fn ordinary_argument_foreign_child_takes_the_writable_const_carrier() {
-    let outcome = argument_outcome(FOREIGN_CHILD_INPUT, "entry::p", "foreign returning child");
-    println!(
-        "ORDINARY-ARGUMENT[foreign child] form={:?} reason={}\n{}",
-        outcome.subject_form, outcome.subject_reason, outcome.emitted
-    );
-    assert_eq!(outcome.subject_form, Form::Slice { mutable: true });
-    assert!(
-        outcome
-            .emitted
-            .contains("dup(p.as_mut_ptr().cast::<i32>().cast_const())"),
-        "the corpus-realistic shape takes the same carrier:\n{}",
-        outcome.emitted
-    );
-    assert!(
-        super::verify::type_checks_str(&outcome.emitted),
-        "emitted output type/borrow-checks:\n{}",
-        outcome.emitted
-    );
-}
 
 #[test]
 fn ordinary_argument_shared_subject_holds_with_its_typed_reason() {

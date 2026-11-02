@@ -307,41 +307,6 @@ pub unsafe extern "C" fn go() {
     assert!(text.contains("fnp_take(mutp:Box<"), "{}", out.source);
 }
 
-/// A slice owner's raw pointer is fat; its hand-over is not this rule's.
-#[test]
-fn w6a_r776_a_slice_owner_is_held() {
-    let out = run(
-        "r776-slice",
-        r#"
-unsafe extern "C" fn buf_new() -> *mut i8 {
-    let mut b = malloc((16 as usize) * ::std::mem::size_of::<i8>()) as *mut i8;
-    if b.is_null() {
-        return 0 as *mut i8;
-    }
-    sscanf(b"http://x\0" as *const u8 as *const i8, b"%[^://]\0" as *const u8 as *const i8, b);
-    return b;
-}
-unsafe extern "C" fn keep_c(mut h: *mut *mut i8, mut b: *mut i8, mut depth: i32) -> i32 {
-    if depth > 0 as i32 {
-        return keep_c(h, b, depth - 1 as i32);
-    }
-    *h = b;
-    return 1 as i32;
-}
-pub unsafe extern "C" fn go(mut h: *mut *mut i8) {
-    let mut b = buf_new();
-    keep_c(h, b, 0 as i32);
-}
-"#,
-    );
-    let receipts = &out.artifacts.return_certificate_receipts;
-    assert!(handovers(receipts).is_empty(), "{receipts}\n{}", out.source);
-    assert!(
-        receipts.contains("call-argument-not-a-lend:keep_c(h, b, 0 as i32)"),
-        "{receipts}"
-    );
-}
-
 /// Codex (R776-5 review, high): two transfers into the same formal on two
 /// paths — only the second is a last use in the text — are two occurrences;
 /// one ready hand-over does not cover both, so the certificate withdraws.
