@@ -1,7 +1,16 @@
+//! BO's mutability analysis: the legacy Foster mutability analysis with era-5c's load gate
+//! (R545-1, [`LoadGate`]) and its own libc table (`libc.rs`, which keeps the record's rows: master's
+//! PR #130 added `strtod` / `strtol` / … rows to the legacy table, and they are not taken here).
+//! The `Mutability` lattice and the Rust-library table are the legacy crate's (the master-merge
+//! cleanup's legacy-copy stage, the user's word in main's session 11-02).
+
 use std::ops::Range;
 
 use libc::libc_call;
-use library::library_call;
+use pointer_replacer::analyses::type_qualifier::foster::mutability::library::library_call;
+pub use pointer_replacer::analyses::type_qualifier::foster::mutability::{
+    Mutability, MutabilityResult,
+};
 use rustc_middle::mir::{
     BinOp, HasLocalDecls, Location, Operand, Place, ProjectionElem, Rvalue, Terminator,
     visit::Visitor,
@@ -11,10 +20,9 @@ use rustc_type_ir::TyKind;
 
 use crate::{
     analyses::{
-        lattice::{HasBottom, HasTop, Lattice},
         mir::{self, CallKind, TerminatorExt},
         type_qualifier::foster::{
-            BooleanLattice, InferCtxt, StructFields, TypeQualifiers, Var,
+            InferCtxt, StructFields, Var,
             constraint_system::{BooleanSystem, ConstraintSystem},
         },
     },
@@ -22,7 +30,6 @@ use crate::{
 };
 
 mod libc;
-mod library;
 // #[cfg(test)]
 // mod test;
 
@@ -71,76 +78,6 @@ pub fn mutability_analysis_gated<'tcx>(
     database.greatest_model(&mut result.model);
     result
 }
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-/// [`Mutability::Mut`] ⊑ [`Mutability::Imm`]
-pub enum Mutability {
-    Imm,
-    Mut,
-}
-
-impl Mutability {
-    #[inline]
-    pub fn is_mutable(&self) -> bool {
-        *self == Mutability::Mut
-    }
-
-    #[inline]
-    pub fn is_immutable(&self) -> bool {
-        *self == Mutability::Imm
-    }
-}
-
-impl std::fmt::Display for Mutability {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Mutability::Imm => write!(f, "&read"),
-            Mutability::Mut => write!(f, "&read_write"),
-        }
-    }
-}
-
-pub type MutabilityResult = TypeQualifiers<Mutability>;
-
-impl From<Mutability> for bool {
-    fn from(mutability: Mutability) -> Self {
-        mutability == Mutability::Imm
-    }
-}
-
-impl From<bool> for Mutability {
-    fn from(b: bool) -> Self {
-        if b { Mutability::Imm } else { Mutability::Mut }
-    }
-}
-
-impl HasBottom for Mutability {
-    const BOTTOM: Self = Self::Mut;
-}
-
-impl HasTop for Mutability {
-    const TOP: Self = Self::Imm;
-}
-
-impl Lattice for Mutability {
-    fn join(&mut self, other: &Self) -> bool {
-        if let (Self::Mut, Self::Imm) = (*self, *other) {
-            *self = Self::Imm;
-            return true;
-        }
-        false
-    }
-
-    fn meet(&mut self, other: &Self) -> bool {
-        if let (Self::Imm, Self::Mut) = (*self, *other) {
-            *self = Self::Mut;
-            return true;
-        }
-        true
-    }
-}
-
-impl BooleanLattice for Mutability {}
 
 pub struct MutabilityAnalysis<'infer, 'tcx, D> {
     ctxt: InferCtxt<'infer, 'tcx, D>,
@@ -469,9 +406,9 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
                         let offset: usize = tys
                             .iter()
                             .take(field.index())
-                            .map(|t| super::count_ptr(t))
+                            .map(|t| crate::analyses::type_qualifier::foster::count_ptr(t))
                             .sum();
-                        let field_count = super::count_ptr(ty);
+                        let field_count = crate::analyses::type_qualifier::foster::count_ptr(ty);
                         place_vars = Range {
                             start: place_vars.start + offset,
                             end: place_vars.start + offset + field_count,

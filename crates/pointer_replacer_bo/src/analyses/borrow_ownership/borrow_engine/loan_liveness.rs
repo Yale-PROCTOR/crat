@@ -15,7 +15,10 @@ use rustc_mir_dataflow::{
     points::{DenseLocationMap, PointIndex},
 };
 
-use crate::analyses::borrow::{BorrowSet, Loan, Provenance};
+use crate::analyses::{
+    borrow::{BorrowSet, Loan, Provenance},
+    borrow_ownership::borrow_fork::LoanLocation,
+};
 
 pub(super) fn compute_loan_liveness<'tcx>(
     tcx: TyCtxt<'tcx>,

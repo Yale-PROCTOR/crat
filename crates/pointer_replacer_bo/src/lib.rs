@@ -29,21 +29,12 @@ extern crate rustc_type_ir;
 extern crate smallvec;
 extern crate thin_vec;
 
-// The analyses this crate owns: BO's own, and the three legacy modules whose variants BO
-// needs (copies of the branch's versions; the legacy crate keeps master's). Every other
-// `crate::analyses::…` path resolves to the legacy crate's module through the globs.
+// The analyses this crate owns: BO's own (`borrow_ownership`, which also holds the two parts of
+// the legacy analyses BO runs differently: `borrow_fork` and `mutability`). Every other
+// `crate::analyses::…` path resolves to the legacy crate's module through the glob.
 pub mod analyses {
     pub mod bo_adapter;
-    pub mod borrow;
     pub mod borrow_ownership;
-    pub mod mir_variable_grouping;
-    pub mod type_qualifier {
-        pub mod foster {
-            pub mod mutability;
-            pub use pointer_replacer::analyses::type_qualifier::foster::*;
-        }
-        pub use pointer_replacer::analyses::type_qualifier::*;
-    }
     pub use pointer_replacer::analyses::*;
 }
 mod analysis_budget;

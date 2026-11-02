@@ -22,7 +22,7 @@ use crate::{
 };
 
 mod libc;
-mod library;
+pub mod library;
 // #[cfg(test)]
 // mod test;
 

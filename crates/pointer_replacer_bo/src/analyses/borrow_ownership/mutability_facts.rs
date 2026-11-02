@@ -37,8 +37,8 @@ use rustc_span::def_id::LocalDefId;
 
 use crate::{
     analyses::{
+        borrow_ownership::mutability::{MutabilityResult, mutability_analysis},
         mir_variable_grouping::SourceVarGroups,
-        type_qualifier::foster::mutability::mutability_analysis,
     },
     utils::rustc::RustProgram,
 };
@@ -125,12 +125,12 @@ impl MutFacts {
         program: &RustProgram<'tcx>,
         keep_load: &dyn Fn(LocalDefId, &rustc_middle::mir::Place<'tcx>) -> bool,
     ) -> MutFacts {
-        let result = crate::analyses::type_qualifier::foster::mutability::mutability_analysis_gated(
+        let result = crate::analyses::borrow_ownership::mutability::mutability_analysis_gated(
             program,
             Some(keep_load),
         );
         let groups = SourceVarGroups::new(program);
-        let mutables = groups.postprocess_mut_res_outermost(program, &result);
+        let mutables = postprocess_mut_res_outermost(&groups, program, &result);
         MutFacts {
             mutables,
             all_mut: false,
@@ -163,4 +163,35 @@ impl MutFacts {
                 .and_then(|per_local| per_local.get(local))
                 .is_none()
     }
+}
+
+/// era-5c R545-1: `SourceVarGroups::postprocess_mut_res` with each local's bit taken from its
+/// OUTERMOST level only (the cells it points at), not `any` depth. Used only by the
+/// model-conditional verification facts, where a written Ref element still reaches the outer
+/// level through Foster's (kept) load guard. (Moved here from this crate's copy of the legacy
+/// `mir_variable_grouping`, the master-merge cleanup's legacy-copy stage.)
+fn postprocess_mut_res_outermost(
+    groups: &SourceVarGroups,
+    program: &RustProgram,
+    mutability_result: &MutabilityResult,
+) -> FxHashMap<LocalDefId, IndexVec<Local, bool>> {
+    program
+        .functions
+        .iter()
+        .map(|&f| {
+            let mut muts = mutability_result
+                .function_body_facts(f)
+                .map(|muts| muts.first().is_some_and(|m| m.is_mutable()))
+                .collect::<IndexVec<_, _>>();
+            if let Some(groups) = groups.inner.get(&f) {
+                for locals in groups.values() {
+                    let is_mutable = locals.iter().any(|local| muts[*local]);
+                    for local in locals {
+                        muts[*local] = is_mutable;
+                    }
+                }
+            }
+            (f, muts)
+        })
+        .collect::<FxHashMap<_, _>>()
 }

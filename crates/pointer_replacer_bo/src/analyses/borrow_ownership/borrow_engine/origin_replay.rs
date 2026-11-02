@@ -18,9 +18,10 @@ use crate::{
         bo_adapter,
         borrow::{
             BorrowInferenceResults, Borrower, GBorrowInferCtxt, Loan, Provenance, ProvenanceOwner,
-            ProvenanceSet, StructFieldSlot, borrow_inference,
+            ProvenanceSet, StructFieldSlot,
         },
         borrow_ownership::{
+            borrow_fork::{LoanLocation, borrow_inference},
             coherence::SelectedCopyLendLoan,
             esc_minimal, export,
             origin_flow::{self, OriginFlowResults},
@@ -567,6 +568,7 @@ mod copy_lend_identity_tests {
         analyses::{
             borrow::Borrower,
             borrow_ownership::{
+                borrow_fork::LoanLocation,
                 coherence::SelectedCopyLendLoan,
                 crate_slots::CrateSlots,
                 esc_minimal::with_fixture_selection,

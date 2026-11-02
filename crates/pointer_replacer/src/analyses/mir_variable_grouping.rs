@@ -22,7 +22,7 @@ use crate::{
 /// Group MIR locals by their corresponding source variable names.
 /// This includes both locals with debug info and temporaries that are copies.
 pub struct SourceVarGroups {
-    inner: FxHashMap<LocalDefId, FxHashMap<Local, Vec<Local>>>,
+    pub inner: FxHashMap<LocalDefId, FxHashMap<Local, Vec<Local>>>,
 }
 
 impl SourceVarGroups {

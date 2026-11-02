@@ -76,7 +76,8 @@ mod fork_sync {
         const BOUNDARY: &str =
             "==== MIRROR BOUNDARY — the tripwire compares everything below this line ====\n";
         let mirror = include_str!("places_conflict.rs");
-        let production = include_str!("../../borrow/places_conflict.rs");
+        let production =
+            include_str!("../../../../../pointer_replacer/src/analyses/borrow/places_conflict.rs");
         let body = mirror
             .split_once(BOUNDARY)
             .expect("mirror header boundary present")

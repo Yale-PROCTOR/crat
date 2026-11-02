@@ -59,12 +59,10 @@ use super::{
 use crate::{
     analyses::{
         borrow_ownership::{
-            SlotKind, crate_slots::CrateSlots, slots::StructFieldSlot, solver::SlotRef,
+            SlotKind, crate_slots::CrateSlots, mutability::mutability_analysis,
+            slots::StructFieldSlot, solver::SlotRef,
         },
-        type_qualifier::foster::{
-            fatness::{Fatness, fatness_analysis},
-            mutability::mutability_analysis,
-        },
+        type_qualifier::foster::fatness::{Fatness, fatness_analysis},
     },
     bo_rewriter::ownership_fields::lifecycle::{DEPTH_WITNESS_NONE, WAIVER_LEAK_RECURSIVE},
     utils::rustc::RustProgram,

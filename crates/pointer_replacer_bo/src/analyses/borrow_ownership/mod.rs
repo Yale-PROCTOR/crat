@@ -8,6 +8,7 @@ use std::ops::Range;
 pub(crate) mod array_fields;
 mod assoc;
 pub(crate) mod borrow_engine;
+pub(crate) mod borrow_fork;
 pub(crate) mod borrow_verify;
 pub(crate) mod boundary_table;
 pub(crate) mod cache_contract;
@@ -51,6 +52,7 @@ mod kind_order_tests;
 pub(crate) mod licensing;
 pub(crate) mod model_cache;
 pub(crate) mod move_store;
+pub(crate) mod mutability;
 pub(crate) mod mutability_facts;
 pub(crate) mod null_paths;
 #[cfg(test)]

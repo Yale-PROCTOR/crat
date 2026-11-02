@@ -25,7 +25,10 @@ use super::{
 };
 use crate::analyses::{
     borrow::{Borrower, ProvenanceOwner, ProvenanceSet},
-    borrow_ownership::boundary_table::{self, Matcher, Role},
+    borrow_ownership::{
+        borrow_fork::LoanLocation,
+        boundary_table::{self, Matcher, Role},
+    },
 };
 
 pub(crate) type Invalidates = SparseBitMatrix<PointIndex, Loan>;

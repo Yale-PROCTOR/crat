@@ -34,7 +34,10 @@ use super::{
     solver::{GuardedSolveResult, HardLoopSolver, KindSolver, Selectors, SlotRef},
 };
 use crate::{
-    analyses::borrow::{self, ConflictEdge, ProvenanceOwner},
+    analyses::{
+        borrow::{self, ProvenanceOwner},
+        borrow_ownership::borrow_fork::ConflictEdge,
+    },
     utils::rustc::RustProgram,
 };
 

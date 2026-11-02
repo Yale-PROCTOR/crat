@@ -30,10 +30,8 @@ mod tests {
     const BORROW_ALLOW: &[&str] = &[
         // → BO-side reconstruction (the replaying fact source +
         //   orchestration; the fork consumes production's pre-invalidation facts):
-        "borrow_inference",
         "BorrowInferenceResults",
         "GBorrowInferCtxt",
-        "collect_invalid_loan_demotions",
         // → with `borrow_inference` retirement (BO-native data model replaces the imported types):
         "BorrowSet",
         "Loan",
@@ -41,7 +39,21 @@ mod tests {
         "Provenance",
         "ProvenanceSet",
         "ProvenanceOwner",
-        "ConflictEdge",
+        // The master-merge cleanup's legacy-copy stage (the user's word in main's session 11-02):
+        // `borrow_fork.rs` builds the loan set and runs the fact computations of the legacy
+        // module it used to copy, so it names the legacy data type, the constraint graph, the
+        // seven fact modules and the borrowing-method predicate. `borrow_inference`,
+        // `ConflictEdge` and `collect_invalid_loan_demotions` are BO's own there.
+        "BorrowData",
+        "ProvenanceConstraintGraph",
+        "errors",
+        "invalidates",
+        "killed",
+        "loan_liveness",
+        "provenance_liveness",
+        "requires",
+        "subset_closure",
+        "is_borrowing_method",
         // → field candidacy (the fork disables a Raw field's loan via the manifest-widened
         //   `disable_owner(ProvenanceOwner::Field(field))`; `StructFieldSlot` is the field key):
         "StructFieldSlot",

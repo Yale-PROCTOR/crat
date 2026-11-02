@@ -22,7 +22,10 @@ use super::{
     source_events::{self, Coverage, SourceEventKey, SourceEvents, SourcePhase, SourceRole},
 };
 use crate::{
-    analyses::borrow::{BorrowInferenceResults, Loan, ProvenanceOwner, StructFieldSlot},
+    analyses::{
+        borrow::{BorrowInferenceResults, Loan, ProvenanceOwner, StructFieldSlot},
+        borrow_ownership::borrow_fork::LoanLocation,
+    },
     utils::rustc::RustProgram,
 };
 

@@ -8,7 +8,7 @@ mod mut_depth_robustness {
     use rustc_hir::{ItemKind, OwnerNode};
 
     use crate::{
-        analyses::type_qualifier::foster::mutability::{Mutability, mutability_analysis},
+        analyses::borrow_ownership::mutability::{Mutability, mutability_analysis},
         utils::rustc::RustProgram,
     };
 
@@ -71,7 +71,7 @@ pub unsafe fn load_struct(s: S) -> *mut i32 { s.p }
 /// The production ownership pipeline, as the legacy crate runs it: the baseline oracle of
 /// `borrow_ownership_coherence` (moved from the legacy `tests.rs`'s `ownership_analysis`,
 /// which master keeps private). Explicit legacy paths: under D7 the production pipeline is
-/// master's, and this crate's `analyses::type_qualifier::foster::mutability` is BO's copy.
+/// master's, and this crate's `analyses::borrow_ownership::mutability` is BO's own.
 mod ownership_analysis {
     use pointer_replacer::{
         analyses::{
@@ -4522,9 +4522,9 @@ unsafe fn caller() -> i32 {
         use rustc_hash::FxHashMap;
         use rustc_span::def_id::LocalDefId;
 
-        use crate::analyses::{
-            borrow::{self, ConflictEdge},
-            borrow_ownership::borrow_engine,
+        use crate::analyses::borrow_ownership::{
+            borrow_engine,
+            borrow_fork::{self, ConflictEdge},
         };
 
         // 3c-i: EMPTY. 3c-ii enumerates deliberate divergences here as (case-ID, expected DELTA)
@@ -4623,7 +4623,7 @@ unsafe fn caller() -> i32 {
         // produce a conflict edge — proves the differential is not comparing empty==empty.
         run_compiler(programs[0].1, |tcx| {
             let program = collect_program(tcx);
-            let edges = borrow::borrow_conflicts(
+            let edges = borrow_fork::borrow_conflicts(
                 &program,
                 |_: LocalDefId| |_: Local| true,
                 |_: LocalDefId| |_: Local| true,
@@ -4639,7 +4639,7 @@ unsafe fn caller() -> i32 {
                 let program = collect_program(tcx);
                 // round-0 (`borrow_conflicts`) across mutability:
                 for mutb in [true, false] {
-                    let prod = borrow::borrow_conflicts(
+                    let prod = borrow_fork::borrow_conflicts(
                         &program,
                         |_: LocalDefId| |_: Local| true,
                         move |_: LocalDefId| move |_: Local| mutb,
@@ -4656,7 +4656,7 @@ unsafe fn caller() -> i32 {
                 // replaying across raw-candidacy × mutability, all-Ref base:
                 for raw in [false, true] {
                     for mutb in [true, false] {
-                        let prod = borrow::borrow_conflicts_replaying(
+                        let prod = borrow_fork::borrow_conflicts_replaying(
                             &program,
                             |_: LocalDefId| |_: Local| true,
                             move |_: LocalDefId| move |_: Local| raw,
@@ -4705,7 +4705,7 @@ unsafe fn f() {
                     local_by_var_name(tcx, f, "r2"),
                 ];
                 let rl = &rl;
-                let prod = borrow::borrow_conflicts_replaying(
+                let prod = borrow_fork::borrow_conflicts_replaying(
                     &program,
                     |_: LocalDefId| |_: Local| true,
                     move |_fd: LocalDefId| move |local: Local| rl.contains(&local),
@@ -8657,11 +8657,9 @@ pub unsafe fn f_drop(b: *mut F) {
         use rustc_span::def_id::LocalDefId;
 
         use super::{collect_program, run_compiler};
-        use crate::analyses::{
-            borrow::ConflictEdge,
-            borrow_ownership::borrow_engine::{
-                borrow_conflicts, demotion_witness_census, loan_liveness_census,
-            },
+        use crate::analyses::borrow_ownership::{
+            borrow_engine::{borrow_conflicts, demotion_witness_census, loan_liveness_census},
+            borrow_fork::ConflictEdge,
         };
 
         /// Canonical, order-insensitive rendering of a conflict-edge map.

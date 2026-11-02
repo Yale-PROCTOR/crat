@@ -22,10 +22,11 @@ use super::{
 use crate::{
     analyses::{
         borrow::{
-            BorrowInferenceResults, Borrower, ConflictEdge, GBorrowInferCtxt, Loan, Provenance,
-            ProvenanceOwner, ProvenanceSet, StructFieldSlot, collect_invalid_loan_demotions,
+            BorrowInferenceResults, Borrower, GBorrowInferCtxt, Loan, Provenance, ProvenanceOwner,
+            ProvenanceSet, StructFieldSlot,
         },
         borrow_ownership::{
+            borrow_fork::{ConflictEdge, LoanLocation, collect_invalid_loan_demotions},
             coherence::SelectedCopyLendLoans,
             esc_minimal,
             export::{self, LoanClass},
@@ -757,7 +758,7 @@ where
     K: Fn(LocalDefId) -> L,
     L: Fn(Local) -> bool,
 {
-    use crate::analyses::borrow::borrow_inference;
+    use crate::analyses::borrow_ownership::borrow_fork::borrow_inference;
 
     let ctxt = GBorrowInferCtxt::new(program, is_candidate, is_mutable);
     let mut out = FxHashMap::default();

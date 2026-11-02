@@ -34,7 +34,10 @@ use super::{
     solver::SlotRef,
 };
 use crate::{
-    analyses::borrow::{BorrowSet, Borrower, Loan, ProvenanceOwner, StructFieldSlot},
+    analyses::{
+        borrow::{BorrowSet, Borrower, Loan, ProvenanceOwner, StructFieldSlot},
+        borrow_ownership::borrow_fork::LoanLocation,
+    },
     utils::rustc::RustProgram,
 };
 
