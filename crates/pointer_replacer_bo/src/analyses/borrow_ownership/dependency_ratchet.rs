@@ -111,10 +111,6 @@ mod tests {
         ),
         (
             "src/analyses/borrow_ownership/coherence.rs",
-            "add_coherence_tagging_uses",
-        ),
-        (
-            "src/analyses/borrow_ownership/coherence.rs",
             "add_coherence_removal_only",
         ),
         (
