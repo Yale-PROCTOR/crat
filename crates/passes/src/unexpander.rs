@@ -11,7 +11,7 @@ use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     self as hir, QPath,
-    def::Res,
+    def::{DefKind, Res},
     def_id::{DefId, LocalDefId},
     intravisit,
     intravisit::Visitor as _,
@@ -247,7 +247,8 @@ impl MutVisitor for AstVisitor<'_> {
 
     fn visit_expr(&mut self, expr: &mut Expr) {
         if let Some(mut unexpanded) = self
-            .unexpanded_panic(expr)
+            .unexpanded_comparison_assert(expr)
+            .or_else(|| self.unexpanded_panic(expr))
             .or_else(|| self.unexpanded_print(expr))
         {
             unexpanded.attrs = expr.attrs.clone();
@@ -353,6 +354,152 @@ impl MutVisitor for AstVisitor<'_> {
 }
 
 impl AstVisitor<'_> {
+    fn path_resolution(&self, expression: &Expr) -> Option<Res> {
+        let ExprKind::Path(None, path) = &unwrap_paren(expression).kind else { return None };
+        self.ast_to_hir.path_span_to_res.get(&path.span).copied()
+    }
+
+    fn binding(&self, pattern: &Pat) -> Option<hir::HirId> {
+        if !matches!(
+            pattern.kind,
+            PatKind::Ident(BindingMode(ByRef::No, Mutability::Not), _, None)
+        ) {
+            return None;
+        }
+        let pattern = self.ast_to_hir.get_pat(pattern.id, self.tcx)?;
+        let hir::PatKind::Binding(_, id, _, None) = pattern.kind else { return None };
+        Some(id)
+    }
+
+    fn is_binding(&self, expression: &Expr, binding: hir::HirId) -> bool {
+        expression.attrs.is_empty() && self.path_resolution(expression) == Some(Res::Local(binding))
+    }
+
+    fn is_dereferenced_binding(&self, expression: &Expr, binding: hir::HirId) -> bool {
+        expression.attrs.is_empty()
+            && matches!(&unwrap_paren(expression).kind, ExprKind::Unary(UnOp::Deref, value) if self.is_binding(value, binding))
+    }
+
+    fn variant(&self, expression: &Expr) -> Option<DefId> {
+        let Res::Def(_, mut definition) = self.path_resolution(expression)? else { return None };
+        if matches!(self.tcx.def_kind(definition), DefKind::Ctor(..)) {
+            definition = self.tcx.parent(definition);
+        }
+        matches!(self.tcx.def_kind(definition), DefKind::Variant).then_some(definition)
+    }
+
+    fn unexpanded_comparison_assert(&mut self, expression: &Expr) -> Option<Expr> {
+        let ExprKind::Match(scrutinee, arms, _) = &unwrap_paren(expression).kind else {
+            return None;
+        };
+        let [arm] = arms.as_slice() else { return None };
+        if arm.guard.is_some() || !arm.attrs.is_empty() {
+            return None;
+        }
+        let PatKind::Tuple(bindings) = &arm.pat.kind else { return None };
+        let [left_pattern, right_pattern] = bindings.as_slice() else { return None };
+        let left_binding = self.binding(left_pattern)?;
+        let right_binding = self.binding(right_pattern)?;
+        let ExprKind::Tup(operands) = &unwrap_paren(scrutinee).kind else { return None };
+        let [left, right] = operands.as_slice() else { return None };
+        let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Not, left) = &unwrap_paren(left).kind
+        else {
+            return None;
+        };
+        let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Not, right) = &unwrap_paren(right).kind
+        else {
+            return None;
+        };
+        let ExprKind::Block(body, None) = &arm.body.as_ref()?.kind else { return None };
+        if !matches!(body.rules, BlockCheckMode::Default) {
+            return None;
+        }
+        let [statement] = body.stmts.as_slice() else { return None };
+        let StmtKind::Expr(condition) = &statement.kind else { return None };
+        let ExprKind::If(comparison, failure, None) = &condition.kind else { return None };
+        if !condition.attrs.is_empty() || !matches!(failure.rules, BlockCheckMode::Default) {
+            return None;
+        }
+        let (comparison, equality) = match &unwrap_paren(comparison).kind {
+            ExprKind::Unary(UnOp::Not, inner) => (unwrap_paren(inner), true),
+            _ => (unwrap_paren(comparison), false),
+        };
+        let ExprKind::Binary(operator, compared_left, compared_right) = &comparison.kind else {
+            return None;
+        };
+        if operator.node != BinOpKind::Eq
+            || !self.is_dereferenced_binding(compared_left, left_binding)
+            || !self.is_dereferenced_binding(compared_right, right_binding)
+        {
+            return None;
+        }
+        let [kind, invocation] = failure.stmts.as_slice() else { return None };
+        let StmtKind::Let(kind) = &kind.kind else { return None };
+        let LocalKind::Init(kind_value) = &kind.kind else { return None };
+        if !kind.attrs.is_empty() || kind.ty.is_some() {
+            return None;
+        }
+        let kind_binding = self.binding(&kind.pat)?;
+        let variant = self.variant(kind_value)?;
+        if variant.is_local()
+            || self.tcx.def_path_str(self.tcx.parent(variant)) != "core::panicking::AssertKind"
+            || self.tcx.item_name(variant).as_str() != if equality { "Eq" } else { "Ne" }
+        {
+            return None;
+        }
+        let StmtKind::Semi(invocation) = &invocation.kind else { return None };
+        let (name, arguments) = self.core_panicking_call(invocation)?;
+        let [kind_argument, left_argument, right_argument, message] = arguments else {
+            return None;
+        };
+        if name.as_str() != "assert_failed"
+            || !invocation.attrs.is_empty()
+            || !self.is_binding(kind_argument, kind_binding)
+        {
+            return None;
+        }
+        for (argument, binding) in [
+            (left_argument, left_binding),
+            (right_argument, right_binding),
+        ] {
+            let ExprKind::AddrOf(BorrowKind::Ref, Mutability::Not, value) = &argument.kind else {
+                return None;
+            };
+            if !argument.attrs.is_empty() || !self.is_dereferenced_binding(value, binding) {
+                return None;
+            }
+        }
+        let message = if self
+            .variant(message)
+            .is_some_and(|definition| self.tcx.is_lang_item(definition, hir::LangItem::OptionNone))
+        {
+            String::new()
+        } else {
+            let ExprKind::Call(constructor, arguments) = &message.kind else { return None };
+            let [format] = arguments.as_slice() else { return None };
+            if !self.variant(constructor).is_some_and(|definition| {
+                self.tcx.is_lang_item(definition, hir::LangItem::OptionSome)
+            }) || !matches!(format.kind, ExprKind::FormatArgs(_))
+            {
+                return None;
+            }
+            let mut format = format.clone();
+            self.visit_expr(&mut format);
+            let format = pprust::expr_to_string(&format);
+            format!(
+                ", {}",
+                format.strip_prefix("format_args!(")?.strip_suffix(')')?
+            )
+        };
+        let (mut left, mut right) = (unwrap_paren(left).clone(), unwrap_paren(right).clone());
+        self.visit_expr(&mut left);
+        self.visit_expr(&mut right);
+        let left = pprust::expr_to_string(&left);
+        let right = pprust::expr_to_string(&right);
+        let name = if equality { "assert_eq" } else { "assert_ne" };
+        Some(expr!("::core::{name}!({left}, {right}{message})"))
+    }
+
     fn resolved_call<'a>(&self, expression: &'a Expr) -> Option<(DefId, &'a [P<Expr>])> {
         let ExprKind::Call(callee, arguments) = &unwrap_paren(expression).kind else {
             return None;
@@ -477,6 +624,15 @@ impl AstVisitor<'_> {
             }
         }
         let (name, arguments) = self.core_panicking_call(expression)?;
+        if name == sym::panic
+            && let [argument] = arguments
+            && let ExprKind::Lit(literal) = &argument.kind
+            && let Ok(LitKind::Str(message, _)) = LitKind::from_token_lit(*literal)
+            && message.as_str() != "internal error: entered unreachable code"
+        {
+            let message = message.as_str().replace('{', "{{").replace('}', "}}");
+            return Some(expr!("::core::panic!({message:?})"));
+        }
         if name.as_str() == "panic_explicit" && arguments.is_empty() {
             return Some(expr!("::core::panic!(\"explicit panic\")"));
         }
@@ -893,6 +1049,104 @@ fn captured(value: i32) -> ! { panic!("Invalid value: {value}") }
             source.contains("\"{1} {0}\", value, next_value()"),
             "{source}"
         );
+    }
+
+    #[test]
+    fn comparison_assertions_preserve_operands_messages_and_expression_roles() {
+        let source = assert_stable_panic_source(
+            r#"
+fn left() -> String { String::new() }
+fn right() -> String { String::new() }
+fn message() -> usize { 7 }
+fn f() {
+    assert_eq!(left(), right());
+    assert_ne!(left(), right(), "detail: {}", message());
+}
+fn tail(left: &[i32], right: &[i32]) { assert_eq!(left, right) }
+fn returned(left: &str, right: &str) { return assert_ne!(left, right); }
+"#,
+        );
+        assert!(source.contains("::core::assert_eq!("), "{source}");
+        assert!(source.contains("::core::assert_ne!("), "{source}");
+        assert_eq!(source.matches("left()").count(), 3, "{source}");
+        assert_eq!(source.matches("right()").count(), 3, "{source}");
+        assert_eq!(source.matches("message()").count(), 2, "{source}");
+        assert!(source.contains("detail:"), "{source}");
+    }
+
+    #[test]
+    fn comparison_assertion_reconstruction_uses_resolved_identity() {
+        let source = normalize_panic_source(
+            r#"
+mod panicking { pub fn assert_failed(value: i32) -> i32 { value + 1 } }
+macro_rules! assert_eq { ($($arg:tt)*) => { 7 }; }
+macro_rules! assert_ne { ($($arg:tt)*) => { 9 }; }
+fn f(left: &str, right: &str) {
+    ::core::assert_eq!(left, right);
+    ::core::assert_ne!(left, right);
+}
+fn lookalike() -> i32 { panicking::assert_failed(3) }
+"#,
+        );
+        assert!(source.contains("::core::assert_eq!("), "{source}");
+        assert!(source.contains("::core::assert_ne!("), "{source}");
+        assert!(source.contains("panicking::assert_failed(3)"), "{source}");
+    }
+
+    #[test]
+    fn literal_core_panics_preserve_escaping_constness_and_never_coercions() {
+        let source = assert_stable_panic_source(
+            r#"
+#![feature(panic_internals)]
+const fn pending() -> ! { todo!() }
+const fn absent() -> ! { unimplemented!() }
+fn initializer() -> i32 { let value: i32 = todo!(); value }
+const fn literal() -> ! {
+    ::core::panicking::panic("literal {braces}, \"quotes\", \\slash\nnewline")
+}
+"#,
+        );
+        assert!(source.contains("not yet implemented"), "{source}");
+        assert!(source.contains("not implemented"), "{source}");
+        assert!(source.contains("{{braces}}"), "{source}");
+        assert!(source.contains("const fn literal"), "{source}");
+    }
+
+    #[test]
+    fn assertions_and_literal_panics_survive_preparation_and_postprocessing() {
+        let code = r#"
+pub fn compare(left: &str, right: &str) {
+    assert_eq!(left, right, "detail {}", left.len());
+    assert_ne!(left, right);
+}
+pub const fn pending() -> ! { todo!() }
+"#;
+        let expanded = utils::compilation::run_compiler_on_str(code, |tcx| {
+            crate::expander::expand(crate::expander::Config::default(), tcx)
+        })
+        .unwrap();
+        let prepared = utils::compilation::run_compiler_on_str(&expanded, crate::preparer::prepare)
+            .unwrap()
+            .unwrap()
+            .code;
+        let interfaces = utils::compilation::run_compiler_on_str(&expanded, |tcx| {
+            crate::interface_fixer::fix_interfaces(&crate::interface_fixer::Config::default(), tcx)
+        })
+        .unwrap();
+        let resolved = utils::compilation::run_compiler_on_str(&interfaces, |tcx| {
+            crate::unsafe_resolver::resolve_unsafe(&crate::unsafe_resolver::Config::default(), tcx)
+        })
+        .unwrap();
+        for input in [prepared, resolved] {
+            let output = utils::compilation::run_compiler_on_str(&input, |tcx| {
+                super::unexpand(super::Config::default(), tcx)
+            })
+            .unwrap();
+            utils::compilation::run_compiler_on_str(&output, utils::type_check).expect(&output);
+            assert!(!output.contains("panicking::"), "{output}");
+            assert!(output.contains("::core::assert_eq!("), "{output}");
+            assert!(output.contains("not yet implemented"), "{output}");
+        }
     }
 
     #[test]

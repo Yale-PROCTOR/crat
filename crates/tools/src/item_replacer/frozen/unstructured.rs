@@ -180,11 +180,11 @@ pub fn replace_unstructured_scc(
                 unreachable!()
             };
             implementation_fn.body = body.body.clone();
-            if pprust::item_to_string(&implementation) == pprust::item_to_string(stub) {
+            if crate::preservation::has_unfilled_holes(&implementation, None) {
                 return Err(item_error(
                     ReplacementErrorKind::InvalidTransformation,
                     requested,
-                    "complete the unfilled whole-function stub".to_owned(),
+                    "complete all unfilled transformation holes".to_owned(),
                 ));
             }
             replace_function_at_path(&mut candidate.items, &path, implementation)?;

@@ -604,7 +604,7 @@ fn malformed_frozen_bundles_return_errors_without_compiler_analysis_or_panics() 
 }
 
 #[test]
-fn unfilled_stub_metadata_identifies_only_exact_current_whole_function_stubs() {
+fn unfilled_stub_metadata_identifies_only_requested_functions() {
     let frozen = freeze(
         "pub unsafe fn read(p: *const i32) -> i32 { *p } pub unsafe fn other(p: *const i32) -> i32 { *p }",
     );
@@ -646,6 +646,27 @@ fn unfilled_stub_metadata_identifies_only_exact_current_whole_function_stubs() {
     mixed.transformation = mixed.transformation.replace("todo!()", "0");
     let (_, repaired) = metadata(&frozen, &mixed);
     assert!(repaired.unfilled_stub_items.is_empty());
+}
+
+#[test]
+fn nested_holes_in_requested_functions_are_repairable_without_rejecting_other_stubs() {
+    let frozen = freeze(
+        "pub unsafe fn read(p: *const i32) -> i32 { *p } pub unsafe fn other(p: *const i32) -> i32 { *p }",
+    );
+    for expression in [
+        "{ let value: i32 = todo!(); value }",
+        "(|| ::core::todo!())()",
+    ] {
+        let mut requested = request(&frozen.functions[0], None);
+        requested.transformation = requested.transformation.replace("todo!()", expression);
+        let (output, unfilled) = metadata(&frozen, &requested);
+        assert_eq!(unfilled.unfilled_stub_items, vec![0], "{expression}");
+        run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+        requested.transformation = requested.transformation.replace(expression, "0");
+        let (output, repaired) = metadata(&frozen, &requested);
+        assert!(repaired.unfilled_stub_items.is_empty());
+        assert!(output.replacement.source.contains("todo!()"));
+    }
 }
 
 #[test]
@@ -745,6 +766,9 @@ fn unstructured_rejects_wrong_signatures_labels_unsafe_items_and_whole_function_
         "unsafe fn target(mut x: i32) -> i32 { fn extra() {} x }",
         "unsafe fn target(mut x: i32) -> i32 { (|| { use std::mem; x })() }",
         "unsafe fn target(mut x: i32) -> i32 { todo!() }",
+        "unsafe fn target(mut x: i32) -> i32 { let value: i32 = todo!(); value }",
+        "unsafe fn target(mut x: i32) -> i32 { (|| ::core::todo!())() }",
+        "unsafe fn target(mut x: i32) -> i32 { vec![todo!()].len() as i32 }",
         "unsafe fn target(mut x: i32) -> i32;",
         "unsafe fn target(mut x: i32) -> i32 { x } fn extra() {}",
         "unsafe fn other(mut x: i32) -> i32 { x }",
