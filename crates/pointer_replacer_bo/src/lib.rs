@@ -53,9 +53,7 @@ mod bo_rewriter;
 mod coverage_recon;
 mod phase_log;
 mod raw_boundary_census_schema;
-pub use bo_pipeline::{
-    BoReceipt, Config, env_from_file as bo_env_from_file, query_timeout_env_value, rewrite_bo,
-};
+pub use bo_pipeline::{BoReceipt, Config, query_timeout_env_value, rewrite_bo};
 pub use pointer_replacer::{rewriter, utils};
 
 #[cfg(test)]

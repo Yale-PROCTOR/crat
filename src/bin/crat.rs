@@ -132,18 +132,13 @@ struct Args {
     points_to_file: Option<PathBuf>,
     #[arg(long, value_delimiter = ',', help = "Names of functions exposed to C")]
     c_exposed_fn: Vec<String>,
-    #[arg(
-        long,
-        help = "File of analysis switches for the pointer pass (default: $DIR/config/analysis-env.sh, else the frame env of record under $DIR/crates/pointer_replacer_bo/frames)"
-    )]
-    bo_env: Option<PathBuf>,
     #[arg(long, help = "Write the pointer pass's emission receipt to this file")]
     bo_receipt: Option<PathBuf>,
     #[arg(
         long,
         value_name = "SECS",
         value_parser = clap::value_parser!(u32).range(1..=4_294_967),
-        help = "Per-query z3 budget of the pointer pass in seconds (default 600); outranks CRAT_BO_QUERY_TIMEOUT_MS and the --bo-env file"
+        help = "Per-query z3 budget of the pointer pass in seconds (default 600); outranks CRAT_BO_QUERY_TIMEOUT_MS"
     )]
     bo_query_timeout: Option<u32>,
 
@@ -408,7 +403,6 @@ fn main() {
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
 
-    let bo_env = args.bo_env;
     let bo_receipt = args.bo_receipt;
     let bo_query_timeout = args.bo_query_timeout;
 
@@ -660,8 +654,7 @@ fn main() {
                 }
             }
             Pass::Pointer => {
-                // Relay main/388 O2 (R1386-1): the flag's budget, set before the env file is read
-                // (which never overwrites a set variable): the flag > the variable > the file > 600 s.
+                // Relay main/388 O2 (R1386-1): the flag's budget: the flag > the variable > 600 s.
                 if let Some(secs) = bo_query_timeout {
                     let ms =
                         pointer_replacer_bo::query_timeout_env_value(secs).unwrap_or_else(|e| {
@@ -671,24 +664,6 @@ fn main() {
                     // Safety: the driver's main thread, before the analysis starts any thread; nothing
                     // reads the environment concurrently.
                     unsafe { std::env::set_var("CRAT_BO_QUERY_TIMEOUT_MS", ms) };
-                }
-                let env_file = bo_env.clone().or_else(|| {
-                    let dir = PathBuf::from(std::env::var_os("DIR")?);
-                    [
-                        dir.join("config/analysis-env.sh"),
-                        dir.join("crates/pointer_replacer_bo/frames/l01p14u-s39-mutlend-o-env.sh"),
-                    ]
-                    .into_iter()
-                    .find(|path| path.is_file())
-                });
-                if let Some(path) = &env_file {
-                    let n = pointer_replacer_bo::bo_env_from_file(path).unwrap_or_else(|e| {
-                        eprintln!("{e}");
-                        std::process::exit(1);
-                    });
-                    if config.verbose {
-                        println!("pointer: {n} variables set from {}", path.display());
-                    }
                 }
                 let receipt = pointer_replacer_bo::rewrite_bo(
                     &file,

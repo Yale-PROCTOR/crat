@@ -1866,7 +1866,6 @@ impl GlueSpec {
                     unsafe_expr(crate::bo_rewriter::bridge_spelling::text(
                         &base,
                         self.mutable,
-                        deref,
                     ))
                 } else {
                     unsafe_expr(deref)
@@ -9006,12 +9005,9 @@ mod r738_1_census_n_override {
 #[cfg(test)]
 mod bridge_spelling_operand_tests {
     use super::{Decision, Form, GlueCore, GlueSpec, known_raw_operand, owner_view_candidate};
-    use crate::bo_rewriter::{
-        bridge_spelling::with_spelling,
-        decision::{
-            Degradation, DegradeReason,
-            box_facts::{BoxPlan, BoxShape},
-        },
+    use crate::bo_rewriter::decision::{
+        Degradation, DegradeReason,
+        box_facts::{BoxPlan, BoxShape},
     };
 
     fn degraded() -> Decision {
@@ -9054,14 +9050,12 @@ mod bridge_spelling_operand_tests {
         );
         assert!(known_raw_operand(Some(Some(&degraded())), Some("p")));
         assert!(known_raw_operand(None, Some("tmp.as_mut_ptr()")));
-        with_spelling(true, || {
-            let mut spec = GlueSpec::core(GlueCore::Reborrow, false);
-            let text = spec.render("p").unwrap();
-            assert!(text.contains("&*p") && !text.contains("as_ref"), "{text}");
-            spec.raw_operand = true;
-            let text = spec.render("p").unwrap();
-            assert!(text.contains("p.as_ref().unwrap()"), "{text}");
-        });
+        let mut spec = GlueSpec::core(GlueCore::Reborrow, false);
+        let text = spec.render("p").unwrap();
+        assert!(text.contains("&*p") && !text.contains("as_ref"), "{text}");
+        spec.raw_operand = true;
+        let text = spec.render("p").unwrap();
+        assert!(text.contains("p.as_ref().unwrap()"), "{text}");
     }
 
     /// A `Box` operand keeps `&*`: its subject is not KNOWN raw, and the owner's view (wave-6a's
@@ -9070,15 +9064,13 @@ mod bridge_spelling_operand_tests {
     fn a_box_operand_keeps_the_deref_spelling() {
         let owner = boxed();
         assert!(!known_raw_operand(Some(Some(&owner)), Some("s")));
-        with_spelling(true, || {
-            let view = owner_view_candidate(Some(&owner), Form::Ref { mutable: false }, "s")
-                .expect("an optional owner has a reference view");
-            assert!(
-                view.replacement.contains("&*s") && !view.replacement.contains("as_ref"),
-                "{}",
-                view.replacement
-            );
-        });
+        let view = owner_view_candidate(Some(&owner), Form::Ref { mutable: false }, "s")
+            .expect("an optional owner has a reference view");
+        assert!(
+            view.replacement.contains("&*s") && !view.replacement.contains("as_ref"),
+            "{}",
+            view.replacement
+        );
     }
 }
 

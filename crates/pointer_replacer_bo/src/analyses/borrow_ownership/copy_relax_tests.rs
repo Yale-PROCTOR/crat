@@ -1,27 +1,8 @@
 //! The depth-0 Copy relaxation and the merge liveness. Each witness runs the full solve of a
-//! fixture (the joint pass, borrow verification, retirement, the relax loop) in a child under the
-//! switches of the pinned env file and reads the settled kinds by name.
+//! fixture (the joint pass, borrow verification, retirement, the relax loop) in a child and reads
+//! the settled kinds by name.
 
 use std::collections::BTreeMap;
-
-const FRAME_ENV: &str = include_str!("../../../frames/l01p14u-env.sh");
-
-/// The pinned switches: every `CRAT_` export of the env file but the raw-cause sidecar and
-/// the launch identity (`CRAT_ERA5_*`), which a fixture solve does not take.
-fn frame_arms() -> Vec<(String, String)> {
-    FRAME_ENV
-        .lines()
-        .filter_map(|line| line.strip_prefix("export "))
-        .filter_map(|assignment| {
-            let assignment = assignment.split('#').next()?.trim();
-            let (key, value) = assignment.split_once('=')?;
-            (key.starts_with("CRAT_")
-                && !key.starts_with("CRAT_ERA5_")
-                && !key.starts_with("CRAT_ERA5C_RAW_CAUSE"))
-            .then(|| (key.to_owned(), value.trim().to_owned()))
-        })
-        .collect()
-}
 
 /// (1) `q` is raw for a reason that does not involve `p`'s loans (it is a cast's source), its value
 /// never leaves the function, and nothing invalidates a loan `p`'s origin carries while `q` lives:
@@ -247,9 +228,6 @@ fn rows(shape: &str) -> BTreeMap<String, String> {
         "--nocapture",
         "--test-threads=1",
     ]);
-    for (key, value) in frame_arms() {
-        command.env(key, value);
-    }
     command.env("CRAT_E5C_CR_SHAPE", shape);
     let output = command.output().expect("child test");
     let text = format!(

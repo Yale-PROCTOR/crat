@@ -2738,8 +2738,7 @@ impl<'a> SeamGraftVisitor<'a> {
                     && !spec.optional
                     && spec.unwrap.is_none()
                     && spec.null_arm != NullArm::Checked)
-                    .then(|| super::bridge_spelling::expr_kind(core_arg.clone(), spec.mutable))
-                    .flatten();
+                    .then(|| super::bridge_spelling::expr_kind(core_arg.clone(), spec.mutable));
                 let kind = match spelled {
                     Some(kind) => kind,
                     None => {
@@ -4099,12 +4098,12 @@ fn surface_argument(
         )
     } else if matches!(form, Some(Form::Ref { mutable: true })) {
         super::mechanical_receipt::present_unsafe_text(
-            super::bridge_spelling::text(&name, true, format!("&mut *{name}")),
+            super::bridge_spelling::text(&name, true),
             enclosing_unsafe_fn,
         )
     } else if matches!(form, Some(Form::Ref { mutable: false })) {
         super::mechanical_receipt::present_unsafe_text(
-            super::bridge_spelling::text(&name, false, format!("&*{name}")),
+            super::bridge_spelling::text(&name, false),
             enclosing_unsafe_fn,
         )
     } else if ty.starts_with("Box<") && !ty.starts_with("Box<[") {

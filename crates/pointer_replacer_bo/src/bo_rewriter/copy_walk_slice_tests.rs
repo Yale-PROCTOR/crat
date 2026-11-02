@@ -7,11 +7,8 @@
 //! tulipindicators' `smoke::get_array` E0308, reverted with four custody rows
 //! behind it. The formal takes the slice form its copy uses.
 //!
-//! Each witness runs the rewrite in a child under the frame of record's arms
-//! (`frames/l01p14u-env.sh`) with the S39 switches named or not, as era-5c's
-//! `copy_relax_tests` do: the switches are read from the environment.
-
-const FRAME_ENV: &str = include_str!("../../frames/l01p14u-env.sh");
+//! Each witness runs the rewrite in a child with the S39 switches named or not,
+//! as era-5c's `copy_relax_tests` do.
 
 const ALLOW: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments, unused_variables, non_snake_case, non_camel_case_types)]\n";
 
@@ -121,24 +118,6 @@ pub unsafe extern "C" fn run_maybe(mut n: i32, mut q: *mut f64) -> i32 {
 }
 "#;
 
-/// The frame's arms: every `CRAT_` export of the frame's env file but the
-/// launch identity (`CRAT_ERA5_*`) and the raw-cause sidecar, which a fixture
-/// rewrite does not take (era-5c's `copy_relax_tests::frame_arms`).
-fn frame_arms() -> Vec<(String, String)> {
-    FRAME_ENV
-        .lines()
-        .filter_map(|line| line.strip_prefix("export "))
-        .filter_map(|assignment| {
-            let assignment = assignment.split('#').next()?.trim();
-            let (key, value) = assignment.split_once('=')?;
-            (key.starts_with("CRAT_")
-                && !key.starts_with("CRAT_ERA5_")
-                && !key.starts_with("CRAT_ERA5C_RAW_CAUSE"))
-            .then(|| (key.to_owned(), value.trim().to_owned()))
-        })
-        .collect()
-}
-
 #[test]
 #[ignore = "runs under the frame's arms in a child of the r324 witnesses"]
 fn r324_inner_rewrite() {
@@ -227,9 +206,6 @@ fn rewrite_withdrawn(shape: &str, relax: bool, withdrawn: Option<&str>) -> Emitt
         "--nocapture",
         "--test-threads=1",
     ]);
-    for (key, value) in frame_arms() {
-        command.env(key, value);
-    }
     command.env("CRAT_R324_SHAPE", shape);
     if let Some(labels) = withdrawn {
         command.env("CRAT_R324_WITHDRAW", labels);

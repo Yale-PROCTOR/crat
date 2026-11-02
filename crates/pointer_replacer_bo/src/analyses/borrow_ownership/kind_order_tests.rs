@@ -1,10 +1,7 @@
 //! The objective's order Ref > Owning > Raw (`own` at 1 in place of the raw term). Each witness
-//! runs the full solve of a fixture in a child under the pinned env file's switches and reads the
-//! settled kinds by name.
+//! runs the full solve of a fixture in a child and reads the settled kinds by name.
 
 use std::collections::BTreeMap;
-
-const FRAME_ENV: &str = include_str!("../../../frames/l01p14u-s39-env.sh");
 
 const LIBC: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, unused_assignments, non_camel_case_types)]
@@ -182,21 +179,6 @@ const SHAPES: [(&str, &str); 12] = [
     ("STACK_CURSOR", STACK_CURSOR),
 ];
 
-fn frame_arms() -> Vec<(String, String)> {
-    FRAME_ENV
-        .lines()
-        .filter_map(|line| line.strip_prefix("export "))
-        .filter_map(|assignment| {
-            let assignment = assignment.split('#').next()?.trim();
-            let (key, value) = assignment.split_once('=')?;
-            (key.starts_with("CRAT_")
-                && !key.starts_with("CRAT_ERA5_")
-                && !key.starts_with("CRAT_ERA5C_RAW_CAUSE"))
-            .then(|| (key.to_owned(), value.trim().to_owned()))
-        })
-        .collect()
-}
-
 /// Every slot's settled kind for a corpus program (`CRAT_E5C_KO_PATH=<lib.rs>`), under the switch as
 /// the environment gives it: `fn::_local@d<depth>` / `Struct::field@d<depth>` and the kind. An
 /// observation for choosing fixtures (run with --ignored --nocapture).
@@ -301,9 +283,6 @@ fn model(shape: &str) -> BTreeMap<String, String> {
         "--nocapture",
         "--test-threads=1",
     ]);
-    for (key, value) in frame_arms() {
-        command.env(key, value);
-    }
     command.env("CRAT_E5C_KO_SHAPE", shape);
     let output = command.output().expect("child test");
     let text = format!(

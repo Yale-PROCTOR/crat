@@ -656,16 +656,11 @@ pub(crate) fn render_bridge(
         // contract); the reborrow is of exactly that element.
         // R1128-1: a non-null raw-to-reference bridge; the switch spells it.
         return Some(if spec.mutable {
-            crate::bo_rewriter::bridge_spelling::text(
-                &format!("({text}) as *mut {pointee}"),
-                true,
-                format!("&mut *(({text}) as *mut {pointee})"),
-            )
+            crate::bo_rewriter::bridge_spelling::text(&format!("({text}) as *mut {pointee}"), true)
         } else {
             crate::bo_rewriter::bridge_spelling::text(
                 &format!("({text}) as *const {pointee}"),
                 false,
-                format!("&*(({text}) as *const {pointee})"),
             )
         });
     }

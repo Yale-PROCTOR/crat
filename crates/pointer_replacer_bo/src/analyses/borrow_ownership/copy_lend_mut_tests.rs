@@ -1,13 +1,10 @@
 //! The MUTABLE copy-lend (`CRAT_ERA5C_COPY_LEND_MUT=on`). A copy `q = p` whose destination is
 //! written through is lent `q = &mut *p` when no read, write or reassignment of `p` (or of another
 //! copy of `p`) happens while `q` is live; the lend's loan is unique, so the replay stays the
-//! judge. Each witness runs in a child under the reference solve configuration's env file
-//! (`FRAME_ENV`) with the switch as named, and reads the classifier's row for each copy pair and
-//! the settled kinds by name.
+//! judge. Each witness runs in a child with the switch as named, and reads the classifier's row
+//! for each copy pair and the settled kinds by name.
 
 use std::collections::BTreeMap;
-
-const FRAME_ENV: &str = include_str!("../../../frames/l01p14u-s39-env.sh");
 
 const LIBC: &str = r#"
 #![allow(dead_code, unused_unsafe, unused_mut, unused_assignments, non_camel_case_types)]
@@ -146,23 +143,6 @@ fn shape(name: &str) -> String {
     format!("{LIBC}{body}")
 }
 
-/// The reference configuration's arms: every `CRAT_` export but the raw-cause sidecar and the launch
-/// identity (`CRAT_ERA5_*`), which a fixture solve does not take.
-fn frame_arms() -> Vec<(String, String)> {
-    FRAME_ENV
-        .lines()
-        .filter_map(|line| line.strip_prefix("export "))
-        .filter_map(|assignment| {
-            let assignment = assignment.split('#').next()?.trim();
-            let (key, value) = assignment.split_once('=')?;
-            (key.starts_with("CRAT_")
-                && !key.starts_with("CRAT_ERA5_")
-                && !key.starts_with("CRAT_ERA5C_RAW_CAUSE"))
-            .then(|| (key.to_owned(), value.trim().to_owned()))
-        })
-        .collect()
-}
-
 /// The classifier's rows (`fn q p drop`, `drop` = `eligible` or `eligible-mut` when kept) for the
 /// shape under the switch as the environment gives it.
 fn classifier_rows(code: &str) -> Vec<String> {
@@ -262,9 +242,6 @@ fn seen_with(name: &str, extra: &[(&str, &str)]) -> Seen {
         "--nocapture",
         "--test-threads=1",
     ]);
-    for (key, value) in frame_arms() {
-        command.env(key, value);
-    }
     command.env("CRAT_E5C_CM_SHAPE", name);
     for (key, value) in extra {
         command.env(key, value);

@@ -109,8 +109,8 @@ pub(crate) fn inbound_wrapper_unplaceable(box_param_receipts: &str) -> Vec<Strin
 
 /// Relay main/388 O2 (R1386-1, the user's word): `--bo-query-timeout <SECS>`'s value as the
 /// milliseconds `CRAT_BO_QUERY_TIMEOUT_MS` carries -- 1 to 4,294,967 s, so `SECS x 1000` fits a `u32`.
-/// The driver sets the variable before [`env_from_file`] runs, which never overwrites a set variable,
-/// so the flag outranks the variable, which outranks the `--bo-env` file, which outranks 600 s.
+/// The driver sets the variable, so the flag outranks a variable the caller set, which outranks
+/// 600 s.
 pub fn query_timeout_env_value(secs: u32) -> Result<String, String> {
     if secs == 0 {
         return Err("--bo-query-timeout must be at least 1 second".to_owned());
@@ -123,45 +123,6 @@ pub fn query_timeout_env_value(secs: u32) -> Result<String, String> {
                 u32::MAX / 1000
             )
         })
-}
-
-/// Sets every `export KEY=VALUE` line of a frame env file that is not already set in the
-/// process environment. Host-local names are skipped, so are values that expand a variable;
-/// an inline comment after the value is ignored.
-pub fn env_from_file(path: &Path) -> Result<usize, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("read {}: {error}", path.display()))?;
-    let mut set = 0;
-    for line in text.lines() {
-        let Some(rest) = line.trim().strip_prefix("export ") else {
-            continue;
-        };
-        let Some((key, value)) = rest.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        if matches!(
-            key,
-            "SYSROOT" | "LD_LIBRARY_PATH" | "RUSTUP_TOOLCHAIN" | "TMPDIR"
-        ) {
-            continue;
-        }
-        let value = value
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .trim_matches('"');
-        if value.is_empty() || value.starts_with('#') || value.contains('$') {
-            continue;
-        }
-        if std::env::var_os(key).is_none() {
-            // Safety: called on the driver's main thread before the analysis starts any
-            // thread; nothing else reads the environment concurrently.
-            unsafe { std::env::set_var(key, value) };
-            set += 1;
-        }
-    }
-    Ok(set)
 }
 
 /// Runs the emission path of record on the crate whose root file is `input` and writes the
@@ -736,35 +697,6 @@ mod query_timeout_flag_tests {
         );
         assert!(query_timeout_env_value(0).is_err());
         assert!(query_timeout_env_value(4_294_968).is_err());
-    }
-
-    /// Relay main/388 O2 (R1386-1): a variable already set -- the flag's, or the caller's -- outranks
-    /// the `--bo-env` file, which sets it only when unset. A variable of this test's own is used, so
-    /// the process's `CRAT_BO_QUERY_TIMEOUT_MS` (read once by the solver) is never touched.
-    #[test]
-    fn r1386_a_set_variable_outranks_the_bo_env_file() {
-        const KEY: &str = "CRAT_BO_R1386_PRECEDENCE_TEST";
-        let file = std::env::temp_dir().join(format!("r1386-precedence-{}.sh", std::process::id()));
-        std::fs::write(&file, format!("export {KEY}=from-file\n")).unwrap();
-        // Safety: a variable no other code or test reads; set and removed on this test's thread.
-        unsafe { std::env::set_var(KEY, "from-flag") };
-        env_from_file(&file).unwrap();
-        assert_eq!(
-            std::env::var(KEY).as_deref(),
-            Ok("from-flag"),
-            "the set variable wins"
-        );
-        // Safety: as above.
-        unsafe { std::env::remove_var(KEY) };
-        env_from_file(&file).unwrap();
-        assert_eq!(
-            std::env::var(KEY).as_deref(),
-            Ok("from-file"),
-            "unset, the file sets it"
-        );
-        // Safety: as above.
-        unsafe { std::env::remove_var(KEY) };
-        let _ = std::fs::remove_file(&file);
     }
 }
 

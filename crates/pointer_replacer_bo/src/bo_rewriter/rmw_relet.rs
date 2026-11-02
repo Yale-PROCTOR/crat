@@ -13,8 +13,10 @@
 //!   =>  { let __crat_fresh_1 = &mut *p.offset(i); *__crat_fresh_1 += 1; }
 //! ```
 //!
-//! Emission only, behind `CRAT_RMW_RELET=on` (default off); it runs after every
-//! other AST pass, so no decision and no planned edit is touched. The rule:
+//! Emission only, always on (the record's value; the switch `CRAT_RMW_RELET`
+//! that could turn it off is fixed at `on`, the master-merge cleanup S3); it
+//! runs after every other AST pass, so no decision and no planned edit is
+//! touched. The rule:
 //! - a statement `PLACE = RHS` whose RHS mentions PLACE, or `PLACE op= RHS`;
 //! - PLACE is a place (fields, indexing, `offset`-family steps, parentheses)
 //!   with a dereference in its projection, rooted at a local or formal that is a
@@ -50,17 +52,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{HirId, def::Res, def_id::LocalDefId, intravisit};
 
 use super::decision::{Decision, DecisionTable};
-
-/// The switch `CRAT_RMW_RELET`: `on` applies the pass; anything else (the
-/// default, absent) leaves the emission as it was.
-pub(crate) fn enabled() -> bool {
-    std::env::var("CRAT_RMW_RELET").as_deref() == Ok("on")
-}
-
-/// A test crate opts in by defining an item of this name: the switch is
-/// process-global state, and the suite runs in parallel.
-#[cfg(test)]
-pub(crate) const TEST_MARKER: &str = "__crat_rmw_relet_test";
 
 /// Deliberate faults for the witness test (`rmw_relet_tests`), test builds only.
 #[cfg(test)]
@@ -104,17 +95,7 @@ pub(crate) fn apply(
     krate: &mut rustc_ast::Crate,
     guard: &mut super::ast_transform::Composition,
 ) -> RmwStats {
-    let mut on = enabled() && !fault(5);
-    #[cfg(test)]
-    {
-        on = on
-            || (!fault(5)
-                && krate
-                    .items
-                    .iter()
-                    .any(|item| item.kind.ident().is_some_and(|i| i.as_str() == TEST_MARKER)));
-    }
-    if !on {
+    if fault(5) {
         return RmwStats::default();
     }
     // R216: a crate whose EVERY class is withheld keeps its input bytes (the
