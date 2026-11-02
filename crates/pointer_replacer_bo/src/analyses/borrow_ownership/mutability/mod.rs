@@ -1,15 +1,17 @@
 //! BO's mutability analysis: the legacy Foster mutability analysis with era-5c's load gate
-//! (R545-1, [`LoadGate`]) and its own libc table (`libc.rs`, which keeps the record's rows: master's
-//! PR #130 added `strtod` / `strtol` / … rows to the legacy table, and they are not taken here).
+//! (R545-1, [`LoadGate`]). The libc and Rust-library tables are the legacy crate's, master's PR
+//! #130 `strtod` / `strtof` / `strtold` / `strtol` / `strtoll` / `strtoul` / `strtoull` rows
+//! included (the user's word in main's session 11-02).
 //! The `Mutability` lattice and the Rust-library table are the legacy crate's (the master-merge
 //! cleanup's legacy-copy stage, the user's word in main's session 11-02).
 
 use std::ops::Range;
 
-use libc::libc_call;
-use pointer_replacer::analyses::type_qualifier::foster::mutability::library::library_call;
 pub use pointer_replacer::analyses::type_qualifier::foster::mutability::{
     Mutability, MutabilityResult,
+};
+use pointer_replacer::analyses::type_qualifier::foster::mutability::{
+    libc::libc_call, library::library_call,
 };
 use rustc_middle::mir::{
     BinOp, HasLocalDecls, Location, Operand, Place, ProjectionElem, Rvalue, Terminator,
@@ -29,7 +31,6 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-mod libc;
 // #[cfg(test)]
 // mod test;
 

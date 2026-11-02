@@ -21,7 +21,7 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-mod libc;
+pub mod libc;
 pub mod library;
 // #[cfg(test)]
 // mod test;
