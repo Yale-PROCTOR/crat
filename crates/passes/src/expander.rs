@@ -6,7 +6,7 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::{Symbol, kw, sym};
+use rustc_span::{Ident, Symbol, kw, sym};
 use serde::Deserialize;
 use utils::expr;
 
@@ -48,13 +48,15 @@ pub fn expand(config: Config, tcx: TyCtxt<'_>) -> String {
         ]);
     }
 
-    AstVisitor.visit_crate(krate);
+    AstVisitor { tcx }.visit_crate(krate);
     pprust::crate_to_string_for_macros(krate)
 }
 
-struct AstVisitor;
+struct AstVisitor<'tcx> {
+    tcx: TyCtxt<'tcx>,
+}
 
-impl MutVisitor for AstVisitor {
+impl MutVisitor for AstVisitor<'_> {
     fn visit_item(&mut self, item: &mut ast::Item) {
         if let ast::ItemKind::Mod(_, ident, _) = &mut item.kind
             && ident.name == kw::Mod
@@ -78,6 +80,38 @@ impl MutVisitor for AstVisitor {
         mut_visit::walk_expr(self, expr);
     }
 
+    fn visit_path(&mut self, path: &mut ast::Path) {
+        mut_visit::walk_path(self, path);
+        let [root, module, ..] = path.segments.as_slice() else { return };
+        if root.ident.name != kw::DollarCrate {
+            return;
+        }
+        let Some(def_id) = root.ident.span.ctxt().outer_expn_data().macro_def_id else {
+            return;
+        };
+        if def_id.is_local() || !self.tcx.is_diagnostic_item(sym::vec_macro, def_id) {
+            return;
+        }
+        // Printed paths lose the macro hygiene that makes `$crate` accessible.
+        match (module.ident.name.as_str(), path.segments.len()) {
+            ("vec", _) => {}
+            ("boxed", 3) if path.segments[2].ident.name.as_str() == "box_new" => {
+                let function = &mut path.segments[2];
+                let mut boxed = ast::PathSegment::from_ident(Ident::new(
+                    Symbol::intern("Box"),
+                    function.ident.span,
+                ));
+                boxed.args = function.args.take();
+                function.ident.name = sym::new;
+                path.segments.insert(2, boxed);
+            }
+            _ => return,
+        }
+        path.segments[0].ident.name = sym::std;
+        path.segments
+            .insert(0, ast::PathSegment::path_root(path.span));
+    }
+
     fn visit_field_def(&mut self, fd: &mut ast::FieldDef) {
         fd.attrs.retain(|attr| {
             let ast::AttrKind::Normal(attr) = &attr.kind else { return true };
@@ -87,3 +121,6 @@ impl MutVisitor for AstVisitor {
         mut_visit::walk_field_def(self, fd);
     }
 }
+
+#[cfg(test)]
+mod tests;
