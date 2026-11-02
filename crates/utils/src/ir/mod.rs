@@ -135,6 +135,21 @@ where
         TyKind::Float(FloatTy::F128) => write!(out, "f128").map_err(Into::into),
         TyKind::Adt(adt_def, args) => {
             write!(out, "{}", nominal_path(adt_def.did())?)?;
+            let defaults = if policy == MirTypeFormatPolicy::SourceValid {
+                tcx.generics_of(adt_def.did())
+                    .own_params
+                    .iter()
+                    .rev()
+                    .take_while(|param| {
+                        param.default_value(tcx).is_some_and(|default| {
+                            default.instantiate(tcx, args) == args[param.index as usize]
+                        })
+                    })
+                    .count()
+            } else {
+                0
+            };
+            let args = &args[..args.len() - defaults];
             if !args.is_empty() {
                 write!(out, "<")?;
                 for (i, arg) in args.iter().enumerate() {

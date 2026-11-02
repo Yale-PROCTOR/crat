@@ -909,3 +909,40 @@ pub unsafe fn helper(x: i32) -> i32 {
     }
 }
 "####;
+pub const INFERRED_VECTORS: &str = r####"
+pub mod src {
+    pub mod lib {
+        pub unsafe fn arr_del(num: i32) {
+            let mut arr = <[_]>::into_vec(::std::boxed::Box::new([num, 2, 3, 4]));
+            arr.remove(0);
+        }
+
+        pub unsafe fn arr_ins(num: i32) {
+            let mut arr = Vec::new();
+            arr.push(1);
+            arr.insert(0, num);
+        }
+
+        pub unsafe fn helxo(names: &[&str]) -> usize {
+            let mut order = Vec::new();
+            order.push(names[0]);
+            order.len()
+        }
+
+        pub unsafe fn search_and_replace(orig: &[u8], value: &[u8]) -> usize {
+            let mut replacement = Vec::new();
+            replacement.extend_from_slice(orig);
+            replacement.extend_from_slice(value);
+            replacement.push(0);
+            replacement.len()
+        }
+
+        pub unsafe fn utf8_filter(input: &[u8]) -> usize {
+            let mut copy = Vec::with_capacity(input.len() + 1);
+            copy.extend_from_slice(input);
+            copy.push(0);
+            copy.len()
+        }
+    }
+}
+"####;
