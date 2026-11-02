@@ -5,9 +5,12 @@ use rustc_ast::{
     StmtKind,
     mut_visit::{self, MutVisitor},
     ptr::P,
+    token::{Token, TokenKind},
+    tokenstream::{TokenStream, TokenTree},
     visit::{self, Visitor},
 };
 use rustc_ast_pretty::pprust;
+use rustc_span::{Symbol, kw};
 use smallvec::{SmallVec, smallvec};
 use thin_vec::ThinVec;
 
@@ -28,6 +31,139 @@ pub(crate) fn function_signature(function: &rustc_ast::Fn) -> String {
     **body = function.clone();
     body.body = None;
     pprust::item_to_string(&item)
+}
+
+pub(crate) fn has_unfilled_holes(item: &Item, view: Option<&SkeletonView>) -> bool {
+    fn standard_macro(names: &[Symbol], expected: &str) -> bool {
+        matches!(names, [name] if name.as_str() == expected)
+            || matches!(names, [root, name] if matches!(root.as_str(), "core" | "std") && name.as_str() == expected)
+    }
+
+    fn token_hole(tokens: &TokenStream) -> bool {
+        let tokens = tokens.iter().collect::<Vec<_>>();
+        let mut index = 0;
+        while index < tokens.len() {
+            let token = tokens[index];
+            let nested = match (token, tokens.get(index + 1), tokens.get(index + 2)) {
+                (
+                    TokenTree::Token(
+                        Token {
+                            kind: TokenKind::Ident(..),
+                            ..
+                        },
+                        _,
+                    ),
+                    Some(TokenTree::Token(
+                        Token {
+                            kind: TokenKind::Bang,
+                            ..
+                        },
+                        _,
+                    )),
+                    Some(TokenTree::Delimited(.., nested)),
+                ) => nested,
+                _ => {
+                    if let TokenTree::Delimited(.., nested) = token
+                        && token_hole(nested)
+                    {
+                        return true;
+                    }
+                    index += 1;
+                    continue;
+                }
+            };
+            let TokenTree::Token(
+                Token {
+                    kind: TokenKind::Ident(name, _),
+                    ..
+                },
+                _,
+            ) = token
+            else {
+                unreachable!()
+            };
+            let mut names = vec![*name];
+            let mut start = index;
+            while start >= 2
+                && matches!(
+                    tokens[start - 1],
+                    TokenTree::Token(
+                        Token {
+                            kind: TokenKind::PathSep,
+                            ..
+                        },
+                        _
+                    )
+                )
+            {
+                let TokenTree::Token(
+                    Token {
+                        kind: TokenKind::Ident(name, _),
+                        ..
+                    },
+                    _,
+                ) = tokens[start - 2]
+                else {
+                    break;
+                };
+                names.push(*name);
+                start -= 2;
+            }
+            names.reverse();
+            if standard_macro(&names, "todo")
+                || (!standard_macro(&names, "stringify") && token_hole(nested))
+            {
+                return true;
+            }
+            index += 3;
+        }
+        false
+    }
+
+    struct Finder {
+        labels: Option<HashSet<u32>>,
+        active: bool,
+        found: bool,
+    }
+    impl<'ast> Visitor<'ast> for Finder {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            let previous = self.active;
+            if let Some(label) = statement_label(statement) {
+                self.active = self
+                    .labels
+                    .as_ref()
+                    .is_none_or(|labels| labels.contains(&label));
+            }
+            if !self.found {
+                visit::walk_stmt(self, statement);
+            }
+            self.active = previous;
+        }
+
+        fn visit_mac_call(&mut self, mac: &'ast rustc_ast::MacCall) {
+            if !self.active {
+                return;
+            }
+            let names = mac
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.name)
+                .filter(|name| *name != kw::PathRoot)
+                .collect::<Vec<_>>();
+            if standard_macro(&names, "stringify") {
+                return;
+            }
+            self.found |= standard_macro(&names, "todo") || token_hole(&mac.args.tokens);
+        }
+    }
+    let mut finder = Finder {
+        labels: view.map(|view| view.transform_labels().into_iter().collect()),
+        active: view.is_none(),
+        found: false,
+    };
+    finder.visit_item(item);
+    finder.found
 }
 
 pub(crate) fn make_disposition_forest(
@@ -1791,6 +1927,67 @@ mod tests {
             .unwrap(),
             statement_pair_metadata: metadata,
         }
+    }
+
+    #[test]
+    fn generated_holes_are_detected_in_nested_expressions_and_macro_tokens() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                let skeleton = view("unsafe fn f() { #[proctor(0)] todo!(); }");
+                for expression in [
+                    "todo!()",
+                    "::core::todo!(\"later\")",
+                    "std::todo!()",
+                    "{ let value: i32 = todo!(); value }",
+                    "(|| todo!())()",
+                    "if true { todo!() } else { 0 }",
+                    "vec![todo!()]",
+                    "format!(\"{}\", { ::std::todo!() })",
+                ] {
+                    let source = format!("unsafe fn f() {{ #[proctor(0)] {expression}; }}");
+                    let item = parse_item(&source);
+                    assert!(has_unfilled_holes(&item, Some(&skeleton)), "{source}");
+                    assert!(has_unfilled_holes(&item, None), "{source}");
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn preserved_holes_literals_and_source_panics_are_not_generated_holes() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                for expression in [
+                    "0",
+                    "\"todo!()\"",
+                    "custom::todo!()",
+                    "format!(\"todo!()\")",
+                    "format!(\"{}\", custom::todo!())",
+                    "stringify!(todo!())",
+                    "::core::stringify!(todo!())",
+                    "vec![stringify!(todo!())]",
+                    "concat!(\"text\", ::std::stringify!(todo!()))",
+                    "panic!(\"not yet implemented\")",
+                ] {
+                    let source = format!(
+                        "unsafe fn f() {{ #[proctor(0)] todo!(); #[proctor(1)] {expression}; }}"
+                    );
+                    let item = parse_item(&source);
+                    let mut skeleton = view(&source);
+                    skeleton.statement_dispositions = make_disposition_forest(
+                        &item,
+                        &HashSet::from([1]),
+                        &HashSet::new(),
+                        &HashSet::new(),
+                        &HashSet::new(),
+                    )
+                    .unwrap();
+                    assert!(!has_unfilled_holes(&item, Some(&skeleton)), "{source}");
+                }
+            },
+        );
     }
 
     #[test]

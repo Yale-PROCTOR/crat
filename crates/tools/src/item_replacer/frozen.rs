@@ -469,11 +469,13 @@ pub fn transform_frozen_scc(
             let mut labeled = implementation.clone();
             labeled.attrs.retain(|attr| !is_export_attribute(attr));
             replace_function_at_path(&mut observation.items, &path, labeled)?;
+            let unfilled =
+                crate::preservation::has_unfilled_holes(&implementation, Some(&requested.view));
             let ItemKind::Fn(box body) = &mut implementation.kind else { unreachable!() };
             ProctorLabelRemover.visit_block(body.body.as_mut().unwrap());
             let stub = function_at_path(&candidate.items, &path)
                 .expect("frozen template contains the requested function");
-            if pprust::item_to_string(&implementation) == pprust::item_to_string(stub) {
+            if unfilled || pprust::item_to_string(&implementation) == pprust::item_to_string(stub) {
                 unfilled_stub_items.push(requested.id);
             }
             replace_function_at_path(&mut candidate.items, &path, implementation)?;
