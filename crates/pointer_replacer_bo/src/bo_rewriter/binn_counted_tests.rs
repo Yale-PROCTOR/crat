@@ -1929,7 +1929,7 @@ fn w6v2_raw_caller_of_a_header_view_takes_the_fallback_extent() {
     // The number appears exactly once, in the const ITEM the emitter inserts;
     // the call site names the path, never the literal.
     assert_eq!(
-        source.matches("1024").count(),
+        source.matches("268435456").count(),
         1,
         "the extent is the named const, never an inlined number: {source}"
     );
@@ -1983,7 +1983,7 @@ fn w6v2_header_path_takes_the_ruled_fallback_extent() {
         "the chain carries the view: {source}"
     );
     assert!(
-        !source.contains("1024"),
+        !source.contains("268435456"),
         "no extent is ever inlined as a number: {source}"
     );
     assert!(super::verify::type_checks_str(&source), "{source}");

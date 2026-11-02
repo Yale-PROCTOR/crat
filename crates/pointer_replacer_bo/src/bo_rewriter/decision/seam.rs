@@ -2739,7 +2739,7 @@ mod tests {
             "unsafe { core::slice::from_raw_parts(p, crate::FALLBACK_SLICE_EXTENT) }"
         );
         assert!(
-            !fabricated.contains("1024"),
+            !fabricated.contains("268435456"),
             "the extent is NAMED, never spelled as a bare literal: {fabricated}"
         );
         assert!(
