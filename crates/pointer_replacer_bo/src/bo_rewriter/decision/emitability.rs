@@ -671,8 +671,24 @@ impl AddressUseClass {
     }
 }
 
+/// A call anywhere in the right-hand side, not only at its top: a cast or a
+/// field read of a call result still runs the call (heman's
+/// `heman_image_texel(..) as *mut kmVec3`, whose call the receiver-input
+/// planner owns), so the body rule leaves it to the planners that adapt calls.
 fn body_side_effecting(expr: &Expr<'_>) -> bool {
-    matches!(expr.kind, ExprKind::Call(..) | ExprKind::MethodCall(..))
+    struct Calls(bool);
+    impl<'v> Visitor<'v> for Calls {
+        fn visit_expr(&mut self, expr: &'v Expr<'v>) {
+            if matches!(expr.kind, ExprKind::Call(..) | ExprKind::MethodCall(..)) {
+                self.0 = true;
+            } else {
+                rustc_hir::intravisit::walk_expr(self, expr);
+            }
+        }
+    }
+    let mut calls = Calls(false);
+    calls.visit_expr(expr);
+    calls.0
 }
 
 /// Peel `as` casts to reach the underlying operand.

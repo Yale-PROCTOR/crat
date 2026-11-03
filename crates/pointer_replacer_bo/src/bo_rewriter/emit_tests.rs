@@ -6019,11 +6019,18 @@ fn e2_body_n3_side_effecting_assignment_is_evaluated_once_and_skipped() {
         "a skipped body site holds nothing:\n{}",
         attempt.receipt
     );
+    if let Some(text) = text_for(&attempt.emission, "lib.rs") {
+        assert_eq!(
+            text.matches("next(p, calls)").count(),
+            1,
+            "the side effect is evaluated exactly once:\n{text}"
+        );
+    }
+    let original = std::fs::read_to_string(attempt.fixture.root()).expect("fixture source");
     assert_eq!(
-        e2_root_text(&attempt).matches("next(p, calls)").count(),
+        original.matches("next(p, calls)").count(),
         1,
-        "the side effect is evaluated exactly once:\n{}",
-        e2_root_text(&attempt)
+        "the unmodified input evaluates the side effect exactly once:\n{original}"
     );
 }
 
