@@ -5950,28 +5950,25 @@ fn e2_type_checks(attempt: &E2Attempt) -> bool {
     verify::type_checks_crate(temp.root())
 }
 
-/// E2-BODY-W2 — a later assignment reuses the mutable scalar adapter.
+/// E2-BODY-W2 — a later assignment reuses the mutable scalar adapter, in any
+/// function (S8: the body adapters are a rule, not a list of eight).
 #[test]
 fn e2_body_w2_assignment_uses_the_production_scalar_adapter() {
     let src = format!(
         "{E_ADAPT_PRE}\
-         pub mod src {{ pub mod json {{\n\
-         pub unsafe fn json_extract_get_object_size(p: *mut i32) -> i32 {{\n\
+         pub mod m {{\n\
+         pub unsafe fn object_size(p: *mut i32) -> i32 {{\n\
          \x20   let mut x = 0; let mut q: *mut i32 = &mut x; q = p; *q += 1; *q\n\
          }}\n\
-         }} }}\n"
+         }}\n"
     );
     let attempt = e2_attempt(&src, &|table| {
-        force_body_forms(
-            table,
-            &["json_extract_get_object_size::p"],
-            &[("json_extract_get_object_size::q", true)],
-        );
+        force_body_forms(table, &["object_size::p"], &[("object_size::q", true)]);
     });
     assert!(
         attempt.receipt.lines().any(|line| {
             line.starts_with("body-placed\t")
-                && line.contains("json_extract_get_object_size")
+                && line.contains("object_size")
                 && line.contains("assignment-rhs")
         }),
         "the assignment must ride the production receipt:\n{}",
@@ -5988,80 +5985,45 @@ fn e2_body_w2_assignment_uses_the_production_scalar_adapter() {
     );
 }
 
-/// E2-N3 — a side-effecting RHS stays residual and is never duplicated.
+/// E2-N3 (S8) — a side-effecting RHS is a typed skip: it is never duplicated,
+/// never glued and never holds its class (the verify gate decides, as for any
+/// site the body rule does not adapt).
 #[test]
-fn e2_body_n3_side_effecting_assignment_is_evaluated_once_and_refused() {
+fn e2_body_n3_side_effecting_assignment_is_evaluated_once_and_skipped() {
     let src = format!(
         "{E_ADAPT_PRE}\
-         pub mod src {{ pub mod json {{\n\
+         pub mod m {{\n\
          unsafe fn next(p: *const i32, calls: &mut i32) -> *const i32 {{ *calls += 1; p }}\n\
-         pub unsafe fn json_extract_get_string_size(p: *const i32, calls: &mut i32) -> i32 {{\n\
+         pub unsafe fn string_size(p: *const i32, calls: &mut i32) -> i32 {{\n\
          \x20   let mut x = 0; let mut q: *const i32 = &mut x; q = next(p, calls); *q\n\
          }}\n\
-         }} }}\n"
+         }}\n"
     );
     let attempt = e2_attempt(&src, &|table| {
-        force_body_forms(
-            table,
-            &["json_extract_get_string_size::p"],
-            &[("json_extract_get_string_size::q", false)],
-        );
+        force_body_forms(table, &["string_size::p"], &[("string_size::q", false)]);
     });
     assert!(
         attempt.receipt.lines().any(|line| {
-            line.starts_with("body-blocked\t")
-                && line.contains("json_extract_get_string_size")
+            line.starts_with("body-skipped\t")
+                && line.contains("string_size")
                 && line.contains("body-side-effecting-rhs")
         }),
-        "the side-effect control must be typed, not silently absent:\n{}",
+        "the side-effect skip must be typed, not silently absent:\n{}",
         attempt.receipt
     );
     assert!(
-        attempt.emission.files.is_empty(),
-        "the blocked body site holds the whole signature class"
+        !attempt
+            .receipt
+            .lines()
+            .any(|line| line.starts_with("body-blocked\t") && line.contains("string_size")),
+        "a skipped body site holds nothing:\n{}",
+        attempt.receipt
     );
-    let original = std::fs::read_to_string(attempt.fixture.root()).expect("fixture source");
     assert_eq!(
-        original.matches("next(p, calls)").count(),
+        e2_root_text(&attempt).matches("next(p, calls)").count(),
         1,
-        "the unmodified input evaluates the side effect exactly once:\n{original}"
-    );
-}
-
-/// The exact-eight allowlist is a production fact: an identical ninth function
-/// must not acquire a body adapter.
-#[test]
-fn e2_body_scope_adapts_only_the_enumerated_function_identity() {
-    let src = format!(
-        "{E_ADAPT_PRE}\
-         pub mod src {{ pub mod json {{\n\
-         pub unsafe fn json_extract_get_array_size(p: *const i32) -> i32 {{ let q: *const i32 = p; *q }}\n\
-         pub unsafe fn ninth_not_scoped(p: *const i32) -> i32 {{ let q: *const i32 = p; *q }}\n\
-         }} }}\n"
-    );
-    let attempt = e2_attempt(&src, &|table| {
-        force_body_forms(
-            table,
-            &["json_extract_get_array_size::p", "ninth_not_scoped::p"],
-            &[
-                ("json_extract_get_array_size::q", false),
-                ("ninth_not_scoped::q", false),
-            ],
-        );
-    });
-    let body = attempt
-        .receipt
-        .lines()
-        .filter(|line| line.starts_with("body-"))
-        .collect::<Vec<_>>();
-    assert!(
-        body.iter()
-            .any(|line| line.contains("json_extract_get_array_size")),
-        "{body:?}"
-    );
-    assert!(
-        body.iter().all(|line| !line.contains("ninth_not_scoped")),
-        "{body:?}"
+        "the side effect is evaluated exactly once:\n{}",
+        e2_root_text(&attempt)
     );
 }
 
