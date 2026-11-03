@@ -142,7 +142,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
             locals,
             fn_locals: _,
             struct_fields,
-            tcx: _,
+            tcx,
         } = self.ctxt;
         let database = &mut self.database;
 
@@ -181,7 +181,11 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                 }
             }
             Rvalue::Cast(_, Operand::Copy(rhs) | Operand::Move(rhs), _) => {
-                // for cast, we process the head ptr only
+                let preserves_carrier = struct_fields
+                    .carriers
+                    .preserves_cast(rhs.ty(local_decls, tcx).ty, lhs.ty(local_decls, tcx).ty);
+                // Ordinary casts constrain only the head pointer; carrier casts
+                // also preserve the pointee's qualifier slots.
                 let lhs = place_vars::<MutCtxt>(lhs, local_decls, locals, struct_fields, database);
                 let mut rhs_deref = None;
                 let rhs = place_vars::<UnknownCtxt>(
@@ -197,6 +201,12 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                     database.guard(lhs, rhs);
                     if let Some(rhs_deref) = rhs_deref {
                         database.guard(lhs, rhs_deref)
+                    }
+                }
+                if preserves_carrier {
+                    for (lhs, rhs) in lhs_rhs {
+                        database.guard(lhs, rhs);
+                        database.guard(rhs, lhs);
                     }
                 }
             }
@@ -424,6 +434,13 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
                 base_ty = base_ty.builtin_deref(true).unwrap();
             }
             ProjectionElem::Field(field, ty) => {
+                if struct_fields.carriers.is_carrier(base_ty) {
+                    if field.index() != 0 {
+                        return place_vars.end..place_vars.end;
+                    }
+                    base_ty = ty;
+                    continue;
+                }
                 match base_ty.kind() {
                     TyKind::Adt(adt_def, _) => {
                         assert!(place_vars.is_empty());
@@ -444,9 +461,9 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
                         let offset: usize = tys
                             .iter()
                             .take(field.index())
-                            .map(|t| super::count_ptr(t))
+                            .map(|t| struct_fields.count_ptr(t))
                             .sum();
-                        let field_count = super::count_ptr(ty);
+                        let field_count = struct_fields.count_ptr(ty);
                         place_vars = Range {
                             start: place_vars.start + offset,
                             end: place_vars.start + offset + field_count,

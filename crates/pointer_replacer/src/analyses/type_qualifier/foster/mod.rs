@@ -1,9 +1,13 @@
 //! Foster style flow-insensitive type qualifier inference algorithm
 
 pub use constraint_system::{BooleanLattice, Var};
+use rustc_hir::LangItem;
 use rustc_index::IndexVec;
 use rustc_middle::ty::{Ty, TyCtxt};
-use rustc_span::def_id::LocalDefId;
+use rustc_span::{
+    def_id::{DefId, LocalDefId},
+    sym,
+};
 use rustc_type_ir::TyKind;
 
 use crate::{
@@ -18,7 +22,60 @@ pub mod constraint_system;
 pub mod fatness;
 pub mod mutability;
 
-pub type StructFields = encoding::StructFields<Var>;
+#[cfg(test)]
+mod tests;
+
+pub struct StructFields {
+    fields: encoding::StructFields<Var>,
+    carriers: PointerCarriers,
+}
+
+impl StructFields {
+    pub fn fields(&self, did: LocalDefId) -> impl Iterator<Item = std::ops::Range<Var>> + '_ {
+        self.fields.fields(did)
+    }
+
+    pub fn count_ptr(&self, ty: Ty<'_>) -> usize {
+        count_ptr(ty, self.carriers)
+    }
+
+    pub fn is_pointer_carrier(&self, ty: Ty<'_>) -> bool {
+        self.carriers.is_carrier(ty)
+    }
+
+    pub fn preserves_carrier_cast<'tcx>(&self, source: Ty<'tcx>, target: Ty<'tcx>) -> bool {
+        self.carriers.preserves_cast(source, target)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PointerCarriers {
+    unique: Option<DefId>,
+    non_null: Option<DefId>,
+}
+
+impl PointerCarriers {
+    fn is_carrier(self, ty: Ty<'_>) -> bool {
+        ty.is_box()
+            || matches!(ty.kind(), TyKind::Adt(adt, _) if Some(adt.did()) == self.unique || Some(adt.did()) == self.non_null)
+    }
+
+    fn pointee(self, ty: Ty<'_>) -> Option<Ty<'_>> {
+        if let Some(inner) = ty.builtin_deref(true) {
+            return Some(inner);
+        }
+        let TyKind::Adt(_, arguments) = ty.kind() else { return None };
+        self.is_carrier(ty).then(|| arguments.type_at(0))
+    }
+
+    fn preserves_cast<'tcx>(self, source: Ty<'tcx>, target: Ty<'tcx>) -> bool {
+        (self.is_carrier(source) || self.is_carrier(target))
+            && self
+                .pointee(source)
+                .is_some_and(|pointee| Some(pointee) == self.pointee(target))
+    }
+}
+
 pub type FnLocals = encoding::FnLocals<Var>;
 
 pub struct TypeQualifiers<Qualifier> {
@@ -27,10 +84,10 @@ pub struct TypeQualifiers<Qualifier> {
     pub model: IndexVec<Var, Qualifier>,
 }
 
-pub fn count_ptr(mut ty: Ty) -> usize {
+fn count_ptr(mut ty: Ty, carriers: PointerCarriers) -> usize {
     let mut cnt = 0;
     loop {
-        if let Some(inner_ty) = ty.builtin_deref(true) {
+        if let Some(inner_ty) = carriers.pointee(ty) {
             cnt += 1;
             ty = inner_ty;
             continue;
@@ -40,7 +97,7 @@ pub fn count_ptr(mut ty: Ty) -> usize {
             continue;
         }
         if let TyKind::Tuple(tys) = ty.kind() {
-            return cnt + tys.iter().map(|t| count_ptr(t)).sum::<usize>();
+            return cnt + tys.iter().map(|t| count_ptr(t, carriers)).sum::<usize>();
         }
         break cnt;
     }
@@ -54,6 +111,10 @@ where Domain: BooleanLattice
         let tcx = rust_program.tcx;
         let fns = &rust_program.functions[..];
         let structs = &rust_program.structs[..];
+        let carriers = PointerCarriers {
+            unique: tcx.lang_items().get(LangItem::PtrUnique),
+            non_null: tcx.get_diagnostic_item(sym::NonNull),
+        };
 
         let mut model = IndexVec::new();
         // not necessary, but need initialization anyway
@@ -62,18 +123,21 @@ where Domain: BooleanLattice
         let next: Var = model.next_index();
 
         let (struct_fields, next) = encode_structs(next, structs, tcx, |field_ty| {
-            let num_ptrs = count_ptr(field_ty);
+            let num_ptrs = count_ptr(field_ty, carriers);
             model.extend(std::iter::repeat_n(Domain::BOTTOM, num_ptrs));
             num_ptrs
         });
         let (fn_locals, _) = encode_fns(next, fns, tcx, |local_ty| {
-            let num_ptrs = count_ptr(local_ty);
+            let num_ptrs = count_ptr(local_ty, carriers);
             model.extend(std::iter::repeat_n(Domain::BOTTOM, num_ptrs));
             num_ptrs
         });
 
         Self {
-            struct_fields,
+            struct_fields: StructFields {
+                fields: struct_fields,
+                carriers,
+            },
             fn_locals,
             model,
         }

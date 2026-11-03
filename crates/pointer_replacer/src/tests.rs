@@ -1122,6 +1122,23 @@ fn run_test_with_config(code: &str, config: &Config, includes: &[&str], excludes
 }
 
 #[test]
+fn test_existing_boxed_handle_rewrites_and_type_checks() {
+    run_test(
+        r#"
+pub struct Handle { pub value: i32 }
+pub unsafe fn create() -> *mut Handle {
+    let mut handle = Box::new(Handle { value: 0 });
+    let pointer = &mut *handle as *mut Handle;
+    std::mem::forget(handle);
+    pointer
+}
+"#,
+        &["Box::new"],
+        &[],
+    );
+}
+
+#[test]
 fn test_local_ptr_to_ref() {
     run_test(
         r#"

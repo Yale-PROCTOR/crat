@@ -2199,7 +2199,6 @@ fn assert_skeleton(source: &str, path: &str, expected: &str) {
             canonical_item(&function(&records, path).baseline.skeleton),
             {
                 let mut expected = utils::ast::parse_crate(expected.to_owned());
-                PresentationBindingNormalizer.visit_crate(&mut expected);
                 ParenNormalizer.visit_crate(&mut expected);
                 pprust::item_to_string(&expected.items[0])
             }
@@ -4289,7 +4288,7 @@ fn replaces_leaf_expression_payloads_with_todo() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f() -> i32 { let x: i32 = 1; callee(x); todo!(); -x + 2 }",
+        "pub unsafe fn f() -> i32 { let mut x: i32 = 1; callee(x); todo!(); -x + 2 }",
     );
 }
 
@@ -4317,7 +4316,7 @@ fn materializes_inferred_types_for_simple_bindings() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f() { let b: bool = true; let i: i32 = -1i32; let u: u64 = 1u64; let n: f32 = 1.5f32; let c: char = 'x'; let t: (i32, u8) = (1i32, 2u8); let a: [u16; 3] = [1u16; 3]; let r: &i32 = &i; let l: Local = Local; }",
+        "pub unsafe fn f() { let mut b: bool = true; let mut i: i32 = -1i32; let mut u: u64 = 1u64; let mut n: f32 = 1.5f32; let mut c: char = 'x'; let mut t: (i32, u8) = (1i32, 2u8); let mut a: [u16; 3] = [1u16; 3]; let mut r: &i32 = &i; let mut l: Local = Local; }",
     );
 }
 
@@ -4333,7 +4332,7 @@ fn preserves_mutability_declarations_and_existing_types() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f() { let mut a: i32 = 1; let x: T; let y: Count = 2; x = T; let _ = (a, x, y); }",
+        "pub unsafe fn f() { let mut a: i32 = 1; let mut x: T; let mut y: Count = 2; x = T; let _ = (a, x, y); }",
     );
 }
 
@@ -4348,7 +4347,7 @@ fn holes_assignments_and_preserves_return_and_break_roles() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(mut x: i32) -> i32 { x = 1; x += 2; let y: i32 = loop { break x; }; return y; }",
+        "pub unsafe fn f(mut x: i32) -> i32 { x = 1; x += 2; let mut y: i32 = loop { break x; }; return y; }",
     );
 }
 
@@ -4366,7 +4365,7 @@ fn preserves_if_and_else_structure() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(flag: bool) { if flag { sink(1); } else { sink(2); } }",
+        "pub unsafe fn f(mut flag: bool) { if flag { sink(1); } else { sink(2); } }",
     );
 }
 
@@ -4380,7 +4379,7 @@ fn preserves_nested_if_and_else_if_structure() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(a: bool, b: bool, c: bool) -> i32 { let x: i32 = if a { 1 } else { 2 }; if b { if c { x } else { 3 } } else if a { 4 } else { 5 } }",
+        "pub unsafe fn f(mut a: bool, mut b: bool, mut c: bool) -> i32 { let mut x: i32 = if a { 1 } else { 2 }; if b { if c { x } else { 3 } } else if a { 4 } else { 5 } }",
     );
 }
 
@@ -4394,7 +4393,7 @@ fn preserves_if_let_and_while_let_patterns() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(mut value: Option<i32>) { if let Some(x) = value { sink(x); } while let Some(x) = value { sink(x); value = None; } }",
+        "pub unsafe fn f(mut value: Option<i32>) { if let Some(mut x) = value { sink(x); } while let Some(mut x) = value { sink(x); value = None; } }",
     );
 }
 
@@ -4409,7 +4408,7 @@ fn preserves_while_for_and_loop_constructs() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(mut n: i32, pairs: [(i32, i32); 2]) { 'w: while n > 0 { n -= 1; } for (x, y) in todo!() { sink(x + y); } 'l: loop { break 'l; } }",
+        "pub unsafe fn f(mut n: i32, mut pairs: [(i32, i32); 2]) { 'w: while n > 0 { n -= 1; } for (mut x, mut y) in todo!() { sink(x + y); } 'l: loop { break 'l; } }",
     );
 }
 
@@ -4425,7 +4424,7 @@ fn preserves_match_arms_patterns_guards_and_order() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(e: E, n: i32, pair: (i32, i32)) -> i32 { let a: i32 = match e { E::Unit => { 0 } E::Tuple(x) if x > 0 => { x } E::Tuple(_) => { -1 } E::Struct { x } => { sink(x); x }, }; let b: i32 = match todo!() { 0 => { 0 } 1..=3 => { 1 } _ => { 2 } }; match pair { (x, y) => { a + b + x + y } } }",
+        "pub unsafe fn f(mut e: E, mut n: i32, mut pair: (i32, i32)) -> i32 { let mut a: i32 = match e { E::Unit => { 0 } E::Tuple(mut x) if x > 0 => { x } E::Tuple(_) => { -1 } E::Struct { mut x } => { sink(x); x }, }; let mut b: i32 = match todo!() { 0 => { 0 } 1..=3 => { 1 } _ => { 2 } }; match pair { (mut x, mut y) => { a + b + x + y } } }",
     );
 }
 
@@ -4441,7 +4440,7 @@ fn preserves_let_else_and_plain_nested_blocks() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(value: Option<i32>) -> i32 { let Some(x): Option<i32> = value else { return 0; }; let y: i32 = { sink(x); x + 1 }; y }",
+        "pub unsafe fn f(mut value: Option<i32>) -> i32 { let Some(mut x): Option<i32> = value else { return 0; }; let mut y: i32 = { sink(x); x + 1 }; y }",
     );
 }
 
@@ -4459,7 +4458,7 @@ fn preserves_existing_identifiers_paths_and_patterns() {
     assert_skeleton(
         source,
         "keep_names",
-        "pub unsafe fn keep_names(mut input_value: m::Pair) -> i32 { let mut local_total: i32 = input_value.left; 'outer: loop { let m::Pair { left: bound_left, right: bound_right } = input_value; local_total += bound_left + bound_right; break 'outer; } local_total }",
+        "pub unsafe fn keep_names(mut input_value: m::Pair) -> i32 { let mut local_total: i32 = input_value.left; 'outer: loop { let m::Pair { left: mut bound_left, right: mut bound_right } = input_value; local_total += bound_left + bound_right; break 'outer; } local_total }",
     );
 }
 
@@ -4489,7 +4488,7 @@ fn preserves_payloadless_control_expressions_without_holes() {
     assert_skeleton(
         source,
         "f",
-        "pub unsafe fn f(flag: bool) { if flag { return; } loop { if flag { continue; } break; } }",
+        "pub unsafe fn f(mut flag: bool) { if flag { return; } loop { if flag { continue; } break; } }",
     );
 }
 
@@ -4532,17 +4531,17 @@ fn allows_restricted_conditionals_beneath_non_control_payloads() {
     assert_skeleton(
         source,
         "assign",
-        "pub unsafe fn assign(mut value: i32, flag: bool) { value = 1 + if flag { 2 } else { 3 }; }",
+        "pub unsafe fn assign(mut value: i32, mut flag: bool) { value = 1 + if flag { 2 } else { 3 }; }",
     );
     assert_skeleton(
         source,
         "wrapped_return",
-        "pub unsafe fn wrapped_return(flag: bool) -> Option<i32> { return Some(if flag { 1 } else { 2 }); }",
+        "pub unsafe fn wrapped_return(mut flag: bool) -> Option<i32> { return Some(if flag { 1 } else { 2 }); }",
     );
     assert_skeleton(
         source,
         "wrapped_let",
-        "pub unsafe fn wrapped_let(flag: bool) -> i32 { let value: ::core::option::Option<i32> = Some(if flag { 1 } else { 2 }); value.unwrap() }",
+        "pub unsafe fn wrapped_let(mut flag: bool) -> i32 { let mut value: ::core::option::Option<i32> = Some(if flag { 1 } else { 2 }); value.unwrap() }",
     );
 }
 
@@ -4573,7 +4572,7 @@ fn allows_else_if_chains_and_recursive_branch_tail_conditionals() {
             source,
             path,
             &format!(
-                "pub unsafe fn {path}(c1: bool, c2: bool) -> i32 {{ let value: ::core::option::Option<i32> = {}; value.unwrap() }}",
+                "pub unsafe fn {path}(mut c1: bool, mut c2: bool) -> i32 {{ let mut value: ::core::option::Option<i32> = {}; value.unwrap() }}",
                 if path == "chained" {
                     "Some(if c1 { 1 } else if c2 { 2 } else { 3 })"
                 } else {
@@ -6614,6 +6613,150 @@ pub unsafe fn caller(values: &[i32], left: i32, right: i32) -> i32 {
     let records = generate(source);
     let caller = function(&records, "caller");
     assert_eq!(caller.baseline.transform_labels(), Vec::<u32>::new());
+    assert!(caller.target_signature.contains("values: &[i32]"));
+}
+
+#[test]
+fn boxed_handles_generate_skeletons_after_box_dereference_lowering() {
+    let source = r#"
+pub struct Handle { pub value: i32 }
+pub unsafe fn create() -> *mut Handle {
+    let mut handle = Box::new(Handle { value: 0 });
+    let pointer = &mut *handle as *mut Handle;
+    std::mem::forget(handle);
+    pointer
+}
+"#;
+    let records = generate(source);
+    let record = function(&records, "create");
+    assert!(record.baseline.needs_transformation);
+    assert!(record.annotated_source.contains("Box::new"));
+}
+
+#[test]
+fn reference_signatures_and_preserved_vec_operations_type_check() {
+    let source = r#"
+type Borrow<'a> = &'a mut Vec<i32>;
+pub unsafe fn add_element(arr: &mut Vec<i32>, value: i32) {
+    arr.push(value);
+}
+pub unsafe fn identity(arr: Borrow<'_>) -> Borrow<'_> { arr }
+pub unsafe fn caller(arr: &mut Vec<i32>) { add_element(arr, 1); }
+pub unsafe fn shared(value: &i32) -> &i32 { value }
+"#;
+    let records = generate(source);
+    let mut candidate = "type Borrow<'a> = &'a mut Vec<i32>;\n".to_owned();
+    for name in ["add_element", "identity", "caller", "shared"] {
+        let record = function(&records, name);
+        assert!(!record.baseline.needs_transformation, "{name}");
+        assert!(!record.target_signature.contains("Option"), "{name}");
+        candidate.push_str(&record.baseline.skeleton);
+    }
+    assert!(
+        function(&records, "identity")
+            .target_signature
+            .contains("Borrow<'_>")
+    );
+    let candidate = candidate
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("#[proctor("))
+        .collect::<Vec<_>>()
+        .join("\n");
+    run_compiler_on_str(&candidate, utils::type_check).expect(&candidate);
+}
+
+#[test]
+fn reference_rule_types_ignore_propagated_pointer_decisions() {
+    let source = "pub unsafe fn read(value: &i32) -> i32 { *value }";
+    run_compiler_on_str(source, |tcx| {
+        let mut surface = utils::ast::parse_crate(source.to_owned());
+        let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+        mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+        let function = local_def_path("read", tcx);
+        let reference = tcx
+            .fn_sig(function)
+            .instantiate_identity()
+            .skip_binder()
+            .inputs()[0];
+        assert_eq!(
+            selected_target_type_tree(reference, PtrKind::OptRef(false), &mapper.ast_to_hir, tcx),
+            semantic_type_tree(reference, &mapper.ast_to_hir, tcx)
+        );
+    })
+    .unwrap();
+}
+
+#[test]
+fn converted_raw_returns_retain_borrows_from_existing_references() {
+    for source in [
+        "pub unsafe fn borrowed(value: &i32) -> *const i32 { value as *const i32 }",
+        "pub unsafe fn borrowed<'v>(value: &'v i32) -> *const i32 { value as *const i32 }",
+        "type Borrow<'v> = &'v i32; pub unsafe fn borrowed<'v>(value: Borrow<'v>) -> *const i32 { value as *const i32 }",
+    ] {
+        let records = generate(source);
+        let record = function(&records, "borrowed");
+        assert!(!record.target_signature.contains("Option"));
+        assert!(record.target_signature.contains("-> &"));
+        let candidate = format!(
+            "type Borrow<'v> = &'v i32; {} {{ value }}",
+            record.target_signature
+        );
+        run_compiler_on_str(&candidate, utils::type_check).expect(&candidate);
+    }
+
+    let source = "pub unsafe fn choose<'x, 'y>(left: &'x i32, right: &'y i32, flag: bool) -> *const i32 { if flag { left as *const i32 } else { right as *const i32 } }";
+    let records = generate(source);
+    let signature = &function(&records, "choose").target_signature;
+    assert!(signature.contains("left: &'x i32"), "{signature}");
+    assert!(signature.contains("right: &'y i32"), "{signature}");
+    let candidate = format!("{signature} {{ if flag {{ left }} else {{ right }} }}");
+    run_compiler_on_str(&candidate, utils::type_check).expect(&candidate);
+}
+
+#[test]
+fn normalization_preserves_resolved_variants_and_constants() {
+    let source = r#"
+pub enum Choice { Empty, Value(i32) }
+use Choice::Empty as vacant;
+const ZERO: i32 = 0;
+pub unsafe fn optional(value: Option<i32>) -> i32 {
+    match value { Some(value) => { value } None => { 0 } }
+}
+pub unsafe fn choice(value: Choice) -> i32 {
+    match value { vacant => { 0 } Choice::Value(value) => { value } }
+}
+pub unsafe fn constant(value: i32) -> i32 {
+    match value { ZERO => { 0 } other => { other } }
+}
+"#;
+    let records = generate(source);
+    let mut candidate = "pub enum Choice { Empty, Value(i32) }\nuse Choice::Empty as vacant;\nconst ZERO: i32 = 0;\n".to_owned();
+    for name in ["optional", "choice", "constant"] {
+        let record = function(&records, name);
+        assert!(!record.baseline.needs_transformation, "{name}");
+        for rendering in [
+            &record.annotated_source,
+            &record.baseline.skeleton,
+            &record.applied.skeleton,
+        ] {
+            for variant in ["mut None", "mut vacant", "mut ZERO"] {
+                assert!(!rendering.contains(variant), "{rendering}");
+            }
+        }
+        candidate.push_str(&record.baseline.skeleton);
+    }
+    assert!(
+        function(&records, "optional")
+            .baseline
+            .skeleton
+            .contains("Some(mut value)")
+    );
+    let candidate = candidate
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("#[proctor("))
+        .collect::<Vec<_>>()
+        .join("\n");
+    run_compiler_on_str(&candidate, utils::type_check).expect(&candidate);
 }
 
 #[test]
