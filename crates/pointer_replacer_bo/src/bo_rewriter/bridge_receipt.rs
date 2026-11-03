@@ -82,8 +82,8 @@ pub(crate) enum BridgeExtentKind {
     /// nor the allocation.
     MaskPlusOne(String),
     /// **wave-6l relay 063.** The fallback extent where a companion was
-    /// refused; the reason names the refusal (`kx-list:<subject>`,
-    /// `only-zero`, `mask-as-count:<argument>`, `no-op-mask:<argument>`).
+    /// refused; the reason names the refusal (`only-zero`,
+    /// `mask-as-count:<argument>`, `no-op-mask:<argument>`).
     Refused(String),
 }
 

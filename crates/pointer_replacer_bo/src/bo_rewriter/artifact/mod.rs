@@ -254,7 +254,6 @@ mod tests {
             extent_proof_companions: Default::default(),
             field_alloc_lengths: Default::default(),
             nul_walk_sites: Default::default(),
-            kx_refused: Default::default(),
             nul_exact_parameters: Default::default(),
             wide_access_parameters: Default::default(),
             nul_exact_callers: Default::default(),

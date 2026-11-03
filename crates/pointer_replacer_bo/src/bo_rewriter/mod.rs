@@ -9409,16 +9409,6 @@ fn finish_decide<'tcx>(
             .collect();
         // wave-6l relay 077 (R776-4): the C strings the NUL-walk arm licenses.
         table.nul_walk_sites = decision::nul_walk_arm::sites(tcx, &facts);
-        // wave-6l relay 063 (R645-5 item 2): the parameters the KX list names.
-        // The seam refuses their adjacency licence whatever produced it.
-        table.kx_refused = table
-            .entries
-            .iter()
-            .filter_map(|(subject, _)| {
-                decision::kx_refusals::listed(tcx, subject)
-                    .map(|row| ((subject.fn_did, subject.hir_id), row))
-            })
-            .collect();
 
         // Use-edit nesting is a property of a PAIR of edits, so it cannot be seen by
         // `decide_one`, which is handed one subject at a time. Runs here, over the

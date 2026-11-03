@@ -339,8 +339,8 @@ pub(crate) enum SeamLen {
     /// parameter's name rides along so the receipt can name what was guessed.
     PositionalSibling { text: String, param: String },
     /// **wave-6l relay 063 (R645-5).** The fabricated extent where a companion
-    /// was REFUSED: the KX list (`kx-list:<subject>`), an argument only ever
-    /// `0` (`only-zero`), a mask offered as a count (`mask-as-count:<arg>`),
+    /// was REFUSED: an argument only ever `0` (`only-zero`), a mask offered
+    /// as a count (`mask-as-count:<arg>`),
     /// or the masked arm's `mask + 1` of a constant mask (`no-op-mask:<arg>`,
     /// relay 066). Rendered and counted exactly as [`Fabricated`](Self::Fabricated); the
     /// receipt names the refusal: `fallback(extent-refused:<reason>)`.
@@ -6288,10 +6288,8 @@ pub(crate) fn synthesize_with_raw_boundary(
                     } else {
                         let argument = companion
                             .and_then(|i| site.args.iter().find(|argument| argument.index == i));
-                        // Relay 063: three refusals of a licensed companion,
-                        // each receipted; the root takes the fallback.
-                        //  * (item 2) the KX list: the adjacency licence of a
-                        //    listed parameter, whatever produced it;
+                        // Relay 063: refusals of a licensed companion, each
+                        // receipted; the root takes the fallback.
                         //  * (R631-4 (iv)) a companion only ever `0`;
                         //  * (item 6) a mask as a count, on the adjacency arms
                         //    (R477-6's masked arm licenses `mask + 1` on its
@@ -6299,9 +6297,6 @@ pub(crate) fn synthesize_with_raw_boundary(
                         //  * (relay 066) the masked arm's `mask + 1` of a
                         //    constant (no-op) mask.
                         let adjacency = arm != LenEvidence::Contract;
-                        let kx = param_key
-                            .get(&(*callee, pos.index))
-                            .and_then(|key| table.kx_refused.get(key));
                         let mask_formal = companion
                             .and_then(|i| tcx.fn_arg_idents(callee.to_def_id()).get(i).copied())
                             .flatten()
@@ -6309,13 +6304,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                                 super::masked_runtime::mask_named(ident.name.as_str())
                             });
                         refused = argument.and_then(|argument| {
-                            if adjacency && let Some(row) = kx {
-                                Some(format!("kx-list:{row}"))
-                            } else if super::masked_runtime::always_zero(
-                                tcx,
-                                site.caller,
-                                argument.span,
-                            ) {
+                            if super::masked_runtime::always_zero(tcx, site.caller, argument.span) {
                                 Some("only-zero".to_owned())
                             } else if adjacency
                                 && !masked

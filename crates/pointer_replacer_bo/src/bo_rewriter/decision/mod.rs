@@ -86,9 +86,6 @@ pub(crate) mod global_or_integer;
 pub(crate) mod identity_cast;
 pub(crate) mod interface;
 pub(crate) mod io_domain;
-#[cfg(test)]
-mod kx_refusal_tests;
-pub(crate) mod kx_refusals;
 pub(crate) mod licensed_lift;
 pub(crate) mod lifetime;
 #[cfg(test)]
@@ -1245,10 +1242,6 @@ pub(crate) struct DecisionTable {
     /// NUL-walk arm licenses `strlen + 1` for (`nul_walk_arm::sites`).
     pub(crate) nul_walk_sites:
         rustc_hash::FxHashMap<(LocalDefId, rustc_span::Span), nul_walk_arm::Site>,
-    /// **wave-6l relay 063 (R645-5 item 2).** The parameters the KX list names
-    /// (`kx_refusals::KX_LIST`), keyed as `slice_input_companions`, with the row
-    /// the receipt names. The seam refuses their adjacency licence.
-    pub(crate) kx_refused: FxHashMap<(LocalDefId, rustc_hir::HirId), String>,
     /// **R491-7 (wave-5c).** Callee parameters whose body walks them to a NUL
     /// with the EXACT extent licensed — the walk reaches the NUL on every path,
     /// or the pointer is handed to a libc string function whose contract
@@ -2059,7 +2052,6 @@ pub(crate) fn decide_with_raw_fallbacks(
         extent_proof_companions: Default::default(),
         field_alloc_lengths: Default::default(),
         nul_walk_sites: Default::default(),
-        kx_refused: Default::default(),
         nul_exact_parameters: Default::default(),
         wide_access_parameters: Default::default(),
         nul_exact_callers: Default::default(),
@@ -4291,7 +4283,6 @@ mod self_consistency_tests {
             extent_proof_companions: Default::default(),
             field_alloc_lengths: Default::default(),
             nul_walk_sites: Default::default(),
-            kx_refused: Default::default(),
             nul_exact_parameters: Default::default(),
             wide_access_parameters: Default::default(),
             nul_exact_callers: Default::default(),

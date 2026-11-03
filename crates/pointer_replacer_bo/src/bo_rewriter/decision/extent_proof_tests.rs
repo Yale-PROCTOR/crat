@@ -568,8 +568,8 @@ mod src {
 
 /// The negative witness: the index is never the extent. The prover refuses
 /// `(in_0, i)` (the read at `i` is not below `i`), and the seam, where the
-/// reader chain's old licence named `i`, takes the KX list's refusal
-/// (build B) and the fallback, never `(i) as usize`.
+/// reader chain's old licence named `i`, takes the fallback, never
+/// `(i) as usize`.
 #[test]
 fn w6l_extent_lodepng_the_pixel_index_is_not_the_extent() {
     assert_eq!(
