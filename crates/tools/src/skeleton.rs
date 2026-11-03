@@ -460,7 +460,7 @@ fn make_function_record<'tcx>(
     validate_function_body(&source, &surface.path)?;
     let opaque_expressions = collect_opaque_expressions(&source, &surface.path, ast_to_hir, tcx)?;
     annotate_function(&mut source, &opaque_expressions);
-    PresentationBindingNormalizer.visit_item(&mut source);
+    PresentationBindingNormalizer { ast_to_hir, tcx }.visit_item(&mut source);
     let statement_classification = classify_function_statements(
         &source,
         &opaque_expressions,
@@ -1374,6 +1374,7 @@ fn apply_target_signature<'a, 'tcx>(
         return Ok(());
     };
     let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
+    let source_signature = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
     let mut lifetimes = vec![];
     for lifetime in decision
         .input_lifetimes
@@ -1391,13 +1392,72 @@ fn apply_target_signature<'a, 'tcx>(
         if force_main_argv && index == 1 {
             continue;
         }
+        let original = body.local_decls[rustc_middle::mir::Local::from_usize(index + 1)].ty;
+        if !original.is_raw_ptr() {
+            if let ty::TyKind::Ref(_, _, mutability) = original.kind()
+                && let Some(lifetime) = decision.input_lifetimes.get(index).copied().flatten()
+            {
+                let source = source_signature.inputs()[index];
+                let ty::TyKind::Ref(region, _, _) = source.kind() else { unreachable!() };
+                let source_lifetime = match region.kind() {
+                    ty::RegionKind::ReStatic => Some(Symbol::intern("static")),
+                    ty::RegionKind::ReEarlyParam(parameter) => Some(parameter.name),
+                    ty::RegionKind::ReLateParam(parameter) => match parameter.kind {
+                        ty::LateParamRegionKind::Named(_, name) => Some(name),
+                        _ => None,
+                    },
+                    ty::RegionKind::ReBound(_, bound) => match bound.kind {
+                        ty::BoundRegionKind::Named(_, name) => Some(name),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+                .map(|name| Symbol::intern(name.as_str().trim_start_matches('\'')))
+                .filter(|name| {
+                    name.as_str() == "static"
+                        || function.generics.params.iter().any(|parameter| {
+                            parameter.ident.name.as_str().trim_start_matches('\'') == name.as_str()
+                        })
+                });
+                if let Some(source_lifetime) = source_lifetime {
+                    if source_lifetime != lifetime
+                        && let Some(parameter) =
+                            function.generics.params.iter_mut().find(|parameter| {
+                                parameter.ident.name.as_str().trim_start_matches('\'')
+                                    == source_lifetime.as_str()
+                            })
+                    {
+                        let parsed = utils::item!(
+                            "fn f<'{}: '{}>() {{}}",
+                            source_lifetime.as_str(),
+                            lifetime.as_str()
+                        );
+                        let ItemKind::Fn(box parsed) = parsed.kind else { unreachable!() };
+                        parameter
+                            .bounds
+                            .extend(parsed.generics.params[0].bounds.iter().cloned());
+                    }
+                    continue;
+                }
+                let source_hint = param.ty.clone();
+                *param.ty = target_type(
+                    original,
+                    PtrKind::Ref(mutability.is_mut()),
+                    Some(lifetime),
+                    Some(&source_hint),
+                    type_speller,
+                    function_path,
+                    &format!("parameter `{}`", parameter_name(param, index)),
+                )?;
+            }
+            continue;
+        }
         let Some(kind) = decision.input_decs.get(index).copied().flatten() else {
             continue;
         };
         if raw_decision_matches_ast_type(kind, &param.ty) {
             continue;
         }
-        let original = body.local_decls[rustc_middle::mir::Local::from_usize(index + 1)].ty;
         let lifetime = decision.input_lifetimes.get(index).copied().flatten();
         let source_hint = param.ty.clone();
         *param.ty = target_type(
@@ -1411,6 +1471,9 @@ fn apply_target_signature<'a, 'tcx>(
         )?;
     }
     if let Some(kind) = decision.output_dec
+        && body.local_decls[rustc_middle::mir::RETURN_PLACE]
+            .ty
+            .is_raw_ptr()
         && let FnRetTy::Ty(output) = &mut function.sig.decl.output
         && !raw_decision_matches_ast_type(kind, output)
     {
@@ -1464,9 +1527,12 @@ fn local_item_kind(item: &Item) -> &'static str {
     }
 }
 
-struct PresentationBindingNormalizer;
+struct PresentationBindingNormalizer<'a, 'tcx> {
+    ast_to_hir: &'a utils::ir::AstToHir,
+    tcx: TyCtxt<'tcx>,
+}
 
-impl MutVisitor for PresentationBindingNormalizer {
+impl MutVisitor for PresentationBindingNormalizer<'_, '_> {
     fn visit_item(&mut self, item: &mut Item) {
         if let ItemKind::Fn(function) = &mut item.kind
             && function.sig.decl.c_variadic()
@@ -1482,6 +1548,10 @@ impl MutVisitor for PresentationBindingNormalizer {
     fn visit_pat(&mut self, pat: &mut Pat) {
         if let PatKind::Ident(BindingMode(by_ref, mutability), ..) = &mut pat.kind
             && *by_ref == ByRef::No
+            && self
+                .ast_to_hir
+                .get_pat(pat.id, self.tcx)
+                .is_some_and(|pattern| matches!(pattern.kind, hir::PatKind::Binding(..)))
         {
             *mutability = Mutability::Mut;
         }
@@ -1501,6 +1571,13 @@ fn raw_decision_matches_ast_type(kind: PtrKind, ty: &Ty) -> bool {
 
 fn add_lifetime_params(generics: &mut rustc_ast::Generics, lifetimes: &[Symbol]) {
     for lifetime in lifetimes.iter().rev() {
+        if lifetime.as_str() == "static"
+            || generics.params.iter().any(|parameter| {
+                parameter.ident.name.as_str().trim_start_matches('\'') == lifetime.as_str()
+            })
+        {
+            continue;
+        }
         let parsed = utils::item!("fn f<'{}>() {{}}", lifetime.as_str());
         let ItemKind::Fn(box parsed) = parsed.kind else { unreachable!() };
         generics.params.insert(0, parsed.generics.params[0].clone());
@@ -2145,7 +2222,7 @@ fn selected_target_type_tree<'tcx>(
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'tcx>,
 ) -> Option<TypeTree> {
-    let (ty::TyKind::RawPtr(inner, _) | ty::TyKind::Ref(_, inner, _)) = source.kind() else {
+    let ty::TyKind::RawPtr(inner, _) = source.kind() else {
         return semantic_type_tree(source, ast_to_hir, tcx);
     };
     let inner = semantic_type_tree(*inner, ast_to_hir, tcx)?;

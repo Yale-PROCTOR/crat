@@ -99,7 +99,7 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
             locals,
             fn_locals: _,
             struct_fields,
-            tcx: _,
+            tcx,
         } = self.ctxt;
         let database = &mut self.database;
 
@@ -141,7 +141,12 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                 }
             }
             Rvalue::Cast(_, Operand::Copy(rhs) | Operand::Move(rhs), _) => {
-                // for cast, we process the head ptr only
+                let preserves_carrier = struct_fields.preserves_carrier_cast(
+                    rhs.ty(local_decls, tcx).ty,
+                    lhs.ty(local_decls, tcx).ty,
+                );
+                // Ordinary casts constrain only the head pointer; carrier casts
+                // also preserve the pointee's qualifier slots.
                 let keep = keep_load(rhs);
                 let lhs = place_vars::<MutCtxt>(lhs, local_decls, locals, struct_fields, database);
                 let mut rhs_deref = None;
@@ -160,6 +165,12 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for MutabilityAnalysis<
                         && keep
                     {
                         database.guard(lhs, rhs_deref)
+                    }
+                }
+                if preserves_carrier {
+                    for (lhs, rhs) in lhs_rhs {
+                        database.guard(lhs, rhs);
+                        database.guard(rhs, lhs);
                     }
                 }
             }
@@ -387,6 +398,13 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
                 base_ty = base_ty.builtin_deref(true).unwrap();
             }
             ProjectionElem::Field(field, ty) => {
+                if struct_fields.is_pointer_carrier(base_ty) {
+                    if field.index() != 0 {
+                        return place_vars.end..place_vars.end;
+                    }
+                    base_ty = ty;
+                    continue;
+                }
                 match base_ty.kind() {
                     TyKind::Adt(adt_def, _) => {
                         assert!(place_vars.is_empty());
@@ -407,9 +425,9 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
                         let offset: usize = tys
                             .iter()
                             .take(field.index())
-                            .map(|t| crate::analyses::type_qualifier::foster::count_ptr(t))
+                            .map(|t| struct_fields.count_ptr(t))
                             .sum();
-                        let field_count = crate::analyses::type_qualifier::foster::count_ptr(ty);
+                        let field_count = struct_fields.count_ptr(ty);
                         place_vars = Range {
                             start: place_vars.start + offset,
                             end: place_vars.start + offset + field_count,
@@ -460,5 +478,62 @@ pub(crate) fn conservative_call<'tcx>(
         for var in arg_vars {
             database.bottom(var);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{mutability_analysis, mutability_analysis_gated};
+
+    #[test]
+    fn pointer_carriers_preserve_nested_mutability() {
+        let source = r#"
+pub unsafe fn boxed(value: Box<*mut i32>) {
+    **value = 1;
+}
+pub unsafe fn nested(value: Box<Box<*mut i32>>) {
+    ***value = 1;
+}
+pub unsafe fn nonnull(value: std::ptr::NonNull<*mut i32>) {
+    let raw: *const *mut i32 = std::mem::transmute(value);
+    **raw = 1;
+}
+pub unsafe fn tuple(value: (std::ptr::NonNull<*mut i32>, *mut i32)) {
+    let raw: *const *mut i32 = std::mem::transmute(value.0);
+    **raw = 1;
+    *value.1 = 2;
+}
+"#;
+        utils::compilation::run_compiler_on_str(source, |tcx| {
+            let program = crate::utils::rustc::RustProgram {
+                tcx,
+                functions: tcx.hir_body_owners().collect(),
+                structs: vec![],
+            };
+            let shared =
+                pointer_replacer::analyses::type_qualifier::foster::mutability::mutability_analysis(
+                    &program,
+                );
+            let ungated = mutability_analysis(&program);
+            let gated = mutability_analysis_gated(&program, Some(&|_, _| false));
+            for &function in &program.functions {
+                let expected = shared.function_facts(function, tcx).nth(1).unwrap();
+                let actual = ungated.function_facts(function, tcx).nth(1).unwrap();
+                assert_eq!(actual, expected);
+                let (layers, inner) = match tcx.item_name(function.to_def_id()).as_str() {
+                    "nested" => (3, 2),
+                    "tuple" => (3, 1),
+                    _ => (2, 1),
+                };
+                assert_eq!(actual.len(), layers);
+                assert!(actual[inner].is_mutable());
+                assert!(actual.last().unwrap().is_mutable());
+                let gated = gated.function_facts(function, tcx).nth(1).unwrap();
+                assert_eq!(gated.len(), layers);
+                assert!(gated[inner].is_mutable());
+                assert!(gated.last().unwrap().is_mutable());
+            }
+        })
+        .unwrap();
     }
 }
