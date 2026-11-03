@@ -13729,6 +13729,29 @@ fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> Stri
         ));
         push_overlap_columns(&mut out, None, "-", "-");
     }
+    // S8: the body rule's typed skips (no class held).
+    for blocked in &table.seams.body_skipped {
+        let site = sm.span_to_diagnostic_string(blocked.span);
+        let adapter_key = format!("{}#{}@{}", blocked.owner_fn, blocked.context.key(), site);
+        out.push_str(&format!(
+            "body-skipped\t{}\t{}\t{}\t-\t-\t{}\t-\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}",
+            blocked.owner_fn,
+            blocked.block.key(),
+            site,
+            blocked.owner_fn,
+            blocked.candidate_template.unwrap_or("-"),
+            adapter_key,
+            blocked.source_shape,
+            blocked.context.key(),
+            blocked.destination,
+            blocked.expected.key(),
+            blocked.found.map_or("-", decision::seam::Form::key),
+            blocked.candidate_template.unwrap_or("-"),
+            blocked.root_identity,
+            u8::from(blocked.blind),
+        ));
+        push_overlap_columns(&mut out, None, "-", "-");
+    }
     // Item 4a: companion-length coverage, one row per LENGTH-GATED POSITION.
     for (callee, index, evidence) in &table.seams.length_evidence {
         out.push_str(&format!(

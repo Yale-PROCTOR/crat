@@ -3543,6 +3543,11 @@ pub(crate) struct SeamPlan {
     pub edits: Vec<SeamEdit>,
     pub body_edits: Vec<BodyEdit>,
     pub body_blocked: Vec<BlockedBody>,
+    /// S8: the body sites the rule could not glue (a side-effecting, null,
+    /// cast or unnameable right-hand side, a render refusal, `&` to `&mut`),
+    /// receipted as `body-skipped` and left to the verify gate: unlike
+    /// `body_blocked` they hold no signature class.
+    pub body_skipped: Vec<BlockedBody>,
     /// Rejected call positions, including the candidate and peer facts that
     /// existed before the gate.
     ///
@@ -8475,8 +8480,20 @@ pub(crate) fn synthesize_with_raw_boundary(
         });
     }
 
-    // Item E wave 2 — scalar-reference body adapters. The allowlist lives in
-    // the HIR producer, so there is no second scope decision here.
+    super::wave5r::complete_casts(tcx, table, &mut plan);
+    super::construction_values::complete(tcx, table, &mut plan);
+    super::raw_place_values::complete(tcx, table, &mut plan);
+    super::call_result_option::complete(tcx, table, &mut plan);
+    super::raw_initializer::complete(tcx, table, &mut plan);
+    super::ownership_fields_native::complete_declarations(tcx, table, &mut plan);
+    super::source_typed_local::complete(tcx, table, &mut plan);
+    super::source_typed_local::complete_derived(tcx, table, &mut plan);
+    // S8 (the user's word in main's session 11-03): the scalar-reference body
+    // adapters, a rule over every function (Item E wave 2 ran them in eight
+    // named corpus functions). They run after the dedicated producers above and
+    // leave every span those already edited or held; a right-hand side they
+    // cannot glue is a typed skip (`body_skipped`), never a hold, so the verify
+    // gate decides that class as it does for any site without an adapter.
     let mut body_sites = facts.body_adapters.clone();
     body_sites.sort_by_key(|site| {
         (
@@ -8486,6 +8503,13 @@ pub(crate) fn synthesize_with_raw_boundary(
         )
     });
     for site in body_sites {
+        let taken = |span: Span| span.lo() < site.rhs_span.hi() && site.rhs_span.lo() < span.hi();
+        if plan.body_edits.iter().any(|edit| taken(edit.span))
+            || plan.body_blocked.iter().any(|blocked| taken(blocked.span))
+            || plan.body_skipped.iter().any(|skipped| taken(skipped.span))
+        {
+            continue;
+        }
         let Some(destination_decision) = decision_of.get(&(site.owner, site.destination)) else {
             continue;
         };
@@ -8499,7 +8523,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             .cloned()
             .unwrap_or_else(|| format!("{owner_fn}::<unknown-destination>"));
         if site.side_effecting {
-            plan.body_blocked.push(BlockedBody {
+            plan.body_skipped.push(BlockedBody {
                 owner_class: SignatureClassId::of(site.owner),
                 owner_fn,
                 destination,
@@ -8549,7 +8573,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 false,
             ),
             ArgShape::NullLit => {
-                plan.body_blocked.push(BlockedBody {
+                plan.body_skipped.push(BlockedBody {
                     owner_class: SignatureClassId::of(site.owner),
                     owner_fn,
                     destination,
@@ -8573,7 +8597,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 (Form::Raw, site.rhs_span, root, true)
             }
             ArgShape::RawExpr { .. } | ArgShape::Cast { .. } | ArgShape::Other => {
-                plan.body_blocked.push(BlockedBody {
+                plan.body_skipped.push(BlockedBody {
                     owner_class: SignatureClassId::of(site.owner),
                     owner_fn,
                     destination,
@@ -8596,7 +8620,7 @@ pub(crate) fn synthesize_with_raw_boundary(
             Ok(None) => {}
             Ok(Some((spec, family))) => {
                 let Some(text) = text.as_deref() else {
-                    plan.body_blocked.push(BlockedBody {
+                    plan.body_skipped.push(BlockedBody {
                         owner_class: SignatureClassId::of(site.owner),
                         owner_fn,
                         destination,
@@ -8615,7 +8639,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 let Some(replacement) =
                     spec.render_in_context(text, enclosing_function_is_unsafe(tcx, site.owner))
                 else {
-                    plan.body_blocked.push(BlockedBody {
+                    plan.body_skipped.push(BlockedBody {
                         owner_class: SignatureClassId::of(site.owner),
                         owner_fn,
                         destination,
@@ -8662,7 +8686,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                     blind,
                 });
             }
-            Err(SeamBlock::SharedToMut) => plan.body_blocked.push(BlockedBody {
+            Err(SeamBlock::SharedToMut) => plan.body_skipped.push(BlockedBody {
                 owner_class: SignatureClassId::of(site.owner),
                 owner_fn,
                 destination,
@@ -8676,7 +8700,7 @@ pub(crate) fn synthesize_with_raw_boundary(
                 root_identity: root_label(&labels, site.owner, root),
                 blind,
             }),
-            Err(_) => plan.body_blocked.push(BlockedBody {
+            Err(_) => plan.body_skipped.push(BlockedBody {
                 owner_class: SignatureClassId::of(site.owner),
                 owner_fn,
                 destination,
@@ -8692,14 +8716,6 @@ pub(crate) fn synthesize_with_raw_boundary(
             }),
         }
     }
-    super::wave5r::complete_casts(tcx, table, &mut plan);
-    super::construction_values::complete(tcx, table, &mut plan);
-    super::raw_place_values::complete(tcx, table, &mut plan);
-    super::call_result_option::complete(tcx, table, &mut plan);
-    super::raw_initializer::complete(tcx, table, &mut plan);
-    super::ownership_fields_native::complete_declarations(tcx, table, &mut plan);
-    super::source_typed_local::complete(tcx, table, &mut plan);
-    super::source_typed_local::complete_derived(tcx, table, &mut plan);
     complete_interface_inventory(
         tcx,
         facts,

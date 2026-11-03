@@ -565,7 +565,7 @@ impl BodyAdapterContext {
     }
 }
 
-/// One exact scalar-reference adapter candidate in an allowlisted function.
+/// One exact scalar-reference adapter candidate in a function body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct BodyAdapterSite {
     pub owner: LocalDefId,
@@ -669,21 +669,6 @@ impl AddressUseClass {
             Self::Neither => "neither",
         }
     }
-}
-
-const WAVE2_BODY_FUNCTIONS: &[&str] = &[
-    "src::enc::backward_references_hq::BrotliZopfliCreateCommands",
-    "src::enc::block_splitter::BrotliSplitBlock",
-    "src::enc::block_splitter::CountLiterals",
-    "src::json::json_extract_get_array_size",
-    "src::json::json_extract_get_object_size",
-    "src::json::json_extract_get_string_size",
-    "src::libtree::visited_files_contains",
-    "src::lodepng::color_tree_add",
-];
-
-fn wave2_body_owner(tcx: TyCtxt<'_>, owner: LocalDefId) -> bool {
-    WAVE2_BODY_FUNCTIONS.contains(&tcx.def_path_str(owner.to_def_id()).as_str())
 }
 
 fn body_side_effecting(expr: &Expr<'_>) -> bool {
@@ -1415,8 +1400,7 @@ fn operand_source_type<'tcx>(
 
 impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
     fn visit_stmt(&mut self, stmt: &'tcx rustc_hir::Stmt<'tcx>) {
-        if wave2_body_owner(self.tcx, self.fn_did)
-            && let rustc_hir::StmtKind::Let(local) = stmt.kind
+        if let rustc_hir::StmtKind::Let(local) = stmt.kind
             && matches!(local.pat.kind, rustc_hir::PatKind::Binding(..))
             && let Some(init) = local.init
         {
@@ -1463,8 +1447,7 @@ impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
                 expression_shape: return_expression_shape(self.tcx, expr),
             });
         }
-        if wave2_body_owner(self.tcx, self.fn_did)
-            && let ExprKind::Assign(lhs, rhs, _) = expr.kind
+        if let ExprKind::Assign(lhs, rhs, _) = expr.kind
             && let Some(destination) = Self::resolved_local(lhs)
         {
             self.facts.body_adapters.push(BodyAdapterSite {
