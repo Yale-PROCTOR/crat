@@ -150,10 +150,6 @@ const RERENDERED: &str = "return-certificate-struct-fill-rerendered";
 const CHAIN_THROUGH: &str = "chain-through:";
 
 impl Certificates {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.callees.is_empty()
-    }
-
     pub(crate) fn receipts_tsv(&self) -> String {
         let mut out = String::from("callee\tkind\tdetail\n");
         let mut callees: Vec<&Certificate> = self.callees.values().collect();

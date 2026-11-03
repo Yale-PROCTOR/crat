@@ -107,11 +107,6 @@ pub(crate) fn walk_io_domain_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u3
     }
 }
 
-/// The plain answer, for callers that do not report the budget.
-pub(crate) fn is_io_domain_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>, depth: u32) -> bool {
-    walk_io_domain_ty(tcx, ty, depth).io_domain
-}
-
 /// Every subject whose own declared type reaches the io-domain, and how many
 /// subjects the walk could not decide within its budget.
 pub(crate) fn collect(

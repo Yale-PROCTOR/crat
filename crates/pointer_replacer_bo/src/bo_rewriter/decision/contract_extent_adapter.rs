@@ -749,11 +749,6 @@ pub(crate) fn collect(
 }
 
 impl CandidateIndex {
-    /// R397-6(b): the declined candidates, for the receipt.
-    pub(crate) fn declines(&self) -> impl Iterator<Item = (&(LocalDefId, HirId), &DeclineCause)> {
-        self.declines.iter()
-    }
-
     /// One TSV row per declined candidate and form — only candidates that
     /// would otherwise PROMOTE (the decline is read after every promotability
     /// gate in [`select`]).

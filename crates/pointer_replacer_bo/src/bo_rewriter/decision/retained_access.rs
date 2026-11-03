@@ -5089,16 +5089,7 @@ pub(crate) enum Shape {
     Other,
 }
 
-impl Shape {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Shape::SelfRef => "self",
-            Shape::Cycle => "cycle",
-            Shape::Recursive => "recursive",
-            Shape::Other => "other",
-        }
-    }
-}
+impl Shape {}
 
 struct Shapes {
     self_holders: FxHashSet<Obj>,
@@ -5447,30 +5438,6 @@ impl RetainedAccessCheck {
             }
         }
         check
-    }
-
-    /// The check with the raw-field predicate given.
-    pub(crate) fn compute_with(
-        program: &RustProgram<'_>,
-        field_raw: &dyn Fn(DefId, usize) -> bool,
-    ) -> Self {
-        Self::compute_options(program, field_raw, Options::default())
-    }
-
-    /// The check with `fault` removed: the witnesses' faults.
-    pub(crate) fn compute_faulted(
-        program: &RustProgram<'_>,
-        field_raw: &dyn Fn(DefId, usize) -> bool,
-        fault: Option<Rule>,
-    ) -> Self {
-        Self::compute_options(
-            program,
-            field_raw,
-            Options {
-                fault,
-                ..Options::default()
-            },
-        )
     }
 
     pub(crate) fn compute_options(

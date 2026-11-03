@@ -46,17 +46,6 @@ impl Closure {
             }
         }
     }
-
-    pub(crate) fn receipts_tsv(&self) -> String {
-        let mut out = String::from("pointee\tkind\tdetail\n");
-        let mut receipts = self.receipts.clone();
-        receipts.sort();
-        for receipt in receipts {
-            out.push_str(&receipt);
-            out.push('\n');
-        }
-        out
-    }
 }
 
 /// Every depth-1 raw pointee an ADT signature position mentions.

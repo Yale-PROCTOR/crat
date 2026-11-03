@@ -361,10 +361,6 @@ impl<'a> From<&'a super::super::DecideCtx> for SiblingInputs<'a> {
     }
 }
 
-pub(crate) fn collect(tcx: TyCtxt<'_>, ctx: &super::super::DecideCtx) -> Vec<SiblingPotential> {
-    collect_inventory(tcx, ctx).potentials
-}
-
 pub(crate) fn collect_inventory(
     tcx: TyCtxt<'_>,
     ctx: &super::super::DecideCtx,

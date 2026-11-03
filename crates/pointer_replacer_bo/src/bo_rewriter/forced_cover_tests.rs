@@ -45,16 +45,6 @@ fn seam_receipts(src: &str) -> String {
     .expect("fixture compiles")
 }
 
-/// The overlap-proof row for `callee`'s parameter `param`.
-fn overlap_proof<'a>(tsv: &'a str, callee: &str, param: usize) -> &'a str {
-    tsv.lines()
-        .find(|row| {
-            row.starts_with(&format!("overlap-proof\t{callee}\t"))
-                && row.contains(&format!("\tparam:{param}\t"))
-        })
-        .unwrap_or_else(|| panic!("an overlap proof for {callee}#{param}:\n{tsv}"))
-}
-
 /// **R573-4 witness, end to end — the receipt names the rule.** At `Stitch → Setup` the
 /// star is `data` (a non-retaining `*const u8`) against `m`, and against `hasher` / `params`,
 /// which `Setup` stores through each other (both retain). The single-primary rule held the call

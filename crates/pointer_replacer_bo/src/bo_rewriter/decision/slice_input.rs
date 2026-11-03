@@ -1563,15 +1563,4 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
     }
 }
 
-impl Hold {
-    pub(crate) fn key(self) -> &'static str {
-        match self {
-            Self::OutsideScope => "outside-scope",
-            Self::CalleeNotFat => "callee-not-fat",
-            Self::CallerNotSupplied => "caller-not-supplied",
-            Self::CallerNullable => "caller-nullable",
-            Self::IncompleteCallers => "incomplete-callers",
-            Self::CompanionNotIndexBound => "companion-not-the-index-bound",
-        }
-    }
-}
+impl Hold {}

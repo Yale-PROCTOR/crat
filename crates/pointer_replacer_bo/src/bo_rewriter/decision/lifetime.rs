@@ -276,13 +276,6 @@ pub(crate) struct LifetimeEligibility {
 }
 
 impl LifetimeEligibility {
-    pub(crate) fn through_raw_field(
-        &self,
-        function: LocalDefId,
-    ) -> Option<&super::return_through_raw_field::ThroughRawFieldReuse> {
-        self.through_raw_field.get(&function)
-    }
-
     pub(crate) fn return_permit(&self, subject: NodeKey) -> Option<&ReturnLifetimePermit> {
         self.return_permits.get(&subject)
     }
@@ -358,10 +351,6 @@ impl LifetimeEligibility {
         self.output_storage_escapes
             .iter()
             .any(|(candidate, _)| *candidate == source)
-    }
-
-    pub(crate) fn failures(&self) -> impl Iterator<Item = (NodeKey, LifetimeFailure)> + '_ {
-        self.failures.iter().map(|(&key, &failure)| (key, failure))
     }
 
     pub(crate) fn web_roots(&self) -> &BTreeSet<String> {
@@ -1266,10 +1255,6 @@ impl LifetimePlan {
         self.functions.get(&did)
     }
 
-    pub(crate) fn function_count(&self) -> usize {
-        self.functions.len()
-    }
-
     pub(crate) fn functions(&self) -> impl Iterator<Item = (LocalDefId, &FunctionPlan)> + '_ {
         self.functions.iter().map(|(&did, plan)| (did, plan))
     }
@@ -1720,10 +1705,6 @@ impl StaticFnPtrSeed {
 impl FnPtrWeb {
     pub(crate) fn roots(&self) -> impl Iterator<Item = LocalDefId> + '_ {
         self.roots.iter().copied()
-    }
-
-    pub(crate) fn members(&self) -> impl Iterator<Item = LocalDefId> + '_ {
-        self.members.iter().copied()
     }
 
     pub(crate) fn contains(&self, function: LocalDefId) -> bool {

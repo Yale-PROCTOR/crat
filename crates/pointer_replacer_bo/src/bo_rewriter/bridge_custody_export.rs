@@ -2653,45 +2653,6 @@ mod tests {
         });
     }
 
-    fn r295_an_unstatable_composition_names_its_condition() {
-        const SOURCE: &str = "fn caller(x: *mut i32) { f(x, x); }";
-        let lo = SOURCE.find("f(x").expect("fixture call");
-        let hi = SOURCE.find(");").expect("fixture call end") + 1;
-        let inner = lo + "f(".len();
-        let mut export = Export::default();
-        export.files.insert(
-            "lib.rs".to_owned(),
-            OriginalFile {
-                source: SOURCE.to_owned(),
-                sha256: String::new(),
-                global_start: 0,
-            },
-        );
-        export.pending_sites = vec![PendingSiteRow {
-            site_id: "raw-boundary-site:caller:0:0:f:0".to_owned(),
-            waiver: super::super::decision::sibling_overlap::PENDING_REASON.to_owned(),
-            source_file: "lib.rs".to_owned(),
-            call: Ok(PendingCallRow {
-                lo,
-                hi,
-                edits: vec![
-                    (lo, hi, "f(x, x)".to_owned()),
-                    (inner, inner + 1, "y".to_owned()),
-                ],
-                rendered: None,
-            }),
-            siblings: Vec::new(),
-        }];
-        let sources = BTreeMap::from([("lib.rs".to_owned(), SOURCE.to_owned())]);
-        let issues = pending_sibling_overlap_issues(&export, Some(&sources));
-        assert_eq!(issues.len(), 1, "{issues:#?}");
-        assert!(
-            issues[0].contains("emitted-call-unrenderable")
-                && issues[0].contains("inner-original-occurs-2-times"),
-            "the unstatable composition must name itself: {issues:#?}"
-        );
-    }
-
     /// A minimal audit row: only `coverage_id`, `data` and `issues` are read
     /// by the transport check these two tests exercise.
     fn sibling_audit_row(id: &str) -> super::super::sibling_audit::Row {

@@ -5,9 +5,6 @@
 //! The independent test target also imports this module. No module here reads
 //! a model cache or runs an analysis; native producers live in decision/.
 
-#[path = "ownership_fields_transaction.rs"]
-pub mod transaction;
-
 /// A local-definition index transported from one compiler session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OwnerId(pub u32);
@@ -45,15 +42,6 @@ pub mod hoist;
 #[path = "ownership_fields_emission.rs"]
 pub mod emission;
 
-#[path = "ownership_fields_declaration.rs"]
-pub mod declaration;
-
-#[path = "ownership_fields_custody.rs"]
-pub mod custody;
-
-#[path = "ownership_fields_uses.rs"]
-pub mod field_uses;
-
 #[path = "ownership_fields_boundary.rs"]
 pub mod boundary;
 
@@ -62,18 +50,6 @@ pub mod free_sites;
 
 #[path = "ownership_fields_depth.rs"]
 pub mod drop_depth;
-
-#[path = "ownership_fields_copy.rs"]
-pub mod struct_copy;
-
-#[path = "ownership_fields_apply.rs"]
-pub mod application;
-
-#[path = "ownership_fields_recovery.rs"]
-pub mod recovery;
-
-#[path = "ownership_fields_raw_audit.rs"]
-pub mod raw_audit;
 
 #[path = "ownership_fields_export.rs"]
 pub mod export;

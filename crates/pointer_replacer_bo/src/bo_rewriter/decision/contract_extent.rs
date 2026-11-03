@@ -120,20 +120,7 @@ pub(crate) enum LengthPlan {
     Fallback(FallbackReason),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Waiver {
-    /// The existing slice-extent-out-of-scope@addendum-77, not a new waiver.
-    SliceExtent,
-}
-
-impl LengthPlan {
-    pub(crate) fn waiver(&self) -> Option<Waiver> {
-        match self {
-            Self::Evidence { .. } => None,
-            Self::Fallback(_) => Some(Waiver::SliceExtent),
-        }
-    }
-}
+impl LengthPlan {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Promotion {

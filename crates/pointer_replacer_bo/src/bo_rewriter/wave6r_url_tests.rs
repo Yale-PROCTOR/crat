@@ -68,20 +68,6 @@ fn wave6r_url_fresh_result_callee_discharges_write_through_shared_view() {
     );
 }
 
-/// The site must stay blocked. Which arm names the hold depends on arm order
-/// — `write-through-shared-view` here, `positive-retention` once a retention
-/// check runs first (the batch-8 composition) — and both are the same
-/// soundness fact for these shapes: the callee retains or hands back the alias.
-fn held(input: &str) {
-    let row = hostname_arg0_disposition(input);
-    assert!(
-        row.contains("\tblocked\t")
-            && (row.contains("ordinary-argument-permission:write-through-shared-view")
-                || row.contains("raw-boundary-positive-retention")),
-        "the hold must stand: {row}"
-    );
-}
-
 /// The body scan on its own, for the shapes the decision engine re-kinds
 /// before they reach a disposition row.
 fn scan(input: &str, function: &str, index: usize) -> bool {

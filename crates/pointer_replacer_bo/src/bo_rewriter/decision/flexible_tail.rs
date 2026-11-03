@@ -80,26 +80,6 @@ pub(crate) struct Transactions {
 }
 
 impl Transactions {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.structs.is_empty()
-    }
-
-    pub(crate) fn owning_return(&self, function: LocalDefId) -> Option<&StructTransaction> {
-        self.structs
-            .values()
-            .find(|t| t.owning_returns.contains(&function))
-    }
-
-    pub(crate) fn owning_param(
-        &self,
-        function: LocalDefId,
-        index: usize,
-    ) -> Option<&StructTransaction> {
-        self.structs
-            .values()
-            .find(|t| t.owning_params.contains(&(function, index)))
-    }
-
     pub(crate) fn receipts_tsv(&self) -> String {
         let mut out = String::from("struct\tkind\tdetail\n");
         for transaction in self.structs.values() {

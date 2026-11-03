@@ -132,17 +132,6 @@ impl Inputs {
         self.native_candidates = candidates;
         self
     }
-
-    /// The native producer must derive authenticated facts independently of
-    /// the hypothetical Box rendering. No positive insertion is enabled until
-    /// all native producer and final-interface obligations are discharged.
-    pub(crate) fn install(&mut self, node: Node, bundle: Evidence<Bundle>) -> Result<(), Hold> {
-        let Some(row) = self.rows.get_mut(&node) else {
-            return Err(Hold::Identity);
-        };
-        *row = bundle;
-        Ok(())
-    }
 }
 #[derive(Clone, Debug)]
 pub(crate) enum Hold {

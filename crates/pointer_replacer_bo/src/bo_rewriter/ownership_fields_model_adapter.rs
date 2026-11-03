@@ -7,9 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     EvidenceKey, OwnerId, SiteId,
-    emission::{
-        self, EmitHold, Emitted, Grant, GrantStatus, Kind, OwnCallFacts, OwnerInput, OwnerType,
-    },
+    emission::{self, EmitHold, Emitted, Grant, GrantStatus, Kind, OwnCallFacts, OwnerType},
     export::{
         Digest, Evidence, EvidenceOwner, FactFamily, FactRef, GenerationRecipe, Missing,
         MissingReason, ProgramId, RecordKey, SourceFrame,
@@ -208,58 +206,4 @@ impl Prepared<'_> {
             },
         })
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AllocationShape {
-    Ordinary,
-    FlexibleTail { expression: String },
-}
-#[derive(Clone, Debug)]
-pub struct ShapeEvidence {
-    pub key: EvidenceKey,
-    pub shape: Evidence<AllocationShape>,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReceiverHold {
-    Evidence(Missing),
-    FlexibleTail { expression: String },
-    ConstructionUnmappable { depth: u8 },
-    Consumer(EmitHold),
-}
-/// The model grants a kind; layout, initialization and P1′-E remain emission
-/// obligations. In particular neither a flexible tail nor a depth-2 slot is
-/// silently turned into an ordinary outer Box allocation.
-pub fn receiver(
-    grant: &ModelGrant,
-    shape: &ShapeEvidence,
-    call: &OwnCallFacts,
-    name: &str,
-    ty: &OwnerType,
-    input: &OwnerInput,
-) -> Result<Emitted, ReceiverHold> {
-    if shape.key != grant.grant.key
-        || grant.receipt.key != grant.grant.key
-        || grant.grant.key.model != grant.receipt.frame.entry_sha256.0
-    {
-        return Err(ReceiverHold::Evidence(Missing {
-            owner: EvidenceOwner::NativeIdentity,
-            reason: MissingReason::Occurrence,
-        }));
-    }
-    if grant.receipt.subject.depth != 1 {
-        return Err(ReceiverHold::ConstructionUnmappable {
-            depth: grant.receipt.subject.depth,
-        });
-    }
-    match need(&shape.shape).map_err(ReceiverHold::Evidence)? {
-        AllocationShape::FlexibleTail { expression } => {
-            return Err(ReceiverHold::FlexibleTail {
-                expression: expression.clone(),
-            });
-        }
-        AllocationShape::Ordinary => {}
-    }
-    let permit = emission::admit_call(&grant.grant, call).map_err(ReceiverHold::Consumer)?;
-    emission::receiver(&permit, name, ty, input).map_err(ReceiverHold::Consumer)
 }

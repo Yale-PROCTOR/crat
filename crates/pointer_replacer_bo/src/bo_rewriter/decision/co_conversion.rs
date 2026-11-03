@@ -553,10 +553,6 @@ impl CoConv {
         self.node_block.get(&key).copied()
     }
 
-    pub(crate) fn edges(&self) -> &[EdgeObligation] {
-        &self.edges
-    }
-
     pub(crate) fn pair_sites(&self) -> &[PairSiteDecision] {
         &self.pair_sites
     }

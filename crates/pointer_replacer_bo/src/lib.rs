@@ -40,6 +40,7 @@ pub mod analyses {
 mod analysis_budget;
 mod bo_pipeline;
 mod bo_rewriter;
+#[cfg(test)]
 mod coverage_recon;
 mod phase_log;
 mod raw_boundary_census_schema;

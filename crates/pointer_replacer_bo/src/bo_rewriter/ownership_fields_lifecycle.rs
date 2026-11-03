@@ -72,14 +72,7 @@ pub enum ClosePlan {
     },
 }
 
-impl ClosePlan {
-    pub fn receipt(&self) -> &'static str {
-        match self {
-            Self::Drop { receipt, .. } => receipt,
-            Self::LeakRecursive { .. } => "waiver-leak(recursive-drop)",
-        }
-    }
-}
+impl ClosePlan {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CloseHold {

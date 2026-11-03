@@ -48,8 +48,6 @@ pub(crate) mod cast_offset;
 pub(crate) mod co_conversion;
 pub(crate) mod compare_only_offset;
 #[cfg(test)]
-mod compare_only_offset_probe;
-#[cfg(test)]
 mod compare_only_offset_tests;
 #[cfg(test)]
 mod compare_only_plain_tests;

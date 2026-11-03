@@ -1697,40 +1697,6 @@ impl PairDisjointnessIndex {
         );
         out
     }
-
-    #[allow(
-        dead_code,
-        reason = "witness surface: every certify() outcome, for the RED-first tests \
-                  and the census ledger column main may add"
-    )]
-    pub(crate) fn ledger_tsv(&self, tcx: TyCtxt<'_>, program: &RustProgram<'_>) -> String {
-        let names: FxHashMap<u32, LocalDefId> = program
-            .functions
-            .iter()
-            .map(|did| (did.local_def_index.as_u32(), *did))
-            .collect();
-        let name = |index: u32| {
-            names.get(&index).map_or_else(
-                || format!("#{index}"),
-                |did| tcx.def_path_str(did.to_def_id()),
-            )
-        };
-        let mut out = String::from("caller\tcallee\tleft\tright\toutcome\n");
-        for row in self.ledger.borrow().iter() {
-            let outcome = match row.outcome {
-                Ok(kind) => kind.key(),
-                Err(why) => why.key(),
-            };
-            out.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{outcome}\n",
-                name(row.caller),
-                name(row.callee),
-                row.left,
-                row.right,
-            ));
-        }
-        out
-    }
 }
 
 /// R624-1 / R628-7 (f): the other side of an allocation-identity pair. An

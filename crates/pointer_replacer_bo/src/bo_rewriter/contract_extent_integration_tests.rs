@@ -97,23 +97,6 @@ fn promotions(source: &str) -> Vec<super::decision::contract_extent::Promotion> 
     .expect("contract-extent decision table")
 }
 
-fn fact_debug(source: &str) -> String {
-    ::utils::compilation::run_compiler_on_input(::utils::compilation::str_to_input(source), |tcx| {
-        let (table, ctx) = super::decide_table_with_ctx(tcx)?;
-        Ok::<_, String>(format!(
-            "paths={:#?}\nforeign={:#?}\ndecisions={:#?}",
-            ctx.facts.raw_boundary_argument_paths(),
-            ctx.facts.foreign_call_args,
-            (
-                table.entries,
-                ctx.raw_boundary_artifacts.additive_family_receipts
-            ),
-        ))
-    })
-    .expect("slice-use debug fixture compiles")
-    .expect("slice-use debug table")
-}
-
 fn emitted(source: &str) -> String {
     let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(source) else {
         panic!("contract-extent fixture must emit")
@@ -2137,56 +2120,6 @@ fn w4l08_the_receipt_is_a_census_artifact_row() {
     );
     assert_eq!(lines.next(), None, "one lift, one row: {tsv}");
 }
-
-/// **W4-B1 (R480-2)** — `BrotliWriteBits`'s shape, minimised: the callee binds
-/// a byte pointer out of `array.offset(..)`, so it is no slice candidate of its
-/// own and the caller is held `held:local-callee-access-extent`. The caller's
-/// ROOT is an allocation whose size is recoverable, and that extent is what the
-/// slice form carries.
-const W4_B1_SIZED_ROOT: &str = r#"
-#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
-pub type uint8_t = u8;
-pub type size_t = usize;
-extern "C" {
-    fn malloc(_: u64) -> *mut core::ffi::c_void;
-}
-unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
-    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
-    *p = 1 as uint8_t;
-    *pos = (*pos).wrapping_add(8 as size_t);
-}
-pub unsafe extern "C" fn StoreIt(mut n: size_t) {
-    let mut storage: *mut uint8_t =
-        malloc(n.wrapping_mul(::std::mem::size_of::<uint8_t>() as size_t) as u64) as *mut uint8_t;
-    let mut pos: size_t = 0 as size_t;
-    BrotliWriteBits(&mut pos, storage);
-}
-"#;
-
-/// The same shape with the root one frame further away: the held subject is a
-/// PARAMETER, and its only call site hands it the sized allocation.
-const W4_B1_SIZED_ROOT_THROUGH_A_PARAMETER: &str = r#"
-#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
-pub type uint8_t = u8;
-pub type size_t = usize;
-extern "C" {
-    fn malloc(_: u64) -> *mut core::ffi::c_void;
-}
-unsafe extern "C" fn BrotliWriteBits(mut pos: *mut size_t, mut array: *mut uint8_t) {
-    let mut p: *mut uint8_t = &mut *array.offset((*pos >> 3 as i32) as isize) as *mut uint8_t;
-    *p = 1 as uint8_t;
-    *pos = (*pos).wrapping_add(8 as size_t);
-}
-unsafe extern "C" fn StoreInner(mut pos: *mut size_t, mut storage: *mut uint8_t) {
-    BrotliWriteBits(pos, storage);
-}
-pub unsafe extern "C" fn StoreOuter(mut n: size_t) {
-    let mut buffer: *mut uint8_t =
-        malloc(n.wrapping_mul(::std::mem::size_of::<uint8_t>() as size_t) as u64) as *mut uint8_t;
-    let mut pos: size_t = 0 as size_t;
-    StoreInner(&mut pos, buffer);
-}
-"#;
 
 /// The residue: the root is a call this analysis does not read — no allocation,
 /// no array, no literal, no companion length. It stays held and is COUNTED.

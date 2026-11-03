@@ -71,6 +71,7 @@ use crate::{
 
 pub(crate) mod additive;
 pub(crate) mod apply;
+#[cfg(test)]
 pub(crate) mod artifact;
 pub(crate) mod bridge_receipt;
 pub(crate) mod bridge_spelling;
@@ -193,7 +194,6 @@ mod slice_cursor_prelude;
 mod slice_forms_ast;
 #[cfg(test)]
 mod slice_forms_tests;
-pub(crate) mod use_census;
 pub(crate) mod verify;
 #[cfg(test)]
 mod wave5d_accumulator_tests;
@@ -591,11 +591,6 @@ pub(crate) struct E2Timings {
     pub(crate) receipt_render_wall_s: String,
     pub(crate) compiler_verification_wall_s: String,
 }
-
-/// The columns of [`RawBoundaryArtifacts::premise_view_sites`]: the function's
-/// path, the binding, the site's span, why (b) fails, and `clears` / `fails`
-/// under the dominance reading.
-pub(crate) const PREMISE_VIEW_SITES_HEADER: &str = "function\tbinding\tsite\trule_b\tquiet_prefix";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RawBoundaryArtifacts {
@@ -3959,49 +3954,6 @@ pub(crate) fn diagnose_once(
             .to_owned()
     })?;
     Ok((observed_root, diags))
-}
-
-/// Item E's one-iteration differential verifier. It runs the ordinary round-0
-/// emission and baseline-subtracted compile, records every attribution, and
-/// returns before any revert, re-render, or bisect step can execute.
-#[allow(
-    dead_code,
-    reason = "Item E's cfg(test) corpus worker is the sole consumer of this one-iteration instrument"
-)]
-pub(crate) fn diagnose_e1_once(root: &std::path::Path) -> Result<E1Capture, String> {
-    rewrite_core_injected(
-        ::utils::compilation::path_to_input(root),
-        Some(root),
-        MAX_REVERT_ROUNDS,
-        &|_| {},
-        false,
-        true,
-        false,
-        None,
-    )
-    .into_e1_capture()
-}
-
-/// Raw-boundary census entry: capture the one-iteration diagnostic payload,
-/// then allow exactly the production atom/function verifier to converge. It is
-/// one decision/emission pass and therefore one cache load, not two stitched
-/// measurements.
-#[allow(
-    dead_code,
-    reason = "consumed by the cfg(test) raw-boundary corpus worker"
-)]
-pub(crate) fn diagnose_raw_boundary_census(root: &std::path::Path) -> Result<E1Capture, String> {
-    rewrite_core_injected(
-        ::utils::compilation::path_to_input(root),
-        Some(root),
-        MAX_REVERT_ROUNDS,
-        &|_| {},
-        false,
-        true,
-        true,
-        None,
-    )
-    .into_e1_capture()
 }
 
 /// Copy the session's thread-local cells into the outcome, ON the compiler thread.
@@ -12733,22 +12685,6 @@ pub(crate) fn e1_sole_blocker_flags<'a>(
     .collect()
 }
 
-/// **Producer A's artifact** for the crate in `tcx`.
-///
-/// The reconciliation's caller lives outside this module; this only emits.
-#[allow(
-    dead_code,
-    reason = "producer A's artifact has no non-test consumer until the rewriter \
-              is wired into the pipeline — the same standing as `rewrite_m1`. \
-              Its test consumers are the C.1 reconciliation and C.4's corpus \
-              mode. Targeted so dead_code stays live over everything reachable."
-)]
-pub(crate) fn artifact_rows(
-    tcx: TyCtxt<'_>,
-) -> Result<Vec<crate::coverage_recon::schema::Row>, String> {
-    decide_table(tcx).map(|table| artifact::rows(tcx, &table))
-}
-
 /// **S3.2′-0 — the FACTS-SIDE JOIN.** One TSV row per subject, reporting the
 /// analysis facts *directly*, before `decide_one`'s ordering collapses them.
 ///
@@ -13067,43 +13003,6 @@ pub(crate) fn raw_boundary_trace_artifacts(
     decide_table_with_ctx(tcx).map(|(_, ctx)| ctx.raw_boundary_artifacts)
 }
 
-/// **S2-2 — the freed-slot kind census.**
-///
-/// A leaked free's value kind is *observed, not designed* (backlog S2-2,
-/// 2026-07-04): a leaked free can in principle settle `Ref`, and a freed-`Ref`
-/// consumed by codegen is a reference to freed memory. The sink-slot collector
-/// the item asked for was never built and **no `freed_ref` count has ever been
-/// taken**. This takes it.
-///
-/// Reuses [`decide_table_with_ctx`] so no extra BO solve runs (R1), and is its
-/// own pass so a failure here voids nothing else (R2).
-///
-/// # Why the argument shape is read at HIR
-///
-/// The cast arm — `free(p as *mut c_void)` versus `free(p)` on an already-`*mut
-/// c_void` local — is a **syntactic** question, and only HIR answers it. It
-/// matters because the cast is what A1 degrades on, which is the incidental
-/// mitigation the reconciliation refused to treat as a discharge.
-///
-/// # No silent caps
-///
-/// An argument that does not resolve to a subject — `free((*s).field)`,
-/// `free(arr[i])`, `free(f())` — is recorded with its cause, never dropped.
-/// **An unresolved argument is not evidence of absence**, and a census that
-/// counted only the easy shapes would under-report in exactly the direction
-/// that makes the gate look discharged.
-#[allow(
-    dead_code,
-    reason = "S2-2 measurement pass; consumed by the corpus worker behind the \
-              artifact dir. Not part of the pipeline."
-)]
-pub(crate) fn freed_slots_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
-    let (table, ctx) = decide_table_with_ctx(tcx)?;
-    let program = collect_program(tcx);
-    let sites = free_sites(tcx, &program.functions);
-    freed_slots_tsv_from(tcx, table, ctx, sites)
-}
-
 const DEALLOCATORS: &[&str] = &["free", "xfree", "cfree", "g_free"];
 
 /// Free sites, from HIR alone.
@@ -13332,141 +13231,6 @@ fn deallocator_pointer_call(
             if matches!(path.res,
                 rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Static { .. }, did)
                     if dealloc_statics.contains(&did)))
-}
-
-fn freed_slots_tsv_from(
-    tcx: TyCtxt<'_>,
-    table: decision::DecisionTable,
-    ctx: DecideCtx,
-    sites: FreeSites,
-) -> Result<String, String> {
-    // Subjects indexed by their HIR binding — the same key A1 uses.
-    let by_hir: rustc_hash::FxHashMap<_, _> = table
-        .entries
-        .iter()
-        .map(|(s, _)| ((s.fn_did, s.hir_id), s))
-        .collect();
-
-    // The DECISION for each subject, keyed as the artifact keys it. S2-2's
-    // hazard is a freed-`Ref` **consumed by codegen**, and the settled kind
-    // alone does not say that: a subject can settle `Ref` in the model and
-    // still be degraded at decision time (A1's as-cast arm, for one). Without
-    // this column the census would answer a question adjacent to the gate's.
-    let decision_of: rustc_hash::FxHashMap<_, _> = table
-        .entries
-        .iter()
-        .map(|(s, d)| {
-            (
-                (s.fn_did, s.local),
-                match d {
-                    decision::Decision::Ref { .. } => "emitted-ref".to_owned(),
-                    decision::Decision::InferredRef { .. } => "inferred-ref".to_owned(),
-                    decision::Decision::Cursor { .. } => "emitted-cursor".to_owned(),
-                    decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => {
-                        "emitted-slice".to_owned()
-                    }
-                    decision::Decision::Opt { slice, .. } => {
-                        if *slice {
-                            "emitted-opt-slice".to_owned()
-                        } else {
-                            "emitted-opt-ref".to_owned()
-                        }
-                    }
-                    decision::Decision::Box(_) => "emitted-box".to_owned(),
-                    decision::Decision::Degraded(r) => r.reason.key().to_owned(),
-                },
-            )
-        })
-        .collect();
-
-    let mut out = String::from("fn_path\tmir_local\tcast\tkind\toutcome\tresolution\tdetail\n");
-    for (hid, cast, _) in &sites.resolved {
-        let owner = hid.owner.def_id;
-        let Some(s) = by_hir.get(&(owner, *hid)) else {
-            out.push_str(&format!(
-                "-\t-\t{}\t-\t-\tunmapped\tno subject for the binding\n",
-                u8::from(*cast)
-            ));
-            continue;
-        };
-        let kind = ctx
-            .slots
-            .fn_local_slots
-            .get(&s.fn_did)
-            .and_then(|u| u.slot_for_local_depth(s.local, 0))
-            .and_then(|id| ctx.model.get(&SlotRef::Local(s.fn_did, id)))
-            .map(|k| match k {
-                SlotKind::Ref => "ref",
-                SlotKind::Raw => "raw",
-                SlotKind::Owning => "owning",
-            })
-            .unwrap_or("-");
-        let outcome = decision_of
-            .get(&(s.fn_did, s.local))
-            .map_or("-", String::as_str);
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{kind}\t{outcome}\tsubject\t\n",
-            tcx.def_path_str(s.fn_did.to_def_id()),
-            s.local.as_u32(),
-            u8::from(*cast),
-        ));
-    }
-    for u in &sites.unresolved {
-        out.push_str(&format!(
-            "-\t-\t-\t-\t-\tnon-local\t{} @ {}\n",
-            u.cause, u.site
-        ));
-    }
-    Ok(out)
-}
-
-/// **S3.2′-3 task 0 — the use-class census, as its own pass.**
-///
-/// Runs **no BO solve** (the `fatness_tsv` precedent): the subject universe
-/// needs the program and `MutFacts`, and the classification is HIR-only. So the
-/// census is cheap enough to sweep on its own rather than riding the recon
-/// worker, which keeps a measurement out of the gate's critical path.
-///
-/// One row per subject, counts parallel to [`use_census::CLASSES`]. The
-/// split-back criterion is **not** evaluated here — see the module doc.
-pub(crate) fn use_census_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
-    let program = collect_program(tcx);
-    let mut_facts = MutFacts::from_program(&program);
-    let mut subjects = collect_subjects(tcx, &program, &mut_facts);
-    subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
-
-    let uses = use_census::collect(tcx, &program.functions);
-    // **Task 2's other axis.** The sign rides the census artifact and NOT the
-    // facts join, because §6 pins every `.facts.tsv` byte-identical except the
-    // one column task 3 adds — a measurement must not spend a pre-registration
-    // it did not ask for. The RAW capture is what lands here (`render`), so the
-    // `None`-is-conservative decision policy never reaches an instrument.
-    let sign = sign_facts::SignFacts::from_program(&program);
-
-    let mut out = String::from("fn_path\tmir_local\tis_param\tsign\tn_uses");
-    for c in use_census::CLASSES {
-        out.push('\t');
-        out.push_str(c);
-    }
-    out.push('\n');
-
-    for s in &subjects {
-        let counts = uses.get(&(s.fn_did, s.hir_id));
-        let total: u32 = counts.map(|c| c.iter().sum()).unwrap_or(0);
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{total}",
-            tcx.def_path_str(s.fn_did.to_def_id()),
-            s.local.as_u32(),
-            u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),
-            sign.render(s.fn_did, s.local),
-        ));
-        for i in 0..use_census::CLASSES.len() {
-            out.push('\t');
-            out.push_str(&counts.map(|c| c[i]).unwrap_or(0).to_string());
-        }
-        out.push('\n');
-    }
-    Ok(out)
 }
 
 /// The golden inputs, for the out-of-module reconciliation harness (C.1).

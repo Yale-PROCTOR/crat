@@ -9,23 +9,12 @@ const PRE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_variabl
 extern \"C\" { fn malloc(size: usize) -> *mut core::ffi::c_void; fn calloc(n: usize, size: usize) -> *mut core::ffi::c_void; \
 fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: usize) -> *mut core::ffi::c_void; }\n";
 
-fn emitted(src: &str) -> String {
-    match super::rewrite_m1(src) {
-        super::RewriteOutcome::Emitted { source, .. } => source,
-        other => panic!("fixture must survive production verify: {other:?}"),
-    }
-}
-
 /// The seam ledger (the production producer's own rows).
 fn seams(src: &str) -> String {
     ::utils::compilation::run_compiler_on_str(&format!("{PRE}{src}"), |tcx| {
         super::seam_tsv(tcx).expect("seam receipt")
     })
     .expect("fixture compiles")
-}
-
-fn flat(source: &str) -> String {
-    source.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The callee bound's receipt for parameter `index` of `function`.

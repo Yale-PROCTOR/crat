@@ -382,19 +382,6 @@ pub(crate) fn signed_counter<'tcx>(tcx: TyCtxt<'tcx>, delta: &'tcx Expr<'tcx>) -
     true
 }
 
-pub(crate) fn computed_argument_view<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    expr: &'tcx Expr<'tcx>,
-    key: (LocalDefId, HirId),
-    raw_boundary_arguments: &FxHashSet<(LocalDefId, HirId, u32, u32)>,
-) -> Option<(SliceRawUse, ComputedArgumentView)> {
-    let view = computed_argument_view_with(tcx, expr, key, raw_boundary_arguments, |delta| {
-        forward_delta(tcx, delta)
-    });
-    debug_assert!(view.is_none() || computed_view_spine(tcx, expr).is_some());
-    view
-}
-
 /// [`computed_argument_view`] under a caller's forward test (R1313-2: the cast-offset arm also
 /// admits a constant whose value is non-negative).
 pub(crate) fn computed_argument_view_with<'tcx>(

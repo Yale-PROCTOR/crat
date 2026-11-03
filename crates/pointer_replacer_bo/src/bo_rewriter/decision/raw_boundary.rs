@@ -4016,17 +4016,6 @@ fn collect_retention_facts<'tcx>(
     facts
 }
 
-/// wave-6v2 (R407-11): the verdict a callee parameter carries once its
-/// output-storage sinks are discharged at a call — its unknowns and its own
-/// dependencies, nothing else.
-fn residual_after_discharge(
-    facts: &RetentionBodyFacts,
-    rows: &FxHashMap<(LocalDefId, usize), RetentionVerdict>,
-    attested: bool,
-) -> Option<RetentionVerdict> {
-    residual_after_discharge_in(facts, rows, None, attested, 0)
-}
-
 /// [`residual_after_discharge`] with the fact table, so a dependency that was
 /// itself discharged or continued contributes ITS residual rather than its row;
 /// the depth bound guards a cycle of discharged calls.
@@ -5037,7 +5026,6 @@ impl RetentionSummaries {
 /// Spent only after every proof has been tried, and only where retention is
 /// the site's one remaining hold.
 pub(crate) const RAW_BOUNDARY_RETENTION_WAIVER_ID: &str = "retention-waiver:tier-2@2026-09-21";
-pub(crate) const RAW_BOUNDARY_RETENTION_WAIVER_TEXT: &str = "Tier-2 retention waiver (user ruling 2026-09-21, addendum 130). At a receipted site whose only remaining hold is a retention receipt, crat emits the bridge it would have emitted under tier 1: the subject keeps its safe form and the callee receives the raw pointer. The conditional soundness claim excludes an execution in which the callee uses that retained raw alias while the originating reference is live. It licenses only the recorded safe-to-raw view at that site, and no other hold: a site carrying a second hold stays held.";
 
 pub(crate) const RAW_BOUNDARY_WAIVER_ID: &str =
     "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01";

@@ -2898,17 +2898,6 @@ pub unsafe extern "C" fn insert(mut node: *mut Node, mut key: i32) -> *mut Node 
 }
 "#;
 
-/// era-5c's L01⁹ avl frame (report 067: avl's ten CROWN units Owning —
-/// `Node::field1` / `field2`, `insert::node`, `newNode::node`, the rotations'
-/// `x` / `y` / `T2`), the readers Ref.
-fn avl_emitted(name: &str, source: &str) -> super::wave6a_allocation_tests::Emitted {
-    let _frame = frame_locks();
-    avl_frame();
-    let out = emitted(name, source);
-    super::test_model_override::clear();
-    out
-}
-
 /// report 067's ten Owning units, the readers `Ref`. The caller holds the
 /// frame locks.
 fn avl_frame() {

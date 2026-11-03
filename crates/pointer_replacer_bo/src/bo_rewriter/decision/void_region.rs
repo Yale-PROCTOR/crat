@@ -92,18 +92,7 @@ pub(crate) enum Shape {
     ScalarBytesRawView,
 }
 
-impl Shape {
-    pub(crate) fn key(self) -> &'static str {
-        match self {
-            Self::Accessor => "accessor",
-            Self::WidthRead => "width-read",
-            Self::WidthWrite => "width-write",
-            Self::ByteView => "byte-view",
-            Self::ScalarBytes => "scalar-bytes",
-            Self::ScalarBytesRawView => "scalar-bytes-raw-view",
-        }
-    }
-}
+impl Shape {}
 
 /// One proven region of a void buffer, keyed by the callee parameter that
 /// receives it.
@@ -145,17 +134,6 @@ impl Region {
         format!(
             "{}*core::mem::size_of::<{}>()",
             super::seam::FABRICATED_LEN_PATH,
-            self.element
-        )
-    }
-
-    pub(crate) fn detail(&self) -> String {
-        format!(
-            "{}:offset={}:len={}:element={}",
-            self.shape.key(),
-            self.offset_bytes,
-            self.len_bytes
-                .map_or_else(|| "fallback".to_owned(), |n| n.to_string()),
             self.element
         )
     }

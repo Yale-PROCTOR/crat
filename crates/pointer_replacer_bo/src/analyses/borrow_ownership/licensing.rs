@@ -139,9 +139,6 @@ mod tests;
 mod witnesses;
 
 #[cfg(test)]
-mod occurrence_capture;
-
-#[cfg(test)]
 mod call_tests;
 
 #[cfg(test)]

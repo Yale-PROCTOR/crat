@@ -638,12 +638,3 @@ pub(crate) fn cast_receiver_type(
         super::declaration::pointee_source(tcx, pointee)
     ))
 }
-
-/// Which subject kinds a call-result subject local can have — kept exhaustive
-/// for the receiving-local exclusion the planner relies on.
-pub(crate) fn is_receiving_local(kind: SubjectKind) -> bool {
-    match kind {
-        SubjectKind::Local => true,
-        SubjectKind::Param { .. } => false,
-    }
-}

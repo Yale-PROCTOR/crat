@@ -1092,27 +1092,6 @@ pub(crate) fn bridged_calls(adapters_tsv: &str) -> Vec<BridgedCall> {
         .collect()
 }
 
-pub(crate) const HEADER: &str =
-    "program\tpremise\tsite_kind\tfunction\tbinding\tordinal\tpointer\tsite\trule_b\tquiet_prefix";
-
-pub(crate) fn render(program: &str, reading: &Reading) -> String {
-    let mut out = format!("{HEADER}\n");
-    for row in &reading.rows {
-        out += &format!(
-            "{program}\tbridge-dereferenceable\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            row.kind.key(),
-            row.function,
-            row.binding,
-            row.ordinal,
-            row.pointer.replace(['\t', '\n'], " "),
-            row.site,
-            row.rule_b.replace(['\t', '\n'], " "),
-            if row.quiet_prefix { "clears" } else { "fails" },
-        );
-    }
-    out
-}
-
 /// The census receipt's P7 lines over the programs read.
 pub(crate) fn census_lines(readings: &[(&str, Result<Reading, String>)]) -> String {
     let mut kinds = BTreeMap::<SiteKind, usize>::new();
@@ -1199,36 +1178,4 @@ pub(crate) fn census_lines(readings: &[(&str, Result<Reading, String>)]) -> Stri
         );
     }
     out
-}
-
-/// Read one program from disk and write its rows beside the census's tables.
-pub(crate) fn read_and_write(
-    program: &str,
-    input_path: &std::path::Path,
-    emitted_path: &std::path::Path,
-    ledger_dir: &std::path::Path,
-) -> Result<Reading, String> {
-    let read =
-        |path: &std::path::Path| std::fs::read_to_string(path).map_err(|_| "missing".to_owned());
-    let input = syn::parse_file(&read(input_path)?).map_err(|_| "input-parse".to_owned())?;
-    let emitted = syn::parse_file(&read(emitted_path)?).map_err(|_| "emitted-parse".to_owned())?;
-    let adapters =
-        std::fs::read_to_string(ledger_dir.join(format!("{program}.raw-boundary-adapters.tsv")))
-            .unwrap_or_default();
-    let mut reading = read_program(&input, &emitted, &bridged_calls(&adapters));
-    merge_lane_views(
-        &mut reading,
-        &std::fs::read_to_string(
-            ledger_dir.join(format!("{program}.raw-boundary-premise-view-sites.tsv")),
-        )
-        .unwrap_or_default(),
-    );
-    std::fs::write(
-        ledger_dir.join(format!(
-            "{program}.raw-boundary-premise-bridge-dereferenceable.tsv"
-        )),
-        render(program, &reading),
-    )
-    .map_err(|_| "write".to_owned())?;
-    Ok(reading)
 }

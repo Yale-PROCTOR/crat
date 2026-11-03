@@ -636,17 +636,7 @@ enum Role {
     Store,
 }
 
-impl Role {
-    /// The owner's generation after this statement, or `None` when the role
-    /// does not change it.
-    fn creates(self) -> bool {
-        matches!(self, Role::Let | Role::Alloc | Role::MoveIn)
-    }
-
-    fn releases(self) -> bool {
-        matches!(self, Role::Free | Role::MoveOut)
-    }
-}
+impl Role {}
 
 #[derive(Default)]
 struct Scan {

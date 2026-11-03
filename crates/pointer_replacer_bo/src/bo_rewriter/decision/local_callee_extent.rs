@@ -1344,23 +1344,6 @@ pub(crate) fn relaxed_by_decisions(
 mod decided_slice_tests {
     use super::*;
 
-    /// `caller::p` is held because `local_read` walks past one element; its
-    /// callee parameter's slice USES do not exempt it (the walk is
-    /// `p.wrapping_add(n)`, not an indexable rewrite), which is what leaves the
-    /// hold in place. That is the corpus shape in miniature — the exemption's
-    /// three conjuncts fall short at collect time — and the only thing R485-4(b)
-    /// adds is the decision.
-    const HELD: &str = r#"
-#![allow(dead_code, unused_unsafe)]
-unsafe fn local_read(p: *const u8, n: usize) -> u8 {
-    let end = p.wrapping_add(n);
-    *end.wrapping_sub(1)
-}
-pub unsafe fn caller(p: *const u8, n: usize) -> u8 {
-    *p.offset(1) + local_read(p, n)
-}
-"#;
-
     /// **Control (ii) — a THIN caller keeps the hold.** This is the line the
     /// first build crossed: `read32(data as *const c_void)` with
     /// `data: *const u8` reads four bytes through a one-element claim, and the

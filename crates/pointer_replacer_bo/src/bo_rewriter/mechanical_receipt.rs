@@ -561,13 +561,6 @@ impl MechanicalExtent {
         }
     }
 
-    fn waiver(&self) -> &str {
-        match self {
-            Self::Fallback { waiver_id, .. } => waiver_id,
-            Self::None | Self::Evidence(_) => "-",
-        }
-    }
-
     pub(crate) fn is_fallback(&self) -> bool {
         matches!(self, Self::Fallback { .. })
     }
@@ -1525,42 +1518,6 @@ pub(crate) fn reconcile_slice_construction_rows(
         .iter()
         .filter(|row| row.terminal.stage == MechanicalStage::Plan)
         .count())
-}
-
-pub(crate) fn render_slice_construction_rows(rows: &[SliceConstructionReceiptRow]) -> String {
-    let mut rendered = rows
-        .iter()
-        .map(|row| {
-            format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                row.terminal.obligation_key.receipt_key(),
-                row.allocation_result.receipt_key(),
-                row.element_type,
-                if row.mutable { "mut" } else { "shared" },
-                if row.nullable { "nullable" } else { "required" },
-                row.length_expression,
-                row.length_provenance,
-                row.extent.evidence(),
-                row.extent.kind(),
-                row.extent.waiver(),
-                row.terminal.stage.key(),
-                row.terminal.state.key(),
-                row.terminal
-                    .reason
-                    .as_ref()
-                    .map_or_else(|| "-".to_owned(), MechanicalTerminalReason::key),
-            )
-        })
-        .collect::<Vec<_>>();
-    rendered.sort();
-    let mut out =
-        specialized_receipt_headers()[raw_schema::SLICE_CONSTRUCTION_RECEIPT_ROWS].join("\t");
-    out.push('\n');
-    for row in rendered {
-        out.push_str(&row);
-        out.push('\n');
-    }
-    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
