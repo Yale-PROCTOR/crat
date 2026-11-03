@@ -8564,14 +8564,21 @@ pub(crate) fn synthesize_with_raw_boundary(
                 (Form::Ref { mutable }, site.rhs_span, base, blind)
             }
             ArgShape::AddrOfCast { mutable, inner } => (Form::Ref { mutable }, inner, None, true),
-            ArgShape::CastOfLocal { binding, inner } => (
-                decision_of
+            // S9: a cast of a local that stays raw is a raw value whose cast is
+            // part of it (`shape as *mut Circle` for a `*const c_void` shape):
+            // the glue takes the whole right-hand side, as for a raw
+            // expression. A cast of a safe local keeps S8's reading.
+            ArgShape::CastOfLocal { binding, inner } => {
+                let found = decision_of
                     .get(&(site.owner, binding))
-                    .map_or(Form::Raw, |decision| form_of(decision)),
-                inner,
-                Some(binding),
-                false,
-            ),
+                    .map_or(Form::Raw, |decision| form_of(decision));
+                let text_span = if found == Form::Raw {
+                    site.rhs_span
+                } else {
+                    inner
+                };
+                (found, text_span, Some(binding), false)
+            }
             ArgShape::NullLit => {
                 plan.body_skipped.push(BlockedBody {
                     owner_class: SignatureClassId::of(site.owner),
