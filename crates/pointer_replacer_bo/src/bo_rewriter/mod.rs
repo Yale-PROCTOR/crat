@@ -806,6 +806,7 @@ pub(crate) enum DeliveryForm {
     /// (1)): degraded on its own, its declaration typed safe by another plan's
     /// surviving edit. It has no decided form, so the tree side confirms the
     /// one thing the ledger claims: the declaration carries a safe form.
+    #[allow(dead_code)]
     OwnerView,
 }
 
@@ -2612,7 +2613,7 @@ fn verify_and_revert(
         // GATE MACHINERY STARTS HERE. Everything below the probe
         // return belongs to the differential; the baseline compile is
         // the first of it, computed once and reused across rounds.
-        let baseline = baseline.get_or_insert_with(|| compute_baseline());
+        let baseline = baseline.get_or_insert_with(&compute_baseline);
         facts.baseline_keys = baseline.keys.values().sum();
         facts.baseline_errors = baseline.errors;
         facts.baseline_msg_env = baseline.messages_embedding_root;
@@ -3074,8 +3075,7 @@ fn verify_and_revert(
         if rounds > max_rounds {
             escalation = Some(format!(
                 "escalation-required: round cap {max_rounds} reached with \
-                 {} error(s) outstanding",
-                outstanding
+                 {outstanding} error(s) outstanding"
             ));
             break;
         }
@@ -3123,9 +3123,8 @@ fn verify_and_revert(
             .collect::<std::collections::BTreeSet<_>>();
         if newly.is_empty() {
             escalation = Some(format!(
-                "escalation-required: {} error(s) attributed to no rewritten \
-                 function",
-                outstanding
+                "escalation-required: {outstanding} error(s) attributed to no rewritten \
+                 function"
             ));
             break;
         }
@@ -9034,9 +9033,9 @@ fn finish_decide<'tcx>(
                     receipts.push(decision::settled_holds::SettledHoldReceipt::of(
                         node, &reason,
                     ));
-                    if !new.contains_key(&node) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = new.entry(node) {
                         pending_held.1.insert(node, reason.clone());
-                        new.insert(node, reason);
+                        e.insert(reason);
                     }
                 }
             }
@@ -10765,8 +10764,7 @@ fn append_surface_declaration_plans(
                         span: None,
                         arm: "surface",
                         position: format!(
-                            "return:form=ref-to-raw:lifetime_plan={}",
-                            return_plan_digest
+                            "return:form=ref-to-raw:lifetime_plan={return_plan_digest}"
                         ),
                         bridge_kind: "return-ref-to-raw",
                         expected_form: "raw",
@@ -11677,7 +11675,9 @@ pub(crate) struct DecideCtx {
     /// **S3.6-1 task 2.** Carried out with the table rather than recomputed by
     /// the census exporter, for R1's reason: the second derivation is what made
     /// the recon worker solve BO twice per program.
+    #[allow(dead_code)]
     coconv: decision::co_conversion::CoConv,
+    #[allow(dead_code)]
     lifetime_eligibility: decision::lifetime::LifetimeEligibility,
     /// The escape shapes, measured **separately and deliberately not gated**.
     ///
@@ -11688,6 +11688,7 @@ pub(crate) struct DecideCtx {
     /// uncalled function escapes just as readily. S3.6-1 multiplies the
     /// population ~4× but does not introduce the class. Measured here so it is
     /// neither folded in silently nor omitted silently.
+    #[allow(dead_code)]
     escapes: Vec<decision::co_conversion::Escape>,
     /// **P2 measurement.** The inputs the class builder consumed, kept so an
     /// alternative overlap rule can be priced without a second front-end pass —
@@ -11698,11 +11699,14 @@ pub(crate) struct DecideCtx {
     overlap_receipt: String,
     analysis: DecisionAnalysisCarrier,
     a5_site_proofs: decision::a5_site_proof::A5SeamProofIndex,
+    #[allow(dead_code)]
     box_facts: decision::box_facts::BoxOwnershipFacts,
     constructions: decision::construction::ConstructionFacts,
     pub(crate) raw_boundary_sites: decision::raw_boundary::RawBoundarySiteFacts,
     pub(crate) retention: decision::raw_boundary::RetentionSummaries,
+    #[allow(dead_code)]
     pub(crate) raw_boundary: decision::raw_boundary::RawBoundaryDispositionIndex,
+    #[allow(dead_code)]
     exposure: decision::exposure::ExposurePolicy,
     raw_boundary_artifacts: RawBoundaryArtifacts,
     e2_artifacts: E2Artifacts,
@@ -13048,8 +13052,11 @@ pub(crate) struct FreeSites {
 /// than by a second walk so the overlap check and the census cannot disagree
 /// about which sites are unresolved.
 pub(crate) struct UnresolvedFree {
+    #[allow(dead_code)]
     pub(crate) cause: &'static str,
+    #[allow(dead_code)]
     pub(crate) site: String,
+    #[allow(dead_code)]
     pub(crate) locals: Vec<(rustc_hir::def_id::LocalDefId, rustc_hir::HirId)>,
 }
 

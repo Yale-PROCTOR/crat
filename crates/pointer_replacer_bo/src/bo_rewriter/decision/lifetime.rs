@@ -125,6 +125,7 @@ pub(crate) enum LifetimeFailure {
     FieldHeld,
     ExternalContractAbsent,
     FnPtrWebHeld,
+    #[allow(dead_code)]
     AstUnplaceable,
     SeamIncompatible,
     /// W6L-1: more than one input parameter feeds the return through raw

@@ -309,7 +309,7 @@ impl ClosureLiveness {
         let blocks = body
             .basic_blocks
             .iter_enumerated()
-            .map(|(block, data)| BlockFacts {
+            .map(|(_block, data)| BlockFacts {
                 statements: data
                     .statements
                     .iter()

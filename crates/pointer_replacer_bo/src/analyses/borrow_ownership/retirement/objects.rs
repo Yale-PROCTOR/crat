@@ -322,6 +322,8 @@ fn statement_effect(
     }
 }
 
+// `argument_index` is read only by the test build's transfer receipt.
+#[cfg_attr(not(test), allow(unused_variables, unused_assignments))]
 fn call_effect<'tcx>(
     program: &RustProgram<'tcx>,
     function: LocalDefId,

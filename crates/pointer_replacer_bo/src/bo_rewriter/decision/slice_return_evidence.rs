@@ -89,10 +89,10 @@ fn fresh_return(program: &RustProgram<'_>, callee: LocalDefId) -> bool {
         for statement in &block.statements {
             let StatementKind::Assign(assignment) = &statement.kind else { continue };
             let (place, value) = &**assignment;
-            if let Rvalue::Ref(_, _, addressed) | Rvalue::RawPtr(_, addressed) = value {
-                if !addressed.is_indirect() {
-                    address_taken.insert(addressed.local);
-                }
+            if let Rvalue::Ref(_, _, addressed) | Rvalue::RawPtr(_, addressed) = value
+                && !addressed.is_indirect()
+            {
+                address_taken.insert(addressed.local);
             }
             let Some(destination) = place.as_local() else { continue };
             if !body.local_decls[destination].ty.is_raw_ptr() {

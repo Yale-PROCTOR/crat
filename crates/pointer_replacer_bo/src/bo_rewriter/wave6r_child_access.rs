@@ -90,7 +90,7 @@ pub(crate) fn result_returned(body: &Body<'_>, local: Local) -> bool {
                     Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => operand_local(operand),
                     _ => None,
                 };
-                let Some(source) = source.filter(|source| aliases.contains(source)) else {
+                let Some(_source) = source.filter(|source| aliases.contains(source)) else {
                     continue;
                 };
                 if lhs.as_local() == Some(rustc_middle::mir::RETURN_PLACE) {

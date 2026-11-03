@@ -647,6 +647,7 @@ pub(crate) enum DegradeReason {
     /// signature edit and the call-level raw-view bridge atomically.
     PairRawView,
     /// BO decided owning; Box forms and the drop policy arrive in S3.
+    #[allow(dead_code)]
     KindOwning,
     /// Box wave-1 filter failure, preserving the exact first-failure class.
     BoxFailure {
@@ -1137,6 +1138,7 @@ pub(crate) struct DecisionTable {
     pub(crate) void_region_receivers: void_region::Receivers,
     pub(crate) forward_slice_parameters: Vec<slice_forms::ForwardParameter>,
     pub(crate) nested_receipts: Vec<nested_slice::Receipt>,
+    #[allow(dead_code)]
     pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
     pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
     pub(crate) declaration_pointees: declaration::DeclarationPointees,

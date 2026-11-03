@@ -57,6 +57,7 @@ pub(crate) struct Certificate {
     pub(crate) callee: LocalDefId,
     pub(crate) callee_path: String,
     /// The pointee as the source spells it.
+    #[allow(dead_code)]
     pub(crate) pointee: String,
     pub(crate) optional: bool,
     pub(crate) shape: BoxShape,
@@ -2907,7 +2908,7 @@ fn certify<'tcx, 's>(
                                 source_certificate.callee_path
                             ),
                         )
-                        .map_err(|reason| hold(reason))?;
+                        .map_err(&hold)?;
                         let owner_transfers = record_sinks(key, owner_sinks);
                         transfers.extend(owner_transfers.into_iter().map(|(d, i, _)| (d, i, key)));
                         (
@@ -2977,7 +2978,7 @@ fn certify<'tcx, 's>(
                         source_certificate.callee_path
                     ),
                 )
-                .map_err(|reason| hold(reason))?;
+                .map_err(&hold)?;
                 let owner_transfers = record_sinks(key, owner_sinks);
                 transfers.extend(owner_transfers.into_iter().map(|(d, i, _)| (d, i, key)));
                 (
@@ -3870,8 +3871,7 @@ fn reseat_generations_consumed(
                 else {
                     return false;
                 };
-                previous.is_none_or(|p| stmt.span.lo() >= p.hi())
-                    && consumes.iter().any(|consume| expr.span == *consume)
+                previous.is_none_or(|p| stmt.span.lo() >= p.hi()) && consumes.contains(&expr.span)
             })
         });
         if !consumed {

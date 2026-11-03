@@ -545,10 +545,10 @@ impl<'tcx> Program<'tcx> {
             let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = callee.kind else {
                 return false;
             };
-            if !path
+            if path
                 .segments
                 .last()
-                .is_some_and(|s| s.ident.as_str() == "size_of")
+                .is_none_or(|s| s.ident.as_str() != "size_of")
             {
                 return false;
             }
@@ -711,7 +711,7 @@ impl<'tcx> Program<'tcx> {
         let length = self.linear(pointer.function, length.value?)?;
         let difference = elements.add(length, -1);
         let slack = difference.constant - offset.constant;
-        (difference.atoms.is_empty() && slack >= 0).then(|| slack as u128)
+        (difference.atoms.is_empty() && slack >= 0).then_some(slack as u128)
     }
 }
 

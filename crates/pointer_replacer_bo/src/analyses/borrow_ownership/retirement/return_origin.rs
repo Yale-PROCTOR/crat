@@ -280,12 +280,11 @@ mod producer {
     ) {
         match statement {
             StatementKind::Assign(box (destination, rvalue)) => {
-                if let Rvalue::Ref(_, _, addressed) | Rvalue::RawPtr(_, addressed) = rvalue {
-                    if let Some(local) = addressed.as_local()
-                        && let Some(index) = layout.index(local)
-                    {
-                        state.exposed[index] = true;
-                    }
+                if let Rvalue::Ref(_, _, addressed) | Rvalue::RawPtr(_, addressed) = rvalue
+                    && let Some(local) = addressed.as_local()
+                    && let Some(index) = layout.index(local)
+                {
+                    state.exposed[index] = true;
                 }
                 let value = match rvalue {
                     Rvalue::Use(value) | Rvalue::Cast(CastKind::PtrToPtr, value, _) => {

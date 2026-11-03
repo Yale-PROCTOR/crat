@@ -7,6 +7,45 @@
 #![feature(trusted_step)]
 #![feature(impl_trait_in_assoc_type)]
 #![warn(unused_extern_crates)]
+// The master CI runs `cargo clippy -- -D warnings`. These lints are structural or stylistic over a
+// large analysis crate (argument counts, nested tuple types, doc continuation, boolean shapes, index
+// loops, ...); they are allowed here, not rewritten, at the merge. `private_interfaces` /
+// `private_bounds`: crate-internal types in `pub(crate)` signatures of public-module items.
+#![allow(
+    private_interfaces,
+    private_bounds,
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    clippy::doc_lazy_continuation,
+    clippy::nonminimal_bool,
+    clippy::needless_range_loop,
+    clippy::field_reassign_with_default,
+    clippy::collapsible_match,
+    clippy::collapsible_if,
+    clippy::large_enum_variant,
+    clippy::result_large_err,
+    clippy::if_same_then_else,
+    clippy::while_let_loop,
+    clippy::redundant_guards,
+    clippy::empty_line_after_doc_comments,
+    clippy::only_used_in_recursion,
+    clippy::question_mark,
+    clippy::needless_borrows_for_generic_args,
+    clippy::enum_variant_names,
+    clippy::useless_conversion,
+    clippy::iter_skip_zero,
+    clippy::cloned_ref_to_slice_refs,
+    clippy::single_range_in_vec_init,
+    clippy::filter_map_bool_then,
+    clippy::drop_non_drop,
+    clippy::wrong_self_convention,
+    clippy::unnecessary_get_then_check,
+    clippy::match_like_matches_macro,
+    clippy::unnecessary_filter_map,
+    clippy::redundant_locals,
+    clippy::uninlined_format_args,
+    clippy::redundant_closure
+)]
 
 extern crate rustc_abi;
 extern crate rustc_ast;

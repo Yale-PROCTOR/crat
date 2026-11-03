@@ -26,10 +26,15 @@ pub trait FreePlanSite {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CastKind {
+    #[allow(dead_code)]
     PointerToVoid,
+    #[allow(dead_code)]
     IdentityPointer,
+    #[allow(dead_code)]
     InteriorPointer,
+    #[allow(dead_code)]
     Integer,
+    #[allow(dead_code)]
     Opaque,
 }
 #[derive(Clone, Debug)]

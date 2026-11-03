@@ -274,10 +274,10 @@ struct LoopCheck<'a, 'tcx> {
 }
 impl<'tcx> Visitor<'tcx> for LoopCheck<'_, 'tcx> {
     fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
-        if let Some(id) = binding(e) {
-            if self.tables.contains(&id) || self.rows.contains(&id) {
-                self.valid = false;
-            }
+        if let Some(id) = binding(e)
+            && (self.tables.contains(&id) || self.rows.contains(&id))
+        {
+            self.valid = false;
         }
         match e.kind {
             ExprKind::Unary(UnOp::Deref, inner) => {
@@ -475,7 +475,7 @@ fn inspect_pair<'tcx>(
             continue;
         }
         let SubjectKind::Param { hir_index } = s.kind else { return Err(Hold::StorageUnproved) };
-        if !flat_slice(d).is_some_and(|(mutable, _)| !mutable) {
+        if flat_slice(d).is_none_or(|(mutable, _)| mutable) {
             return Err(Hold::NullableLevelUnbuilt);
         }
         let spelling = s

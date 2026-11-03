@@ -451,7 +451,7 @@ fn element_zero_in_place(tcx: TyCtxt<'_>, owner: LocalDefId, span: rustc_span::S
     }
     let body = tcx.hir_body_owned_by(owner);
     let mut at = At { span, found: None };
-    at.visit_body(&body);
+    at.visit_body(body);
     let Some(call) = at.found else { return false };
     let rustc_hir::ExprKind::MethodCall(_, _, [offset], _) = call.kind else {
         return false;
@@ -704,7 +704,7 @@ fn literal_step(tcx: TyCtxt<'_>, owner: LocalDefId, span: rustc_span::Span) -> O
     }
     let body = tcx.hir_body_owned_by(owner);
     let mut at = At { span, found: None };
-    at.visit_body(&body);
+    at.visit_body(body);
     let rustc_hir::ExprKind::MethodCall(_, _, [step], _) = at.found?.kind else {
         return None;
     };
@@ -998,7 +998,7 @@ pub(crate) fn nul_walk(
         libc_contract: false,
         indexed: false,
     };
-    walk.visit_body(&body);
+    walk.visit_body(body);
     let _ = walk.tcx;
     if !walk.nul_tested || walk.indexed {
         return None;
@@ -1064,7 +1064,7 @@ pub(crate) fn caller_establishes_nul(tcx: TyCtxt<'_>, subject: &Subject) -> bool
         binding: subject.hir_id,
         found: false,
     };
-    calls.visit_body(&body);
+    calls.visit_body(body);
     calls.found
 }
 

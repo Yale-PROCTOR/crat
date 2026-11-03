@@ -118,9 +118,7 @@ pub(crate) fn plan(
                 .filter(|site| site.source_shape != "null-lit")
                 .map(|site| {
                     let node = (function, site.root?);
-                    if eligibility.return_permit(node).is_none() {
-                        return None;
-                    }
+                    eligibility.return_permit(node)?;
                     let decision = decisions.get(&node)?;
                     let form = match decision {
                         Decision::Ref { .. }

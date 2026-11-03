@@ -187,10 +187,10 @@ pub(crate) fn current() -> Option<Arc<EntryAnalysis>> {
 
 pub(crate) fn record_access(access: SourceAccess) {
     ACCESSES.with(|capture| {
-        if let Some((rows, seen)) = capture.borrow_mut().as_mut() {
-            if seen.insert(access.clone()) {
-                rows.push(access);
-            }
+        if let Some((rows, seen)) = capture.borrow_mut().as_mut()
+            && seen.insert(access.clone())
+        {
+            rows.push(access);
         }
     });
 }

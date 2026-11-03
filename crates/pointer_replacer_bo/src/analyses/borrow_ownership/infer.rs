@@ -618,7 +618,7 @@ where
         place: &Place<'tcx>,
         consume: Option<Consume<SSAIdx>>,
     ) -> Option<Consume<Self::LocalSig>> {
-        let occurrence_ssa = consume.clone();
+        let occurrence_ssa = consume;
         let base = place.local;
         let base_ty = body.local_decls[base].ty;
 

@@ -142,7 +142,9 @@ impl CallObligation {
 #[derive(Clone, Debug)]
 pub(crate) struct SourceFreeSite {
     key: SourceCallKey,
+    #[allow(dead_code)]
     owner: LocalDefId,
+    #[allow(dead_code)]
     binding: HirId,
     callee: DefId,
     span: Span,
@@ -175,7 +177,9 @@ impl SourceFreeSite {
 /// and unwind obligation before treating these source edits as admissible.
 #[derive(Clone, Debug)]
 pub(crate) struct SourcePlan {
+    #[allow(dead_code)]
     owner: LocalDefId,
+    #[allow(dead_code)]
     binding: HirId,
     count: String,
     shape: BoxShape,

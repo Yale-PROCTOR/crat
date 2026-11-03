@@ -108,10 +108,7 @@ fn local_def(index: u32) -> LocalDefId {
 }
 
 /// The store `*p = v` / `(*p)[i] = v` at a site: the function, the body and `p`.
-fn store_through<'b>(
-    body: &'b Body<'_>,
-    (block, statement): (u32, usize),
-) -> Option<(Local, bool)> {
+fn store_through(body: &Body<'_>, (block, statement): (u32, usize)) -> Option<(Local, bool)> {
     let StatementKind::Assign(assign) = &body
         .basic_blocks
         .get(BasicBlock::from_u32(block))?

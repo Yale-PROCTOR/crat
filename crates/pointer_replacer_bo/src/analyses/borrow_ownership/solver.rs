@@ -861,7 +861,7 @@ impl KindSolver {
             let big = vars.len() as u64 + 1;
             // Ref > Owning > Raw: `own` weighs 1 and `raw` nothing. Exactly one kind holds per
             // slot, so a flip gains at most |slots| - 1 < `big`: no reference is ever displaced.
-            for (_, kind_vars) in &vars {
+            for kind_vars in vars.values() {
                 solver.assert_soft(&kind_vars.ref_, big, None);
                 solver.assert_soft(&kind_vars.own, 1u64, None);
             }
@@ -1399,7 +1399,7 @@ impl KindSolver {
             &self.solver,
             self.tracker.as_ref(),
             || format!("field-reader-kind-reference-effect({lhs:?},{rhs:?})"),
-            &effect.implies(&self.lend_guard(lhs, rhs)),
+            &effect.implies(self.lend_guard(lhs, rhs)),
         );
     }
 
@@ -1797,7 +1797,7 @@ impl KindSolver {
                         support.push(self.vars[slot].ref_.clone());
                     }
                 }
-                clauses.push((decision.guard, true, guard.implies(&Bool::and(&support))));
+                clauses.push((decision.guard, true, guard.implies(Bool::and(&support))));
             } else {
                 clauses.push((decision.guard, false, !guard));
             }
@@ -1951,7 +1951,7 @@ impl KindSolver {
                     }
                     for key in [
                         format!("{}::_{}@d0", callee, candidate.parameter),
-                        format!("{}::_0@d0", callee),
+                        format!("{callee}::_0@d0"),
                         format!(
                             "{}::_{}@d0",
                             candidate.call.caller, proof.native.receiver.local
@@ -2853,9 +2853,11 @@ impl KindSolver {
             query_reason.clone(),
         );
         if self.demand_query_pending() {
-            let core = (outcome == SatResult::Unsat)
-                .then(|| self.solver.get_unsat_core())
-                .unwrap_or_default();
+            let core = if outcome == SatResult::Unsat {
+                self.solver.get_unsat_core()
+            } else {
+                Default::default()
+            };
             let reason = (outcome == SatResult::Unknown)
                 .then(|| query_reason.clone().unwrap_or_else(|| "-".to_owned()));
             self.note_demand_query(assumptions, outcome, &core, reason);
@@ -2937,9 +2939,11 @@ impl KindSolver {
             initial
         };
         if self.demand_query_pending() {
-            let core = (outcome == SatResult::Unsat)
-                .then(|| hard.solver.get_unsat_core())
-                .unwrap_or_default();
+            let core = if outcome == SatResult::Unsat {
+                hard.solver.get_unsat_core()
+            } else {
+                Default::default()
+            };
             self.note_demand_query(assumptions, outcome, &core, initial_unknown_reason.clone());
         }
         if let Some(reason) = initial_unknown_reason {
@@ -3180,9 +3184,11 @@ impl KindSolver {
                 let selector_index = selectors
                     .index_of(&selector)
                     .expect("dropped selector belongs to selector universe");
-                let core = (outcome == SatResult::Unsat)
-                    .then(|| hard.solver.get_unsat_core())
-                    .unwrap_or_default();
+                let core = if outcome == SatResult::Unsat {
+                    hard.solver.get_unsat_core()
+                } else {
+                    Default::default()
+                };
                 SELECTOR_TRACE_CAPTURE.with(|capture| {
                     let mut capture = capture.borrow_mut();
                     let trace = capture.as_mut().expect("selector trace active");
@@ -3291,9 +3297,11 @@ impl KindSolver {
         let unknown_reason =
             (outcome == SatResult::Unknown).then(|| query_reason.unwrap_or_else(|| "-".to_owned()));
         if self.demand_query_pending() {
-            let core = (outcome == SatResult::Unsat)
-                .then(|| self.solver.get_unsat_core())
-                .unwrap_or_default();
+            let core = if outcome == SatResult::Unsat {
+                self.solver.get_unsat_core()
+            } else {
+                Default::default()
+            };
             self.note_demand_query(&relaxed.assumptions, outcome, &core, unknown_reason.clone());
         }
         #[cfg(test)]
@@ -4027,7 +4035,7 @@ impl BoOwnDatabase<'_> {
             self.optimize,
             self.tracker,
             || "own-traversal-frame".into(),
-            &guard.implies(&self.z3_ast[before].eq(&self.z3_ast[after])),
+            &guard.implies(self.z3_ast[before].eq(&self.z3_ast[after])),
         );
     }
 
@@ -4489,7 +4497,7 @@ impl Database for BoOwnDatabase<'_> {
                 !Bool::and(&[destination, after]),
                 destination.implies(before),
                 after.implies(before),
-                before.implies(&Bool::or(&[destination, after])),
+                before.implies(Bool::or(&[destination, after])),
             ])
         };
         let view = Bool::and(&[!destination, !after.xor(before)]);
@@ -4771,7 +4779,7 @@ impl Database for BoOwnDatabase<'_> {
         for (clause, role) in [
             (effect.implies(&!input.xor(before)), "input"),
             (
-                (!&effect).implies(&Bool::and(&[!input, !after.xor(before)])),
+                (!&effect).implies(Bool::and(&[!input, !after.xor(before)])),
                 "legacy",
             ),
         ] {

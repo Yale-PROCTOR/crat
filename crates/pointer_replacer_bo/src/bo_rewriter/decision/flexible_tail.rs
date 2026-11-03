@@ -43,10 +43,12 @@ pub(crate) struct StructTransaction {
     pub(crate) struct_did: LocalDefId,
     pub(crate) struct_path: String,
     pub(crate) tail_field_index: usize,
+    #[allow(dead_code)]
     pub(crate) tail_field_name: String,
     /// `Box<[T]>` element type as the declaration family renders it.
     pub(crate) element_type: String,
     /// Header field initializers in declaration order (`name: 0 as T`).
+    #[allow(dead_code)]
     pub(crate) header_initializers: Vec<String>,
     /// `impl Copy` / `impl Clone` items for the struct, removed with the split.
     pub(crate) impls_to_remove: Vec<LocalDefId>,
@@ -537,7 +539,7 @@ pub(crate) fn derive<'tcx>(
         let variant = adt.non_enum_variant();
         let struct_ty = tcx.type_of(struct_did).instantiate_identity();
         // 2. Shape: numeric header, trailing `[T; 0|1]` with numeric `T`.
-        let Some((tail_index, tail_field)) = variant.fields.iter().enumerate().last() else {
+        let Some((tail_index, tail_field)) = variant.fields.iter().enumerate().next_back() else {
             hold("flexible-tail-shape:no-fields".to_owned(), &mut out);
             continue;
         };

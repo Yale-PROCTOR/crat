@@ -59,7 +59,7 @@ impl Selection {
                 facts
                     .ownership_asts
                     .get(super::super::ssa::constraint::Var::from_u32(node.var))
-                    .and_then(|ast| evaluate(ast))
+                    .and_then(&mut evaluate)
                     .map(|value| (node, value))
             })
             .collect();
@@ -69,7 +69,7 @@ impl Selection {
                 facts
                     .ownership_asts
                     .get(super::super::ssa::constraint::Var::from_u32(var))
-                    .and_then(|ast| evaluate(ast))
+                    .and_then(&mut evaluate)
                     .map(|value| (var, value))
             })
             .collect();

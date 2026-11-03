@@ -284,25 +284,24 @@ impl Inputs {
                 ) {
                     complete_operations = false;
                 }
-                if let Some(call) = data.terminator().as_call(program.tcx) {
-                    if let CallKind::RustLib(callee) = call.func {
-                        if program
-                            .tcx
-                            .is_diagnostic_item(rustc_span::Symbol::intern("mem_size_of"), callee)
-                            && call.args.is_empty()
-                            && call.destination.projection.is_empty()
-                            && body.local_decls[call.destination.local].ty
-                                == program.tcx.types.usize
-                        {
-                            size_of_calls.insert((block.as_u32(), data.statements.len()));
-                        }
-                        let krate = program.tcx.crate_name(callee.krate);
-                        if matches!(krate.as_str(), "core" | "std")
-                            && program.tcx.item_name(callee).as_str() == "is_null"
-                            && !body.local_decls[call.destination.local].ty.is_raw_ptr()
-                        {
-                            readonly_intrinsics.insert((block.as_u32(), data.statements.len()));
-                        }
+                if let Some(call) = data.terminator().as_call(program.tcx)
+                    && let CallKind::RustLib(callee) = call.func
+                {
+                    if program
+                        .tcx
+                        .is_diagnostic_item(rustc_span::Symbol::intern("mem_size_of"), callee)
+                        && call.args.is_empty()
+                        && call.destination.projection.is_empty()
+                        && body.local_decls[call.destination.local].ty == program.tcx.types.usize
+                    {
+                        size_of_calls.insert((block.as_u32(), data.statements.len()));
+                    }
+                    let krate = program.tcx.crate_name(callee.krate);
+                    if matches!(krate.as_str(), "core" | "std")
+                        && program.tcx.item_name(callee).as_str() == "is_null"
+                        && !body.local_decls[call.destination.local].ty.is_raw_ptr()
+                    {
+                        readonly_intrinsics.insert((block.as_u32(), data.statements.len()));
                     }
                 }
             }
@@ -561,15 +560,13 @@ impl Plan {
                         operand: OperandSyntax::Copy { place } | OperandSyntax::Move { place },
                         ..
                     } = &occurrence.syntax.expression
+                        && body.pointer_locals.contains(&place.local)
+                        && (occurrence.syntax.immediate_origin != ImmediateOrigin::Transfer
+                            || !body
+                                .pointer_locals
+                                .contains(&occurrence.syntax.destination.local))
                     {
-                        if body.pointer_locals.contains(&place.local)
-                            && (occurrence.syntax.immediate_origin != ImmediateOrigin::Transfer
-                                || !body
-                                    .pointer_locals
-                                    .contains(&occurrence.syntax.destination.local))
-                        {
-                            supported = false;
-                        }
+                        supported = false;
                     }
                     if let Some(callee) = &occurrence.callee {
                         supported &= match callee {

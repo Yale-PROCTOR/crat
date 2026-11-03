@@ -98,6 +98,7 @@ impl ArgumentExtent {
 pub(crate) enum OwnershipContract {
     BorrowView,
     Consume,
+    #[allow(dead_code)]
     Produce,
     AtomicSourceSink,
 }

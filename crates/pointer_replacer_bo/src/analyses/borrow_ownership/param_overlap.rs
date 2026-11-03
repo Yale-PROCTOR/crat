@@ -507,11 +507,7 @@ pub(crate) fn check_snapshot_equivalence(graph: &SnapshotEffectGraph) -> Snapsho
     {
         return SnapshotVerdict::VolatileOrAtomic;
     }
-    if graph
-        .events
-        .iter()
-        .any(|effect| *effect == SnapshotEffect::OpaqueEscape)
-    {
+    if graph.events.contains(&SnapshotEffect::OpaqueEscape) {
         return SnapshotVerdict::OpaqueEscape;
     }
     for (start, effect) in graph.events.iter().enumerate() {

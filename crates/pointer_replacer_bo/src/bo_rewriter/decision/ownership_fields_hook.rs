@@ -135,13 +135,16 @@ impl Inputs {
 }
 #[derive(Clone, Debug)]
 pub(crate) enum Hold {
+    #[allow(dead_code)]
     Missing(Missing),
     Identity,
     Construction,
     Projection,
     RecursiveSuppression,
     Lend(lend::LendHold),
+    #[allow(dead_code)]
     Free(free_sites::FreeHold),
+    #[allow(dead_code)]
     Close(lifecycle::CloseHold),
     NativeEffects(super::ownership_fields_effects::EffectsHold),
 }
@@ -240,7 +243,7 @@ fn validate(bundle: &Bundle) -> Result<BoxPlan, Hold> {
             expect_edit(&plan, span, &code)?;
         }
         for receipt in lend.receipts {
-            plan.receipts.push(format!("box-lend-t1 {:?}", receipt));
+            plan.receipts.push(format!("box-lend-t1 {receipt:?}"));
         }
     }
     let free = need(&bundle.frees)?;
@@ -265,7 +268,7 @@ fn validate(bundle: &Bundle) -> Result<BoxPlan, Hold> {
         }
         claimed_spans.push(span);
         expect_edit(&plan, span, expression(&emitted.code))?;
-        plan.receipts.push(format!("box-free-identity {:?}", sink));
+        plan.receipts.push(format!("box-free-identity {sink:?}"));
     }
     let mut close_events = BTreeSet::new();
     for close in need(&bundle.closes)? {

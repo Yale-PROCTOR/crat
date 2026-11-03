@@ -68,9 +68,11 @@ pub struct SourceInstance {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvidenceOwner {
     AcceptedModel,
+    #[allow(dead_code)]
     Era5b,
     FrameQualification,
     NativeIdentity,
+    #[allow(dead_code)]
     Emission,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,17 +86,26 @@ pub type Evidence<T> = Result<T, Missing>;
 pub enum MissingReason {
     /// Exact contract field supplied by the decoder; no placeholder value.
     Field(&'static str),
+    #[allow(dead_code)]
     Conditional,
+    #[allow(dead_code)]
     Held(LicensingHold),
     Frame(&'static str),
+    #[allow(dead_code)]
     IncompleteFamily,
+    #[allow(dead_code)]
     DeclarationSet,
+    #[allow(dead_code)]
     DuplicateDeclaration(DeclarationKey),
+    #[allow(dead_code)]
     Selection,
+    #[allow(dead_code)]
     GlobalFieldScheme,
     Occurrence,
     Companion(FactFamily),
+    #[allow(dead_code)]
     DuplicateClose(SiteId),
+    #[allow(dead_code)]
     CloseReason(SiteId),
     ModelNotOwning(Kind),
     ModelInventory,
@@ -108,6 +119,7 @@ pub struct RecordKey {
     pub row: u32,
 }
 pub trait FactTag {
+    #[allow(dead_code)]
     const FAMILY: FactFamily;
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,7 +140,7 @@ macro_rules! families {
     ($($tag:ident),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
         pub enum FactFamily { $($tag),+ }
-        $(#[derive(Clone, Debug, PartialEq, Eq)] pub struct $tag;
+        $(#[derive(Clone, Debug, PartialEq, Eq)] #[allow(dead_code)] pub struct $tag;
           impl FactTag for $tag { const FAMILY: FactFamily = FactFamily::$tag; })+
     }
 }
@@ -165,6 +177,7 @@ families!(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceFrame {
     L01DoublePrime,
+    #[allow(dead_code)]
     L01TriplePrime,
 }
 #[cfg(test)]
@@ -342,72 +355,124 @@ pub struct Row {
 // Unknown future variants must be rejected by the decoder, never flattened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InternalSite {
+    #[allow(dead_code)]
     RouteCycle,
+    #[allow(dead_code)]
     PathWithoutReturn,
+    #[allow(dead_code)]
     ParameterIndex,
+    #[allow(dead_code)]
     MultipleOwningParameters,
+    #[allow(dead_code)]
     ParameterNotRawPointer,
+    #[allow(dead_code)]
     PointeeNotStruct,
+    #[allow(dead_code)]
     GenericFieldDeclaration,
+    #[allow(dead_code)]
     HeterogeneousPointerField,
+    #[allow(dead_code)]
     SinkNotFree,
+    #[allow(dead_code)]
     SingleDescendantOnly,
+    #[allow(dead_code)]
     ReturnTypeMismatch,
+    #[allow(dead_code)]
     ForeignCallNotSink,
+    #[allow(dead_code)]
     UnsupportedExpression,
+    #[allow(dead_code)]
     NonPointerDestinationWithSource,
+    #[allow(dead_code)]
     SourceOperandMissing,
+    #[allow(dead_code)]
     ConsumedCellNotRefilled,
+    #[allow(dead_code)]
     SinkOnView,
+    #[allow(dead_code)]
     ViewStoredIntoOwningCell,
+    #[allow(dead_code)]
     FieldStoreDeferred,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InternalError {
+    #[allow(dead_code)]
     Unsupported(InternalSite),
+    #[allow(dead_code)]
     Coverage(u32),
+    #[allow(dead_code)]
     ParentFreeWithLiveDescendant,
+    #[allow(dead_code)]
     CompetingDisposition,
+    #[allow(dead_code)]
     UnaccountedToken,
+    #[allow(dead_code)]
     AmbiguousRoute {
         choices: usize,
         from: StaticNode,
         to: StaticNode,
     },
+    #[allow(dead_code)]
     MissingTransfer,
+    #[allow(dead_code)]
     BoundaryCoverage,
+    #[allow(dead_code)]
     FrameCoverage,
+    #[allow(dead_code)]
     BoundaryDisagreement,
+    #[allow(dead_code)]
     MultipleSinks,
+    #[allow(dead_code)]
     PathBudget,
+    #[allow(dead_code)]
     LoopWithTokenOperation,
+    #[allow(dead_code)]
     PointerDestinationStore,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallError {
+    #[allow(dead_code)]
     Unsupported,
+    #[allow(dead_code)]
     NativeCall,
+    #[allow(dead_code)]
     Boundary,
+    #[allow(dead_code)]
     Type,
+    #[allow(dead_code)]
     Internal(InternalError),
+    #[allow(dead_code)]
     FieldScheme(String),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallerHold {
+    #[allow(dead_code)]
     Coverage,
+    #[allow(dead_code)]
     UnsupportedEffect,
+    #[allow(dead_code)]
     Origin,
+    #[allow(dead_code)]
     CellIdentity,
+    #[allow(dead_code)]
     MissingStore,
+    #[allow(dead_code)]
     MissingReset,
+    #[allow(dead_code)]
     MissingNullInit,
+    #[allow(dead_code)]
     CompetingResponsibility,
+    #[allow(dead_code)]
     Forwarding,
+    #[allow(dead_code)]
     LawCoverage,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LicensingHold {
+    #[allow(dead_code)]
     Declaration,
+    #[allow(dead_code)]
     Call(CallError),
+    #[allow(dead_code)]
     Caller(CallerHold),
 }

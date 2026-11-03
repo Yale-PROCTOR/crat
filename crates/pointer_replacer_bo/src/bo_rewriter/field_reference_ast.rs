@@ -1027,10 +1027,10 @@ pub(crate) fn address_taken_names(krate: &rustc_ast::Crate) -> FxHashSet<String>
         }
 
         fn visit_path(&mut self, path: &'a rustc_ast::Path) {
-            if self.1 > 0 {
-                if let Some(last) = path.segments.last() {
-                    self.0.insert(last.ident.name.to_string());
-                }
+            if self.1 > 0
+                && let Some(last) = path.segments.last()
+            {
+                self.0.insert(last.ident.name.to_string());
             }
             rustc_ast::visit::walk_path(self, path);
         }

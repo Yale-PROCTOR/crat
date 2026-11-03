@@ -885,10 +885,10 @@ fn array_decay_length(
 /// `by_binding` itself is deliberately NOT reclassified: it is the S3.2′
 /// measurement substrate and feeds Box sizing, forecasts and receipts that have
 /// nothing to do with extents.
-pub(crate) fn walked_construction<'a>(
-    facts: &'a ConstructionFacts,
+pub(crate) fn walked_construction(
+    facts: &ConstructionFacts,
     node: (LocalDefId, HirId),
-) -> Option<(&'a Construction, HirId)> {
+) -> Option<(&Construction, HirId)> {
     let declared = facts.by_binding.get(&node)?;
     let init_hir = *facts.init_hirs.get(&node)?;
     if !matches!(declared, Construction::NullLit) {

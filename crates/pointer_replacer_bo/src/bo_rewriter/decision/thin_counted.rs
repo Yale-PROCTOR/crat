@@ -38,7 +38,9 @@ pub(crate) enum Count {
 #[derive(Debug, Clone)]
 pub(crate) struct Proof {
     pub count_parameter: usize,
+    #[allow(dead_code)]
     pub count: Count,
+    #[allow(dead_code)]
     pub callers: usize,
     pub reader: Option<thin_counted_entropy::ReaderProof>,
     pub members: Vec<LocalDefId>,

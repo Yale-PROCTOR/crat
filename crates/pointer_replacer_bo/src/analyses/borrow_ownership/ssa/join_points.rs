@@ -134,6 +134,12 @@ impl<Payload> FromIterator<(Local, Payload)> for BasicBlockNodes<Payload> {
     }
 }
 
+impl<T> Default for BasicBlockNodes<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> BasicBlockNodes<T> {
     pub fn new() -> Self {
         BasicBlockNodes {

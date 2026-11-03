@@ -1827,11 +1827,11 @@ fn classify_store_source(
             _ => return StoreSourceOrigin::Unknown,
         }
     }
-    let result = match keys.len() {
+
+    match keys.len() {
         0 => StoreSourceOrigin::Fresh,
         _ => StoreSourceOrigin::All(keys.into_iter().collect()),
-    };
-    result
+    }
 }
 
 #[cfg(test)]

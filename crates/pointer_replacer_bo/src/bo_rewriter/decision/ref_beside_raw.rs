@@ -774,9 +774,9 @@ pub(crate) fn holds(
                         base: Some(base),
                         through_deref: true,
                         ..
-                    } => !decision_of
+                    } => decision_of
                         .get(&(call.caller, base))
-                        .is_some_and(|decision| !is_raw(decision)),
+                        .is_none_or(|decision| is_raw(decision)),
                     ArgShape::RawExpr { .. } => arg.array_start_blind.unwrap_or(true),
                     ArgShape::AddrOf { .. }
                     | ArgShape::BareLocal(_)

@@ -154,6 +154,7 @@ struct Chain {
     /// The inner accessor this chain continues, if any.
     inner: Option<LocalDefId>,
     /// The parameter binding.
+    #[allow(dead_code)]
     param: HirId,
     param_name: String,
 }

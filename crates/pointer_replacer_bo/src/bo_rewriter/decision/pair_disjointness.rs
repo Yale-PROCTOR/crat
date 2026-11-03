@@ -467,11 +467,13 @@ struct ArgRecord {
     /// apart from the probe column below, which no rule may read.
     is_null: bool,
     /// R478-5 probe column; no rule reads it.
+    #[allow(dead_code)]
     why: UnknownWhy,
     /// R478-5: whether this argument is pointer-typed at all. The probe
     /// enumerates EVERY argument pair, scalars included; the census only ever
     /// asks about pointer positions, so the column's table filters on this.
     /// Probe-only; no rule reads it.
+    #[allow(dead_code)]
     is_pointer: bool,
     /// R624-1 (f): this argument is a direct read `(b).F` of an admitted,
     /// not offset-admitted field, and a store into `F` of the same object runs
@@ -2615,10 +2617,7 @@ fn allocator_fn_pointer_fields(
     assignments
         .into_iter()
         .filter_map(|(key, stores)| {
-            if stores
-                .iter()
-                .any(|store| *store == FieldStore::NotAnAllocator)
-            {
+            if stores.contains(&FieldStore::NotAnAllocator) {
                 return None;
             }
             let strongest = stores
@@ -2628,7 +2627,7 @@ fn allocator_fn_pointer_fields(
                     FieldStore::Unresolved | FieldStore::NotAnAllocator => None,
                 })
                 .reduce(Freshness::join)?;
-            let unresolved = stores.iter().any(|store| *store == FieldStore::Unresolved);
+            let unresolved = stores.contains(&FieldStore::Unresolved);
             Some((
                 key,
                 if unresolved {
@@ -3718,9 +3717,9 @@ fn classify_locals<'tcx>(
                 && fact.other_shapes.iter().all(|shape| *shape == "call")
             {
                 UnknownWhy::CallResult
-            } else if fact.other_shapes.iter().any(|shape| *shape == "field") {
+            } else if fact.other_shapes.contains(&"field") {
                 UnknownWhy::FieldRead
-            } else if fact.other_shapes.iter().any(|shape| *shape == "index") {
+            } else if fact.other_shapes.contains(&"index") {
                 UnknownWhy::IndexRead
             } else if fact.assignments.is_empty() {
                 UnknownWhy::NoFreshSource

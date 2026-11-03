@@ -29,7 +29,7 @@ fn observed_form(tcx: TyCtxt<'_>, ty: Ty<'_>) -> Option<Form> {
         TyKind::Adt(definition, arguments)
             if tcx.lang_items().option_type() == Some(definition.did()) =>
         {
-            let payload = arguments.get(0)?.as_type()?;
+            let payload = arguments.first()?.as_type()?;
             let TyKind::Ref(_, pointee, mutability) = payload.kind() else { return None };
             Some(Form::Opt {
                 mutable: mutability.is_mut(),

@@ -90,6 +90,12 @@ impl<T: Voidable> Consume<T> {
 
 impl<T: Copy> Copy for Consume<T> {}
 
+impl Default for Consume<SSAIdx> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Consume<SSAIdx> {
     #[inline]
     pub const fn new() -> Self {

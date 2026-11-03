@@ -563,9 +563,7 @@ pub(crate) fn deferred_argument_read<'tcx>(
                 let (later_dst, later_rvalue) = &**later_assign;
                 // A fresh local written by a non-writing rvalue that does not
                 // read `_t` itself.
-                if later_dst.as_local().is_none() {
-                    return None;
-                }
+                later_dst.as_local()?;
                 let pure = match later_rvalue {
                     Rvalue::Use(operand)
                     | Rvalue::Cast(_, operand, _)

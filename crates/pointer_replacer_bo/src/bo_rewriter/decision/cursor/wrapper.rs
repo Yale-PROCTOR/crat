@@ -798,6 +798,7 @@ impl Uses<'_, '_> {
     /// is itself a candidate of this family all fall back to the hold.
     fn ephemeral_copy(&self, e: &hir::Expr<'_>) -> Option<(hir::HirId, hir::HirId)> {
         struct Paths<'a, 'tcx> {
+            #[allow(dead_code)]
             tcx: ty::TyCtxt<'tcx>,
             binding: hir::HirId,
             sites: Vec<&'a hir::Expr<'a>>,
@@ -2152,12 +2153,12 @@ pub(super) fn plan(
 /// resolution in this family and this is it: `prospective` is a query parameter
 /// threaded to `table_element_base`, not a second entry point that would
 /// duplicate the resolution and drift from it.
-pub(crate) fn plan_with<'a>(
+pub(crate) fn plan_with(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
     decision: &Decision,
     entries: &[(Subject, Decision)],
-    prospective: Option<&'a super::ProspectiveTable>,
+    prospective: Option<&super::ProspectiveTable>,
 ) -> Option<Result<CursorPlan, CursorHold>> {
     // **R515-5(a), nested 019.** A row this family has ALREADY taken, re-planned
     // against a base that is about to flip. The selection question is answered —
@@ -2242,11 +2243,11 @@ pub(crate) fn plan_with<'a>(
     }
     Some(build(ctx, subject, entries, prospective))
 }
-pub(super) fn build<'a>(
+pub(super) fn build(
     ctx: &Ctx<'_, '_>,
     subject: &Subject,
     entries: &[(Subject, Decision)],
-    prospective: Option<&'a super::ProspectiveTable>,
+    prospective: Option<&super::ProspectiveTable>,
 ) -> Result<CursorPlan, CursorHold> {
     let parameter = matches!(subject.kind, SubjectKind::Param { .. });
     // **The entry window** (R472-6, route 1). A cursor rooted at a raw parameter

@@ -55,6 +55,7 @@ pub struct ModelFrame {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecutionRole {
     CacheOnly,
+    #[allow(dead_code)]
     Analysis,
 }
 /// The five L01″ consumption pins. Real environment setup remains gated;

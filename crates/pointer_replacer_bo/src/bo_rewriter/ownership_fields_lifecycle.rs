@@ -9,7 +9,9 @@ pub enum DropShape {
     Leaf,
     /// Legacy edges are mandatory; absence cannot certify a smaller value.
     Fields(Vec<OwnerId>),
+    #[allow(dead_code)]
     OwnedFields(Vec<DropEdge>),
+    #[allow(dead_code)]
     Unknown,
 }
 
@@ -21,8 +23,11 @@ pub struct DropEdge {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseKind {
+    #[allow(dead_code)]
     ScopeExit,
+    #[allow(dead_code)]
     Overwrite,
+    #[allow(dead_code)]
     Unwind,
 }
 
@@ -145,15 +150,14 @@ pub fn implicit_close(
         }
     }
     let is_recursive = recursive(payload, graph)?;
-    if let Some(depth) = depth {
-        if depth.key != key
+    if let Some(depth) = depth
+        && (depth.key != key
             || depth.kind != kind
             || depth.payload != payload
             || depth.graph_revision != graph_revision
-            || &depth.graph != graph
-        {
-            return Err(CloseHold::DepthWitnessMismatch);
-        }
+            || &depth.graph != graph)
+    {
+        return Err(CloseHold::DepthWitnessMismatch);
     }
     let bounded = depth.is_some_and(|w| w.maximum_depth <= w.admitted_depth);
     if is_recursive && !bounded {

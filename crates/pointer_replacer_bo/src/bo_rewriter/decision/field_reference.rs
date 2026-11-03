@@ -3074,27 +3074,24 @@ fn array_local_candidates(
                             // earlier (`mutable-elements`), so `as_mut_ptr`
                             // needs no arm of its own — it falls through to
                             // the shape hold below.
-                            match segment.ident.name.as_str() {
-                                "as_ptr" => {
-                                    self.sites.push(Site {
-                                        owner: self.owner,
-                                        kind: SiteKind::ArrayView,
-                                        span: p.span,
-                                        field_text: String::new(),
-                                        rhs: None,
-                                        local: None,
-                                        index_text: None,
-                                        consumer: None,
-                                        base: None,
-                                        raw_base: false,
-                                        assign_span: None,
-                                        hoists: Vec::new(),
-                                        cast: None,
-                                        written: false,
-                                    });
-                                    return;
-                                }
-                                _ => {}
+                            if segment.ident.name.as_str() == "as_ptr" {
+                                self.sites.push(Site {
+                                    owner: self.owner,
+                                    kind: SiteKind::ArrayView,
+                                    span: p.span,
+                                    field_text: String::new(),
+                                    rhs: None,
+                                    local: None,
+                                    index_text: None,
+                                    consumer: None,
+                                    base: None,
+                                    raw_base: false,
+                                    assign_span: None,
+                                    hoists: Vec::new(),
+                                    cast: None,
+                                    written: false,
+                                });
+                                return;
                             }
                         }
                         self.hold("array-use-shape");
@@ -3691,7 +3688,7 @@ pub(crate) fn finalize(
     // W6F-5: the decayed array views that the ladder settled as slices carry
     // their declaration here (the type comes from the local's own pointee and
     // the decision's form, exactly as a field-load local's does).
-    for (local, _) in &candidates.decayed_array_views {
+    for local in candidates.decayed_array_views.keys() {
         let Some((subject, decision)) = table
             .entries
             .iter()

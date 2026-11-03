@@ -155,7 +155,7 @@ pub(super) fn inspect<'tcx>(
             continue;
         }
         let SubjectKind::Param { hir_index } = s.kind else { continue };
-        if !flat_slice(d).is_some_and(|(mutable, _)| !mutable) {
+        if flat_slice(d).is_none_or(|(mutable, _)| mutable) {
             continue;
         }
         let Some(spelling) = s

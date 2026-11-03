@@ -39,6 +39,7 @@ pub(crate) fn present_unsafe_text(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum MechanicalFamily {
+    #[allow(dead_code)]
     UnsafeContext,
     A5ProofSiteFallback,
     SliceLocalConstruction,
@@ -47,27 +48,45 @@ pub(crate) enum MechanicalFamily {
     OptLocalConstruction,
     OptUseUnsupported,
     UnsupportedDeclShape,
+    #[allow(dead_code)]
     PairRawView,
     ReturnNotAdapted,
     FlowsIntoRawParam,
+    #[allow(dead_code)]
     BorrowedIntoRawParam,
+    #[allow(dead_code)]
     EscapesViaForeignArg,
+    #[allow(dead_code)]
     EscapesViaFieldStore,
+    #[allow(dead_code)]
     EscapesViaReturn,
+    #[allow(dead_code)]
     RawPointerOperation,
+    #[allow(dead_code)]
     PtrComparison,
+    #[allow(dead_code)]
     CopySourceCoupled,
+    #[allow(dead_code)]
     CastOfConvertingLocal,
+    #[allow(dead_code)]
     ArgCastFormUnbuilt,
+    #[allow(dead_code)]
     NestedUseEdits,
     CallSiteNotAdapted,
     ArgNullLiteral,
+    #[allow(dead_code)]
     PlaceReadPointee,
+    #[allow(dead_code)]
     DuplicatePlaceRoot,
+    #[allow(dead_code)]
     Composition,
+    #[allow(dead_code)]
     GeneratedDependency,
+    #[allow(dead_code)]
     MissingCArm,
+    #[allow(dead_code)]
     Diagnostic,
+    #[allow(dead_code)]
     JsonRecovery,
     Cursor,
 }
@@ -173,6 +192,7 @@ pub(crate) enum MechanicalSubjectKey {
         mir_local: u32,
         slot_depth: u32,
     },
+    #[allow(dead_code)]
     Field {
         owner: DefId,
         field_index: u32,
@@ -224,6 +244,7 @@ pub(crate) enum CanonicalLocation {
         owner: LocalDefId,
         item_local_id: u32,
     },
+    #[allow(dead_code)]
     Declaration {
         owner: LocalDefId,
         declaration_index: u32,
@@ -232,10 +253,8 @@ pub(crate) enum CanonicalLocation {
         defining_class: SignatureClassId,
         key: String,
     },
-    StaticRoot {
-        owner: LocalDefId,
-        root_index: u32,
-    },
+    #[allow(dead_code)]
+    StaticRoot { owner: LocalDefId, root_index: u32 },
 }
 
 impl CanonicalLocation {
@@ -372,6 +391,7 @@ impl MechanicalState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MechanicalMechanism {
+    #[allow(dead_code)]
     UnsafeContextPresentation,
     A5RawView,
     SliceConstruction,
@@ -379,18 +399,28 @@ pub(crate) enum MechanicalMechanism {
     OptionPresentation,
     OptionUnwrapRequired,
     DeclarationExplicitType,
+    #[allow(dead_code)]
     PairRawView,
     ReturnAdapter,
     RawParameterView,
+    #[allow(dead_code)]
     EscapeView,
+    #[allow(dead_code)]
     RawSink,
+    #[allow(dead_code)]
     CopyPropagation,
+    #[allow(dead_code)]
     CastAdapter,
+    #[allow(dead_code)]
     NestedComposition,
     CompositionHoist,
+    #[allow(dead_code)]
     GeneratedDependency,
+    #[allow(dead_code)]
     MissingCArm,
+    #[allow(dead_code)]
     DiagnosticCapture,
+    #[allow(dead_code)]
     JsonRecovery,
     SharedRefToMutRaw,
     Cursor,
@@ -471,8 +501,10 @@ impl MechanicalMechanism {
 pub(crate) enum MechanicalTerminalReason {
     ClassReverted(String),
     ProgramDegradedUnmodifiedInput,
+    #[allow(dead_code)]
     PreCompileDegraded(String),
     RbNegativeWriteAbsent,
+    #[allow(dead_code)]
     CalleeWrites,
     PositiveRetention,
     SliceUseDestinationUnbuilt(String),
@@ -494,10 +526,15 @@ pub(crate) enum MechanicalTerminalReason {
     CompositionCrossingUnhoistable(String),
     Cursor,
     BoxFamily,
+    #[allow(dead_code)]
     FreedSlot,
+    #[allow(dead_code)]
     AnalysisRaw,
+    #[allow(dead_code)]
     ForeignItem,
+    #[allow(dead_code)]
     ImplItem,
+    #[allow(dead_code)]
     IoDomain,
     EvidenceMissing(String),
     /// **R450-3.** The adapter was not held for want of evidence — it was
@@ -638,6 +675,7 @@ pub(crate) enum NegativeWriteEvidence {
     FosterImmutable,
     LibcReadOnly(String),
     Missing,
+    #[allow(dead_code)]
     Writes,
 }
 
@@ -680,7 +718,9 @@ impl TerminalContract {
 pub(crate) enum HoistSafety {
     NotApplicable,
     Place,
+    #[allow(dead_code)]
     SideEffectFreeUnconditional,
+    #[allow(dead_code)]
     Unhoistable(String),
 }
 

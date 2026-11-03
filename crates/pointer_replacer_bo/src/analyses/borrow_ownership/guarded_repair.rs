@@ -862,7 +862,7 @@ impl Planner {
                 continue;
             }
             let mut sources = blame_sources.remove(&blamed).unwrap_or_default();
-            sources.sort_by(|a, b| a.key().cmp(&b.key()));
+            sources.sort_by_key(|a| a.key());
             match lifecycle_before
                 .get(&blamed)
                 .copied()
@@ -924,7 +924,7 @@ impl Planner {
             if existing
                 .len()
                 .checked_add(target_additions.len())
-                .map_or(true, |count| count > Self::HAZARD_KEY_BUDGET)
+                .is_none_or(|count| count > Self::HAZARD_KEY_BUDGET)
             {
                 let mut candidate = target_additions
                     .first()

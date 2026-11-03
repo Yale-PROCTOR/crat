@@ -207,7 +207,7 @@ where 'tcx: 'infercx
                         (reader, lent)
                     })
                     .unwrap_or((false, false));
-                let container = lent.then(|| (output_param.r#use.start, output_param.def.start));
+                let container = lent.then_some((output_param.r#use.start, output_param.def.start));
                 if lent {
                     ownership_boundary::lent(&mut argument_record);
                     if let (Some(before), Some(after)) =

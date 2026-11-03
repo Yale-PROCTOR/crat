@@ -285,6 +285,7 @@ pub(crate) struct FunctionExposure {
 pub(crate) struct ExposurePolicy {
     functions: Vec<FunctionExposure>,
     static_fnptr_seeds: Vec<StaticFnPtrSeed>,
+    #[allow(dead_code)]
     seed_counts: SeedCounts,
     /// The seed's configured names that matched no local function (R1295-1).
     pub(crate) unmatched: Vec<String>,

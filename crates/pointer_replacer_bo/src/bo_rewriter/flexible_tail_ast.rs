@@ -141,36 +141,35 @@ impl MutVisitor for Apply<'_> {
                 field.ty = P(::utils::ast::parse_ty(format!("Box<[{element}]>")));
                 strip_copy_clone_derives(&mut item.attrs);
                 self.placed_structs.insert(did);
-            } else if let rustc_ast::ItemKind::Fn(function) = &mut item.kind {
-                if let Some(output) = self.returns.get(&did) {
-                    // The output type's own node: a parameter pass may hold
-                    // the item, and the two edits do not overlap.
-                    let (claim_id, claim_span) = match &function.sig.decl.output {
-                        rustc_ast::FnRetTy::Ty(ty) => (ty.id, ty.span),
-                        rustc_ast::FnRetTy::Default(_) => (item.id, item.span),
-                    };
-                    if !self
-                        .guard
-                        .claim(claim_id, claim_span, "flexible-tail:return")
-                    {
-                        self.failures.push(format!("return-claim-refused:{did:?}"));
-                        return smallvec![item];
-                    }
-                    // The source's own pointee spelling, boxed — the same text
-                    // the receivers' declarations carry.
-                    let boxed = match &function.sig.decl.output {
-                        rustc_ast::FnRetTy::Ty(ty) if !output.starts_with("Option<") => {
-                            boxed_pointee(ty).unwrap_or_else(|| output.clone())
-                        }
-                        // W6A-A1: the certificate's own text (`Option<Box<T>>`).
-                        _ => output.clone(),
-                    };
-                    function.sig.decl.output =
-                        rustc_ast::FnRetTy::Ty(P(::utils::ast::parse_ty(boxed)));
-                    self.placed_returns.insert(did);
+            } else if let rustc_ast::ItemKind::Fn(function) = &mut item.kind
+                && let Some(output) = self.returns.get(&did)
+            {
+                // The output type's own node: a parameter pass may hold
+                // the item, and the two edits do not overlap.
+                let (claim_id, claim_span) = match &function.sig.decl.output {
+                    rustc_ast::FnRetTy::Ty(ty) => (ty.id, ty.span),
+                    rustc_ast::FnRetTy::Default(_) => (item.id, item.span),
+                };
+                if !self
+                    .guard
+                    .claim(claim_id, claim_span, "flexible-tail:return")
+                {
+                    self.failures.push(format!("return-claim-refused:{did:?}"));
+                    return smallvec![item];
                 }
-                // Owning parameters are subjects: the declaration pass boxes them.
+                // The source's own pointee spelling, boxed — the same text
+                // the receivers' declarations carry.
+                let boxed = match &function.sig.decl.output {
+                    rustc_ast::FnRetTy::Ty(ty) if !output.starts_with("Option<") => {
+                        boxed_pointee(ty).unwrap_or_else(|| output.clone())
+                    }
+                    // W6A-A1: the certificate's own text (`Option<Box<T>>`).
+                    _ => output.clone(),
+                };
+                function.sig.decl.output = rustc_ast::FnRetTy::Ty(P(::utils::ast::parse_ty(boxed)));
+                self.placed_returns.insert(did);
             }
+            // Owning parameters are subjects: the declaration pass boxes them.
         }
         rustc_ast::mut_visit::walk_flat_map_item(self, item)
     }

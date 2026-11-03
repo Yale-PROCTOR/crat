@@ -44,6 +44,7 @@ use super::{Ctx, Decision, DeclShape, Subject, SubjectKind, declaration, seam};
 use crate::bo_rewriter::{additive::FamilyStage, bridge_receipt::SignatureClassId};
 
 pub(crate) struct CallResultValue {
+    #[allow(dead_code)]
     pub(crate) initializer: Span,
     pub(crate) pointee: String,
     pub(crate) callee: LocalDefId,
@@ -115,6 +116,7 @@ fn local_callee(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> Option<LocalDefId> {
 /// null test, a dereference (`*cmd`, `(*cmd).field`), or a field access. A
 /// `return`, a store, a cast and a call argument are all refused here.
 struct Uses<'tcx> {
+    #[allow(dead_code)]
     tcx: TyCtxt<'tcx>,
     binding: HirId,
     ok: bool,
@@ -377,7 +379,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Window<'a, 'tcx> {
                     self.visit_expr(arg);
                 }
             }
-            ExprKind::MethodCall(segment, receiver, args, _) => {
+            ExprKind::MethodCall(segment, receiver, _args, _) => {
                 if self.is_the_local(receiver) && segment.ident.name.as_str() == "is_null" {
                     return;
                 }

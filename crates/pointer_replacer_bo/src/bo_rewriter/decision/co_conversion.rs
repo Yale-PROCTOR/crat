@@ -95,6 +95,7 @@ pub(crate) enum BlockReason {
     /// the unchecked one — is exactly this distinction, so a census that
     /// reported both as `flows-into-raw-param` would file a compiler-caught
     /// revert risk under a silent-UB reason.
+    #[allow(dead_code)]
     FlowsIntoOtherForm,
     /// The same silent coercion, into a **pinned** callee — one whose signature
     /// is fixed by a fn-pointer cast and which M1 will never adapt.
@@ -205,6 +206,7 @@ pub(crate) enum OverlapRule {
     /// soundness.
     BlindOnly,
     /// Block every mutable pair regardless of roots — maximal conservatism.
+    #[allow(dead_code)]
     AllPairs,
 }
 

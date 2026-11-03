@@ -1487,20 +1487,18 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                         // and the end pointer `let end = p.offset(n)`.
                         let offset = segment.ident.name.as_str() == "offset";
                         self.classify(e, index, offset);
-                    } else {
-                        if !read_in_place(self.tcx, e) {
-                            // A masked address handed on, or read wide through
-                            // a cast, reads past `mask` (relay 065, the final
-                            // probe on `FindLongestMatchHROLLING_FAST`).
-                            self.unproven = true;
-                        } else if masked_local(self.tcx, self.body, index, self.companion) {
-                            self.local_masked = true;
-                        } else if !pure_inline_mask(index, self.companion) {
-                            // (the third review's B-2) `data[(v & mask)]` is
-                            // proven in place too; it neither makes nor unmakes
-                            // the in-place verdict.
-                            self.unproven = true;
-                        }
+                    } else if !read_in_place(self.tcx, e) {
+                        // A masked address handed on, or read wide through
+                        // a cast, reads past `mask` (relay 065, the final
+                        // probe on `FindLongestMatchHROLLING_FAST`).
+                        self.unproven = true;
+                    } else if masked_local(self.tcx, self.body, index, self.companion) {
+                        self.local_masked = true;
+                    } else if !pure_inline_mask(index, self.companion) {
+                        // (the third review's B-2) `data[(v & mask)]` is
+                        // proven in place too; it neither makes nor unmakes
+                        // the in-place verdict.
+                        self.unproven = true;
                     }
                 }
                 ExprKind::Index(base, index, _) if is_binding(base, self.binding) => {
@@ -1512,20 +1510,18 @@ fn index_bound_by_companion(tcx: TyCtxt<'_>, function: LocalDefId, parameter: us
                         }
                     } else if !self.mask_formal {
                         self.classify(e, index, false);
-                    } else {
-                        if !read_in_place(self.tcx, e) {
-                            // A masked address handed on, or read wide through
-                            // a cast, reads past `mask` (relay 065, the final
-                            // probe on `FindLongestMatchHROLLING_FAST`).
-                            self.unproven = true;
-                        } else if masked_local(self.tcx, self.body, index, self.companion) {
-                            self.local_masked = true;
-                        } else if !pure_inline_mask(index, self.companion) {
-                            // (the third review's B-2) `data[(v & mask)]` is
-                            // proven in place too; it neither makes nor unmakes
-                            // the in-place verdict.
-                            self.unproven = true;
-                        }
+                    } else if !read_in_place(self.tcx, e) {
+                        // A masked address handed on, or read wide through
+                        // a cast, reads past `mask` (relay 065, the final
+                        // probe on `FindLongestMatchHROLLING_FAST`).
+                        self.unproven = true;
+                    } else if masked_local(self.tcx, self.body, index, self.companion) {
+                        self.local_masked = true;
+                    } else if !pure_inline_mask(index, self.companion) {
+                        // (the third review's B-2) `data[(v & mask)]` is
+                        // proven in place too; it neither makes nor unmakes
+                        // the in-place verdict.
+                        self.unproven = true;
                     }
                 }
                 _ => {}

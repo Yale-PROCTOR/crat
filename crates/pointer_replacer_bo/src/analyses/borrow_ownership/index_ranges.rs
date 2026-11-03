@@ -276,12 +276,12 @@ impl Bound {
 
     fn min(self, other: Bound) -> Option<Bound> {
         self.comparable(other)
-            .then(|| if self.add <= other.add { self } else { other })
+            .then_some(if self.add <= other.add { self } else { other })
     }
 
     fn max(self, other: Bound) -> Option<Bound> {
         self.comparable(other)
-            .then(|| if self.add >= other.add { self } else { other })
+            .then_some(if self.add >= other.add { self } else { other })
     }
 }
 
@@ -3276,9 +3276,9 @@ impl<'a, 'tcx> Ctx<'a, 'tcx> {
                         },
                         At::Terminator(_) => None,
                     };
-                    if !taken
+                    if taken
                         .and_then(|local| self.derivs.get(&local))
-                        .is_some_and(|deriv| deriv.root == holder)
+                        .is_none_or(|deriv| deriv.root != holder)
                     {
                         return Footprint::Unknown("holder-address");
                     }

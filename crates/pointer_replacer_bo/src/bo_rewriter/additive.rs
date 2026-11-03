@@ -831,7 +831,7 @@ fn only_change_is_superseded(
 fn protected_from_retirement(
     prior: &StageSnapshot,
     candidate: &StageSnapshot,
-    policy: &FamilyPolicy,
+    _policy: &FamilyPolicy,
     owner: SignatureClassId,
     hir: HirId,
 ) -> bool {
@@ -1682,15 +1682,13 @@ impl RetiredReceipts {
             if let super::mechanical_receipt::MechanicalSubjectKey::Local {
                 owner, mir_local, ..
             } = obligation.planned.key.subject
-            {
-                if let Some((_, old)) = prior
+                && let Some((_, old)) = prior
                     .table
                     .entries
                     .iter()
                     .find(|(s, _)| s.fn_did == owner && s.local.as_u32() == mir_local)
-                {
-                    obligation.planned.found_form = decision::seam::form_of(old).key().to_owned();
-                }
+            {
+                obligation.planned.found_form = decision::seam::form_of(old).key().to_owned();
             }
             let site_cause = obligation.intended_terminal_reason.as_ref().map_or_else(
                 || format!("owner-cause:{}", withdrawal.cause),

@@ -664,7 +664,7 @@ impl Discharges {
             releasing,
             Location {
                 block: BasicBlock::from_usize(event.source.key.block as usize),
-                statement_index: event.source.key.statement as usize,
+                statement_index: event.source.key.statement,
             },
         );
         let mut steps = event.route.iter();

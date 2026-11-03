@@ -238,11 +238,29 @@ fn flexible_tail_evidence(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecordedEquation {
-    Linear { left: Var, right: Var, result: Var },
-    Assume { var: Var, value: bool },
-    Equal { left: Var, right: Var },
-    LessEqual { left: Var, right: Var },
-    EqMin { result: Var, left: Var, right: Var },
+    Linear {
+        left: Var,
+        right: Var,
+        result: Var,
+    },
+    Assume {
+        var: Var,
+        value: bool,
+    },
+    Equal {
+        left: Var,
+        right: Var,
+    },
+    LessEqual {
+        left: Var,
+        right: Var,
+    },
+    #[allow(dead_code)]
+    EqMin {
+        result: Var,
+        left: Var,
+        right: Var,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -696,7 +714,9 @@ pub(crate) enum ConstructionBridgeFailure {
     MultipleDefinitions,
     BranchOrJoinFed,
     NonTransparentRvalue,
+    #[allow(dead_code)]
     ProjectedPlace,
+    #[allow(dead_code)]
     CrossFunctionHop,
     MultipleTerminals,
     DifferentSubject,
@@ -1501,6 +1521,7 @@ pub(crate) struct BoxOwnershipFacts {
     equations: Vec<RecordedEquation>,
     version_sites: Vec<VersionSite>,
     endpoints: Vec<EndpointFact>,
+    #[allow(dead_code)]
     replay_error: Option<String>,
     canonical_sha256: String,
     move_edges: Vec<(SlotRef, SlotRef)>,
@@ -1533,6 +1554,7 @@ impl BoxPointeeOverride {
 pub(crate) enum ImplicitCloseKind {
     Overwrite,
     ScopeExit,
+    #[allow(dead_code)]
     Unwind,
 }
 
@@ -2306,7 +2328,7 @@ impl BoxOwnershipFacts {
                 super::construction::Construction::Alloc { callee, .. } => Some(callee.as_str()),
                 _ => None,
             })
-            .or_else(|| match construction {
+            .or(match construction {
                 super::construction::Construction::Alloc { callee, .. } => Some(callee.as_str()),
                 _ => None,
             })

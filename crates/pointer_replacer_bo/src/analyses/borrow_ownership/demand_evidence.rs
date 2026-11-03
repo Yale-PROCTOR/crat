@@ -357,10 +357,10 @@ impl DemandEvidence {
                 {
                     return Err("core endpoint was not active".to_owned());
                 }
-                if let Some(candidate) = &event.candidate {
-                    if !endpoints.contains(candidate) || !event.active.contains(candidate) {
-                        return Err("dangling or inactive candidate".to_owned());
-                    }
+                if let Some(candidate) = &event.candidate
+                    && (!endpoints.contains(candidate) || !event.active.contains(candidate))
+                {
+                    return Err("dangling or inactive candidate".to_owned());
                 }
                 match event.phase {
                     QueryPhase::SelectorSearch

@@ -777,7 +777,7 @@ fn rvalue_operands<'tcx>(rvalue: &Rvalue<'tcx>, visit: &mut impl FnMut(&Operand<
             visit(left);
             visit(right);
         }
-        Rvalue::Aggregate(_, operands) => operands.iter().for_each(|operand| visit(operand)),
+        Rvalue::Aggregate(_, operands) => operands.iter().for_each(visit),
         _ => {}
     }
 }

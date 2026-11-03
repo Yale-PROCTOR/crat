@@ -423,9 +423,9 @@ pub(crate) fn audit(
     })
 }
 
-fn one<'a>(
-    rows: Vec<&'a super::super::ownership_occurrence::Consumption>,
-) -> Result<&'a super::super::ownership_occurrence::Consumption, Hold> {
+fn one(
+    rows: Vec<&super::super::ownership_occurrence::Consumption>,
+) -> Result<&super::super::ownership_occurrence::Consumption, Hold> {
     let [row] = rows.as_slice() else { return Err(Hold::LawCoverage) };
     Ok(*row)
 }

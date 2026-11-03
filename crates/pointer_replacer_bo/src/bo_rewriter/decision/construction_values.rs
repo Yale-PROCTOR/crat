@@ -117,7 +117,6 @@ fn admissible_source(tcx: TyCtxt<'_>, source: &Subject) -> bool {
     match source.kind {
         SubjectKind::Param { .. } => true,
         SubjectKind::Local => copy_value(tcx, source).is_none(),
-        _ => false,
     }
 }
 

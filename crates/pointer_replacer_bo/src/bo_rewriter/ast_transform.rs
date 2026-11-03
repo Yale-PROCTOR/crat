@@ -1997,10 +1997,10 @@ pub(crate) struct SeamGraftStats {
 /// `Paren` between the cast and its operand shifts the node without shifting
 /// the span, so the search is by the coordinate the decision layer actually
 /// recorded.
-pub(super) fn find_by_span<'a>(
-    e: &'a rustc_ast::Expr,
+pub(super) fn find_by_span(
+    e: &rustc_ast::Expr,
     want: rustc_span::Span,
-) -> Option<&'a rustc_ast::Expr> {
+) -> Option<&rustc_ast::Expr> {
     struct Find<'a> {
         want: rustc_span::Span,
         hit: Option<&'a rustc_ast::Expr>,
@@ -2786,7 +2786,7 @@ impl<'a> SeamGraftVisitor<'a> {
             glue_expr(GlueShape::Some_, spec.mutable, core, None)
                 .expect("the `Some` wrapper is length-free and cannot decline")
         } else {
-            (*core).kind
+            core.kind
         })
     }
 }

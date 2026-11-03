@@ -358,7 +358,7 @@ fn inputs(expression: &Expression) -> Vec<&PlaceSyntax> {
     }
 }
 
-fn uses<'a>(rows: &'a [SourceOccurrence], local: u32) -> Vec<&'a SourceOccurrence> {
+fn uses(rows: &[SourceOccurrence], local: u32) -> Vec<&SourceOccurrence> {
     rows.iter()
         .filter(|row| {
             inputs(&row.syntax.expression)

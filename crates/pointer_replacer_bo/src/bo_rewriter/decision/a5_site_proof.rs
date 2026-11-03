@@ -145,7 +145,9 @@ pub(crate) struct A5SeamProofIndex {
     unavailable: Option<&'static str>,
     world: &'static str,
     guard: &'static str,
+    #[allow(dead_code)]
     global_setup_wall_s: f64,
+    #[allow(dead_code)]
     pair_classification_wall_s: f64,
     /// wave-6p (R400-4): disjointness certificates consulted when the audited
     /// verdict is not `Clear`. Absent until attached; never attached to an

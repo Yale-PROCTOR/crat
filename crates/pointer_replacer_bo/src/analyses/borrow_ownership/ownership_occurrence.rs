@@ -701,25 +701,25 @@ pub(crate) fn validate_terminal_links(
         {
             return Err("multiple terminals for one local at one return point".into());
         }
-        if terminal.role == "local-final-zero" {
-            if let Present(values) = &terminal.values {
-                let mut seen = std::collections::BTreeSet::new();
-                for value in values {
-                    if !seen.insert(value.var)
-                        || !zeros
-                            .get(&terminal.point)
-                            .is_some_and(|vars| vars.contains(&value.var))
-                    {
-                        return Err(format!(
-                            "terminal final value has no corresponding zero assumption: {:?} local {} var {}",
-                            terminal.point, terminal.local, value.var
-                        ));
-                    }
-                    witnessed
-                        .entry(terminal.point.clone())
-                        .or_default()
-                        .insert(value.var);
+        if terminal.role == "local-final-zero"
+            && let Present(values) = &terminal.values
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            for value in values {
+                if !seen.insert(value.var)
+                    || !zeros
+                        .get(&terminal.point)
+                        .is_some_and(|vars| vars.contains(&value.var))
+                {
+                    return Err(format!(
+                        "terminal final value has no corresponding zero assumption: {:?} local {} var {}",
+                        terminal.point, terminal.local, value.var
+                    ));
                 }
+                witnessed
+                    .entry(terminal.point.clone())
+                    .or_default()
+                    .insert(value.var);
             }
         }
     }

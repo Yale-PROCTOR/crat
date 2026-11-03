@@ -7,6 +7,9 @@
 #![feature(trusted_step)]
 #![feature(impl_trait_in_assoc_type)]
 #![warn(unused_extern_crates)]
+// Since the master merge exposes these modules (`pub mod analyses`) to the new plugin, a few
+// `pub fn new()` types become public API; master's code is unchanged.
+#![allow(clippy::new_without_default)]
 
 extern crate either;
 extern crate rustc_abi;

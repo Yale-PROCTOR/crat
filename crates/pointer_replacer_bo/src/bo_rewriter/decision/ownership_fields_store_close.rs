@@ -142,7 +142,7 @@ fn taken_in_value(
     is_moved: &dyn Fn(&Expr<'_>) -> bool,
 ) -> Option<NoneWitness> {
     let ExprKind::Call(_, arguments) = peel(value).kind else { return None };
-    (arguments.iter().any(|a| is_moved(a)) && mentions(value, base) == 1)
+    (arguments.iter().any(is_moved) && mentions(value, base) == 1)
         .then_some(NoneWitness::TakenInValue)
 }
 

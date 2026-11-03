@@ -1098,7 +1098,7 @@ fn slice_uses_of(
         let admitted = raw
             .boundary_span
             .is_some_and(|b| boundaries.iter().any(|allowed| allowed.contains(b)))
-            || fields.iter().any(|field| *field == raw.span);
+            || fields.contains(&raw.span);
         if !admitted {
             return Err(format!(
                 "raw-use:{}",

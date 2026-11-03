@@ -1119,7 +1119,7 @@ pub(crate) fn count_argument<'tcx>(
             return Ok((width.render(), route));
         }
         if route != Route::RawTwin {
-            let discriminant = width.discriminant.map(|k| args.get(k)).flatten();
+            let discriminant = width.discriminant.and_then(|k| args.get(k));
             super::binn_counted::root_rule(tcx, table, site.caller, argument, width, discriminant)?;
         }
         return Ok((width.render(), route));
@@ -1464,7 +1464,7 @@ fn is_allocation_call(tcx: TyCtxt<'_>, owner: LocalDefId, e: &Expr<'_>) -> bool 
         return matches!(tcx.item_name(did).as_str(), "malloc" | "calloc");
     }
     let Some(local) = did.as_local() else { return false };
-    if !tcx.hir_maybe_body_owned_by(local).is_some() {
+    if tcx.hir_maybe_body_owned_by(local).is_none() {
         return false;
     }
     let body = tcx.hir_body_owned_by(local).value;
@@ -2762,7 +2762,7 @@ impl rustc_ast::mut_visit::MutVisitor for CallGraft<'_> {
             self.consumed.insert(key);
             return;
         }
-        let rustc_ast::ExprKind::Call(callee, args) = &mut e.kind else {
+        let rustc_ast::ExprKind::Call(callee, _args) = &mut e.kind else {
             // R410-2(d): a call another family's edit already replaced (an
             // A5 / PAIR raw-view snapshot wraps the call in a block) — the
             // counted-void plan YIELDS the call: it is consumed, unplaced,

@@ -583,7 +583,6 @@ fn nested_ast_composition(
                     // re-rendered inner as wave-6l's build; until it lands
                     // such a site holds at apply time (`apply-site-rollback`,
                     // the one owner) instead of holding both classes here.
-                    | ("c-raw-reborrow-shared", "shared-weakening")
                     | ("typed-raw-temporary", "box-expression")
                     // Relay 025: the mutable twin — quadtree's `find_(
                     // get_quadrant_(node, &mut test), x, y)`, the three
@@ -950,10 +949,9 @@ pub(crate) fn link_a5_fallback_carriers(
                             && view.expected_form == Form::Raw
                             && view.adapted_expression == super::c9::A5_RAW_VALUE_PLACEHOLDER
                     })
+                    && let Ok((file, lo, hi)) = locate(call.call_span)
                 {
-                    if let Ok((file, lo, hi)) = locate(call.call_span) {
-                        calls.push((file, lo, hi, "a5-proof-site-raw-view"));
-                    }
+                    calls.push((file, lo, hi, "a5-proof-site-raw-view"));
                 }
             }
             for call in &table.seams.pair_raw_calls {
@@ -967,10 +965,9 @@ pub(crate) fn link_a5_fallback_carriers(
                         .views
                         .iter()
                         .any(|view| view.argument_index == proof.index)
+                    && let Ok((file, lo, hi)) = locate(call.call_span)
                 {
-                    if let Ok((file, lo, hi)) = locate(call.call_span) {
-                        calls.push((file, lo, hi, "pair-raw-view"));
-                    }
+                    calls.push((file, lo, hi, "pair-raw-view"));
                 }
             }
         }
@@ -4913,22 +4910,21 @@ pub(crate) fn plan(
             | Decision::Box(_)
             | Decision::Degraded(_) => None,
         };
-        if let Some(base) = cursor_plan.and_then(|plan| plan.delivered_base.as_ref()) {
-            if let Some(atoms) = table
+        if let Some(base) = cursor_plan.and_then(|plan| plan.delivered_base.as_ref())
+            && let Some(atoms) = table
                 .seams
                 .raw_boundary_atom_groups
                 .get(&(subject.fn_did, base.binding))
-            {
-                for atom in atoms {
-                    cursor_base_atom_owners
-                        .entry(atom.id.clone())
-                        .or_default()
-                        .insert(SignatureClassId::of(subject.fn_did));
-                    subject_atom_ids.push(atom.id.clone());
-                }
-                subject_atom_ids.sort();
-                subject_atom_ids.dedup();
+        {
+            for atom in atoms {
+                cursor_base_atom_owners
+                    .entry(atom.id.clone())
+                    .or_default()
+                    .insert(SignatureClassId::of(subject.fn_did));
+                subject_atom_ids.push(atom.id.clone());
             }
+            subject_atom_ids.sort();
+            subject_atom_ids.dedup();
         }
         let (mutable, use_edits_in, optional, fat, box_plan) = match decision {
             Decision::Cursor { mutable, plan } => {
@@ -5090,7 +5086,7 @@ pub(crate) fn plan(
             || super::decision::null_init_declaration::has_explicit_declaration(
                 table, subject, decision,
             );
-        let planned_declaration = inferred_box || typed_pattern || typed_receiver;
+        let _planned_declaration = inferred_box || typed_pattern || typed_receiver;
         // wave-6f: a local loaded from a converting field carries an explicit
         // declaration planned by the field transaction; no type span to splice.
         let typed_field_load = typed_field_load(table, subject);
@@ -5411,7 +5407,7 @@ pub(crate) fn plan(
                                 Arm::Surface.key()
                             },
                             if raw_op {
-                                format!("{}@{}..{}", subject_id, lo, hi)
+                                format!("{subject_id}@{lo}..{hi}")
                             } else {
                                 subject_id.clone()
                             },

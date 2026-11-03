@@ -14,8 +14,10 @@ pub enum Kind {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GrantStatus {
+    #[allow(dead_code)]
     Candidate,
     Selected,
+    #[allow(dead_code)]
     Retracted,
 }
 #[derive(Clone, Debug)]
@@ -60,8 +62,10 @@ pub enum EmitHold {
     LiveReference,
     Protector,
     MissingEvidence(&'static str),
+    #[allow(dead_code)]
     WrongClose,
     SinkIdentity,
+    #[allow(dead_code)]
     Construction,
 }
 

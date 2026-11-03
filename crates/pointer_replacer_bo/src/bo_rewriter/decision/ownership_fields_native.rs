@@ -38,8 +38,10 @@ type Node = (LocalDefId, HirId);
 pub(crate) enum NativeHold {
     Source(SourceHold),
     Call(Hold),
+    #[allow(dead_code)]
     Missing(&'static str),
     Identity,
+    #[allow(dead_code)]
     Peer(&'static str),
     FinalInterface,
 }
@@ -1778,8 +1780,7 @@ fn derive_bundle(
             let nonconsuming_scope =
                 formal::require_nonconsuming(effects, &emitted).map_err(NativeHold::Call)?;
             receipts.push(format!(
-                "native-nonconsuming-proof {:?} arg={argument} scope={nonconsuming_scope}",
-                key
+                "native-nonconsuming-proof {key:?} arg={argument} scope={nonconsuming_scope}"
             ));
             let retention_scope = match inputs.retention.get(callee, argument) {
                 Some(RetentionVerdict::NoRetain { certificate }) => {
@@ -1797,8 +1798,7 @@ fn derive_bundle(
                     .scope(),
             };
             receipts.push(format!(
-                "native-noretention-proof {:?} arg={argument} scope={retention_scope}",
-                key
+                "native-noretention-proof {key:?} arg={argument} scope={retention_scope}"
             ));
             if yield_discharged {
                 receipts.push(format!(

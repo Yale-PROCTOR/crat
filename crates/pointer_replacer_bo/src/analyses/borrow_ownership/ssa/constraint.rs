@@ -150,6 +150,12 @@ pub struct Gen {
     next: Var,
 }
 
+impl Default for Gen {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Gen {
     #[inline]
     pub const fn new() -> Self {
@@ -405,6 +411,12 @@ impl Database for () {
 pub struct Z3Database {
     pub solver: z3::Solver,
     pub z3_ast: IndexVec<Var, z3::ast::Bool>,
+}
+
+impl Default for Z3Database {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Z3Database {

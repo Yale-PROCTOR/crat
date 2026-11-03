@@ -21,7 +21,9 @@ pub struct EdgeKey {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Payload {
+    #[allow(dead_code)]
     Sized(String),
+    #[allow(dead_code)]
     Slice(String),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +46,9 @@ pub struct Formal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retention {
     T1NoRetention,
+    #[allow(dead_code)]
     Unknown,
+    #[allow(dead_code)]
     Retains,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +59,7 @@ pub struct RetentionProof {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestedUse {
     Lend,
+    #[allow(dead_code)]
     Move,
 }
 #[derive(Clone, Debug)]

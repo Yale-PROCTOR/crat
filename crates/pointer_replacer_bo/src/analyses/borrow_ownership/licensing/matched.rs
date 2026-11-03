@@ -727,7 +727,7 @@ fn round_sizes(
 /// the targets in `base`; `B_d` = sum over scopes of seeds x |R_d| (seeds = the scope's inputs and
 /// its own sources' endpoints), `T_d` = sum of |R_d|, the largest |R_d|, and the scopes with |R_d|
 /// >= 1,000 / >= 10,000; for d = 0..=10, 16, 24, 32, 48 and the last level, and where the sets stop
-/// growing (`inf`); the Port side (sum of seeds x outputs, local), and the scopes per SCC height.
+/// > growing (`inf`); the Port side (sum of seeds x outputs, local), and the scopes per SCC height.
 fn closure_lines(facts: &Facts, base: &BTreeMap<Scope, Function>) -> Vec<String> {
     if !crate::phase_log::sub_marks_on() {
         return Vec::new();
@@ -2496,7 +2496,7 @@ impl MatchedTransport {
         // order and first proofs, the rounds and the final functions are the full fixpoint's, and
         // `base` is cloned whole once. The reference switch keeps the full rounds.
         let scan = reference_scans();
-        let callers_of = callers_of(&calls);
+        let callers_of = callers_of(calls);
         let mut calls_by_caller: BTreeMap<Scope, Vec<(&CallKey, &Call)>> = BTreeMap::new();
         for (key, call) in calls {
             calls_by_caller
@@ -2537,7 +2537,7 @@ impl MatchedTransport {
                 if affected.is_some() {
                     super::freeze_counts::base_recloned();
                 }
-                functions = Self::apply(&base, &calls, &relations);
+                functions = Self::apply(base, calls, &relations);
             }
             crate::phase_log::sub("matched:apply", "end", || {
                 format!(
@@ -2919,15 +2919,18 @@ impl MatchedTransport {
             .values()
             .filter(|function| function.contains(node))
             .flat_map(|function| {
-                function.sources.iter().filter_map(|source| {
-                    function
-                        .paths(source.node, source.guards.clone(), source.proof.clone())
-                        .keys()
-                        .any(|(reached, guards)| {
-                            *reached == node && !(exact && guards.is_summarized())
-                        })
-                        .then(|| source.instance.clone())
-                })
+                function
+                    .sources
+                    .iter()
+                    .filter(|&source| {
+                        function
+                            .paths(source.node, source.guards.clone(), source.proof.clone())
+                            .keys()
+                            .any(|(reached, guards)| {
+                                *reached == node && !(exact && guards.is_summarized())
+                            })
+                    })
+                    .map(|source| source.instance.clone())
             })
             .collect()
     }

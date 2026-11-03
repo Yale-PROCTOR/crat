@@ -91,7 +91,7 @@ fn assignments<'tcx>(
         binding,
         out: &mut out,
     }
-    .visit_body(&body);
+    .visit_body(body);
     out
 }
 
@@ -180,7 +180,7 @@ pub(crate) fn admit(
     let rustc_hir::Node::Expr(assign) = tcx.parent_hir_node(use_expr.hir_id) else {
         return None;
     };
-    let ExprKind::Assign(lhs, rhs, _) = assign.kind else {
+    let ExprKind::Assign(lhs, _rhs, _) = assign.kind else {
         return None;
     };
     if lhs.hir_id != use_expr.hir_id {

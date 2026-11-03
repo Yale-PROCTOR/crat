@@ -419,12 +419,11 @@ pub(crate) fn effects(
                     field_state = Some(Value::Null);
                 }
                 Expression::Value { operand } | Expression::Cast { operand, .. } => {
-                    if let Expression::Cast { cast, .. } = &row.syntax.expression {
-                        if cast != "PtrToPtr"
-                            && row.syntax.immediate_origin != ImmediateOrigin::Null
-                        {
-                            return None;
-                        }
+                    if let Expression::Cast { cast, .. } = &row.syntax.expression
+                        && cast != "PtrToPtr"
+                        && row.syntax.immediate_origin != ImmediateOrigin::Null
+                    {
+                        return None;
                     }
                     if !dst.projection.is_empty() {
                         if name == &make.callee

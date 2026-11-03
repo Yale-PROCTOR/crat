@@ -272,7 +272,7 @@ fn plan_body_exact<'tcx>(
                     statement_index: site.key.statement,
                 },
             )
-            .map_err(&error)?,
+            .map_err(error)?,
         )
     };
     if old == Some(branch.result) {

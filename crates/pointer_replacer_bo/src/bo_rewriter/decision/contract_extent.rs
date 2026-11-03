@@ -10,16 +10,25 @@ use crate::analyses::borrow_ownership::SlotKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CurrentForm {
-    Ref { mutable: bool, nullable: bool },
+    Ref {
+        mutable: bool,
+        nullable: bool,
+    },
+    #[allow(dead_code)]
     Slice,
+    #[allow(dead_code)]
     Other,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NonLengthHold {
+    #[allow(dead_code)]
     Uninitialized,
+    #[allow(dead_code)]
     MissingRangeAlias,
+    #[allow(dead_code)]
     Evaluation,
+    #[allow(dead_code)]
     ReturnCustody,
     Existing(String),
 }
@@ -48,6 +57,7 @@ pub(crate) struct SubjectFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CountGap {
     UnitsUnproved,
+    #[allow(dead_code)]
     TransportMissing,
 }
 

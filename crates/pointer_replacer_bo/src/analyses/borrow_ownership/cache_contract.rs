@@ -310,7 +310,9 @@ pub(crate) struct StreamedEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct StreamHashes {
     pub(crate) entry: String,
+    #[allow(dead_code)]
     pub(crate) payload: String,
+    #[allow(dead_code)]
     pub(crate) exports: String,
 }
 impl Drop for StreamedEntry {
@@ -488,10 +490,10 @@ pub(crate) fn publish_streamed(directory: &Path, entry: &StreamedEntry) -> Resul
     if checked.key != entry.metadata.key || checked.inputs != entry.metadata.inputs {
         return Err("staged stream metadata changed before publication".into());
     }
-    if let Some(hashes) = &entry.hashes {
-        if file_sha256(&entry.path)? != hashes.entry {
-            return Err("staged stream bytes changed before publication".into());
-        }
+    if let Some(hashes) = &entry.hashes
+        && file_sha256(&entry.path)? != hashes.entry
+    {
+        return Err("staged stream bytes changed before publication".into());
     }
     let destination = directory.join(format!("{}.json", entry.metadata.key));
     if destination.exists() {
