@@ -779,6 +779,84 @@ pub unsafe fn user(a: *const i32) -> i32 {
         assert!(text.contains("let p: &i32 = first(a);"), "{}", got.tree());
     }
 
+    /// **S9: a cast of a raw local keeps its cast under the glue** (the user's
+    /// word in main's session 11-03, "진행하자"). TRACTOR's `c2MakeProxy` shape
+    /// under a name no corpus carries: `shape` is a `*const c_void` that stays
+    /// raw, and `let c: *mut Circle = shape as *mut Circle;` settles a shared
+    /// reference. At S8 the body rule read the right-hand side as a cast of a
+    /// local and rendered `&*shape` (found `&c_void`, E0308), so the function
+    /// reverted. The cast is part of the raw value: the glue takes the whole
+    /// right-hand side, as it does for a raw expression.
+    const CAST_OF_RAW_LOCAL_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+pub mod m {
+    #[repr(C)]
+    pub struct Circle { pub r: f32, pub x: f32 }
+    pub unsafe fn radius(shape: *const core::ffi::c_void) -> f32 {
+        let mut c: *mut Circle = shape as *mut Circle;
+        (*c).r + (*c).x
+    }
+}
+"#;
+
+    #[test]
+    fn s9_a_cast_of_a_raw_local_keeps_its_cast_under_the_glue() {
+        let got = run(CAST_OF_RAW_LOCAL_SHAPE);
+        let key = got
+            .subjects
+            .lines()
+            .filter_map(|line| line.split('\t').next())
+            .find(|key| key.starts_with("m::radius::c#"))
+            .unwrap_or_else(|| panic!("no m::radius::c row in\n{}", got.subjects))
+            .to_owned();
+        assert_eq!(
+            column(&got.subjects, &key, "placed"),
+            "1",
+            "{}",
+            got.subjects
+        );
+        let text = got.tree().split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains("c: &Circle = &*(shape as *mut Circle);"),
+            "the cast stays inside the glue:\n{}",
+            got.tree()
+        );
+    }
+
+    /// **S9 control: a cast of a local that is itself a reference is S8's.**
+    /// `a` settles a shared reference, so `a as *const i32` is a cast of a
+    /// safe local. S9 changes only the raw-local case. At S8 this fixture
+    /// delivers no tree (every ready class reverts), and the control pins that
+    /// S9 leaves it so: both subjects decided and placed, no tree.
+    const CAST_OF_SAFE_LOCAL_SHAPE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_assignments, unused_mut)]
+pub mod m {
+    pub unsafe fn twice(a: *mut i32) -> i32 {
+        let mut b: *const i32 = a as *const i32;
+        *b + *a
+    }
+}
+"#;
+
+    #[test]
+    fn s9_a_cast_of_a_safe_local_is_rendered_as_at_s8() {
+        let got = run(CAST_OF_SAFE_LOCAL_SHAPE);
+        for key in ["m::twice::a#1", "m::twice::b#2"] {
+            assert_eq!(
+                column(&got.subjects, key, "decision"),
+                "ref",
+                "{key}\n{}",
+                got.subjects
+            );
+            assert_eq!(column(&got.subjects, key, "placed"), "1", "{key}");
+        }
+        assert!(
+            got.emitted.is_none(),
+            "S9 leaves the safe-local cast as S8 had it:\n{}",
+            got.emitted.as_deref().unwrap_or_default()
+        );
+    }
+
     /// **(b), the terminal replay** (wave-6f 011 on batch 8's composition):
     /// `lodepng_memcpy(out as *mut c_void, ((*reader).data).offset(bytepos)
     /// as *const c_void, n)` — `src`'s position takes the A5 raw view and its
