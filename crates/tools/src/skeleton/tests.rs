@@ -2633,6 +2633,96 @@ fn inferred_vec_types_preserve_nondefault_allocators_and_avoid_shadowed_names() 
 }
 
 #[test]
+fn void_pointer_aliases_and_callback_locals_compile_without_dependency_externs() {
+    let source = r#"
+pub type Value = *mut core::ffi::c_void;
+pub unsafe fn identity(value: Value) -> Value { value }
+pub unsafe fn callback(callback: Option<extern "C" fn(Value) -> Value>) {
+    let compare = callback;
+    let value = compare.unwrap()(core::ptr::null_mut());
+}
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    let identity = &frozen
+        .functions
+        .iter()
+        .find(|function| function.record.name == "identity")
+        .unwrap()
+        .record;
+    assert_eq!(
+        compact(&identity.target_signature),
+        "pub unsafe fn identity(mut value: *mut ::core::ffi::c_void) -> *mut ::core::ffi::c_void"
+    );
+    let skeletons = frozen
+        .functions
+        .iter()
+        .map(|function| function.record.baseline.skeleton.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        compact(&skeletons).contains(
+            "let mut compare: ::core::option::Option<extern \"C\" fn(*mut ::core::ffi::c_void) -> *mut ::core::ffi::c_void>"
+        ),
+        "{skeletons}"
+    );
+    let skeleton_source = format!(
+        "pub type Value = *mut core::ffi::c_void;\n{}",
+        skeletons
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("#[proctor("))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    for generated in [&frozen.target_source, &skeleton_source] {
+        let mut config =
+            utils::compilation::make_config(utils::compilation::str_to_input(generated));
+        config.opts.externs = rustc_session::config::Externs::new(Default::default());
+        utils::compilation::run_compiler(config, utils::type_check).expect(generated);
+    }
+}
+
+#[test]
+fn void_type_spelling_preserves_imports_and_standard_crate_aliases() {
+    for (context, pointee, expected) in [
+        ("", "core::ffi::c_void", "::core::ffi::c_void"),
+        ("#![no_std]", "core::ffi::c_void", "::core::ffi::c_void"),
+        ("use core::ffi::c_void as Void;", "Void", "Void"),
+        (
+            "#![feature(no_core)]\n#![no_core]\n#![no_implicit_prelude]\nextern crate core as platform;\nuse platform::todo;",
+            "platform::ffi::c_void",
+            "::platform::ffi::c_void",
+        ),
+        (
+            "#![feature(no_core)]\n#![no_core]\n#![no_implicit_prelude]\nextern crate std as platform;\nuse platform::todo;",
+            "platform::ffi::c_void",
+            "::platform::ffi::c_void",
+        ),
+    ] {
+        let source = format!(
+            "{context}\npub type Value = *mut {pointee};\npub unsafe fn identity(value: Value) -> Value {{ value }}"
+        );
+        let frozen = run_compiler_on_str(&source, |tcx| {
+            let records = make_skeletons(&source, tcx).unwrap();
+            crate::freeze_project(&source, &records, tcx).unwrap()
+        })
+        .unwrap();
+        assert_eq!(
+            compact(&frozen.functions[0].record.target_signature),
+            format!("pub unsafe fn identity(mut value: *mut {expected}) -> *mut {expected}")
+        );
+        let mut config = utils::compilation::make_config(utils::compilation::str_to_input(
+            &frozen.target_source,
+        ));
+        config.opts.externs = rustc_session::config::Externs::new(Default::default());
+        utils::compilation::run_compiler(config, utils::type_check).expect(&frozen.target_source);
+    }
+}
+
+#[test]
 fn external_reexports_can_name_definitions_from_other_crates() {
     let source = r#"
         #![no_std]

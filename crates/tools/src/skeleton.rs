@@ -1970,6 +1970,7 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
         namespace: Namespace,
     ) -> Vec<String> {
         let mut paths = vec![];
+        let mut standard_paths = vec![];
         for (root_name, root_def_id) in &self.external_roots {
             let mut queue = VecDeque::from([(*root_def_id, Vec::<String>::new())]);
             let mut best_modules = FxHashMap::<DefId, (usize, String)>::default();
@@ -1986,7 +1987,18 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
                     let mut child_path = prefix.clone();
                     child_path.push(child.ident.to_string());
                     if def_id == target && child.res.ns() == Some(namespace) {
-                        paths.push(format!("::{root_name}::{}", child_path.join("::")));
+                        let path = format!("::{root_name}::{}", child_path.join("::"));
+                        // Helper externs can expose libc even when the target has no libc dependency.
+                        if self.tcx.is_lang_item(target, hir::LangItem::CVoid)
+                            && matches!(
+                                self.tcx.crate_name(root_def_id.krate).as_str(),
+                                "core" | "std"
+                            )
+                        {
+                            standard_paths.push(path);
+                        } else {
+                            paths.push(path);
+                        }
                     }
                     if matches!(child.res, Res::Def(DefKind::Mod, _)) {
                         let rendered = child_path.join("::");
@@ -1998,6 +2010,9 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
                     }
                 }
             }
+        }
+        if !standard_paths.is_empty() {
+            paths = standard_paths;
         }
         sort_paths(&mut paths);
         paths
