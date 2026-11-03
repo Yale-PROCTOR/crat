@@ -9,9 +9,11 @@ use rustc_hir::{
     def_id::LocalDefId,
     intravisit::{Visitor, walk_expr},
 };
+#[cfg(test)]
+use rustc_middle::ty::Ty;
 use rustc_middle::{
     mir::Local,
-    ty::{Ty, TyCtxt, TyKind},
+    ty::{TyCtxt, TyKind},
 };
 use rustc_span::Span;
 

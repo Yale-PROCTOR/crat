@@ -1,6 +1,8 @@
 //! Caller array/count evidence for typed thin forwarding parameters.
+#[cfg(test)]
+use rustc_hir::HirId;
 use rustc_hir::{
-    Expr, ExprKind, HirId, Node, PatKind, StmtKind,
+    Expr, ExprKind, Node, PatKind, StmtKind,
     def::Res,
     def_id::LocalDefId,
     intravisit::{self, Visitor},

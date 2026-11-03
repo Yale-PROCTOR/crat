@@ -12,9 +12,13 @@ use serde::{
 };
 use serde_json::Value;
 
+#[cfg(test)]
+use crate::analyses::borrow_ownership::origin_evidence::OriginAvailability;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::origin_evidence::OriginMissing;
 use crate::analyses::borrow_ownership::{
     cache_contract::{CompleteEntry, SCHEMA, SemanticInputs, semantic_key},
-    origin_evidence::{OriginAvailability, OriginEvidence, OriginMissing},
+    origin_evidence::OriginEvidence,
     portable_export::{self, CaptureAvailability, ExportFamily, REQUIRED_FAMILIES, ScopeGap},
     strict_json::{Discard, UniqueValue},
 };

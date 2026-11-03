@@ -1295,6 +1295,7 @@ pub(crate) enum RetentionUnknownReason {
 }
 
 impl RetentionUnknownReason {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 15] = [
         Self::CalleeUnresolved,
         Self::FnPtrWeb,
@@ -5797,7 +5798,9 @@ pub(crate) fn template_for(
     ownership: Option<super::raw_boundary_contracts::OwnershipContract>,
     has_negative_write_evidence: bool,
 ) -> Result<BridgeTemplate, RawBoundaryBlockReason> {
-    use super::{Decision, box_facts::BoxShape, raw_boundary_contracts::OwnershipContract};
+    #[cfg(test)]
+    use super::box_facts::BoxShape;
+    use super::{Decision, raw_boundary_contracts::OwnershipContract};
 
     if matches!(
         ownership,
@@ -7085,6 +7088,7 @@ impl RawBoundaryDispositionIndex {
         out
     }
 
+    #[cfg(test)]
     pub(crate) fn disposition(&self, key: &RawBoundarySiteKey) -> Option<&RawBoundaryDisposition> {
         self.by_site.get(key)
     }

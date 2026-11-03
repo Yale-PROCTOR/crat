@@ -906,6 +906,7 @@ impl<'tcx> NonConsumingProof<'_, 'tcx> {
         std::ptr::eq(self.index, index) && self.callee == callee && self.proof.argument == argument
     }
 
+    #[cfg(test)]
     pub(crate) fn checked_calls(&self) -> &BTreeSet<EffectsSite> {
         &self.proof.checked_calls
     }
@@ -916,6 +917,7 @@ impl<'tcx> NonConsumingProof<'_, 'tcx> {
         self.scope
     }
 
+    #[cfg(test)]
     pub(crate) fn checked_functions(&self) -> &BTreeSet<u32> {
         &self.proof.checked_functions
     }

@@ -3,12 +3,19 @@
 //! no required field has an Option/default. Proof bodies may live in exact,
 //! typed companion records. Their digests and family tags are checked by the
 //! adapter; interpreting those bodies remains the named producer's obligation.
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    marker::PhantomData,
-};
+#[cfg(test)]
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
+use std::marker::PhantomData;
 
-use super::{EvidenceKey, FieldClassId, SiteId, emission::Kind, lifecycle::CloseKind};
+#[cfg(test)]
+use super::EvidenceKey;
+#[cfg(test)]
+use super::FieldClassId;
+#[cfg(test)]
+use super::lifecycle::CloseKind;
+use super::{SiteId, emission::Kind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Digest(pub [u8; 32]);
@@ -16,6 +23,7 @@ pub struct Digest(pub [u8; 32]);
 pub struct ProgramId(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FunctionId(pub String);
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FieldKey(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -44,11 +52,13 @@ pub struct StaticNode {
     pub construction: u32,
     pub var: u32,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceLineage {
     Exact(Vec<CallKey>),
     Recursive { application: CallKey },
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceInstance {
     pub endpoint: EquationId,
@@ -106,6 +116,7 @@ pub struct FactRef<T: FactTag> {
     marker: PhantomData<T>,
 }
 impl<T: FactTag> FactRef<T> {
+    #[cfg(test)]
     pub fn new(record: RecordKey) -> Self {
         Self {
             record,
@@ -156,16 +167,19 @@ pub enum SourceFrame {
     L01DoublePrime,
     L01TriplePrime,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProducerIdentity {
     pub source: String,
     pub analysis_digest: Digest,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CertificateIdentity {
     pub source: String,
     pub full_analysis_digest: Digest,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub program: ProgramId,
@@ -182,12 +196,14 @@ pub struct Frame {
     pub snapshot_offset: u32,
     pub source_frame: SourceFrame,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FamilyTransport {
     SameEpoch,
     /// Required for each retained entry in a mixed epoch family manifest.
     Compared(Evidence<FactRef<FamilyComparison>>),
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Manifest {
     pub schema: u32,
@@ -198,6 +214,7 @@ pub struct Manifest {
     pub transport: Evidence<FamilyTransport>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Certificate {
     Caller {
@@ -209,11 +226,13 @@ pub enum Certificate {
         member: Evidence<FactRef<MemberProof>>,
     },
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Valuations {
     pub owning: BTreeMap<StaticNode, bool>,
     pub guards: BTreeMap<EquationId, bool>,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Selection {
     pub guard: EquationId,
@@ -225,6 +244,7 @@ pub struct Selection {
     pub validation: Evidence<FactRef<SelectionValidation>>,
     pub attestation: Evidence<Frame>,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Disposition {
     Held(LicensingHold),
@@ -232,6 +252,7 @@ pub enum Disposition {
     Selected(Evidence<Selection>),
     Missing(Missing),
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GlobalFieldScheme {
     /// Whole-declaration selection. Not the union of MemberDecision.fields.
@@ -242,6 +263,7 @@ pub struct GlobalFieldScheme {
     pub selection_basis: Evidence<FactRef<SelectedGlobalFields>>,
     pub frame: Evidence<Frame>,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Occurrence {
     pub declaration: DeclarationKey,
@@ -253,17 +275,20 @@ pub struct Occurrence {
     pub generation_recipe: Evidence<FactRef<GenerationRecipe>>,
     pub transported_key: Evidence<EvidenceKey>,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Projection {
     Deref,
     Field(u32),
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExtraCloseReason {
     LiveAtScopeExit,
     LiveAtUnwind,
     OverwrittenUniqueOwner,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtraClose {
     pub site: SiteId,
@@ -275,6 +300,7 @@ pub struct ExtraClose {
     pub depth: Evidence<FactRef<DropDepth>>,
 }
 
+#[cfg(test)]
 /// Each reference addresses a typed companion body whose named fields are the
 /// report-001 contracts and the existing consumer structs. Missing facts stay
 /// attached to the affected site; a kind grant is not an emission permission.
@@ -296,6 +322,7 @@ pub struct Companions {
     pub custody: Evidence<FactRef<Custody>>,
     pub raw_audit: Evidence<FactRef<RawAudit>>,
 }
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     pub declaration_key: Evidence<DeclarationKey>,

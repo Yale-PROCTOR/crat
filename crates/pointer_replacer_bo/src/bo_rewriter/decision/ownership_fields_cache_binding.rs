@@ -3,29 +3,74 @@
 //! module performs no IO, cache loading, environment changes or analysis.
 //! Dynamic generation evidence is not present in the cache and stays Missing.
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
-use rustc_hash::{FxHashMap, FxHashSet};
-use sha2::{Digest as _, Sha256};
+#[cfg(test)]
+use rustc_hash::FxHashMap;
+#[cfg(test)]
+use rustc_hash::FxHashSet;
+#[cfg(test)]
+use sha2::Digest as _;
+#[cfg(test)]
+use sha2::Sha256;
 
-use crate::{
-    analyses::borrow_ownership::{
-        SlotKind,
-        cache_contract::{self, SemanticInputs, StreamHashes, stream::Metadata},
-        crate_slots::CrateSlots,
-        slot_key::{field_key, local_key},
-        slots::{SlotId, SlotOwner},
-        solver::SlotRef,
-    },
-    bo_rewriter::ownership_fields::{
-        OwnerId, SiteId,
-        emission::Kind,
-        export::{Digest, Evidence, EvidenceOwner, Missing, MissingReason, SourceFrame},
-        model_adapter::{AcceptedInputs, ConsumptionPins, ExecutionRole, ModelFrame, ModelSlot},
-    },
-    utils::rustc::RustProgram,
-};
+#[cfg(test)]
+use crate::analyses::borrow_ownership::SlotKind;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::cache_contract;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::cache_contract::SemanticInputs;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::cache_contract::StreamHashes;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::cache_contract::stream::Metadata;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::crate_slots::CrateSlots;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::slot_key::field_key;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::slot_key::local_key;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::slots::SlotId;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::slots::SlotOwner;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::solver::SlotRef;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::OwnerId;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::SiteId;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::emission::Kind;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::export::Digest;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::export::Evidence;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::export::EvidenceOwner;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::export::Missing;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::export::MissingReason;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::export::SourceFrame;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::model_adapter::AcceptedInputs;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::model_adapter::ConsumptionPins;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::model_adapter::ExecutionRole;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::model_adapter::ModelFrame;
+#[cfg(test)]
+use crate::bo_rewriter::ownership_fields::model_adapter::ModelSlot;
+#[cfg(test)]
+use crate::utils::rustc::RustProgram;
 
+#[cfg(test)]
 pub(crate) struct NativeCacheInputs<'a, 'tcx> {
     pub(crate) metadata: &'a Metadata,
     pub(crate) hashes: &'a StreamHashes,
@@ -39,6 +84,7 @@ pub(crate) struct NativeCacheInputs<'a, 'tcx> {
     pub(crate) required_bindings: Evidence<BTreeSet<SiteId>>,
 }
 
+#[cfg(test)]
 pub(crate) fn bind(
     expected: &ModelFrame,
     native: NativeCacheInputs<'_, '_>,
@@ -212,18 +258,21 @@ pub(crate) fn bind(
     })
 }
 
+#[cfg(test)]
 fn frame_hold(field: &'static str) -> Missing {
     Missing {
         owner: EvidenceOwner::FrameQualification,
         reason: MissingReason::Frame(field),
     }
 }
+#[cfg(test)]
 fn inventory_hold() -> Missing {
     Missing {
         owner: EvidenceOwner::NativeIdentity,
         reason: MissingReason::ModelInventory,
     }
 }
+#[cfg(test)]
 fn parse_digest(value: &str, field: &'static str) -> Evidence<Digest> {
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(frame_hold(field));

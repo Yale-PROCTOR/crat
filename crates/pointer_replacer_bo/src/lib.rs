@@ -8,7 +8,6 @@
 #![feature(impl_trait_in_assoc_type)]
 #![warn(unused_extern_crates)]
 
-extern crate either;
 extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_ast_pretty;

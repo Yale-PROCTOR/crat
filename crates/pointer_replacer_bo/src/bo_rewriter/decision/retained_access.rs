@@ -5305,6 +5305,7 @@ impl Verdict {
         }
     }
 
+    #[cfg(test)]
     /// The receipt detail: `<kind>:<witness>` of the first hold, or `unknown`.
     pub(crate) fn receipt(&self) -> Option<String> {
         match self {
@@ -6157,6 +6158,7 @@ impl RetainedAccessCheck {
         self.verdicts.get(&(f, local))
     }
 
+    #[cfg(test)]
     /// Assert that `body` is the body the check read for `f`.
     pub(crate) fn assert_body(&self, f: LocalDefId, body: &Body<'_>) {
         assert_eq!(
@@ -6166,11 +6168,13 @@ impl RetainedAccessCheck {
         );
     }
 
+    #[cfg(test)]
     /// Every verdict, for the receipt tables.
     pub(crate) fn verdicts(&self) -> impl Iterator<Item = (&(LocalDefId, Local), &Verdict)> {
         self.verdicts.iter()
     }
 
+    #[cfg(test)]
     /// `premise=outside-byte-view` for a subject Clear only under P8.
     pub(crate) fn premise(&self, f: LocalDefId, local: Local) -> Option<&'static str> {
         self.premised
@@ -6197,6 +6201,7 @@ impl RetainedAccessCheck {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn container_of_sites(&self) -> &[(LocalDefId, Local)] {
         &self.container_of
     }

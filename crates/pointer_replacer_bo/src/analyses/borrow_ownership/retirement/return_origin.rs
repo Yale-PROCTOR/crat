@@ -4,7 +4,9 @@
 //! certificates. This module changes neither that analysis nor object factories.
 
 use rustc_hash::FxHashMap;
-use rustc_middle::mir::{Local, Location};
+use rustc_middle::mir::Local;
+#[cfg(test)]
+use rustc_middle::mir::Location;
 use rustc_span::def_id::LocalDefId;
 
 use crate::{
@@ -65,10 +67,12 @@ mod producer {
     use std::collections::VecDeque;
 
     use rustc_hash::FxHashMap;
+    #[cfg(test)]
+    use rustc_middle::mir::BasicBlock;
     use rustc_middle::{
         mir::{
-            BasicBlock, Body, CastKind, Const, Local, Operand, Place, Rvalue, START_BLOCK,
-            StatementKind, TerminatorKind,
+            Body, CastKind, Const, Local, Operand, Place, Rvalue, START_BLOCK, StatementKind,
+            TerminatorKind,
         },
         ty::{Ty, TyKind},
     };

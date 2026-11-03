@@ -428,6 +428,7 @@ pub(crate) fn reconcile_box_mir_drops(
     Ok(matched)
 }
 
+#[cfg(test)]
 /// The same hard gate, over a crate **rooted at a path**.
 ///
 /// A multi-file crate cannot be handed to the string gate: its modules resolve

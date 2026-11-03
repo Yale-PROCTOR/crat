@@ -644,6 +644,7 @@ struct ConstructionBridgeHop {
 struct ConstructionBridgeTemps(Vec<ConstructionBridgeHop>);
 
 impl ConstructionBridgeTemps {
+    #[cfg(test)]
     fn from_hops(hops: impl IntoIterator<Item = ConstructionBridgeHop>) -> Self {
         Self(hops.into_iter().collect())
     }
@@ -1694,6 +1695,7 @@ impl BoxOwnershipFacts {
         Ok(source_site)
     }
 
+    #[cfg(test)]
     pub(crate) fn construction_bridges_tsv(
         &self,
         tcx: rustc_middle::ty::TyCtxt<'_>,
@@ -1823,6 +1825,7 @@ impl BoxOwnershipFacts {
         output
     }
 
+    #[cfg(test)]
     pub(crate) fn default_fill_candidates_tsv(
         &self,
         tcx: rustc_middle::ty::TyCtxt<'_>,

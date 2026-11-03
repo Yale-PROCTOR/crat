@@ -36,10 +36,9 @@ use rustc_hash::FxHashSet;
 use rustc_hir::{HirId, def_id::LocalDefId};
 use rustc_middle::ty::TyCtxt;
 
-use super::{
-    emitability::{ArgShape, EmitabilityFacts},
-    raw_boundary_contracts::classify_contract,
-};
+#[cfg(test)]
+use super::emitability::ArgShape;
+use super::{emitability::EmitabilityFacts, raw_boundary_contracts::classify_contract};
 
 /// Does this exact foreign position consume more than one element?
 ///

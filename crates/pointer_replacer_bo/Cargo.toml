@@ -18,10 +18,8 @@ tracing.workspace = true
 etrace.workspace = true
 typed-arena.workspace = true
 serde.workspace = true
-# Promoted from dev-dependencies for S2a-H: the reconciliation ARTIFACT is
-# shipping code (producer B is not `cfg(test)`, by ruling), so its JSONL
-# encoder cannot be test-only. Already a workspace dependency and already
-# compiled for this crate's test target, so the promotion costs nothing.
+# The model cache's contract and the analysis's evidence exports encode JSON
+# (cache_contract, portable_export, *_evidence).
 serde_json.workspace = true
 sha2.workspace = true
 

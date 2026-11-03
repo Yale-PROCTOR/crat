@@ -1083,6 +1083,7 @@ pub(crate) enum RewriteOutcome {
     },
 }
 
+#[cfg(test)]
 /// M1 entry point: source in, rewritten source out.
 ///
 /// The four phases run in order, each handed the previous one's finished value:
@@ -1204,6 +1205,7 @@ pub(crate) fn rewrite_m1_census_world(input: &str) -> RewriteOutcome {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
     rewrite_core(
         ::utils::compilation::path_to_input(root),
@@ -1379,6 +1381,7 @@ pub(crate) fn rewrite_m1_path_with_emission_config(
     )
 }
 
+#[cfg(test)]
 fn rewrite_core(
     input: rustc_session::config::Input,
     tree_base: Option<&std::path::Path>,
@@ -1396,6 +1399,7 @@ fn rewrite_core(
     )
 }
 
+#[cfg(test)]
 /// [`rewrite_core`] with a hook applied to the finished decision table at the
 /// PHASE BOUNDARY, before `plan` sees it.
 ///
@@ -3860,6 +3864,7 @@ fn param_name(param: &rustc_hir::Param<'_>) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 /// The analysis front-end: everything from BO's model to a finished decision
 /// table, with the structural self-check and the coverage gate applied.
 ///
@@ -3870,6 +3875,7 @@ fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, Stri
     decide_table_perturbed(tcx, |_| {}).map(|(table, _ctx)| table)
 }
 
+#[cfg(test)]
 /// [`decide_table`], keeping the pipeline's by-products (**R1**).
 ///
 /// Exists so a caller that needs the slots, the accepted model or the
@@ -3898,6 +3904,7 @@ pub(crate) fn cache_fingerprint_for_test(tcx: TyCtxt<'_>) -> String {
     )
 }
 
+#[cfg(test)]
 fn decide_table_with_ctx_config<'tcx>(
     tcx: TyCtxt<'tcx>,
     a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
@@ -3913,6 +3920,7 @@ pub(crate) fn decide_table_with_emission_config<'tcx>(
     decide_table_perturbed_config(tcx, |_| {}, a5_override, run_config)
 }
 
+#[cfg(test)]
 /// **Validation-transfer entry.** One emit, one diagnose, no revert loop.
 ///
 /// The loop's `.err` log concatenates every round's compile, so a structural-vs-
@@ -4061,6 +4069,7 @@ struct OutcomeFacts {
 }
 
 impl RewriteOutcome {
+    #[cfg(test)]
     /// The first verify's diagnostics, whichever way the run ended.
     ///
     /// An accessor rather than a `match` at the call site: the one-filling-site
@@ -5386,6 +5395,7 @@ pub(crate) enum AttributionRule {
 }
 
 impl AttributionRule {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 5] = [
         Self::ExactEdit,
         Self::ExactSeam,
@@ -5394,6 +5404,7 @@ impl AttributionRule {
         Self::Unresolved,
     ];
 
+    #[cfg(test)]
     pub(crate) fn key(self) -> &'static str {
         match self {
             Self::ExactEdit => "exact-edit",
@@ -7540,6 +7551,7 @@ fn prepare_plan_files<'tcx>(
     })
 }
 
+#[cfg(test)]
 /// [`decide_table`] with a hook applied to the collector's real output at the
 /// PHASE BOUNDARY, before `decide` runs.
 ///
@@ -11711,6 +11723,7 @@ impl DecideCtx {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct BoxPlanArtifact {
     pub(crate) tsv: String,
     pub(crate) bridges: String,
@@ -11791,6 +11804,7 @@ fn box_mir_drop_policies(
     policies
 }
 
+#[cfg(test)]
 pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, String> {
     let (table, ctx) = decide_table_with_ctx(tcx)?;
     let bridges = ctx.box_facts.construction_bridges_tsv(
@@ -12685,6 +12699,7 @@ pub(crate) fn e1_sole_blocker_flags<'a>(
     .collect()
 }
 
+#[cfg(test)]
 /// **S3.2′-0 — the FACTS-SIDE JOIN.** One TSV row per subject, reporting the
 /// analysis facts *directly*, before `decide_one`'s ordering collapses them.
 ///
@@ -12841,6 +12856,7 @@ pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
     Ok(out)
 }
 
+#[cfg(test)]
 /// **S3.6-1 task 2 — the CO-CONVERSION CLASS CENSUS.**
 ///
 /// One row per class **member**, not per class. The per-class view is a
@@ -13268,6 +13284,7 @@ pub(crate) fn decisions_with_ty_span_erased(
     .map(|(table, _ctx)| artifact::rows(tcx, &table))
 }
 
+#[cfg(test)]
 /// **S3.6-1 — the SEAM COLUMN** (ruling item 3, 2026-08-11): every adapter site
 /// and every refused one, with its reason.
 ///

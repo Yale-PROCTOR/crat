@@ -85,6 +85,7 @@ impl SignFacts {
         self.verdict(fn_did, local).unwrap_or(true)
     }
 
+    #[cfg(test)]
     /// Rendering for the measurement column — the raw capture, never the policy.
     pub(crate) fn render(&self, fn_did: LocalDefId, local: Local) -> &'static str {
         match self.verdict(fn_did, local) {

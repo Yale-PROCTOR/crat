@@ -17,6 +17,7 @@ use crate::{
     bo_rewriter::fat_facts::FatFacts,
 };
 
+#[cfg(test)]
 /// Receipt fields are single-line TSV cells. Keep the compiler spelling in the
 /// semantic plan and normalize only the copy written to a receipt.
 fn receipt_expression(value: &str) -> String {
@@ -24,6 +25,7 @@ fn receipt_expression(value: &str) -> String {
 }
 
 impl Promotion {
+    #[cfg(test)]
     pub(crate) fn receipt_sites(&self) -> String {
         self.sites
             .iter()
@@ -39,6 +41,7 @@ impl Promotion {
             .join(";")
     }
 
+    #[cfg(test)]
     pub(crate) fn receipt_count_operands(&self) -> String {
         self.sites
             .iter()
@@ -67,6 +70,7 @@ impl Promotion {
             .join(";")
     }
 
+    #[cfg(test)]
     pub(crate) fn receipt_length(&self) -> String {
         match &self.length {
             LengthPlan::Evidence { elements, .. } => receipt_expression(elements),
@@ -74,6 +78,7 @@ impl Promotion {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn receipt_extent_kind(&self) -> &'static str {
         match self.length {
             LengthPlan::Evidence { .. } => "evidence",
@@ -81,6 +86,7 @@ impl Promotion {
         }
     }
 
+    #[cfg(test)]
     /// The `contract_extent_fatness` receipt column: the fatness conjunct
     /// that admitted the promotion.
     pub(crate) fn receipt_fatness(&self) -> &'static str {
@@ -91,6 +97,7 @@ impl Promotion {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn receipt_waiver(&self) -> &'static str {
         match self.length {
             LengthPlan::Evidence { .. } => "-",
@@ -115,6 +122,7 @@ impl Promotion {
 }
 
 impl Requirement {
+    #[cfg(test)]
     fn receipt_key(&self) -> &'static str {
         match self {
             Self::OneElement => "one-element",

@@ -542,6 +542,7 @@ impl FieldTransactions {
             .collect()
     }
 
+    #[cfg(test)]
     /// **The classes a HELD field-transaction edit must withdraw** (relay 061 /
     /// R523-3 — the sixth claim-refusal arm's key).
     ///

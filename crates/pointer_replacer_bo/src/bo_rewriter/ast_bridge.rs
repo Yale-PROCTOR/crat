@@ -303,6 +303,7 @@ pub(crate) fn splice_fn_prints_per_file(
     (out, s, maps)
 }
 
+#[cfg(test)]
 /// **The root file alone**, for callers that emit one text: the string entry,
 /// the goldens, and the parity gates. Selects by `spans.first()`'s file — the
 /// same rule the pre-A1 shape used — so single-file callers are byte-identical

@@ -292,6 +292,7 @@ impl LenArm {
         }
     }
 
+    #[cfg(test)]
     /// The signature evidence, whichever arm placed the length. The
     /// `lengated` rows read this so the `len-elsewhere` / `len-absent` split
     /// survives fabrication as bound-verification's derivability input.
@@ -392,6 +393,7 @@ impl SeamLen {
         )
     }
 
+    #[cfg(test)]
     /// What was guessed, when the length is a positional pick: the receipt
     /// reads `fallback(sibling-by-position:<param>)`.
     pub(crate) fn positional_param(&self) -> Option<&str> {
@@ -5319,6 +5321,7 @@ fn complete_interface_inventory<'tcx>(
     plan.generated_item_dependencies.dedup();
 }
 
+#[cfg(test)]
 /// Compute every seam adapter the crate needs.
 ///
 /// Driven by the **type-level matrix**: the walk asks [`glue`] about every

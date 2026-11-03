@@ -392,10 +392,12 @@ impl A5SeamProofIndex {
         self.guard
     }
 
+    #[cfg(test)]
     pub(crate) fn global_setup_wall_s(&self) -> f64 {
         self.global_setup_wall_s
     }
 
+    #[cfg(test)]
     pub(crate) fn pair_classification_wall_s(&self) -> f64 {
         self.pair_classification_wall_s
     }

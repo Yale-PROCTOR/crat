@@ -93,6 +93,7 @@ pub(crate) struct MutFacts {
 }
 
 impl MutFacts {
+    #[cfg(test)]
     /// Forced-mutable: every pointer mutable. The mode-`Off` sweep control and the
     /// non-vacuity control prong of the mutability fixtures (reproduces the all-mutable behavior
     /// exactly).

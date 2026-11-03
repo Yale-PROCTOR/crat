@@ -1,15 +1,30 @@
 //! RB-RETALIAS READ controls over real MIR, without decisions or rewriting.
 
-use rustc_middle::{
-    mir::{
-        Location, Operand, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind,
-        VarDebugInfoContents,
-    },
-    ty::TyKind,
-};
+#[cfg(test)]
+use rustc_middle::mir::Location;
+#[cfg(test)]
+use rustc_middle::mir::Operand;
+#[cfg(test)]
+use rustc_middle::mir::RETURN_PLACE;
+#[cfg(test)]
+use rustc_middle::mir::Rvalue;
+#[cfg(test)]
+use rustc_middle::mir::StatementKind;
+#[cfg(test)]
+use rustc_middle::mir::TerminatorKind;
+#[cfg(test)]
+use rustc_middle::mir::VarDebugInfoContents;
+#[cfg(test)]
+use rustc_middle::ty::TyKind;
 
-use super::decision::return_alias::{self, ReturnUseObservation, ReturnUseState};
+#[cfg(test)]
+use super::decision::return_alias;
+#[cfg(test)]
+use super::decision::return_alias::ReturnUseObservation;
+#[cfg(test)]
+use super::decision::return_alias::ReturnUseState;
 
+#[cfg(test)]
 #[derive(Debug)]
 struct ReadWitness {
     observation: ReturnUseObservation,
@@ -23,6 +38,7 @@ struct ReadWitness {
     destination_fake_reads: usize,
 }
 
+#[cfg(test)]
 fn observe_strchr(body_source: &str) -> ReadWitness {
     let input = format!(
         "#![allow(dead_code, unused_variables, unused_assignments, unused_mut, unused_unsafe)]\n\
@@ -288,6 +304,7 @@ struct ReadProgramInput {
     sources: Vec<ReadSourcePin>,
 }
 
+#[cfg(test)]
 fn verify_read_sources(
     input: &ReadProgramInput,
 ) -> std::collections::BTreeMap<std::path::PathBuf, String> {
@@ -331,10 +348,12 @@ fn verify_read_sources(
     verified
 }
 
+#[cfg(test)]
 fn read_location(location: Location) -> serde_json::Value {
     serde_json::json!({"block": location.block.as_u32(), "statement_index": location.statement_index})
 }
 
+#[cfg(test)]
 fn read_use_sites(sites: &[return_alias::ReturnUseSite]) -> Vec<serde_json::Value> {
     sites
         .iter()
@@ -346,6 +365,7 @@ fn read_use_sites(sites: &[return_alias::ReturnUseSite]) -> Vec<serde_json::Valu
         .collect()
 }
 
+#[cfg(test)]
 fn read_source_span(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     span: rustc_span::Span,
@@ -371,6 +391,7 @@ fn read_source_span(
     })
 }
 
+#[cfg(test)]
 fn read_program_returns(
     input: &ReadProgramInput,
     pinned_sources: &std::collections::BTreeMap<std::path::PathBuf, String>,

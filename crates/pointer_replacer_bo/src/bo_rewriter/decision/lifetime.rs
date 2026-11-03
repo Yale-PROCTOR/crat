@@ -40,6 +40,7 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
+#[cfg(test)]
 /// The minimal E2-X1 observation used to prove that the carrier reaches this
 /// module without an A5-specific projection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +49,7 @@ pub(crate) struct CarrierReceipt {
     pub(crate) native_flows: bool,
 }
 
+#[cfg(test)]
 pub(crate) fn carrier_receipt(origins: Option<&OriginSummaries>) -> CarrierReceipt {
     CarrierReceipt {
         summary_count: origins.map_or(0, |origins| origins.len()),
@@ -240,6 +242,7 @@ impl ReturnLifetimePermit {
         }
     }
 
+    #[cfg(test)]
     fn for_test(subject: NodeKey, source: FnSignatureSlot, target: FnSignatureSlot) -> Self {
         Self::new(
             subject,
@@ -280,6 +283,7 @@ impl LifetimeEligibility {
         self.return_permits.get(&subject)
     }
 
+    #[cfg(test)]
     pub(crate) fn return_permit_count(&self) -> usize {
         self.return_permits.len()
     }
@@ -1259,6 +1263,7 @@ impl LifetimePlan {
         self.functions.iter().map(|(&did, plan)| (did, plan))
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_receipt(&self, tcx: rustc_middle::ty::TyCtxt<'_>) -> String {
         let mut rows = self
             .functions
@@ -1719,10 +1724,12 @@ impl FnPtrWeb {
         &self.mir_call_sites
     }
 
+    #[cfg(test)]
     pub(crate) fn root_count(&self) -> usize {
         self.roots.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn member_count(&self) -> usize {
         self.members.len()
     }

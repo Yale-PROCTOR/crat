@@ -82,6 +82,7 @@ impl SiblingDisposition {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn key(&self) -> &'static str {
         match self {
             Self::Bridged { .. } => "bridged",
@@ -415,6 +416,7 @@ impl super::Plan {
         out
     }
 
+    #[cfg(test)]
     pub(crate) fn sibling_coverage_gaps(
         &self,
         reverted: &BTreeSet<SignatureClassId>,

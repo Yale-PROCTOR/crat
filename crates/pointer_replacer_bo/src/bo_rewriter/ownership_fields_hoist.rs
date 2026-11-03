@@ -1,8 +1,13 @@
 //! P2d scalar-read planning over a resolved argument list.
+#[cfg(test)]
 use std::collections::BTreeSet;
 
-use super::{EvidenceKey, SiteId};
+#[cfg(test)]
+use super::EvidenceKey;
+#[cfg(test)]
+use super::SiteId;
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub enum Argument {
     ScalarRead {
@@ -18,4 +23,5 @@ pub enum Argument {
         expression: String,
     },
 }
+#[cfg(test)]
 impl Argument {}

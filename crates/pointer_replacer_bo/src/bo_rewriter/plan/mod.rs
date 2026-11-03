@@ -247,6 +247,7 @@ pub(crate) struct ClassSite {
 }
 
 impl ClassSite {
+    #[cfg(test)]
     pub(crate) fn edit(
         owner: SignatureClassId,
         caller: SignatureClassId,
@@ -397,11 +398,13 @@ impl ClassInput {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_site(mut self, site: ClassSite) -> Self {
         self.sites.push(site);
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn blocked(mut self, reason: impl Into<String>) -> Self {
         self.block_reasons.push(reason.into());
         self
@@ -438,6 +441,7 @@ pub(crate) struct ClassFinalization {
 }
 
 impl ClassFinalization {
+    #[cfg(test)]
     pub(crate) fn applied_site_count(&self) -> usize {
         self.classes
             .values()
@@ -446,6 +450,7 @@ impl ClassFinalization {
             .sum()
     }
 
+    #[cfg(test)]
     pub(crate) fn live_sites<'a>(
         &'a self,
         reverted: &'a std::collections::BTreeSet<SignatureClassId>,
@@ -1458,6 +1463,7 @@ fn option_receipt_requires_changed_form(
         })
 }
 
+#[cfg(test)]
 /// Class-consistency preflight for the new Option family. A failed optional
 /// operation requests its prior raw disposition; a changed callee interface
 /// remains a load-bearing requirement and keeps the existing class hold.
@@ -2683,6 +2689,7 @@ impl Plan {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn bridge_events(
         &self,
         reverted: &BTreeSet<SignatureClassId>,
@@ -2804,6 +2811,7 @@ impl Plan {
         events
     }
 
+    #[cfg(test)]
     pub(crate) fn unsafe_context_events(
         &self,
         reverted: &std::collections::BTreeSet<SignatureClassId>,
@@ -3010,6 +3018,7 @@ impl Plan {
         (events, a5_rows, slice_rows)
     }
 
+    #[cfg(test)]
     pub(crate) fn declaration_receipt_rows(
         &self,
         reverted: &BTreeSet<SignatureClassId>,

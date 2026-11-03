@@ -157,10 +157,12 @@ impl SourceFreeSite {
         self.span
     }
 
+    #[cfg(test)]
     pub(crate) fn owner(&self) -> LocalDefId {
         self.owner
     }
 
+    #[cfg(test)]
     pub(crate) fn binding(&self) -> HirId {
         self.binding
     }
@@ -272,10 +274,12 @@ impl SourcePlan {
         self.allocation_local
     }
 
+    #[cfg(test)]
     pub(crate) fn owner(&self) -> LocalDefId {
         self.owner
     }
 
+    #[cfg(test)]
     pub(crate) fn binding(&self) -> HirId {
         self.binding
     }

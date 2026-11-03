@@ -1063,6 +1063,7 @@ pub(crate) fn parameter(
     })
 }
 
+#[cfg(test)]
 /// **The licensed byte width of a callee parameter this family has typed**
 /// (relay 023 §2, R408-1 evidence for wave-5c's caller lift).
 ///

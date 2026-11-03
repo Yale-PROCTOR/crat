@@ -405,9 +405,11 @@ fn dependency_ratchet_e2_keeps_cached_model_three_field_schema() {
 }
 
 fn e2_return_bypass_count(source: &str) -> usize {
-    source
+    // The production text ends where the test module begins (S11 gates single
+    // test-only items with `#[cfg(test)]` above it, which are not the boundary).
+    let end = source.find("#[cfg(test)]\nmod ").unwrap_or(source.len());
+    source[..end]
         .lines()
-        .take_while(|line| !line.contains("#[cfg(test)]"))
         .filter(|line| {
             line.contains("EscapeKind::Return") && line.contains("return_permit(escape.subject)")
         })

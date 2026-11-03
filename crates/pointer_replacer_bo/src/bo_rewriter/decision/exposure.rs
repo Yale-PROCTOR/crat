@@ -337,6 +337,7 @@ impl ExposurePolicy {
             .map_or(ExposureSurfacePlan::NotApplicable, |row| row.plan)
     }
 
+    #[cfg(test)]
     pub(crate) fn seed_counts(&self) -> SeedCounts {
         self.seed_counts
     }

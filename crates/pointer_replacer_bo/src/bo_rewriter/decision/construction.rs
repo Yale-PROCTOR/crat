@@ -2706,6 +2706,7 @@ mod slice_construction_tests {
     }
 }
 
+#[cfg(test)]
 /// **R480-2 (B1) — the allocation-root extent, as a query.**
 ///
 /// wave-4's root-extent propagation needs the one fact this family already
@@ -2731,6 +2732,7 @@ pub(crate) struct RootExtent {
     pub(crate) source: SliceLengthSource,
 }
 
+#[cfg(test)]
 pub(crate) fn allocation_root_extent(
     tcx: TyCtxt<'_>,
     facts: &ConstructionFacts,
@@ -2789,6 +2791,7 @@ pub(crate) fn allocation_root_extent(
     }
 }
 
+#[cfg(test)]
 /// `n * size_of::<T>()`, either factor first, in both spellings the corpus
 /// uses: the operator, and c2rust's `wrapping_mul` method call.
 fn product<'tcx>(
@@ -2815,6 +2818,7 @@ fn product<'tcx>(
     })
 }
 
+#[cfg(test)]
 /// `size_of::<T>()` in every spelling the corpus writes, including c2rust's
 /// leading `::` (`::std::mem::size_of::<uint8_t>()`), which
 /// [`exact_element_size`] does not accept and which is deliberately not
@@ -2840,6 +2844,7 @@ fn is_element_size(text: &str, element_type: &str) -> bool {
     .any(|prefix| normalized == format!("{prefix}size_of::<{element}>()"))
 }
 
+#[cfg(test)]
 fn callee_item_name(tcx: TyCtxt<'_>, callee: &rustc_hir::Expr<'_>) -> Option<String> {
     let rustc_hir::ExprKind::Path(path) = Collector::peel(callee).kind else { return None };
     let rustc_hir::QPath::Resolved(_, path) = path else { return None };

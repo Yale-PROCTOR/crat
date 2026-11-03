@@ -146,6 +146,7 @@ pub(crate) struct SoundnessWithdrawal {
 }
 
 impl SoundnessWithdrawal {
+    #[cfg(test)]
     pub(crate) fn null_required_reference(
         tcx: rustc_middle::ty::TyCtxt<'_>,
         constructions: &decision::construction::ConstructionFacts,
@@ -891,6 +892,7 @@ fn protected_from_retirement(
     carried_the_only_reason && reasons.len() == 1
 }
 
+#[cfg(test)]
 pub(crate) fn withdrawals(
     prior: &StageSnapshot,
     candidate: &StageSnapshot,

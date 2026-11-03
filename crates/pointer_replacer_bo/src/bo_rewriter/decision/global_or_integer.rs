@@ -489,18 +489,17 @@ pub(crate) fn flow_roots<'tcx>(
     };
     let mut roots: Vec<FlowRoot> = Vec::new();
     let mut work: Vec<&'tcx Expr<'tcx>> = vec![expr];
-    let mut add_static =
-        |def: DefId, roots: &mut Vec<FlowRoot>, work: &mut Vec<&'tcx Expr<'tcx>>| {
-            let root = FlowRoot::Static(def);
-            if !roots.contains(&root) {
-                roots.push(root);
-                let (stores, addressed) = stores_into_static(body, def);
-                if addressed {
-                    roots.push(FlowRoot::Unbounded);
-                }
-                work.extend(stores);
+    let add_static = |def: DefId, roots: &mut Vec<FlowRoot>, work: &mut Vec<&'tcx Expr<'tcx>>| {
+        let root = FlowRoot::Static(def);
+        if !roots.contains(&root) {
+            roots.push(root);
+            let (stores, addressed) = stores_into_static(body, def);
+            if addressed {
+                roots.push(FlowRoot::Unbounded);
             }
-        };
+            work.extend(stores);
+        }
+    };
     if let Some(Provenance::GlobalValue(def) | Provenance::GlobalStorage(def)) = seed {
         add_static(def, &mut roots, &mut work);
     }

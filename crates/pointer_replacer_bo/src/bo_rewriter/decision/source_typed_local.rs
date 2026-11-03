@@ -223,6 +223,7 @@ fn derived_value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<DerivedValue> {
     derived_view(tcx, subject.fn_did, subject.hir_id)
 }
 
+#[cfg(test)]
 /// **The predicate ownership-fields' native source scan consumes (R440-3).**
 ///
 /// `ownership_fields_source::resolve` refuses an owner whose root has a raw use

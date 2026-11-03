@@ -31,8 +31,10 @@ use rustc_hir::{
 use rustc_middle::ty::{TyCtxt, TyKind};
 use rustc_span::Span;
 
+#[cfg(test)]
+use super::SubjectKind;
 use super::{
-    Decision, DecisionTable, SubjectKind,
+    Decision, DecisionTable,
     raw_boundary::{self, RawBoundaryBlockReason, RawTargetType},
     return_interface::ReturnInterface,
     seam::{self, Form, GlueSpec},

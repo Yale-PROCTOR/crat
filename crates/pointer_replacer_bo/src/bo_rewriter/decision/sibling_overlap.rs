@@ -22,11 +22,13 @@ use rustc_middle::{
 use rustc_mir_dataflow::Analysis;
 use rustc_span::Span;
 
+#[cfg(test)]
+use super::raw_boundary::site_atom_id;
 use super::{
     Subject, SubjectKind,
     a5_site_proof::{A5PeerProof, A5SiteProofVerdict},
     outbound_expression::OutboundExpressionPlans,
-    raw_boundary::{RawBoundarySiteKey, RetentionVerdict, raw_target_type, site_atom_id},
+    raw_boundary::{RawBoundarySiteKey, RetentionVerdict, raw_target_type},
     raw_boundary_contracts::{PointeeAccess, RetentionContract, classify_contract},
     return_interface::ReturnInterface,
     seam::Form,
@@ -323,6 +325,7 @@ pub(crate) struct PendingSiblingReceipt {
 }
 
 impl PendingSiblingReceipt {
+    #[cfg(test)]
     pub(crate) fn site_id(&self) -> String {
         site_atom_id(&self.potential.site)
     }
@@ -361,6 +364,7 @@ impl<'a> From<&'a super::super::DecideCtx> for SiblingInputs<'a> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn collect_inventory(
     tcx: TyCtxt<'_>,
     ctx: &super::super::DecideCtx,

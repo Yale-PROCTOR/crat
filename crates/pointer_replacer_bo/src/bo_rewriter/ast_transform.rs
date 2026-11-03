@@ -102,6 +102,7 @@ fn option_of(inner: P<Ty>) -> TyKind {
     wrapper_of("Option", inner)
 }
 
+#[cfg(test)]
 /// Build the declared type for `form`, **keeping `pointee` as a subtree**.
 ///
 /// The eight `(form, mutable)` combinations render exactly the four spellings
@@ -888,6 +889,7 @@ impl Composition {
         self.claimed.get(&node).copied()
     }
 
+    #[cfg(test)]
     /// The spans this transform actually edited. Empty means the transform
     /// changed nothing — and then nothing is reprinted, which is the correct
     /// answer, not a degenerate one.
@@ -909,6 +911,7 @@ impl Composition {
             .zip(self.claimants.iter().copied())
     }
 
+    #[cfg(test)]
     /// Refusals whose CHALLENGER carries this label — the pass that was turned
     /// away. Derived from the labels rather than by subtracting one pass's
     /// tally from the guard's total, which would mis-attribute the moment a
@@ -1458,6 +1461,7 @@ impl<'a> UseGraftVisitor<'a> {
         ))
     }
 
+    #[cfg(test)]
     /// Close the walk, deriving `unmatched` from what was never reached.
     pub(crate) fn finish(mut self) -> UseGraftStats {
         self.stats.unmatched = self
@@ -4079,6 +4083,7 @@ fn surface_return_pointee(ty: &str) -> Option<String> {
     Some(rustc_ast_pretty::pprust::ty_to_string(pointee))
 }
 
+#[cfg(test)]
 /// The wrapper builder with the ORIGINAL signature beside the converted one
 /// (R470-4: the argument constructor reads the C ABI's own parameter types).
 pub(super) fn surface_wrapper_block_with_outer(
@@ -4090,6 +4095,7 @@ pub(super) fn surface_wrapper_block_with_outer(
     surface_wrapper_block_with_arguments(inner_name, function, return_temp_type, None, Some(outer))
 }
 
+#[cfg(test)]
 pub(super) fn surface_wrapper_block(
     inner_name: &str,
     function: &rustc_ast::Fn,
@@ -5735,6 +5741,7 @@ fn rendered_calls(
     visitor.out
 }
 
+#[cfg(test)]
 pub(crate) fn ast_emitted_source_from(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     capture: &AstCapture,
@@ -5774,6 +5781,7 @@ pub(crate) fn ast_emitted_source_from(
     Ok((source, stats))
 }
 
+#[cfg(test)]
 /// **ARM 1's TEXT DIFFERENTIAL** — the rendered declaration vs the span layer's
 /// own edit, at the same byte offset.
 ///
@@ -5948,6 +5956,7 @@ pub(crate) struct SeamUseSurface {
     pub partial: usize,
 }
 
+#[cfg(test)]
 /// **ARM 4's TASK 0 — the justification census.**
 ///
 /// Arm 4 is `ReRoute` / `DropForm` / `StoreForm`, and the migration's job for
@@ -5998,7 +6007,9 @@ pub(crate) struct JustificationCensus {
     pub lifetime_plan: usize,
 }
 
+#[cfg(test)]
 impl JustificationCensus {
+    #[cfg(test)]
     /// The sum of the buckets. A method rather than a sixth field, so it cannot
     /// drift from the parts.
     ///
@@ -6033,6 +6044,7 @@ impl JustificationCensus {
             + self.lifetime_plan
     }
 
+    #[cfg(test)]
     /// The plan's edit count, derived **without consulting any justification**.
     ///
     /// The real denominator, and the one a conservation gate has to use.
@@ -6050,6 +6062,7 @@ impl JustificationCensus {
         plan.by_file.values().map(Vec::len).sum()
     }
 
+    #[cfg(test)]
     /// Census one whole plan.
     ///
     /// **A named function over the plan, per R8** (ratified at the arm-3
@@ -6069,6 +6082,7 @@ impl JustificationCensus {
         c
     }
 
+    #[cfg(test)]
     /// Count one edit's justification.
     pub(crate) fn count(&mut self, j: &super::plan::Justification) {
         use super::plan::Justification as J;
@@ -7074,6 +7088,7 @@ pub(crate) fn insert_counting<K: Eq + std::hash::Hash, V>(
     }
 }
 
+#[cfg(test)]
 /// **IDENTITY-SET RECONCILIATION — what a count-based ledger cannot do.**
 ///
 /// The phase-4 boundary review's F2, in one sentence: `p4_placed == emitted`
@@ -7108,6 +7123,7 @@ pub(crate) struct IdentityRecon {
     pub examples: Vec<String>,
 }
 
+#[cfg(test)]
 /// Reconcile the identities a walk placed against the identities it owed.
 ///
 /// `label` renders one identity for a human; it is never used for matching, so
@@ -7509,6 +7525,7 @@ thread_local! {
     > = const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
 }
 
+#[cfg(test)]
 /// Per PROGRAM, beside [`reset_graft_refusals`].
 pub(crate) fn reset_graft_held() {
     GRAFT_HELD.with(|cell| cell.borrow_mut().clear());
@@ -7603,6 +7620,7 @@ pub(crate) fn graft_held_table() -> String {
     out
 }
 
+#[cfg(test)]
 pub(crate) fn reset_graft_refusals() {
     GRAFT_REFUSALS.with(|cell| cell.set(0));
 }

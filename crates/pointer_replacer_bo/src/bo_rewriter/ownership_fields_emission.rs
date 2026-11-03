@@ -1,9 +1,10 @@
 //! Typed emission plans over supplied grants. This is not a grant producer or
 //! an AST parser. Expressions/types are compiler-rendered inputs at integration.
-use super::{
-    EvidenceKey,
-    lifecycle::{CloseKind, ClosePlan},
-};
+use super::EvidenceKey;
+#[cfg(test)]
+use super::lifecycle::CloseKind;
+#[cfg(test)]
+use super::lifecycle::ClosePlan;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -118,11 +119,13 @@ pub fn admit_call(grant: &Grant, facts: &OwnCallFacts) -> Result<OwnCallPermit, 
     Ok(OwnCallPermit { key: facts.key })
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OwnerType {
     pub pointee: String,
     pub optional: bool,
 }
+#[cfg(test)]
 impl OwnerType {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Emitted {
@@ -131,6 +134,7 @@ pub struct Emitted {
     pub receipt: &'static str,
 }
 
+#[cfg(test)]
 /// Local-only suppression carrier. Fields keep the declared Option<Box<_>>
 /// interface; field/aggregate cleanup needs a separate transaction lowering.
 #[derive(Clone, Debug)]
@@ -141,6 +145,7 @@ pub struct LeakLocal {
     suppressed_closes: Vec<ClosePlan>,
 }
 
+#[cfg(test)]
 /// Complete adapter-supplied implicit-exit inventory for one local generation.
 /// A single scope/overwrite receipt cannot authorize unconditional suppression.
 #[derive(Clone, Debug)]
@@ -150,8 +155,10 @@ pub struct LeakCoverage {
     pub closes: Vec<ClosePlan>,
 }
 
+#[cfg(test)]
 impl LeakCoverage {}
 
+#[cfg(test)]
 impl LeakLocal {}
 
 pub fn consume_argument(
@@ -190,6 +197,7 @@ pub fn explicit_free(
     })
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct AggregateField {
     pub field: super::FieldClassId,
@@ -197,6 +205,7 @@ pub struct AggregateField {
     pub ty: OwnerType,
     pub generation: EvidenceKey,
 }
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub struct LeakAggregate {
     key: EvidenceKey,
@@ -205,6 +214,8 @@ pub struct LeakAggregate {
     name: String,
     fields: std::collections::BTreeMap<super::FieldClassId, AggregateField>,
 }
+#[cfg(test)]
 impl LeakAggregate {}
 
+#[cfg(test)]
 impl LeakAggregate {}

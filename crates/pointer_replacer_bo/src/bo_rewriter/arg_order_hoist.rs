@@ -91,6 +91,7 @@ impl<'a> HoistVisitor<'a> {
         }
     }
 
+    #[cfg(test)]
     /// The calls hoisted, and the reason each receipted call was not.
     pub(crate) fn finish(self) -> (usize, Vec<&'static str>) {
         (self.applied, self.held)

@@ -12,6 +12,7 @@ use super::{
     },
     decision::raw_boundary::RetentionVerdict,
 };
+#[cfg(test)]
 use crate::raw_boundary_census_schema as raw_schema;
 
 pub(crate) const SLICE_EXTENT_WAIVER_ID: &str = "slice-extent-out-of-scope@addendum-77";
@@ -72,6 +73,7 @@ pub(crate) enum MechanicalFamily {
 }
 
 impl MechanicalFamily {
+    #[cfg(test)]
     pub(crate) const ALL: [Self; 31] = [
         Self::UnsafeContext,
         Self::A5ProofSiteFallback,
@@ -395,6 +397,7 @@ pub(crate) enum MechanicalMechanism {
 }
 
 impl MechanicalMechanism {
+    #[cfg(test)]
     fn for_family(family: MechanicalFamily) -> Self {
         match family {
             MechanicalFamily::UnsafeContext => Self::UnsafeContextPresentation,
@@ -435,6 +438,7 @@ impl MechanicalMechanism {
         }
     }
 
+    #[cfg(test)]
     fn key(self) -> &'static str {
         match self {
             Self::UnsafeContextPresentation => "unsafe-context-presentation",
@@ -545,6 +549,7 @@ pub(crate) enum MechanicalExtent {
 }
 
 impl MechanicalExtent {
+    #[cfg(test)]
     fn kind(&self) -> &'static str {
         match self {
             Self::None => "none",
@@ -553,6 +558,7 @@ impl MechanicalExtent {
         }
     }
 
+    #[cfg(test)]
     fn evidence(&self) -> &str {
         match self {
             Self::None => "-",
@@ -591,6 +597,7 @@ pub(crate) enum MechanicalRetention {
 }
 
 impl MechanicalRetention {
+    #[cfg(test)]
     fn tier(&self) -> &'static str {
         match self {
             Self::None => "none",
@@ -600,6 +607,7 @@ impl MechanicalRetention {
         }
     }
 
+    #[cfg(test)]
     fn waiver(&self) -> &str {
         match self {
             Self::T2 { waiver_id } => waiver_id,
@@ -704,6 +712,7 @@ pub(crate) struct UnsafeContextPresentation {
 }
 
 impl UnsafeContextPresentation {
+    #[cfg(test)]
     fn key(self) -> String {
         format!(
             "unsafe_fn={}:wrapper={}:edition={}{}",
@@ -750,6 +759,7 @@ pub(crate) struct UnsafeContextReceiptEvent {
     pub(crate) drop_reason: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct UnsafeContextReceiptSummary {
     pub(crate) sites: usize,
@@ -758,6 +768,7 @@ pub(crate) struct UnsafeContextReceiptSummary {
     pub(crate) dropped: usize,
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_unsafe_context_events(
     events: &[UnsafeContextReceiptEvent],
 ) -> Result<UnsafeContextReceiptSummary, String> {
@@ -816,6 +827,7 @@ pub(crate) fn reconcile_unsafe_context_events(
     Ok(summary)
 }
 
+#[cfg(test)]
 pub(crate) fn render_unsafe_context_events(events: &[UnsafeContextReceiptEvent]) -> String {
     let mut rows = events
         .iter()
@@ -990,6 +1002,7 @@ impl MechanicalObligationEvent {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_evidence(mut self, evidence: MechanicalEvidence) -> Self {
         self.evidence = evidence;
         self
@@ -1193,10 +1206,12 @@ pub(crate) fn reconcile_mechanical_obligations(
     Ok(summary)
 }
 
+#[cfg(test)]
 pub(crate) fn mechanical_obligation_header() -> String {
     "obligation_key\towner_local_def_id\towner_path\tsubject_key\tcanonical_site_key\tfamily\tprior_reason\texpected_form\tfound_form\targument_kind\tsource_shape\trequired_arms\tmechanism\textent_kind\textent_evidence\tretention_tier\twaiver_id\tunsafe_context\tcomposition_parent\tdependency_classes\tstage\tstate\tdrop_reason\n".to_owned()
 }
 
+#[cfg(test)]
 pub(crate) fn render_mechanical_obligations(events: &[MechanicalObligationEvent]) -> String {
     let mut rows = events
         .iter()
@@ -1258,6 +1273,7 @@ pub(crate) struct SpecializedReceiptTerminal {
     pub(crate) reason: Option<MechanicalTerminalReason>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UnsafeContextReceiptRow {
     pub(crate) terminal: SpecializedReceiptTerminal,
@@ -1321,6 +1337,7 @@ impl A5ProofSiteReceiptPlan {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_a5_proof_site_fallback_rows(
     rows: &[A5ProofSiteFallbackReceiptRow],
     common: &[MechanicalObligationEvent],
@@ -1378,6 +1395,7 @@ pub(crate) fn reconcile_a5_proof_site_fallback_rows(
         .count())
 }
 
+#[cfg(test)]
 pub(crate) fn render_a5_proof_site_fallback_rows(rows: &[A5ProofSiteFallbackReceiptRow]) -> String {
     let mut rendered = rows
         .iter()
@@ -1467,6 +1485,7 @@ impl SliceConstructionReceiptPlan {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_slice_construction_rows(
     rows: &[SliceConstructionReceiptRow],
     common: &[MechanicalObligationEvent],
@@ -1595,6 +1614,7 @@ impl SliceUseReceiptPlan {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_slice_use_rows(
     rows: &[SliceUseAdapterReceiptRow],
     events: &[MechanicalObligationEvent],
@@ -1696,6 +1716,7 @@ pub(crate) fn reconcile_slice_use_rows(
         .count())
 }
 
+#[cfg(test)]
 pub(crate) fn render_slice_use_rows(rows: &[SliceUseAdapterReceiptRow]) -> String {
     let mut rendered = rows
         .iter()
@@ -1816,6 +1837,7 @@ impl OptionPresentationReceiptPlan {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_option_presentation_rows(
     rows: &[OptionPresentationReceiptRow],
     events: &[MechanicalObligationEvent],
@@ -1873,6 +1895,7 @@ pub(crate) fn reconcile_option_presentation_rows(
         .count())
 }
 
+#[cfg(test)]
 pub(crate) fn render_option_presentation_rows(rows: &[OptionPresentationReceiptRow]) -> String {
     let mut rendered = rows
         .iter()
@@ -1962,6 +1985,7 @@ impl DeclarationShapeReceiptPlan {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_declaration_shape_rows(
     rows: &[DeclarationShapeReceiptRow],
     events: &[MechanicalObligationEvent],
@@ -2033,6 +2057,7 @@ pub(crate) fn reconcile_declaration_shape_rows(
         .count())
 }
 
+#[cfg(test)]
 pub(crate) fn render_declaration_shape_rows(rows: &[DeclarationShapeReceiptRow]) -> String {
     let mut rendered = rows
         .iter()
@@ -2569,6 +2594,7 @@ pub(crate) fn is_outbound_return_family(family: MechanicalFamily) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn render_outbound_return_rows(rows: &[OutboundReturnBridgeReceiptRow]) -> String {
     let mut rendered = rows
         .iter()
@@ -2629,6 +2655,7 @@ pub(crate) fn render_outbound_return_rows(rows: &[OutboundReturnBridgeReceiptRow
     output
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RawSinkAdapterReceiptRow {
     pub(crate) terminal: SpecializedReceiptTerminal,
@@ -2644,6 +2671,7 @@ pub(crate) struct RawSinkAdapterReceiptRow {
     pub(crate) retention: MechanicalRetention,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CompositionDependencyReceiptRow {
     pub(crate) terminal: SpecializedReceiptTerminal,
@@ -2656,6 +2684,7 @@ pub(crate) struct CompositionDependencyReceiptRow {
     pub(crate) terminal_root: Option<SignatureClassId>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MissingCShapeReceiptRow {
     pub(crate) terminal: SpecializedReceiptTerminal,
@@ -2669,6 +2698,7 @@ pub(crate) struct MissingCShapeReceiptRow {
     pub(crate) adapter_owner: MechanicalFamily,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DiagnosticPrimaryMessageReceiptRow {
     pub(crate) terminal: SpecializedReceiptTerminal,
@@ -2684,6 +2714,7 @@ pub(crate) struct DiagnosticPrimaryMessageReceiptRow {
     pub(crate) owner_class: Option<SignatureClassId>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct JsonRecoveryReceiptRow {
     pub(crate) terminal: SpecializedReceiptTerminal,
@@ -2694,6 +2725,7 @@ pub(crate) struct JsonRecoveryReceiptRow {
     pub(crate) mechanism: MechanicalMechanism,
 }
 
+#[cfg(test)]
 pub(crate) fn specialized_receipt_headers() -> BTreeMap<&'static str, &'static [&'static str]> {
     BTreeMap::from([
         (
@@ -2919,6 +2951,7 @@ pub(crate) fn specialized_receipt_headers() -> BTreeMap<&'static str, &'static [
     ])
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct IdentitySetReconciliation {
     pub(crate) observed_count: usize,
@@ -2928,7 +2961,9 @@ pub(crate) struct IdentitySetReconciliation {
     pub(crate) duplicates: Vec<String>,
 }
 
+#[cfg(test)]
 impl IdentitySetReconciliation {
+    #[cfg(test)]
     pub(crate) fn is_exact(&self) -> bool {
         self.missing.is_empty()
             && self.unexpected.is_empty()
@@ -2937,6 +2972,7 @@ impl IdentitySetReconciliation {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_identity_rows<CI, CS, PI, PS>(
     control: CI,
     production: PI,
@@ -2974,6 +3010,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(crate) fn reconcile_identity_set<I, S>(
     control: &BTreeSet<String>,
     production: I,

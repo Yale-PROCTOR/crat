@@ -10,15 +10,25 @@ pub(crate) mod consumer;
 mod observer;
 pub(crate) mod reader;
 
-use super::{DecisionTable, SubjectKind, a5_site_proof::A5ProofSiteKey, seam::Form};
+#[cfg(test)]
+use super::DecisionTable;
+#[cfg(test)]
+use super::SubjectKind;
+#[cfg(test)]
+use super::a5_site_proof::A5ProofSiteKey;
+#[cfg(test)]
+use super::seam::Form;
+#[cfg(test)]
 use crate::analyses::borrow_ownership::mutability_facts::MutFacts;
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NativeMutability {
     Missing,
     Present { mutable: bool },
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PositionDiagnostic {
     pub site: Option<A5ProofSiteKey>,
@@ -28,6 +38,7 @@ pub(crate) struct PositionDiagnostic {
     pub formal_mutability: NativeMutability,
 }
 
+#[cfg(test)]
 pub(crate) fn diagnose(table: &DecisionTable, mut_facts: &MutFacts) -> Vec<PositionDiagnostic> {
     table.seams.overlap_proofs.iter().map(|proof| {
         // Read the compiler's local identity, never convert an unvalidated

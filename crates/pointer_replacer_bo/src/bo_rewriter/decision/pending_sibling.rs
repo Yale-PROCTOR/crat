@@ -21,8 +21,10 @@ use rustc_hash::FxHashSet;
 use rustc_hir::{HirId, def_id::LocalDefId};
 use rustc_middle::ty::TyCtxt;
 
+#[cfg(test)]
+use super::Subject;
 use super::{
-    Subject, SubjectKind,
+    SubjectKind,
     emitability::EmitabilityFacts,
     outbound_expression::OutboundExpressionPlans,
     raw_boundary::RawBoundaryDispositionIndex,

@@ -87,6 +87,7 @@ pub(crate) enum RefKind {
 }
 
 impl RefKind {
+    #[cfg(test)]
     pub(crate) fn key(self) -> &'static str {
         match self {
             RefKind::Call => "call",

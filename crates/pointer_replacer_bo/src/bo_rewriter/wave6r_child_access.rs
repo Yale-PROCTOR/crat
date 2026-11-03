@@ -497,6 +497,7 @@ pub(crate) fn position_is_descendant_free(
     )
 }
 
+#[cfg(test)]
 /// The scan's refusal reason for a position, for the receipt and the
 /// witnesses: `None` where `position_is_descendant_free` is true.
 pub(crate) fn position_refusal(

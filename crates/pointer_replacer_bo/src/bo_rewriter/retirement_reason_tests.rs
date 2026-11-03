@@ -12,20 +12,27 @@
 //!
 //! Diagnostic only, `#[ignore]`; nothing gates on it.
 
+#[cfg(test)]
 use rustc_mir_dataflow::Analysis;
 
-use crate::analyses::{
-    borrow_ownership::{
-        SlotKind,
-        construction::solve_bo_overlap_config_reporting,
-        crate_slots::CrateSlots,
-        export::with_bo_export,
-        mutability_facts::MutFacts,
-        origins::compute_origins,
-        param_overlap::{OverlapMode, WholeProgramAttestation},
-    },
-    liveness::MaybeLiveLocals,
-};
+#[cfg(test)]
+use crate::analyses::borrow_ownership::SlotKind;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::construction::solve_bo_overlap_config_reporting;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::crate_slots::CrateSlots;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::export::with_bo_export;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::mutability_facts::MutFacts;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::origins::compute_origins;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::param_overlap::OverlapMode;
+#[cfg(test)]
+use crate::analyses::borrow_ownership::param_overlap::WholeProgramAttestation;
+#[cfg(test)]
+use crate::analyses::liveness::MaybeLiveLocals;
 
 #[test]
 #[ignore]

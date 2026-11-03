@@ -9,6 +9,7 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OwnerId(pub u32);
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct FieldClassId {
     pub owner: OwnerId,

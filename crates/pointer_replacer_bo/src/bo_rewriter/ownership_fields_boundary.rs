@@ -1,11 +1,29 @@
 //! Local owning signatures and exact caller/formal contracts, over typed facts.
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 
-use super::{
-    EvidenceKey, OwnerId, SiteId,
-    emission::{Grant, GrantStatus, Kind, OwnCallFacts, OwnerType, admit_call},
-};
+#[cfg(test)]
+use super::EvidenceKey;
+#[cfg(test)]
+use super::OwnerId;
+#[cfg(test)]
+use super::SiteId;
+#[cfg(test)]
+use super::emission::Grant;
+#[cfg(test)]
+use super::emission::GrantStatus;
+#[cfg(test)]
+use super::emission::Kind;
+#[cfg(test)]
+use super::emission::OwnCallFacts;
+#[cfg(test)]
+use super::emission::OwnerType;
+#[cfg(test)]
+use super::emission::admit_call;
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BoundaryType {
     Owner(OwnerType),
@@ -17,4 +35,5 @@ pub enum BoundaryType {
     },
     Scalar(String),
 }
+#[cfg(test)]
 impl BoundaryType {}

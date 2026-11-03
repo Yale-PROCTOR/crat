@@ -88,6 +88,7 @@ pub(crate) enum BridgeExtentKind {
 }
 
 impl BridgeExtentKind {
+    #[cfg(test)]
     fn key(&self) -> String {
         match self {
             Self::None => "none".to_owned(),
@@ -113,6 +114,7 @@ pub(crate) enum BridgeRetentionTier {
 }
 
 impl BridgeRetentionTier {
+    #[cfg(test)]
     fn key(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -297,11 +299,13 @@ impl BridgeReceiptEvent {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_extent(mut self, extent: BridgeExtentKind) -> Self {
         self.extent = extent;
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_forms(
         mut self,
         expected_form: impl Into<String>,
@@ -314,6 +318,7 @@ impl BridgeReceiptEvent {
         self
     }
 
+    #[cfg(test)]
     pub(crate) fn with_retention(
         mut self,
         tier: BridgeRetentionTier,
@@ -432,10 +437,12 @@ pub(crate) fn reconcile_bridge_events(
     Ok(summary)
 }
 
+#[cfg(test)]
 pub(crate) fn bridge_receipt_header() -> String {
     "site_key\towner_class\tcaller\tcallee\tarm\tposition\tfile\tlo\thi\tbridge_kind\texpected_form\tfound_form\targument_kind\textent_kind\tretention_tier\twaiver_id\tstage\tstate\tdrop_reason\n".to_owned()
 }
 
+#[cfg(test)]
 pub(crate) fn render_bridge_events(events: &[BridgeReceiptEvent]) -> String {
     let mut rows = events
         .iter()

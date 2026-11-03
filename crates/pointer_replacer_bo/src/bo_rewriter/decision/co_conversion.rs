@@ -378,6 +378,7 @@ impl PairSiteDecision {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_pair_roles(
     entries: &[(usize, usize, A5SiteProofVerdict, bool)],
 ) -> BTreeMap<usize, PairRole> {
@@ -563,6 +564,7 @@ impl CoConv {
             .any(|site| site.subject == key && site.role == PairRole::RawView)
     }
 
+    #[cfg(test)]
     pub(crate) fn edge_routes(&self, key: NodeKey) -> Vec<&'static str> {
         let mut routes = self
             .edges
@@ -695,6 +697,7 @@ impl Dsu {
     }
 }
 
+#[cfg(test)]
 /// Build the classes from the **hypothetical** decision table.
 ///
 /// `hypothetical` must be the table produced under
@@ -745,6 +748,7 @@ fn c9_mark_matches(
         && mark.key.pair.function() == callee.local_def_index.as_u32()
 }
 
+#[cfg(test)]
 pub(crate) fn build_with_c9_marks(
     facts: &EmitabilityFacts,
     subjects: &[Subject],
@@ -764,6 +768,7 @@ pub(crate) fn build_with_c9_marks(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_with_c9_marks_and_lifetimes(
     facts: &EmitabilityFacts,
     subjects: &[Subject],
@@ -785,6 +790,7 @@ pub(crate) fn build_with_c9_marks_and_lifetimes(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
     facts: &EmitabilityFacts,
@@ -810,6 +816,7 @@ pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
     facts: &EmitabilityFacts,
@@ -2062,6 +2069,7 @@ pub(crate) enum EscapeKind {
 }
 
 impl EscapeKind {
+    #[cfg(test)]
     pub(crate) fn key(self) -> &'static str {
         match self {
             EscapeKind::StaticStore => "static-store",

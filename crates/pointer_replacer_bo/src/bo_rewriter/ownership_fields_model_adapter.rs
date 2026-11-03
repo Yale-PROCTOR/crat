@@ -5,9 +5,19 @@
 //! This module neither reads a cache nor sets environment variables or solves.
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+use super::emission;
+#[cfg(test)]
+use super::emission::EmitHold;
+#[cfg(test)]
+use super::emission::Emitted;
+#[cfg(test)]
+use super::emission::OwnCallFacts;
+#[cfg(test)]
+use super::emission::OwnerType;
 use super::{
     EvidenceKey, OwnerId, SiteId,
-    emission::{self, EmitHold, Emitted, Grant, GrantStatus, Kind, OwnCallFacts, OwnerType},
+    emission::{Grant, GrantStatus, Kind},
     export::{
         Digest, Evidence, EvidenceOwner, FactFamily, FactRef, GenerationRecipe, Missing,
         MissingReason, ProgramId, RecordKey, SourceFrame,

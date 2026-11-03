@@ -180,6 +180,7 @@ impl CertificateKind {
         }
     }
 
+    #[cfg(test)]
     /// The receipt with its evidence count. `key()` stays a fixed vocabulary so
     /// the census can count it; this is what the lane's ledger records.
     pub(crate) fn receipt(self) -> String {
@@ -239,6 +240,7 @@ fn root_side(class: RootClass) -> usize {
     }
 }
 
+#[cfg(test)]
 /// R486-2 (USER Decision C, 2026-09-21). Named so every site that rests on the
 /// assumption can be counted and, if it is ever withdrawn, found.
 pub(crate) const EXPORTED_ENTRY_STATIC_WAIVER: &str = "exported-entry-static-waiver";
@@ -269,6 +271,7 @@ pub(crate) enum Unproved {
 }
 
 impl Unproved {
+    #[cfg(test)]
     #[allow(
         dead_code,
         reason = "the unproved vocabulary is rendered by `ledger_tsv` and the witnesses"
@@ -1621,6 +1624,7 @@ impl PairDisjointnessIndex {
         self.shared_reads.contains(&(callee, left)) && self.shared_reads.contains(&(callee, right))
     }
 
+    #[cfg(test)]
     pub(crate) fn ledger(&self) -> Vec<LedgerRow> {
         self.ledger.borrow().clone()
     }
@@ -3483,6 +3487,7 @@ enum UnknownWhy {
 }
 
 impl UnknownWhy {
+    #[cfg(test)]
     fn key(self) -> &'static str {
         match self {
             Self::Known => "known",

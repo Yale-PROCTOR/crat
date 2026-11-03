@@ -130,17 +130,17 @@ pub(crate) struct CursorReceipt {
     pub(crate) disposition: Result<(), CursorHold>,
 }
 
-/// **R452-6.** A cursor whose base is a table element (`*t.offset(k)`) is
-/// planned while `t` is still a flat slice of pointers. When `t` later delivers
-/// its inner level (nested's N1), the element becomes a slice VALUE and the
-/// constructor becomes `new(t[k])` — no length, nothing fabricated. That base
-/// is this family's, so the plan is REBUILT here through the family's own
-/// producer: a post-hoc rewrite of a finalised plan costs the cursor entirely
-/// (nested 007's A/B). The caller flips the table first and calls this after.
-///
-/// A rebuild that holds leaves its entry untouched and is reported, so the
-/// caller can withdraw the flip that made this necessary rather than emit a
-/// cursor whose base text no longer types.
+// **R452-6.** A cursor whose base is a table element (`*t.offset(k)`) is
+// planned while `t` is still a flat slice of pointers. When `t` later delivers
+// its inner level (nested's N1), the element becomes a slice VALUE and the
+// constructor becomes `new(t[k])` — no length, nothing fabricated. That base
+// is this family's, so the plan is REBUILT here through the family's own
+// producer: a post-hoc rewrite of a finalised plan costs the cursor entirely
+// (nested 007's A/B). The caller flips the table first and calls this after.
+//
+// A rebuild that holds leaves its entry untouched and is reported, so the
+// caller can withdraw the flip that made this necessary rather than emit a
+// cursor whose base text no longer types.
 thread_local! {
     /// **R525-7 (slicecursor 071) — the stale-replan count, PER PROGRAM.**
     ///
