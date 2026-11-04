@@ -117,7 +117,7 @@ struct Args {
     // Pointer
     #[arg(
         long,
-        help = "Enable verbose ownership solver output for the pointer-old pass"
+        help = "Enable verbose ownership solver output for the pointer pass"
     )]
     pointer_verbose: bool,
     #[arg(short, long, help = "Enable verbose output")]
@@ -132,13 +132,16 @@ struct Args {
     points_to_file: Option<PathBuf>,
     #[arg(long, value_delimiter = ',', help = "Names of functions exposed to C")]
     c_exposed_fn: Vec<String>,
-    #[arg(long, help = "Write the pointer pass's emission receipt to this file")]
+    #[arg(
+        long,
+        help = "Write the pointer-bo pass's emission receipt to this file"
+    )]
     bo_receipt: Option<PathBuf>,
     #[arg(
         long,
         value_name = "SECS",
         value_parser = clap::value_parser!(u32).range(1..=4_294_967),
-        help = "Per-query z3 budget of the pointer pass in seconds (default 600); outranks CRAT_BO_QUERY_TIMEOUT_MS"
+        help = "Per-query z3 budget of the pointer-bo pass in seconds (default 600); outranks CRAT_BO_QUERY_TIMEOUT_MS"
     )]
     bo_query_timeout: Option<u32>,
 
@@ -177,9 +180,9 @@ enum Pass {
     Enum,
     Io,
     Pointer,
-    #[value(name = "pointer-old")]
-    #[serde(rename = "pointer-old")]
-    PointerOld,
+    #[value(name = "pointer-bo")]
+    #[serde(rename = "pointer-bo")]
+    PointerBo,
     Static,
     Simpl,
 }
@@ -213,9 +216,9 @@ struct Config {
     #[serde(default)]
     unexpand: unexpander::Config,
     #[serde(default)]
-    pointer: pointer_replacer_bo::Config,
-    #[serde(default, rename = "pointer-old")]
-    pointer_old: pointer_replacer::Config,
+    pointer: pointer_replacer::Config,
+    #[serde(default, rename = "pointer-bo")]
+    pointer_bo: pointer_replacer_bo::Config,
     #[serde(default)]
     andersen: points_to::andersen::Config,
     #[serde(default)]
@@ -249,7 +252,7 @@ fn main() {
     config.c_exposed_fns.extend(args.c_exposed_fn);
     config.verbose |= args.verbose;
     config.inplace |= args.inplace;
-    config.pointer_old.verbose |= args.pointer_verbose;
+    config.pointer.verbose |= args.pointer_verbose;
     config.passes.extend(args.pass);
     if args.analysis.is_some() {
         config.analysis = args.analysis;
@@ -387,7 +390,7 @@ fn main() {
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
     config
-        .pointer_old
+        .pointer_bo
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
     config
@@ -597,9 +600,9 @@ fn main() {
                     utils::add_dependency(&dir, "num-traits", "0.2.19");
                 }
             }
-            Pass::PointerOld => {
+            Pass::Pointer => {
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_struct_arrays(&config.pointer_old, tcx)
+                    pointer_replacer::rewrite_struct_arrays(&config.pointer, tcx)
                 })
                 .unwrap();
                 if changed {
@@ -607,7 +610,7 @@ fn main() {
                 }
 
                 let (s, changed, field_specs) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_struct_param_fields(&config.pointer_old, tcx)
+                    pointer_replacer::rewrite_struct_param_fields(&config.pointer, tcx)
                 })
                 .unwrap();
                 if !field_specs.is_empty() {
@@ -627,7 +630,7 @@ fn main() {
                 }
 
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_epoch_split(&config.pointer_old, tcx)
+                    pointer_replacer::rewrite_epoch_split(&config.pointer, tcx)
                 })
                 .unwrap();
                 if changed {
@@ -635,7 +638,7 @@ fn main() {
                 }
 
                 let (s, changed) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::rewrite_array_local_provenance(&config.pointer_old, tcx)
+                    pointer_replacer::rewrite_array_local_provenance(&config.pointer, tcx)
                 })
                 .unwrap();
                 if changed {
@@ -643,7 +646,7 @@ fn main() {
                 }
 
                 let (s, bytemuck) = run_compiler_on_path(&file, |tcx| {
-                    pointer_replacer::replace_local_borrows(&config.pointer_old, tcx)
+                    pointer_replacer::replace_local_borrows(&config.pointer, tcx)
                 })
                 .unwrap();
                 std::fs::write(&file, s).unwrap();
@@ -653,7 +656,7 @@ fn main() {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
                 }
             }
-            Pass::Pointer => {
+            Pass::PointerBo => {
                 // Relay main/388 O2 (R1386-1): the flag's budget: the flag > the variable > 600 s.
                 if let Some(secs) = bo_query_timeout {
                     let ms =
@@ -667,7 +670,7 @@ fn main() {
                 }
                 let receipt = pointer_replacer_bo::rewrite_bo(
                     &file,
-                    config.pointer.c_exposed_fns.iter().cloned(),
+                    config.pointer_bo.c_exposed_fns.iter().cloned(),
                 )
                 .unwrap_or_else(|e| {
                     eprintln!("{e}");
@@ -870,5 +873,28 @@ mod tests {
             None,
             "unset: the variable, the file or 600 s decide"
         );
+    }
+
+    /// S15 (the user's word in main's session 11-04: "pointer bo 로 하자"): `pointer` and `[pointer]` are
+    /// master's pass again; the borrow/ownership pass is `pointer-bo`, read from `[pointer-bo]`.
+    #[test]
+    fn s15_pointer_is_masters_pass_and_the_new_one_is_pointer_bo() {
+        let pass =
+            |name: &str| Args::try_parse_from(["crat", "--pass", name, "input"]).map(|a| a.pass);
+        assert!(matches!(pass("pointer").unwrap()[..], [Pass::Pointer]));
+        assert!(matches!(pass("pointer-bo").unwrap()[..], [Pass::PointerBo]));
+        assert!(pass("pointer-old").is_err());
+        let config: Config = toml::from_str(
+            "passes = [\"pointer\", \"pointer-bo\"]\n\
+             [pointer]\nc_exposed_fns = []\nverbose = true\n\
+             [pointer-bo]\nc_exposed_fns = [\"f\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            config.passes[..],
+            [Pass::Pointer, Pass::PointerBo]
+        ));
+        assert!(config.pointer.verbose);
+        assert!(config.pointer_bo.c_exposed_fns.contains("f"));
     }
 }

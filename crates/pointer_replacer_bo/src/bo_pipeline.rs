@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-/// The `[pointer]` table of crat's configuration: the settings of the pointer pass.
+/// The `[pointer-bo]` table of crat's configuration: the settings of the pointer-bo pass.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 pub struct Config {
     #[serde(default)]
