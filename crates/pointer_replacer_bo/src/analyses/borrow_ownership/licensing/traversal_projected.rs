@@ -63,40 +63,6 @@ fn c08_projected_traversal_payload_write_holds() {
 }
 
 #[test]
-#[ignore = "a staged licensing witness that does not hold under the current analysis"]
-fn c08_projected_traversal_deref_field_target_and_metadata() {
-    let code = CODE
-        .replace(
-            "let mut holder=Holder{ptr:root,scalar:0};",
-            "let mut storage=Holder{ptr:root,scalar:0};let holder=&mut storage as *mut Holder;",
-        )
-        .replace("holder.ptr", "(*holder).ptr")
-        .replace("holder.scalar", "(*holder).scalar");
-    let fixture = inspect_attested_frame(&code);
-    eprintln!(
-        "C08_DEREF={}",
-        serde_json::json!({"commits":fixture.commit_trace,"snapshots":fixture.export.ownership_licensing.as_ref().map(|rows|rows.iter().map(|s|serde_json::json!({"offset":s.offset,"field_support":s.field_support,"traversal":s.traversal_correspondences,"consumes":s.metadata.consumes,"boundaries":s.metadata.boundaries,"matched":s.matched})).collect::<Vec<_>>())})
-    );
-    fixture.assert_kind("Holder.ptr", SlotKind::Owning);
-    fixture.assert_kind("caller::result", SlotKind::Ref);
-    let accepted = fixture.export.stack_entry_final.as_ref().unwrap();
-    let [loan] = accepted.traversal_loans.as_slice() else { panic!("one projected returned loan") };
-    assert_eq!(loan.target.projection.len(), 3);
-    let snapshot = fixture
-        .export
-        .ownership_licensing
-        .as_ref()
-        .unwrap()
-        .iter()
-        .find(|s| s.offset == accepted.snapshot_offset)
-        .unwrap();
-    assert!(
-        super::traversal_call::input_target(&snapshot.metadata.facts(), &loan.origin).is_some(),
-        "portable target correspondence must not depend on runtime SlotRef identities"
-    );
-}
-
-#[test]
 fn c08_the_holder_field_has_no_store_under_the_record() {
     let fixture = inspect_attested_frame(CODE);
     let accepted = fixture.export.stack_entry_final.as_ref().unwrap();

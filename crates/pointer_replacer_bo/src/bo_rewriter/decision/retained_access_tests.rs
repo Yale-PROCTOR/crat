@@ -2289,18 +2289,6 @@ pub unsafe fn f() -> i32 {
 }
 "#;
 
-#[test]
-#[ignore = "RED: stand-in round 5, N1 (era-5c 142a §3)"]
-fn e5c_hold_red5_n1_self_recursion() {
-    assert!(held(N1_SELF_RECURSION, "walk::p"));
-}
-
-#[test]
-#[ignore = "RED: stand-in round 5, N2 (era-5c 142a §3)"]
-fn e5c_hold_red5_n2_glob_writeback() {
-    assert!(held(N2_GLOB_WRITEBACK, "f::p"));
-}
-
 /// R816-1, the closed world: an entry's two arguments are distinct objects, but the
 /// program's own aliasing through memory reached from one argument still holds.
 const CLOSED_WORLD: &str = r#"

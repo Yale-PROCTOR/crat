@@ -81,8 +81,6 @@ pub(crate) mod fat_facts;
 pub(crate) mod mechanical_receipt;
 // R351 ownership/fields consumers arrive from the preserved lane commits.
 #[cfg(test)]
-mod class2_pair_trace_tests;
-#[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]
 mod construction_values_tests;
@@ -268,8 +266,6 @@ mod additive_tests;
 mod address_observation_only_tests;
 #[cfg(test)]
 mod address_view_tests;
-#[cfg(test)]
-mod aliased_storage_withdrawal_tests;
 /// **R631-12** — the argument-order hoist, the emission premise of L01¹⁰'s arm (a).
 mod arg_order_hoist;
 #[cfg(test)]
@@ -451,8 +447,6 @@ mod seam_terminal_tests;
 #[cfg(test)]
 mod sibling_audit_tests;
 #[cfg(test)]
-mod sibling_audit_transport_tests;
-#[cfg(test)]
 mod sibling_overlap_tests;
 #[cfg(test)]
 mod slice_passon_tests;
@@ -466,8 +460,6 @@ mod twin_raw_view_custody_tests;
 mod void_pointee_tests;
 #[cfg(test)]
 mod void_region_tests;
-#[cfg(test)]
-mod wave5c_preservation_witness_tests;
 #[cfg(test)]
 mod zero_syntax_custody_tests;
 

@@ -19,48 +19,6 @@ fn reasons(src: &str) -> std::collections::BTreeMap<String, String> {
         .collect()
 }
 
-/// **The verbatim corpus transplant** (R274-3): `copyFileName` and its caller
-/// copied from the derived bzip2 source with the two real argument shapes —
-/// `copyFileName(inName.as_mut_ptr(), name)` over
-/// `pub static mut inName: [Char; 1034]`, and a bare local `name: *mut Char`.
-///
-/// `from` reaches three non-one-element positions in one body: `strlen`
-/// (nul-terminated), the `fprintf` `%s` tail (nul-terminated) and `strncpy`
-/// (byte-count). It is one of the census's 56 subjects.
-const TRANSPLANT_INPUT: &str = r#"
-    #![allow(dead_code, unused_unsafe, unused_mut, non_upper_case_globals, non_snake_case)]
-    pub type Char = i8;
-    #[repr(C)]
-    pub struct FILE {
-        pub handle: i32,
-    }
-    extern "C" {
-        fn strlen(s: *const i8) -> usize;
-        fn strncpy(dest: *mut i8, src: *const i8, n: usize) -> *mut i8;
-        fn fprintf(stream: *mut FILE, fmt: *const i8, ...) -> i32;
-    }
-    pub static mut inName: [Char; 1034] = [0; 1034];
-    pub static mut outName: [Char; 1034] = [0; 1034];
-    pub static mut stream: *mut FILE = 0 as *mut FILE;
-
-    unsafe extern "C" fn copyFileName(mut to: *mut Char, mut from: *mut Char) {
-        if strlen(from) > (1034 as i32 - 10 as i32) as usize {
-            fprintf(stream,
-                    b"bzip2: file name\n`%s'\nis suspiciously long.\n\x00" as *const u8
-                        as *const i8, from,
-                    1034 as i32 - 10 as i32);
-            return;
-        }
-        strncpy(to, from, (1034 as i32 - 10 as i32) as usize);
-        *to.offset((1034 as i32 - 10 as i32) as isize) = '\u{0}' as i32 as Char;
-    }
-
-    pub unsafe fn compress(mut name: *mut Char) {
-        copyFileName(inName.as_mut_ptr(), name);
-        copyFileName(outName.as_mut_ptr(), name);
-    }
-"#;
-
 /// The control that keeps the rule about EXTENT rather than about references: a
 /// subject with array evidence takes a slice form, which carries an extent, and
 /// still bridges to the same counted position.
@@ -136,45 +94,6 @@ const DIRECT_COUNTED_CONTROL_INPUT: &str = r#"
         memcpy(dest, SOURCE.as_ptr(), SOURCE.len());
     }
 "#;
-
-#[test]
-#[ignore = "per-subject containment primitive (R397-6(a), wave-5d): the pair-overlap terminal at the caller withdraws the sibling"]
-fn thin_extent_transplant_of_the_bzip2_shape() {
-    let got = reasons(TRANSPLANT_INPUT);
-    assert_eq!(
-        got.get("to").map(String::as_str),
-        Some("<emitted>"),
-        "the failed `from` candidate must not withdraw `to`'s older slice: {got:#?}"
-    );
-    // **Reported as observed, and it does NOT reach the hold.** Measured:
-    // `from` degrades `call-site-not-adapted` and its sibling `to` degrades
-    // `slice-use-unsupported`.
-    //
-    // The precondition, verified rather than assumed: `LiftAdaptable`
-    // (`decision/mod.rs:1762`) is NOT the blocker — `copyFileName` is
-    // referenced by two `RefKind::Call` sites, so `RefKind::is_adaptable` is
-    // true. The refusal is the co-conversion admission: `from` is not admitted
-    // as a node and neither `node_block` nor `class_block` names a reason, so
-    // it takes the `CallSiteNotAdapted` fallback arm at `decision/mod.rs:1860`.
-    // What the small crate cannot adapt is the SIBLING argument —
-    // `inName.as_mut_ptr()`, a raw expression over a static array — and
-    // refusing that call site takes both parameters with it.
-    //
-    // So the assertion here is the property the transplant CAN carry: this
-    // subject is not delivered as a thin reference. The load-bearing witness
-    // for the identity is the corpus emission run (R274-1).
-    let from = got.get("from").map(String::as_str);
-    assert!(
-        from.is_some(),
-        "the transplant must produce a decision for `from`: {got:#?}"
-    );
-    assert_ne!(
-        from,
-        Some("<emitted>"),
-        "`from` reaches strlen, an fprintf %s tail and strncpy: it may not be \
-         delivered as a thin reference: {got:#?}"
-    );
-}
 
 /// A slice carries its extent, so the same position is fine for it.
 #[test]

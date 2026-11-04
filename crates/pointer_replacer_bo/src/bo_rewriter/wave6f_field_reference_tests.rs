@@ -1213,7 +1213,6 @@ fn w6f_tulip_element_list_initializers_split_by_their_elements() {
 }
 
 const AVL: &str = include_str!("wave6f_fixture_avl.rs");
-const QUADTREE_ROOT: &str = include_str!("wave6f_fixture_quadtree_root.rs");
 const MALLOC_FREE_FIELD: &str = include_str!("wave6f_fixture_malloc_free_field.rs");
 const OWNED_SUBFIELD_WRITE: &str = include_str!("wave6f_fixture_owned_subfield_write.rs");
 
@@ -2526,33 +2525,6 @@ fn w6f_a_non_dependent_owners_revert_leaves_the_text() {
         dependent.contains("pub data: *const u8") && !dependent.contains("Option<&'a [u8]>"),
         "a dependent owner's revert takes the declaration with it"
     );
-}
-
-/// **Relay 059 / R518-3 probe** — if the analysis ever calls `quadtree.root`
-/// Owning, does anything ELSE hold the field? The model override stands in for
-/// the arm matrix's verdict, so the answer separates "the analysis is the only
-/// wall" from "there is a second one waiting behind it".
-#[test]
-#[ignore = "relay 059 probe: run with --ignored --nocapture"]
-fn w6f_probe_quadtree_root_as_an_owned_field() {
-    let _frame = frame_lock();
-    use crate::analyses::borrow_ownership::SlotKind;
-    for kind in [SlotKind::Owning, SlotKind::Ref] {
-        super::test_model_override::set(
-            "w6f-quadtree-root-frame",
-            vec![("quadtree".to_owned(), 0, kind)],
-            Vec::new(),
-        );
-        let observed = observe(QUADTREE_ROOT);
-        super::test_model_override::clear();
-        println!("PROBE-059 model={kind:?}");
-        for (st, field, status, form, cause) in &observed.fields {
-            println!("  ROW {st}.{field} status={status} form={form} cause={cause}");
-        }
-        if observed.fields.is_empty() {
-            println!("  ROW <none>");
-        }
-    }
 }
 
 /// Witness 34 (relay 061 / R523-3) — **the sixth arm's key is the

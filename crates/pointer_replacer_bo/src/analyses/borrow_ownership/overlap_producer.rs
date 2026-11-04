@@ -204,20 +204,8 @@ pub(crate) struct OverlapSiteBranchAudit {
     pub(crate) target_path: String,
     pub(crate) left_parameter: u32,
     pub(crate) right_parameter: u32,
-    #[cfg(test)]
-    pub(crate) left_operand: String,
-    #[cfg(test)]
-    pub(crate) right_operand: String,
-    #[cfg(test)]
-    pub(crate) left_actual: Option<SlotKey>,
-    #[cfg(test)]
-    pub(crate) right_actual: Option<SlotKey>,
     pub(crate) classifier: Option<PairClass>,
-    #[cfg(test)]
-    pub(crate) dependencies: usize,
     pub(crate) family: &'static str,
-    #[cfg(test)]
-    pub(crate) terminator: String,
 }
 
 /// Every call site's overlap pairs with the facts that decide them, for the branch audit.
@@ -298,8 +286,6 @@ pub(crate) fn audit_overlap_site_branches(
                     let left_actual = actual_slot(slots, caller, &body, &args[left].node);
                     let right_actual = actual_slot(slots, caller, &body, &args[right].node);
                     let mut classifier = None;
-                    #[cfg(test)]
-                    let mut dependencies = 0usize;
                     let family = if targets.iter().any(|target| {
                         let target_body =
                             tcx.mir_drops_elaborated_and_const_checked(*target).borrow();
@@ -335,10 +321,6 @@ pub(crate) fn audit_overlap_site_branches(
                                 &args[left].node,
                                 &args[right].node,
                             );
-                            #[cfg(test)]
-                            {
-                                dependencies = dependency_rows.len();
-                            }
                             let verdict = classify_pair(&facts);
                             classifier = Some(verdict);
                             match site_seed_disposition(verdict, dependency_rows.is_empty()) {
@@ -368,20 +350,8 @@ pub(crate) fn audit_overlap_site_branches(
                             target_path: tcx.def_path_str(target.to_def_id()),
                             left_parameter: left as u32 + 1,
                             right_parameter: right as u32 + 1,
-                            #[cfg(test)]
-                            left_operand: format!("{:?}", args[left].node),
-                            #[cfg(test)]
-                            right_operand: format!("{:?}", args[right].node),
-                            #[cfg(test)]
-                            left_actual: left_actual.map(SlotKey::of),
-                            #[cfg(test)]
-                            right_actual: right_actual.map(SlotKey::of),
                             classifier,
-                            #[cfg(test)]
-                            dependencies,
                             family,
-                            #[cfg(test)]
-                            terminator: format!("{:?}", data.terminator().kind),
                         });
                     }
                 }

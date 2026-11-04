@@ -3479,42 +3479,6 @@ fn r447_a_moved_out_owner_takes_the_field_transactions_shape() {
     }
 }
 
-/// R442 (report 033): an alias another family renders as a mutable slice over
-/// this owner keeps the owner typed instead of holding it. IGNORED on this
-/// base with the measured reason: no family here decides one of this
-/// producer's view aliases, and the injection route does not reach the
-/// bundle derivation (report 033 claim 6), so the rule is exercised on the
-/// composition that carries wave-5d2's rule B — run it there with
-/// `--ignored`.
-#[test]
-#[ignore = "composed gate: needs a family that decides this owner's view alias (wave-5d2 rule B)"]
-fn r442_an_alias_another_family_renders_keeps_the_owner_typed() {
-    let input = format!(
-        "{} pub unsafe fn holder(width:i32,height:i32){{ let mut buf=calloc((width*height) as usize,core::mem::size_of::<f32>()) as *mut f32; let mut x=0; while x<width {{ let mut v=buf.offset((height*x) as isize); *v.offset(0)=1.0f32; sink(v,height); x+=1; }} free(buf as *mut core::ffi::c_void); }} unsafe fn sink(v:*mut f32,n:i32){{ let mut i=0; while i<n {{ *v.offset(i as isize)=0.0f32; i+=1; }} }}",
-        declarations()
-    );
-    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
-        let (_, ctx) = super::decide_table_with_ctx_config(
-            tcx,
-            Some((
-                super::OverlapMode::PreciseReplay,
-                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
-            )),
-        )
-        .unwrap();
-        let audit = &ctx.raw_boundary_artifacts.ownership_native;
-        let row = audit
-            .lines()
-            .find(|line| line.starts_with("holder::buf#"))
-            .unwrap_or_else(|| panic!("{audit}"));
-        assert!(
-            !row.contains("native-view-alias-family-owned"),
-            "the alias is the deciding family's to render: {row}"
-        );
-    })
-    .unwrap();
-}
-
 /// R521-5 / relay 072 — the ONE synthesised literal now spells the two field
 /// kinds that made the return certificate refuse the L01^5 units.
 ///

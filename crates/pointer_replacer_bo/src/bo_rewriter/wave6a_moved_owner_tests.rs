@@ -54,52 +54,6 @@ unsafe extern "C" fn WriteRingBuffer(
 }
 "#;
 
-/// brotli's decoder shape: `BrotliDecoderDecompressStream` nulls `next_out`
-/// when there is no room, and passes it on inside its state loop — to
-/// `WriteRingBuffer` directly and through `CopyUncompressedBlockToOutput`.
-const RING: &str = r#"
-// w6a-r738-ring-frame
-unsafe extern "C" fn CopyUncompressedBlockToOutput(
-    mut available_out: *mut usize,
-    mut next_out: *mut *mut u8,
-    mut total_out: *mut usize,
-    mut s: *mut State,
-) -> i32 {
-    loop {
-        let mut result = 0 as i32;
-        result = WriteRingBuffer(s, available_out, next_out, total_out, 0 as i32);
-        if result != 0 as i32 {
-            return result;
-        }
-        (*s).sub = 0 as i32;
-    }
-}
-pub unsafe extern "C" fn Decompress(
-    mut s: *mut State,
-    mut available_out: *mut usize,
-    mut next_out: *mut *mut u8,
-    mut total_out: *mut usize,
-) -> i32 {
-    let mut result = 0 as i32;
-    if *available_out == 0 as usize {
-        next_out = 0 as *mut *mut u8;
-    }
-    loop {
-        if (*s).sub == 1 as i32 {
-            result = WriteRingBuffer(s, available_out, next_out, total_out, 0 as i32);
-            if result != 0 as i32 {
-                break;
-            }
-        }
-        result = CopyUncompressedBlockToOutput(available_out, next_out, total_out, s);
-        if result != 0 as i32 {
-            break;
-        }
-    }
-    return result;
-}
-"#;
-
 /// One call in a loop, no sibling bridge: the call's only later use is the
 /// loop's next pass. Control: `fresh` declares its optional inside the loop,
 /// so each pass moves a new binding.
@@ -143,35 +97,6 @@ pub unsafe extern "C" fn fresh(
 }
 "#;
 
-/// The decoder's shape without its loop: the first call has a later use, and a
-/// sibling argument (`total_out`, a reference both calls are handed) wraps the
-/// call in an A5 raw view.
-const WRAPPED: &str = r#"
-// w6a-r738-wrapped-frame
-unsafe extern "C" fn sink(mut available_out: *mut usize, mut next_out: *mut *mut u8, mut total_out: *mut usize, mut s: *mut State) -> i32 {
-    return WriteRingBuffer(s, available_out, next_out, total_out, 1 as i32);
-}
-pub unsafe extern "C" fn twice(
-    mut s: *mut State,
-    mut available_out: *mut usize,
-    mut next_out: *mut *mut u8,
-    mut total_out: *mut usize,
-) -> i32 {
-    let mut result = 0 as i32;
-    if *available_out == 0 as usize {
-        next_out = 0 as *mut *mut u8;
-    }
-    if (*s).sub == 1 as i32 {
-        result = WriteRingBuffer(s, available_out, next_out, total_out, 0 as i32);
-        if result != 0 as i32 {
-            return result;
-        }
-    }
-    result = sink(available_out, next_out, total_out, s);
-    return result;
-}
-"#;
-
 fn pinned(marker: &str, name: &str, body: &str, locals: &[(&str, SlotKind)]) -> (String, usize) {
     let _frame = super::test_model_override::frame_lock();
     let src = format!("{PRELUDE}{WRITE_RING_BUFFER}{body}");
@@ -202,50 +127,6 @@ fn pinned(marker: &str, name: &str, body: &str, locals: &[(&str, SlotKind)]) -> 
             ..
         } => panic!("{name} must emit: {reason}\n{first_diags:#?}"),
     }
-}
-
-/// The brotli rows' composed shape: both gaps at once, at the census's model
-/// (`WriteRingBuffer::next_out` optional, the caller's optional, the
-/// intermediate callee's formal a reference).
-#[test]
-#[ignore = "R833-1 (USER, 2026-10-05): a safe peer never stays live beside a raw member not shown disjoint (the row-less peer arm holds it), so the shape this pins no longer forms; wave-5d report 138"]
-fn w6a_r738_a_reborrowed_optional_out_parameter_in_the_decoder_loop_compiles() {
-    let (source, reverted) = pinned(
-        "w6a-r738-ring-frame",
-        "r738-ring",
-        RING,
-        &[
-            ("CopyUncompressedBlockToOutput::s", SlotKind::Ref),
-            (
-                "CopyUncompressedBlockToOutput::available_out",
-                SlotKind::Ref,
-            ),
-            ("CopyUncompressedBlockToOutput::next_out", SlotKind::Ref),
-            ("CopyUncompressedBlockToOutput::total_out", SlotKind::Ref),
-            ("Decompress::s", SlotKind::Raw),
-            ("Decompress::available_out", SlotKind::Ref),
-            ("Decompress::next_out", SlotKind::Ref),
-            ("Decompress::total_out", SlotKind::Ref),
-        ],
-    );
-    // Restated under R878-1 (B) (relay 304; main 194a / 196): the retained-access check
-    // of record holds `WriteRingBuffer::next_out` (an access hold through the `*mut u8`
-    // slot it writes, never exempt); the tier's `Depth2StorageShape` rows at the sites
-    // into it say only that a bridge cannot be built. Every caller's `next_out` follows
-    // it raw and each call passes it bare: the lend this witness pinned is lost on
-    // brotli's shape (the emission still compiles, nothing reverts).
-    let text = compact(&source);
-    assert_eq!(reverted, 0, "{source}");
-    assert!(
-        !text.contains("Option<&mut*mutu8>") && !text.contains("as_deref_mut()"),
-        "{source}"
-    );
-    assert_eq!(
-        text.matches("WriteRingBuffer(s,available_out,next_out,total_out,0asi32)")
-            .count(),
-        2,
-        "both calls pass the raw slot bare: {source}"
-    );
 }
 
 #[test]
@@ -312,61 +193,6 @@ fn w6a_r738_a_call_in_a_loop_the_binding_outlives_lends_its_optional() {
     assert!(
         fresh.contains("WriteRingBuffer(s,available_out,next_out,total_out,0asi32)"),
         "fresh moves its own binding: {source}"
-    );
-}
-
-/// Under R829-1 / R861-1 (relay 297, main 188) the sibling the A5 raw view was
-/// built for is held: `twice::available_out` / `twice::total_out` (and
-/// `sink`'s `s` / `available_out` / `total_out`) are borrowed into
-/// `WriteRingBuffer`'s raw formals beside siblings the callee writes (`s`,
-/// `available_out`, `total_out`) and are decided raw
-/// (`held:pair-not-shown-disjoint`). No `__crat_a5_raw_` view wraps the first
-/// call any more; the call still lends the optional, which is this witness's
-/// subject.
-#[test]
-#[ignore = "R833-1 (USER, 2026-10-05): a safe peer never stays live beside a raw member not shown disjoint (the row-less peer arm holds it), so the shape this pins no longer forms; wave-5d report 138"]
-fn w6a_r738_a_wrapped_call_lends_its_optional() {
-    let (source, reverted) = pinned(
-        "w6a-r738-wrapped-frame",
-        "r738-wrapped",
-        WRAPPED,
-        &[
-            ("sink::s", SlotKind::Ref),
-            ("sink::available_out", SlotKind::Ref),
-            ("sink::next_out", SlotKind::Ref),
-            ("sink::total_out", SlotKind::Ref),
-            ("twice::s", SlotKind::Raw),
-            ("twice::available_out", SlotKind::Ref),
-            ("twice::next_out", SlotKind::Ref),
-            ("twice::total_out", SlotKind::Ref),
-        ],
-    );
-    let text = compact(&source);
-    assert_eq!(reverted, 0, "{source}");
-    // R829-1 (relay 297, main 188): twice::available_out / twice::total_out are
-    // held beside the written s / available_out / total_out at WriteRingBuffer;
-    // the pinned `result={let__crat_a5_raw_` view of total_out is gone, both
-    // stay `*mut usize` and the first call is bare.
-    // Restated under R878-1 (B) (relay 304; main 194a / 196): the retained-access check
-    // of record holds `WriteRingBuffer::next_out` (an access hold through the `*mut u8`
-    // slot it writes, never exempt); the tier's `Depth2StorageShape` rows at the sites
-    // into it say only that a bridge cannot be built. Every caller's `next_out` follows
-    // it raw and each call passes it bare: the lend this witness pinned is lost on
-    // brotli's shape (the emission still compiles, nothing reverts).
-    assert!(
-        text.contains(
-            "fntwice(muts:*mutState,mutavailable_out:*mutusize,mutnext_out:*mut*mutu8,muttotal_out:*mutusize,)"
-        ),
-        "{source}"
-    );
-    assert!(
-        !text.contains("__crat_a5_raw_"),
-        "no sibling raw view wraps the first call: {source}"
-    );
-    assert!(
-        text.contains("result=WriteRingBuffer(s,available_out,next_out,total_out,0asi32);")
-            && !text.contains("as_deref_mut()"),
-        "the first call passes the raw slot bare: {source}"
     );
 }
 

@@ -820,20 +820,6 @@ fn r1312_w_a3_offset_arguments_deliver() {
     assert!(text.contains("out[(i) as usize] ="), "{emitted}");
 }
 
-/// A3, the cursor family's two (relay 371 step 4): `merge_sort_iteration::a` hands `a.offset(j)` with
-/// `j = n - 1` (a `Top` index) to a thin formal, an arm the parameter cursor does not have; and
-/// `cp_get_chunk_byte_length::chunk`'s `chunk.offset(-8)` is a `Neg` index at a parameter cursor, which
-/// `wrapper::build` holds (R608-1 / SC-2). Neither is built in step 4.
-#[test]
-#[ignore = "relay 371 step 4: the cursor family's (a Top-index argument arm; a Neg index at a parameter cursor, R608-1 / SC-2) -- the seat's"]
-fn r1312_w_a3_cursor_offset_arguments_deliver() {
-    let (_, subjects, _) = run("w-a3c", &format!("{PRE}{A3}"));
-    let r = rows(&subjects);
-    for label in ["merge_sort_iteration::a", "cp_get_chunk_byte_length::chunk"] {
-        assert_eq!(r[label][3], "delivered", "{label}: {r:#?}");
-    }
-}
-
 /// A3's control (GREEN on the base): a plain non-negative self-advance of a shared slice already delivers as
 /// `data = &data[64..]`; the real `blake256_update::data` is held by its cast arguments, not by the advance.
 #[test]

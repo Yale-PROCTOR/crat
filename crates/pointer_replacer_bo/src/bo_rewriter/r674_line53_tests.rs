@@ -3,62 +3,6 @@
 //! wave-5d's element-pointer arm with their fix `ea01deb2b`.
 use super::wave6a_allocation_tests::{compact, emitted};
 
-/// **The PAIR rendering's E0425 (main 131e; wave-5d 098 STOP 1).** The same-object
-/// PAIR arm hoists `(*t).root` for a call to `start`, whose surfaced helper
-/// `__crat_safe_start` lives in `provider` and is not what `consumer`'s `use`
-/// imports. The arm re-parses the call from its printed text, so the rendered
-/// callee is a new node and `wave5r_helper_path::qualify`, which finds a helper's
-/// calls by their callee span, never qualifies it: before the fix (52's
-/// `fd4a06ccf` and this line) the program degrades (`recovery-degraded`) on
-/// `cannot find function __crat_safe_start`.
-/// wave-5d's fixture, verbatim.
-const PAIR_E0425: &str = r#"#![allow(dead_code, unused_unsafe, unused_mut, unused_variables)]
-extern "C" {
-    fn getenv(name: *const i8) -> *mut i8;
-}
-pub struct Tree { pub root: *mut i32, pub length: u32 }
-pub mod provider {
-    pub unsafe fn start(t: *mut crate::Tree, q: *mut i32, p: *const i32) -> *const i8 {
-        (*t).length += 1;
-        if *p == 0 {
-            return 0 as *const i8;
-        }
-        crate::getenv(b"HOME\0" as *const u8 as *const i8) as *const i8
-    }
-    pub fn install() {
-        let _callback: unsafe fn(*mut crate::Tree, *mut i32, *const i32) -> *const i8 = start;
-    }
-}
-pub mod consumer {
-    use crate::provider::start;
-    pub unsafe fn imported(t: *mut crate::Tree, p: *const i32) -> i32 {
-        let mut s = start(t, (*t).root, p);
-        let mut i: usize = 0;
-        while *s.offset(i as isize) != 0 {
-            i = i.wrapping_add(1);
-        }
-        i as i32
-    }
-}
-"#;
-
-#[test]
-#[ignore = "R833-1 (USER, 2026-10-05): a safe primary never stays live beside a raw view not shown disjoint, so the shape this pins (a ready class with a T2 raw view and a live peer) no longer forms; wave-5d report 138"]
-fn r675_pair_e0425_a_hoisted_call_to_a_surfaced_imported_helper_is_qualified() {
-    let out = emitted("r675_pair_e0425", PAIR_E0425);
-    let flat = compact(&out.source);
-    assert!(
-        flat.contains("__crat_pair_raw_"),
-        "the call takes the PAIR raw view (the arm under test): {}",
-        out.source
-    );
-    assert!(
-        flat.contains("crate::provider::__crat_safe_start("),
-        "the hoisted call reaches the helper through its defining module: {}",
-        out.source
-    );
-}
-
 /// **(iii-a) — R641-2's slice-root exemption follows placement.** brotli
 /// `FindLongestMatchH5::data#3` (52: `unplaceable:slice-use-evidence-held`):
 /// its decision is `Slice`, so the seam's element-spine exemption admitted the

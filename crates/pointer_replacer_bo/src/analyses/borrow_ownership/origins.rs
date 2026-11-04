@@ -164,14 +164,6 @@ fn origin_summaries_from_flows(flows: origin_flow::OriginFlowResults) -> OriginS
     OriginSummaries::native(summaries, flows)
 }
 
-#[cfg(test)]
-pub(crate) fn compute_origins_a2(
-    program: &RustProgram<'_>,
-) -> (OriginSummaries, origin_flow::A2Plan) {
-    let (flows, plan) = origin_flow::analyze_program_origin_flow_a2(program);
-    (origin_summaries_from_flows(flows), plan)
-}
-
 /// Whole-program signature-origin summaries, from the native derivation. The wrapped legacy
 /// derivation, which it reproduces, is not on the BO path; it remains available only as a test
 /// oracle.

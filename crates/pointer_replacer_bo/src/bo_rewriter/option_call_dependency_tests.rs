@@ -130,19 +130,6 @@ fn wave6o_optional_argument_at_optional_formal_depends_on_the_callee_class() {
     );
 }
 
-/// The held call's emission (split from the dependency pin above, wave-5d
-/// 146c): the blocked crossing is left unbridged when the callee's class
-/// reverts — the blocked-seam path's class defect, main's (relay 309; R898-1
-/// (3)). In a run the per-function gate reverts the function (a loss, not UB).
-#[test]
-#[ignore = "main relay 309: the blocked-seam path leaves a held crossing unbridged (wave-5d 146c)"]
-fn wave6o_optional_argument_at_a_held_call_type_checks() {
-    let output =
-        super::emit_tests::ast_emitted_source_of_attested(ACCESSORS).expect("native emission");
-    eprintln!("WAVE6O_CALLDEP_OUTPUT_BEGIN\n{output}\nWAVE6O_CALLDEP_OUTPUT_END");
-    assert!(verify::type_checks_str(&output), "{output}");
-}
-
 #[test]
 fn wave6o_reference_argument_at_reference_formal_records_no_dependency() {
     let (edge, depends, depends_on) = dependency_edges(REFERENCE_ONLY, "caller", "store");

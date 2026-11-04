@@ -122,43 +122,6 @@ pub unsafe fn dropIn(root:*mut Node)->*mut Node{
 }
 "#;
 
-/// A probe only, never a gate: does the member fold chain already reach the
-/// return-to-cell shape, and with which hold? The internal certificate and the
-/// member chain are different surfaces, and the return-to-cell design turns on whether the
-/// link across the call has to be built or only joined.
-#[test]
-#[ignore]
-fn census_b_member_chain_on_the_return_to_cell_shape() {
-    for (name, code) in [
-        ("rc1", format!("{PRELUDE}{RC1}")),
-        ("rc2", format!("{PRELUDE}{RC2}")),
-    ] {
-        with_facts(&code, move |facts| {
-            let declarations = facts.fold_declarations.as_deref().unwrap_or_default();
-            eprintln!(
-                "CENSUS {name} declarations={} caller_coverage={:?}",
-                declarations.len(),
-                super::caller_coverage::assess(facts)
-            );
-            for decision in super::fold_eligibility::plan(facts).unwrap_or_default() {
-                eprintln!(
-                    "CENSUS {name} identity {}->{} {}:{} hold={:?}",
-                    decision.declaration.call.caller,
-                    decision.declaration.call.callee,
-                    decision.declaration.call.block,
-                    decision.declaration.call.statement,
-                    decision.outcome.as_ref().err()
-                );
-            }
-            let members = super::fold_eligibility::member_plan(facts).unwrap_or_default();
-            eprintln!("CENSUS {name} member_decisions={}", members.len());
-            for decision in members {
-                eprintln!("CENSUS {name} member {decision:?}");
-            }
-        });
-    }
-}
-
 #[test]
 fn w_rc_1_the_return_to_cell_store_certifies() {
     with_facts(&format!("{PRELUDE}{RC1}"), |facts| {

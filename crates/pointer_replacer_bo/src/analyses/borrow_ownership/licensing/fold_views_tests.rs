@@ -42,18 +42,6 @@ pub unsafe fn peek(root:*mut Node)->*mut Node{
 }
 "#;
 
-/// A tree rotation. The parameter is stored **into its own descendant's**
-/// field and the descendant is returned, with a grandchild read in between.
-const VW2: &str = r#"
-pub unsafe fn rotate(x:*mut Node)->*mut Node{
- let y=(*x).right;
- let subtree=(*y).left;
- (*y).left=x;
- (*x).right=subtree;
- y
-}
-"#;
-
 /// A borrowed view stored into a cell. **This certifies today, and the
 /// expectation below is the least certain one.** One reading is that
 /// `root->child = minValue(root->child)`
@@ -155,14 +143,6 @@ fn w_vw_2n_d_a_landed_object_with_a_consumed_unrefilled_cell_is_refused() {
 fn w_vw_1_a_borrowed_view_that_is_dropped_certifies() {
     with_facts(&format!("{PRELUDE}{VW1}"), |facts| {
         certify(facts, "peek", 1).expect("a lent component is still the caller's");
-    });
-}
-
-#[test]
-#[ignore = "a staged licensing witness that does not hold under the current analysis"]
-fn w_vw_2_the_rotation_certifies() {
-    with_facts(&format!("{WIDE_PRELUDE}{VW2}"), |facts| {
-        certify(facts, "rotate", 1).expect("the parameter is folded under its own descendant");
     });
 }
 

@@ -368,31 +368,6 @@ fn w5c_slice_input_forwarders_leave_the_extent_hold_under_the_corpus_attestation
     );
 }
 
-/// The delivery itself: RED until the pair beside the hasher is certified
-/// disjoint (report 016 §2).
-#[test]
-#[ignore = "W-C7 RED: the PAIR raw-view role beside the hasher's &mut self_0 (wave-6p's distinct-allocation certificate; report 016)"]
-fn w5c_slice_input_forwarders_deliver() {
-    let input = fixture();
-    let table = decisions(&input);
-    for label in ["StitchToPreviousBlockH2::ringbuffer", "StoreRangeH2::data"] {
-        assert!(
-            matches!(
-                decision(&table, label),
-                super::Decision::Slice { mutable: false, .. }
-            ),
-            "{label}: {:?}",
-            decision(&table, label)
-        );
-    }
-    let emitted = crate::bo_rewriter::emit_tests::ast_emitted_source_of(&input).unwrap();
-    assert!(
-        emitted.contains("unsafe fn StoreRangeH2(self_0: &mut H2, data: &[u8]"),
-        "{emitted}"
-    );
-    assert!(crate::bo_rewriter::verify::type_checks_str(&emitted));
-}
-
 /// **R477-6 — the corpus spelling of the same masked read.** The lane's
 /// `CHAIN` binds the masked index to a local (`let at = (ix & mask) as isize`)
 /// and `index_bound_by_companion` admits it: a local is not another parameter.

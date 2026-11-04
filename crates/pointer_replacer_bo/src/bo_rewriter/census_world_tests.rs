@@ -63,84 +63,6 @@ fn r805_7_an_a5_shape_emits_in_the_census_world() {
 // ---- callee's emitted signature for each shape; wave-5d takes it as its RED's
 // ---- expectation. Run: `census_world_tests::e5c_148_ --ignored --nocapture`.
 
-const E5C_148_ADD: &str = "unsafe fn add(a: *mut i32, b: *mut i32) { *a += *b; }\n";
-
-fn e5c_148_probe(name: &str, body: &str) {
-    let input = format!("{ALLOW}{E5C_148_ADD}{body}");
-    match super::rewrite_m1_census_world(&input) {
-        super::RewriteOutcome::Emitted {
-            source,
-            raw_boundary_artifacts,
-            ..
-        } => {
-            let flat = source.split_whitespace().collect::<Vec<_>>().join(" ");
-            let signature = flat
-                .split("fn add(")
-                .nth(1)
-                .and_then(|rest| rest.split(')').next())
-                .unwrap_or("<no add>");
-            eprintln!("E5C148 {name} signature: add({signature})");
-            for line in raw_boundary_artifacts.pairs.lines() {
-                if line.starts_with("caller") || line.contains("add") {
-                    eprintln!("E5C148 {name} pair: {line}");
-                }
-            }
-        }
-        other => eprintln!("E5C148 {name} outcome: {other:#?}"),
-    }
-}
-
-#[test]
-#[ignore = "era-5c 148 probe (relay 190 item 1)"]
-fn e5c_148_one_static_passed_twice() {
-    e5c_148_probe(
-        "G1G1",
-        "static mut G1: *mut i32 = 0 as *mut i32;\n\
-         pub unsafe fn entry(p: *mut i32) { G1 = p; add(G1, G1); }\n",
-    );
-}
-
-#[test]
-#[ignore = "era-5c 148 probe (relay 190 item 1)"]
-fn e5c_148_two_statics_one_stored_from_the_other() {
-    e5c_148_probe(
-        "G1G2",
-        "static mut G1: *mut i32 = 0 as *mut i32;\n\
-         static mut G2: *mut i32 = 0 as *mut i32;\n\
-         pub unsafe fn set(p: *mut i32) { G1 = p; G2 = G1; }\n\
-         pub unsafe fn entry() { add(G1, G2); }\n",
-    );
-}
-
-#[test]
-#[ignore = "era-5c 148 probe (relay 190 item 1)"]
-fn e5c_148_two_pointees_of_one_pointer() {
-    e5c_148_probe(
-        "PQ",
-        "unsafe fn pair(p: *mut *mut i32, q: *mut *mut i32) { add(*p, *q); }\n\
-         pub unsafe fn entry(x: *mut *mut i32) { pair(x, x); }\n",
-    );
-}
-
-#[test]
-#[ignore = "era-5c 148 probe (relay 190 item 1)"]
-fn e5c_148_two_fields_one_stored_from_the_other() {
-    e5c_148_probe(
-        "FIELDS",
-        "#[repr(C)] pub struct S { a: *mut i32, b: *mut i32 }\n\
-         pub unsafe fn entry(s: *mut S) { (*s).b = (*s).a; add((*s).a, (*s).b); }\n",
-    );
-}
-
-#[test]
-#[ignore = "era-5c 148 probe (relay 190 item 1)"]
-fn e5c_148_control_two_locals() {
-    e5c_148_probe(
-        "CONTROL",
-        "pub unsafe fn entry() { let mut x = 1i32; let mut y = 2i32; add(&mut x, &mut y); }\n",
-    );
-}
-
 /// **R808-5 (wave-6o 110a, brotli's decoder) — a pair PROVEN to overlap is
 /// not two references.** The driver takes `br = &mut (*s).br` and hands `s`
 /// and `br` to callees that write through both. At the record (54′) both
@@ -488,15 +410,6 @@ fn r864_signature(name: &str) -> String {
         }
         other => panic!("the census world emits: {other:#?}"),
     }
-}
-
-/// R864-1 (a) (fan-out 081): `zsqr(x, &mut *x)` with `zsqr::a` raw: `b` is
-/// held raw beside it (no pair row, no A5 proof, not shown disjoint).
-#[test]
-#[ignore = "R864-1 (a) withdrawn from the 57 line after MAX-3 (wave-5d 145): the raw-side arm is not on this line"]
-fn r864_1_a_a_reference_formal_beside_a_raw_formal_not_shown_disjoint_is_held() {
-    let signature = r864_signature("zsqr");
-    assert!(signature.contains("mut b: *mut Z"), "({signature})");
 }
 
 /// Control: the reference side is `&mut local` (a scalar), its address taken

@@ -240,34 +240,6 @@ fn wave6k_a_copy_of_a_copy_keeps_the_refusal() {
     );
 }
 
-/// libcsv `csv_write2::csrc#9` (relay 035; wave-6v 028 route (a)): a counted
-/// `*const c_void` parameter reinterpreted as bytes. The contract rewrites the
-/// initializer and every use, so the local needs no declaration of its own; the
-/// receiver-form refusal degraded it `copy-source-coupled` for lacking one.
-const COUNTED_READ_ALIAS: &str = r#"
-#![allow(dead_code, unused_mut, non_snake_case, unused_variables)]
-static mut SINK: u64 = 0;
-unsafe fn sink(c: i32) -> i32 { SINK = SINK.wrapping_mul(31).wrapping_add(c as u64); 0 }
-unsafe fn csv_fwrite2(mut src: *const core::ffi::c_void, mut src_size: u64, mut quote: u8) -> i32 {
-    let mut csrc = src as *const u8;
-    if src.is_null() { return 0 as i32; }
-    if sink(quote as i32) == -(1 as i32) { return -(1 as i32); }
-    while src_size != 0 {
-        if *csrc as i32 == quote as i32 {
-            if sink(quote as i32) == -(1 as i32) { return -(1 as i32); }
-        }
-        if sink(*csrc as i32) == -(1 as i32) { return -(1 as i32); }
-        src_size = src_size.wrapping_sub(1);
-        csrc = csrc.offset(1);
-    }
-    if sink(quote as i32) == -(1 as i32) { return -(1 as i32); }
-    return 0 as i32;
-}
-unsafe fn csv_fwrite(mut src: *const core::ffi::c_void, mut src_size: u64) -> i32 {
-    return csv_fwrite2(src, src_size, 0x22 as i32 as u8);
-}
-"#;
-
 /// The control: the same copy shape over a source that is NOT a counted
 /// contract keeps the refusal — the exemption is the contract's, not the cast's.
 const PLAIN_CAST_COPY: &str = r#"
@@ -282,33 +254,6 @@ const PLAIN_CAST_COPY: &str = r#"
         chars
     }
 "#;
-
-/// **The hook is in and the predicate now reads it (relay 036); this witness
-/// still cannot fire in a REDUCTION.** `alias_contract` answers from the
-/// contract that rewrote the local, and in this fixture no contract is proved
-/// for `csv_fwrite2::src` at all — the family contracts the outer wrapper
-/// (`csv_fwrite::src`, decided `Opt { slice: true }`) and the alias lives in the
-/// inner function. The corpus is the other way round (`csv_write2::src#3` is a
-/// subject decided `optional` in the same function as `csrc`), so the live check
-/// for these three rows is the census, not a reduction — fixture ≠ corpus,
-/// R452-2 (i). Un-ignore when a reduction contracts the aliasing parameter.
-#[test]
-#[ignore = "the reduction contracts the outer wrapper, not the aliasing parameter (report 036)"]
-fn wave6k_a_counted_read_alias_is_not_asked_for_a_declaration() {
-    let decided = decisions(COUNTED_READ_ALIAS);
-    let csrc = decided
-        .iter()
-        .find(|(name, _)| name == "csrc")
-        .map(|(_, d)| d.clone())
-        .expect("the alias");
-    assert!(
-        !matches!(
-            csrc,
-            Decision::Degraded(ref degraded) if degraded.reason.key() == "copy-source-coupled"
-        ),
-        "the counted alias needs no declaration and must not be degraded for lacking one: {csrc:?}"
-    );
-}
 
 #[test]
 fn wave6k_a_plain_cast_copy_keeps_the_refusal() {

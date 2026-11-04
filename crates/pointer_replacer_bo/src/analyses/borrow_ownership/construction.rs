@@ -152,17 +152,11 @@ pub(crate) struct BoConstruction {
     pub(crate) mode: CopyLendMode,
     pub(crate) nullability: super::nullability::NullabilityFacts,
     pub(crate) field_ref_plan: FieldRefPlan,
-    #[cfg(test)]
-    pub(crate) a2_killed_memberships: usize,
-    #[cfg(test)]
-    pub(crate) a2_opaque_result_guards: usize,
     pub(crate) selectors: Selectors,
     pub(crate) eligibility: CopyLendEligibility,
     pub(crate) esc_minimal: super::esc_minimal::EscMinimalSelection,
     #[cfg(test)]
     pub(crate) stats: BoOwnEmissionStats,
-    #[cfg(test)]
-    pub(crate) eligibility_elapsed: Duration,
     #[cfg(test)]
     pub(crate) emit_elapsed: Duration,
     #[cfg(test)]
@@ -1136,8 +1130,6 @@ fn construct_bo_into_with_esc(
         &format!("mode={mode:?}"),
     );
     crate::analysis_budget::check("bc:copy_lend_eligibility")?;
-    #[cfg(test)]
-    let t = Instant::now();
     let eligibility = if mode == CopyLendMode::LendArm {
         analyze_copy_lend_eligibility(program, slots, mut_facts, origins.native_flows())
     } else {
@@ -1148,8 +1140,6 @@ fn construct_bo_into_with_esc(
         "end",
         &format!("pairs={}", eligibility.pairs.len()),
     );
-    #[cfg(test)]
-    let eligibility_elapsed = t.elapsed();
     crate::phase_log::mark("bc:ownership_constraints", "start", "");
     crate::analysis_budget::check("bc:ownership_constraints")?;
     #[cfg(test)]
@@ -1268,17 +1258,11 @@ fn construct_bo_into_with_esc(
         mode,
         nullability,
         field_ref_plan,
-        #[cfg(test)]
-        a2_killed_memberships: 0,
-        #[cfg(test)]
-        a2_opaque_result_guards: 0,
         selectors,
         eligibility,
         esc_minimal,
         #[cfg(test)]
         stats,
-        #[cfg(test)]
-        eligibility_elapsed,
         #[cfg(test)]
         emit_elapsed,
         #[cfg(test)]
@@ -1428,35 +1412,6 @@ fn construct_bo_into_a16_refined_with_esc(
     };
     let links = add_refined_return_kind_links(program, slots, origins, solver);
     Ok((construction, links))
-}
-
-#[cfg(test)]
-pub(crate) fn construct_bo_into_a2(
-    program: &RustProgram<'_>,
-    slots: &CrateSlots,
-    origins: &OriginSummaries,
-    a2: &super::origin_flow::A2Plan,
-    mut_facts: &MutFacts,
-    solver: &KindSolver,
-    copy_lend_mode: CopyLendMode,
-) -> anyhow::Result<BoConstruction> {
-    let mut construction =
-        construct_bo_into(program, slots, origins, mut_facts, solver, copy_lend_mode)?;
-    let mut guards = 0usize;
-    for guard in &a2.opaque_result_guards {
-        let Some(universe) = slots.fn_local_slots.get(&guard.function) else {
-            continue;
-        };
-        let Some(slot) = universe.slot_for_local_depth(guard.local, guard.depth) else {
-            continue;
-        };
-        solver.add_borrow_exclusion(Some(SlotRef::Local(guard.function, slot)), &[]);
-        super::raw_cause::note_eager(solver, "opaque-result-guard");
-        guards += 1;
-    }
-    construction.a2_killed_memberships = a2.killed_memberships;
-    construction.a2_opaque_result_guards = guards;
-    Ok(construction)
 }
 
 #[cfg(test)]

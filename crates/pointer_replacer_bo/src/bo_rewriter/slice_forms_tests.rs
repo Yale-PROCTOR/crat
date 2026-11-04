@@ -1533,38 +1533,6 @@ fn r475_3_offset_from_on_delivered_references() {
     );
 }
 
-/// The ASYMMETRIC shape, which is brotli's: one end delivered, the other kept raw by a
-/// second caller that does arithmetic on it. If the bridge only fires when BOTH sides
-/// convert, this is the one that stays bare.
-/// **RED-first, preserved and `#[ignore]`d until the fix is built** — this is the shape
-/// brotli has, and it fails today. It is ignored rather than deleted so the fix has its
-/// witness already written, and ignored rather than left red so it adds nothing to the
-/// standing set.
-#[test]
-#[ignore = "R475-3: the receiver bridge does not fire when only one side is delivered; fix owed"]
-fn r475_3_offset_from_with_one_side_still_raw() {
-    let source = emit(OFFSET_FROM_ASYMMETRIC);
-    println!("EMITTED {source}");
-    for bad in ["end.offset_from(", "begin.offset_from("] {
-        assert!(
-            !source.contains(bad),
-            "a delivered reference kept a bare `offset_from` ({bad}):\n{source}"
-        );
-    }
-}
-
-const OFFSET_FROM_ASYMMETRIC: &str = r#"
- #![allow(dead_code, unused_mut, unused_variables)]
- unsafe extern "C" {
-    fn sink(p: *const u8, n: usize);
- }
- pub unsafe fn span_len2(mut begin: *const u8, mut end: *const u8) -> usize {
-    let len = end.offset_from(begin) as usize;
-    sink(begin.offset(1), len);
-    return len;
- }
-"#;
-
 const OFFSET_FROM: &str = r#"
  #![allow(dead_code, unused_mut, unused_variables)]
  unsafe extern "C" {

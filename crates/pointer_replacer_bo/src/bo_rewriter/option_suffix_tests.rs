@@ -86,33 +86,6 @@ fn wave6o_suffix_arm_is_inert_without_a_delivered_base() {
     assert!(verify::type_checks_str(&output), "{output}");
 }
 
-/// **The delivering half.** Where the base DOES deliver — wave-6s2's line
-/// lifts the wall, this lane's declaration types the destination — the value
-/// is `Some(&data[l..])` and the two reads become `s[0]` / `s[1]`.
-///
-/// `#[ignore]`d with its frame: measured on `batch-10-dry8` (`2bdee574b`) plus
-/// this arm, where `data` does deliver (`mut data: &[u8]`) — and there the row
-/// is blocked one stage EARLIER than this arm: the Option family for the owner
-/// falls back because the source's `computed-suffix-raw-view` slice-use
-/// adapter (boundary evidence `body-local-raw-alias-schedule-unproved`) is
-/// DROPPED as `slice-use-evidence-held` when the Option stage re-derives its
-/// exclusions, so the destination never reaches the value planner. Report 016
-/// STOP 1 routes that; this witness turns live when it is answered.
-#[test]
-#[ignore = "blocked upstream of this arm: on dry8 the owner's Option family falls back on the source's computed-suffix-raw-view adapter being dropped (slice-use-evidence-held) — report 016 STOP 1"]
-fn wave6o_computed_view_of_a_delivered_slice_is_the_suffix() {
-    let output = ast_emitted_source_of(COMPUTED_VIEW).expect("native emission");
-    assert!(
-        output.contains("let mut s: Option<&[u8]> = None"),
-        "the destination is declared optional-slice: {output}"
-    );
-    assert!(
-        output.contains("s = Some(&data[(l) as usize..])")
-            || output.contains("s = Some(&data[l..])"),
-        "the value is the suffix, not a one-element carrier: {output}"
-    );
-    assert!(verify::type_checks_str(&output), "{output}");
-}
 /// **The forward-delta control (relay 034).** NOT a fault catcher — see report 023 claim 6: The same shape with
 /// a SIGNED delta — `k: i32`, which may run backwards — must never take the
 /// suffix: a backward view belongs to the cursor family. Dropping the guard in

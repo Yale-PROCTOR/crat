@@ -63,33 +63,6 @@ fn decisions(receipt: &str) -> std::collections::BTreeMap<String, (String, Strin
         .collect()
 }
 
-/// `owner -> [terminal blocking_reason]` from the plan's arm outcomes, read by
-/// column name (rows carry one column more than the header names).
-fn holds(outcomes: &str) -> std::collections::BTreeMap<String, Vec<String>> {
-    let mut lines = outcomes.lines();
-    let header = lines
-        .next()
-        .unwrap_or_default()
-        .split('\t')
-        .collect::<Vec<_>>();
-    let at = |name: &str| {
-        header
-            .iter()
-            .position(|c| *c == name)
-            .expect("arm outcome column")
-    };
-    let (owner, terminal, reason) = (at("owner"), at("terminal"), at("blocking_reason"));
-    let mut out = std::collections::BTreeMap::<String, Vec<String>>::new();
-    for f in lines.map(|l| l.split('\t').collect::<Vec<_>>()) {
-        if f.len() >= header.len() {
-            out.entry(f[owner].to_owned())
-                .or_default()
-                .push(format!("{} {}", f[terminal], f[reason]));
-        }
-    }
-    out
-}
-
 /// The family withdrawals on `new-family-dependency:` (R397-6(a)'s arm) and
 /// every subject's decision, for a RED / GREEN comparison of any program.
 #[test]
@@ -114,57 +87,4 @@ fn r585_4_frame_record() {
         record.join("\n") + "\n",
     )
     .expect("write the record");
-}
-
-const PREPARE_H2: &str = "src::enc::encode::PrepareH2";
-const PREPARE_H2_DATA: &str = "src::enc::encode::PrepareH2::data#4";
-const HASHER_SETUP: &str = "src::enc::encode::HasherSetup";
-
-/// batch 42's shape (with the field-origin rule in): `HasherSetup::data#4` is
-/// decided `slice` but held with its class (`seam-positive-retention`), and
-/// `HasherSetup` passes it bare to `PrepareH2`. The callee position seals the
-/// caller's input form (`source-input:c-raw-slice-shared`, batch 39's rendering),
-/// so `PrepareH2` is not tied to the held class and its `SliceUse` family stays.
-#[test]
-#[ignore = "R585-4: brotli's frame; run by hand with CRAT_R585_PROGRAM and the frame's env"]
-fn r585_4_brotli_prepare_h2_is_not_tied_to_the_held_hasher_setup() {
-    let capture = frame_of("CRAT_R585_PROGRAM");
-    let decisions = decisions(&capture.subject_receipt);
-    let holds = holds(&capture.raw_boundary_artifacts.arm_outcomes);
-    let withdrawals = capture
-        .raw_boundary_artifacts
-        .additive_family_receipts
-        .iter()
-        .filter(|r| r.owner_path == PREPARE_H2 && r.cause.contains("new-family-dependency:"))
-        .map(|r| format!("{} {}", r.family, r.cause))
-        .collect::<Vec<_>>();
-    let data = decisions.get(PREPARE_H2_DATA).cloned();
-    let hasher_setup = holds.get(HASHER_SETUP).cloned().unwrap_or_default();
-    let record = [
-        format!("== {PREPARE_H2_DATA}: {data:?}"),
-        format!("== {PREPARE_H2} withdrawals: {withdrawals:?}"),
-        format!("== {PREPARE_H2} holds: {:?}", holds.get(PREPARE_H2)),
-        format!("== {HASHER_SETUP} holds: {hasher_setup:?}"),
-    ];
-    if let Ok(out) = std::env::var("CRAT_R585_OUT") {
-        std::fs::write(out, record.join("\n") + "\n").expect("write the record");
-    }
-    let mut failures = Vec::new();
-    // Witness: the family stays and the formal is decided a slice …
-    if !withdrawals.is_empty() {
-        failures.push(format!("witness: {PREPARE_H2} withdrawn: {withdrawals:?}"));
-    }
-    if data.as_ref().map(|(decision, ..)| decision.as_str()) != Some("slice") {
-        failures.push(format!("witness: {PREPARE_H2_DATA} is {data:?}"));
-    }
-    // … while the caller is still held on its own wall.
-    if !hasher_setup
-        .iter()
-        .any(|h| h.contains("seam-positive-retention"))
-    {
-        failures.push(format!(
-            "precondition: {HASHER_SETUP} is not held: {hasher_setup:?}"
-        ));
-    }
-    assert!(failures.is_empty(), "{failures:#?}");
 }
