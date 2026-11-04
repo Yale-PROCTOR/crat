@@ -2476,10 +2476,6 @@ mod tests {
     // arm's text comparison; the same cost sat in three more lines, each of
     // which named an identity and stopped. These pin the reasons.
 
-    /// An unstatable composition names WHICH condition fired — here K21's
-    /// guard, an inner original occurring twice in the outer replacement,
-    /// which is exactly the shape a hand-rolled splice produces.
-    #[test]
     /// **R328-4 witness — the emitted initializer is the original with the
     /// emission's own adapter applied.**
     ///
