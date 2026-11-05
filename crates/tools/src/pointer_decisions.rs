@@ -169,22 +169,23 @@ pub(super) fn initial_pointer_decisions(
                     .function_body_fact(function, local.index(), depth.into())
                     .is_some_and(|fact| fact.is_arr())
                     || (*kind == SlotKind::Owning
-                        && (inner.is_c_void(tcx)
-                            || representations.allocations.get(&slot).is_some_and(|sizes| {
-                                let element_size = tcx
-                                    .layout_of(
-                                        ty::TypingEnv::post_analysis(tcx, function)
-                                            .as_query_input(inner),
-                                    )
-                                    .ok()
-                                    .map(|layout| layout.size.bytes());
-                                sizes
-                                    .iter()
-                                    .any(|size| size.is_none() || *size != element_size)
-                            })));
+                        && representations.allocations.get(&slot).is_some_and(|sizes| {
+                            let element_size = tcx
+                                .layout_of(
+                                    ty::TypingEnv::post_analysis(tcx, function)
+                                        .as_query_input(inner),
+                                )
+                                .ok()
+                                .map(|layout| layout.size.bytes());
+                            sizes
+                                .iter()
+                                .any(|size| size.is_none() || *size != element_size)
+                        }));
                 let optional = representations.nullable.contains(&slot);
                 let kind = if matches!(original.kind(), TyKind::Ref(..)) {
                     PtrKind::Ref(source_mutability.is_mut())
+                } else if inner.is_c_void(tcx) {
+                    PtrKind::Raw(source_mutability.is_mut())
                 } else {
                     match (kind, array, optional) {
                         (SlotKind::Raw, _, _) => PtrKind::Raw(source_mutability.is_mut()),

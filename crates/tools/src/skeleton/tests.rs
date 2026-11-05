@@ -2652,7 +2652,7 @@ pub unsafe fn callback(callback: Option<extern "C" fn(Value) -> Value>) {
         .record;
     assert_eq!(
         compact(&identity.target_signature),
-        "pub unsafe fn identity<'a>(mut value: &'a u8) -> &'a u8"
+        "pub unsafe fn identity(mut value: *mut ::core::ffi::c_void) -> *mut ::core::ffi::c_void"
     );
     let skeletons = frozen
         .functions
@@ -2683,7 +2683,7 @@ pub unsafe fn callback(callback: Option<extern "C" fn(Value) -> Value>) {
 }
 
 #[test]
-fn void_promotions_use_bytes_and_preserve_source_alias_context() {
+fn void_pointers_stay_raw_and_preserve_source_alias_context() {
     for (context, pointee) in [
         ("", "core::ffi::c_void"),
         ("#![no_std]", "core::ffi::c_void"),
@@ -2705,9 +2705,16 @@ fn void_promotions_use_bytes_and_preserve_source_alias_context() {
             crate::freeze_project(&source, &records, tcx).unwrap()
         })
         .unwrap();
+        let target_pointee = if pointee == "Void" {
+            pointee.to_owned()
+        } else {
+            format!("::{pointee}")
+        };
         assert_eq!(
             compact(&frozen.functions[0].record.target_signature),
-            "pub unsafe fn identity<'a>(mut value: &'a u8) -> &'a u8"
+            format!(
+                "pub unsafe fn identity(mut value: *mut {target_pointee}) -> *mut {target_pointee}"
+            )
         );
         assert!(
             frozen
@@ -5098,7 +5105,7 @@ fn uses_bo_model_before_symbolic_rewrite_restrictions() {
     assert!(
         function(&records, "void_address")
             .target_signature
-            .contains("out: &u8"),
+            .contains("out: *mut core::ffi::c_void"),
         "{}",
         function(&records, "void_address").target_signature
     );
