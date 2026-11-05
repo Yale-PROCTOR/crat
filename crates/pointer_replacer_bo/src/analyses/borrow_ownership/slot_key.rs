@@ -1,0 +1,56 @@
+//! **The canonical, session-independent name of a BO slot.**
+//!
+//! Every rustc handle a slot is made of — `LocalDefId`, `SlotId`, `HirId`,
+//! `Span` — is **session-local**. Serializing one and reading it back in a
+//! different compiler session is the key-divergence failure this project has
+//! already paid for more than once, so anything that must survive a session
+//! boundary is named here instead.
+//!
+//! The format is `def_path_str`-based, which is stable across sessions for
+//! unchanged source:
+//!
+//! - locals: `{def_path}::_{local}@d{depth}`
+//! - fields: `{def_path}::field{index}@d{depth}`
+//!
+//! # One definition
+//!
+//! The analysis-model cache's loader and the harness's snapshot writer share
+//! **one** canonicalizer rather than a copy each; the harness's model-kind
+//! snapshot is byte-stable and round-trips through it.
+
+use rustc_middle::ty::TyCtxt;
+use rustc_span::def_id::LocalDefId;
+
+pub(crate) fn local_key(tcx: TyCtxt<'_>, fn_did: LocalDefId, local: usize, depth: u8) -> String {
+    format!(
+        "{}::_{}@d{depth}",
+        tcx.def_path_str(fn_did.to_def_id()),
+        local
+    )
+}
+
+pub(crate) fn field_key(
+    tcx: TyCtxt<'_>,
+    struct_did: LocalDefId,
+    field_index: usize,
+    depth: u8,
+) -> String {
+    let element = if tcx.def_kind(struct_did) == rustc_hir::def::DefKind::Struct {
+        let ty = tcx.type_of(struct_did).skip_binder();
+        if let rustc_middle::ty::TyKind::Adt(adt, args) = ty.kind() {
+            adt.all_fields().nth(field_index).is_some_and(|field| {
+                matches!(field.ty(tcx, args).kind(), rustc_middle::ty::TyKind::Array(inner, _)
+                    if matches!(inner.kind(), rustc_middle::ty::TyKind::RawPtr(..)))
+            })
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    format!(
+        "{}::field{field_index}{}@d{depth}",
+        tcx.def_path_str(struct_did.to_def_id()),
+        if element { "::element" } else { "" }
+    )
+}

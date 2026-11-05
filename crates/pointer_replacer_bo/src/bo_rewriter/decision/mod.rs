@@ -1,0 +1,4339 @@
+//! **Phase 1 — decision.** Analysis in, decision table out. No AST mutation.
+//!
+//! Everything that reads BO output or an auxiliary analysis happens here and
+//! nowhere else. The table this phase produces is **immutable and complete
+//! before any edit is planned**: A1 emitability, A2 degradation closure, and
+//! the owning-reachable fixpoint all live here, so no later phase ever has to
+//! ask an analysis a question.
+//!
+//! # E1 state visibility
+//!
+//! This phase may read `crate::analyses::*` (read-only, §2 precedence rule) and
+//! the `BoExport`. It hands [`super::plan`] a finished table by value. It holds
+//! no back-pointer to a later phase, and no later phase holds one to it.
+//!
+//! # Status
+//!
+//! S1 lands the **G01 arm only**: depth-0 pointer *parameters* whose BO kind is
+//! `Ref`. Every other subject degrades with a named reason — the channel S2's
+//! envelope-demotion counters aggregate. A2's degradation closure and the
+//! owning-reachable fixpoint arrive with S2's breadth.
+
+use rustc_hash::FxHashMap;
+use rustc_hir::{HirId, def_id::LocalDefId};
+use rustc_middle::{mir::Local, ty::TyCtxt};
+use rustc_span::Span;
+
+use crate::analyses::borrow_ownership::{
+    SlotKind, crate_slots::CrateSlots, overlap_producer::PlannedCopyMark, solver::SlotRef,
+};
+
+pub(crate) mod a5_site_proof;
+pub(crate) mod allocator_contract;
+pub(crate) mod array_decay;
+#[cfg(test)]
+mod array_decay_tests;
+pub(crate) mod array_start;
+#[cfg(test)]
+mod array_start_tests;
+pub(crate) mod binn_counted;
+pub(crate) mod box_facts;
+pub(crate) mod box_param;
+pub(crate) mod call_result_option;
+pub(crate) mod callee_bound;
+pub(crate) mod callee_parameter_input;
+#[cfg(test)]
+mod carried_nullability_indexed_tests;
+pub(crate) mod cast_offset;
+pub(crate) mod co_conversion;
+pub(crate) mod compare_only_offset;
+#[cfg(test)]
+mod compare_only_offset_tests;
+#[cfg(test)]
+mod compare_only_plain_tests;
+pub(crate) mod construction;
+pub(crate) mod construction_values;
+pub(crate) mod contract_extent;
+pub(crate) mod contract_extent_adapter;
+#[cfg(test)]
+mod contract_seethrough_tests;
+#[cfg(test)]
+mod counted_extent_tests;
+pub(crate) mod counted_void;
+mod counted_void_handle;
+mod counted_void_loop;
+mod counted_void_read;
+mod counted_void_store;
+pub(crate) mod cstring_receiver;
+pub(crate) mod cursor_native;
+pub(crate) mod declaration;
+pub(crate) mod declaration_pattern;
+pub(crate) mod element_extent;
+pub(crate) mod emitability;
+pub(crate) mod exported_pair;
+pub(crate) mod exposure;
+pub(crate) mod extent_proof;
+#[cfg(test)]
+mod extent_proof_tests;
+pub(crate) mod field_alloc;
+#[cfg(test)]
+mod field_alloc_tests;
+pub(crate) mod field_reference;
+pub(crate) mod flexible_tail;
+pub(crate) mod global_or_integer;
+pub(crate) mod identity_cast;
+pub(crate) mod interface;
+pub(crate) mod io_domain;
+pub(crate) mod licensed_lift;
+pub(crate) mod lifetime;
+#[cfg(test)]
+pub(crate) mod lifetime_oracle_tests;
+pub(crate) mod loaded_operand;
+#[cfg(test)]
+mod loaded_operand_tests;
+pub(crate) mod local_callee_extent;
+pub(crate) mod masked_runtime;
+#[cfg(test)]
+mod masked_runtime_tests;
+pub(crate) mod mixed_boundary;
+#[cfg(test)]
+mod mixed_boundary_tests;
+pub(crate) mod native_result_expression;
+pub(crate) mod nested_slice;
+pub(crate) mod nul_walk_arm;
+pub(crate) mod null_init_declaration;
+pub(crate) mod option;
+mod option_ops;
+pub(crate) mod option_thin_extent;
+pub(crate) mod outbound_expression;
+pub(crate) mod outside_byte_view;
+#[cfg(test)]
+mod outside_byte_view_tests;
+pub(crate) mod overlapping_pairs;
+#[cfg(test)]
+mod own_nullable_tests;
+pub(crate) mod ownership_fields_cache_binding;
+pub(crate) mod ownership_fields_constructor;
+pub(crate) mod ownership_fields_deallocator;
+pub(crate) mod ownership_fields_effects;
+pub(crate) mod ownership_fields_formal;
+pub(crate) mod ownership_fields_hook;
+pub(crate) mod ownership_fields_native;
+#[cfg(test)]
+mod ownership_fields_roles_tests;
+pub(crate) mod ownership_fields_source;
+pub(crate) mod ownership_fields_store_close;
+pub(crate) mod pair_disjointness;
+#[cfg(test)]
+mod pair_rule_tests;
+pub(crate) mod pending_hold;
+pub(crate) mod pending_sibling;
+pub(crate) mod pinned_local;
+#[cfg(test)]
+mod pinned_local_tests;
+#[cfg(test)]
+mod proven_overlap_tests;
+pub(crate) mod raw_boundary;
+pub(crate) mod raw_boundary_contracts;
+pub(crate) mod raw_field_null;
+pub(crate) mod raw_initializer;
+pub(crate) mod raw_place_values;
+pub(crate) mod raw_receiver;
+#[cfg(test)]
+mod reader_chain_tests;
+pub(crate) mod receiver_input;
+pub(crate) mod ref_beside_raw;
+pub(crate) mod released_indirect;
+pub(crate) mod retained_access;
+pub(crate) mod retained_access_hold;
+#[cfg(test)]
+mod retained_access_tests;
+pub(crate) mod return_alias;
+pub(crate) mod return_certificate;
+pub(crate) mod return_interface;
+pub(crate) mod return_origin_mutability;
+pub(crate) mod return_receiver;
+pub(crate) mod return_through_raw_field;
+pub(crate) mod returned_child;
+pub(crate) mod returned_child_descent;
+#[cfg(test)]
+mod returned_child_tests;
+pub(crate) mod root_extent;
+pub(crate) mod seam;
+pub(crate) mod settled_holds;
+pub(crate) mod shared_read_pairs;
+pub(crate) mod shared_weakening;
+pub(crate) mod sibling_overlap;
+pub(crate) mod sized_assignment;
+pub(crate) mod slice_carrier;
+pub(crate) mod slice_construction_values;
+pub(crate) mod slice_forms;
+pub(crate) mod slice_input;
+#[cfg(test)]
+mod slice_input_root_tests;
+#[cfg(test)]
+mod slice_input_tests;
+pub(crate) mod slice_local_construction;
+pub(crate) mod slice_passon;
+pub(crate) mod slice_return_evidence;
+pub(crate) mod slice_scalar_return;
+pub(crate) mod slice_use;
+pub(crate) mod source_typed_local;
+pub(crate) mod surface_argument;
+pub(crate) mod thin_counted;
+pub(crate) mod thin_counted_entropy;
+#[cfg(test)]
+pub(crate) mod thin_counted_tests;
+pub(crate) mod thin_extent;
+#[cfg(test)]
+mod thin_into_fat_tests;
+pub(crate) mod universe;
+pub(crate) mod void_pointee;
+pub(crate) mod void_region;
+mod wave5r;
+
+use emitability::EmitabilityFacts;
+
+use super::additive::FamilyStage;
+
+/// **S3.6-1 — what the `referenced` gate does on this pass.**
+///
+/// The gate at `decide_one` position 8 degrades every subject of an in-crate
+/// referenced function. S3.6-1 is the slice that lifts it, and lifting it needs
+/// a question asked one step earlier: *which subjects would convert if the gate
+/// were not there?* That question is what builds the co-conversion classes, and
+/// it must be answered by **this** ladder rather than by a replay of it —
+/// micro-plan §1b measured what a replay costs (a `facts.tsv`-only replay
+/// reported 2,133 against a true 2,075 and was retracted).
+///
+/// So the gate becomes a mode, and the class builder runs the real
+/// [`decide_one`] under [`Self::LiftAdaptable`].
+///
+/// # Why the lifting variant names ADAPTABLE, and why that is not a comment
+///
+/// The pinned population — 295 functions / 640 subjects, 87 % of it
+/// tulipindicators — is **excluded from M1** and deferred to M2/M3 (ruling
+/// 2026-08-10). A variant spelled `Lift` would have made every pinned
+/// parameter a class node, and the exclusion would then have lived only in
+/// prose. Banked rule (2026-08-10): *a parked capability is excluded
+/// structurally — in the types and the count pins — never in prose alone.*
+/// This enum is where that rule is paid for at the decision layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RefGate {
+    /// Adaptable functions pass the gate; **pinned ones still block**.
+    ///
+    /// The hypothetical the class builder asks about. Task 3 is where a
+    /// production call site may pass it, and then only for admissible classes.
+    LiftAdaptable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub(crate) enum Arm {
+    Surface = 0,
+    D4 = 1,
+    C = 2,
+    Pair = 3,
+    Glue = 4,
+    Addr = 5,
+}
+
+impl Arm {
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Surface,
+        Self::D4,
+        Self::C,
+        Self::Pair,
+        Self::Glue,
+        Self::Addr,
+    ];
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Surface => "surface",
+            Self::D4 => "d4",
+            Self::C => "c",
+            Self::Pair => "pair",
+            Self::Glue => "glue",
+            Self::Addr => "addr",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RequiredArmSet(u8);
+
+impl RequiredArmSet {
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub(crate) fn insert(&mut self, arm: Arm) {
+        self.0 |= 1 << (arm as u8);
+    }
+
+    pub(crate) fn contains(self, arm: Arm) -> bool {
+        self.0 & (1 << (arm as u8)) != 0
+    }
+
+    pub(crate) fn remove(&mut self, arm: Arm) {
+        self.0 &= !(1 << (arm as u8));
+    }
+
+    pub(crate) fn union(mut self, other: Self) -> Self {
+        self.0 |= other.0;
+        self
+    }
+
+    pub(crate) fn render(self) -> String {
+        let arms = Arm::ALL
+            .into_iter()
+            .filter(|&arm| self.contains(arm))
+            .map(Arm::key)
+            .collect::<Vec<_>>();
+        if arms.is_empty() {
+            "-".to_owned()
+        } else {
+            arms.join("+")
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArmState {
+    NotRequired,
+    Ready,
+    Blocked,
+}
+
+impl ArmState {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not-required",
+            Self::Ready => "ready",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[cfg(test)]
+mod required_arm_set_tests {
+    use super::*;
+
+    #[test]
+    fn multi_w1_required_arm_set_keeps_every_required_bit_in_fixed_order() {
+        let mut requirements = RequiredArmSet::default();
+        requirements.insert(Arm::Pair);
+        requirements.insert(Arm::C);
+        requirements.insert(Arm::D4);
+        assert_eq!(requirements.render(), "d4+c+pair");
+        assert!(requirements.contains(Arm::D4));
+        assert!(requirements.contains(Arm::C));
+        assert!(requirements.contains(Arm::Pair));
+        assert!(!requirements.contains(Arm::Glue));
+    }
+
+    #[test]
+    fn required_arm_set_union_does_not_drop_an_earlier_arm() {
+        let mut left = RequiredArmSet::default();
+        left.insert(Arm::Surface);
+        let mut right = RequiredArmSet::default();
+        right.insert(Arm::Addr);
+        assert_eq!(left.union(right).render(), "surface+addr");
+    }
+}
+
+/// How the parameter's **declaration** is written in source, for a subject
+/// whose **resolved** type is a pointer.
+///
+/// The two can disagree, and that disagreement is the whole reason subject
+/// collection moved to resolved types: a C2Rust alias
+/// (`pub type lil_value_t = *mut _lil_value_t`) is a pointer parameter that
+/// *reads* as a path. Under R-A such parameters are collected — they are real C
+/// pointer parameters and excluding them would shrink the universe artificially
+/// — and the shape is carried so that an emission obstacle specific to the
+/// shape can be attributed with its own reason instead of vanishing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeclShape {
+    /// `*mut T` / `*const T`, written literally. The only emittable shape at M1.
+    RawPtr,
+    /// A path that resolves to a pointer — the C2Rust type-alias class.
+    Alias,
+    /// Already a reference in source.
+    Reference,
+    /// Resolved as a pointer through some other declaration form.
+    Other,
+}
+
+impl DeclShape {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            DeclShape::RawPtr => "raw-ptr",
+            DeclShape::Alias => "alias",
+            DeclShape::Reference => "reference",
+            DeclShape::Other => "other",
+        }
+    }
+}
+
+/// Which universe a [`Subject`] came from.
+///
+/// The two universes are **disjoint by construction**: parameters occupy MIR
+/// locals `_1 ..= arg_count`, locals occupy `_(arg_count + 1) ..`. Nothing
+/// reconciles them afterwards because nothing has to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubjectKind {
+    /// A pointer parameter. Carries its position in the HIR declaration,
+    /// **0-based**, recorded as collected.
+    ///
+    /// Kept separate from [`Subject::local`] deliberately. The two coincide
+    /// (`local == hir_index + 1`), but deriving the artifact's `arg_index`
+    /// *from* the local would make it a restatement of the alignment key — and a
+    /// pairing field that restates the key can never disagree with it. F1 is
+    /// precisely what such a field looks like.
+    Param { hir_index: usize },
+    /// A named pointer local. **Has no argument position**, so the artifact's
+    /// `arg_index` is `None` for it — which means *not a parameter*, never
+    /// *unpaired*: `compare::pairing_agrees` compares that field by equality and
+    /// nothing presence-tests it (S3.1 pre-flight, swept).
+    Local,
+}
+
+/// One thing M1 must decide about: a pointer **parameter** or a named pointer
+/// **local**.
+///
+/// Subjects and decisions are counted against each other by the structural gate
+/// (`|decisions| == |subjects|`), so a subject that is silently skipped rather
+/// than explicitly degraded fails the gate instead of vanishing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Subject {
+    pub fn_did: LocalDefId,
+    /// MIR local of the parameter: params are `_1 ..= arg_count`.
+    pub local: Local,
+    /// HIR binding of this subject, used to attribute uses to it without
+    /// relying on a name that could be shadowed.
+    ///
+    /// **Must be the binding's real `HirId` — the one `Res::Local` resolves a
+    /// use to.** The two A1 emitability gates key on `(fn_did, hir_id)`, so a
+    /// placeholder here does not weaken them, it makes them *unreachable*: the
+    /// lookup cannot hit and the subject sails past both checks. S3.1 shipped
+    /// `CRATE_HIR_ID` for every local, and both gates were dead over that whole
+    /// population — 0 of 3,142 locals stopped, against 1,231 of 4,306
+    /// parameters. `production_subjects_carry_a_real_hir_binding` bans the
+    /// placeholder in production source so the next population cannot repeat it.
+    ///
+    /// Said the other way: this field is not describable as "a parameter's".
+    /// The doc that said so predated the locals universe and read as true while
+    /// half the population carried a placeholder.
+    pub hir_id: rustc_hir::HirId,
+    /// **Pairing term 1** in the reconciliation artifact: the parameter's
+    /// source name. `None` when the pattern is not a plain binding.
+    pub param_name: Option<String>,
+    /// Which universe this subject came from — and, for a parameter, **pairing
+    /// term 2**.
+    ///
+    /// **An enum rather than `Option<usize>`, deliberately (S3.1).** The
+    /// artifact's `arg_index` derivation matches on this, so adding the locals
+    /// kind made every consumer a compile error until it said what it meant.
+    /// An `Option` would have let a consumer write `unwrap_or(0)` and compile —
+    /// the same silent-acceptance shape S3.0 removed from the `Decision`
+    /// consumers.
+    pub kind: SubjectKind,
+    /// Pointer-chain depth of the RESOLVED subject type.
+    pub ptr_depth: u8,
+    /// Human-readable identity for attribution: `fn_name::param_name`.
+    pub label: String,
+    /// Source span of the subject's declared **type** — the splice target.
+    ///
+    /// **`None` when there is no declared type**, which S3.1 makes reachable:
+    /// `let p = malloc(4) as *mut i32;` has no annotation, and a
+    /// tuple-destructuring `let (a, b): (…)` annotates the *pattern*, not its
+    /// components (measured 2026-08-05: MIR reports per-binding spans while the
+    /// HIR `let` carries one whole-pattern type).
+    ///
+    /// **Such subjects cannot emit — nothing splices them — but this is no
+    /// longer a REASON.** The dissolution (2026-08-12) put the ladder ahead of
+    /// it: 1,084 of the 1,196 name a gate that was already there, and the 112
+    /// for which the missing declaration IS the binding constraint get a
+    /// residual key from [`residual_reason`] naming the owed capability. What
+    /// enforces the no-emission half is the veto in [`decide_one`].
+    ///
+    /// Kept distinct from [`Self::binding_span`] because they mean different
+    /// things: this one is *where an edit would go*, that one is *where the
+    /// subject is*. Using the binding span here would put a non-splice-target
+    /// into the artifact's `decl_span_lo/hi`, whose doc says the audited number
+    /// IS the edit target.
+    pub ty_span: Option<Span>,
+    /// Source span of the subject's **binding** — always present.
+    ///
+    /// Attribution only: it is what a site string renders when there is no
+    /// declared type to point at. For a parameter this is the pattern; for a
+    /// local it is the `var_debug_info` entry's span, which is exactly the HIR
+    /// binding pattern's span (measured, including the `mut p` case).
+    pub binding_span: Span,
+    /// Source span of the pointee type, kept so the plan can preserve the
+    /// pointee's text verbatim rather than re-render it.
+    ///
+    /// `None` when the declaration is not a syntactic raw pointer: an alias
+    /// carries its pointer-ness inside the alias, so there is no pointee text
+    /// to copy. Such subjects are degraded in [`decide_one`], so a `Ref`
+    /// decision always has a pointee span.
+    pub pointee_span: Option<Span>,
+    /// How the declaration is written — see [`DeclShape`].
+    pub decl_shape: DeclShape,
+    pub mutable: bool,
+    /// **The freed-slot fact**: the span of the first deallocator call this
+    /// subject's binding is passed to, or `None`.
+    ///
+    /// Stamped once, in `finish_decide`, over BOTH universes from a single
+    /// [`super::free_sites`] walk — the same call the S2-2 census asks. One
+    /// stamping site rather than one per collector, so the parameter and locals
+    /// populations cannot acquire different freed-ness by construction, and one
+    /// recognizer rather than two so the gate below and the census cannot
+    /// disagree about what "freed" means.
+    ///
+    /// An `Option<Span>` rather than a `bool` + lookup: the predicate and the
+    /// attribution site are the same fact, and splitting them is how a gate
+    /// ends up degrading with a declaration site that says nothing about why.
+    pub freed_at: Option<Span>,
+    /// **U-2′** — did the construction-site recognizer recover a real length?
+    ///
+    /// Stamped alongside `freed_at`, from the same single pass. `false` is the
+    /// approximation path, which U-2′ ratified as the PRIMARY one for borrowed
+    /// forms (measured 2.8 % recoverable over the slice market), with this flag
+    /// as the assumption-violation counter rather than a caveat.
+    ///
+    /// A parameter has no construction site in its own crate, so it reads
+    /// `false` — *"this analysis did not recover a length"*, a statement about
+    /// reach, never a claim about the program. Same rule as `param-no-site`.
+    pub len_recovered: bool,
+    /// **S3.2′-3** — is this binding CONSTRUCTED from a null literal?
+    ///
+    /// Stamped from the same construction pass as `len_recovered`. It is the
+    /// second of the two in-force nullability signals (micro-plan §1): the
+    /// first is a use-site `is_null`, this one is `0 as *mut T` at the
+    /// initializer.
+    ///
+    /// A parameter has no construction site, so it reads `false` — reach, not a
+    /// claim, the `param-no-site` rule again.
+    pub null_init: bool,
+    /// **S3.2′-3** — is the binding itself declared `mut`?
+    ///
+    /// A mutable optional with more than one use is accessed through
+    /// `as_mut()`, and `as_mut()` takes `&mut self`. Without a `mut` binding
+    /// that is `error[E0596]`, so the fact has to be available where the form is
+    /// chosen rather than discovered by the verify loop.
+    pub mut_binding: bool,
+    /// **The dissolution pass** — where this binding's VALUE comes from.
+    ///
+    /// Stamped from the same construction pass as [`Self::null_init`] and
+    /// [`Self::len_recovered`], so the three cannot disagree about what the
+    /// initializer is. The class itself rather than a boolean projection of it,
+    /// because [`residual_reason`] has to name *which* owed capability an
+    /// unspliceable subject is waiting on, and a boolean cannot.
+    ///
+    /// **Read only by [`residual_reason`]**, which runs after every other gate
+    /// has declined to speak. That containment is the point: before the
+    /// dissolution this module read nothing from the construction recognizer
+    /// except two booleans, and that is still true of every gate that can BLOCK
+    /// a subject. The class decides an attribution, never a decision.
+    ///
+    /// `None` for a parameter — no construction site in this crate — and for a
+    /// `let` the recognizer does not classify. The `param-no-site` rule again:
+    /// a statement about reach, never a claim about the program.
+    pub ctor: Option<construction::Construction>,
+}
+
+/// Bindings passed to a deallocator, keyed exactly as A1's emitability gates are
+/// — `(owner, HirId)`.
+///
+/// Takes the resolved slice rather than the parent's `FreeSites` struct: this
+/// phase needs the *fact*, not the recognizer's return type, and a narrower
+/// surface is a narrower coupling.
+#[derive(Default)]
+pub(crate) struct FreedBindings(FxHashMap<(LocalDefId, rustc_hir::HirId), Span>);
+
+impl FreedBindings {
+    /// First site wins, so the attribution is deterministic under a program with
+    /// several frees of one binding — `bst::deleteNode::_1` is freed twice on
+    /// the corpus, and a last-wins rule would make the reported site depend on
+    /// HIR walk order.
+    pub(crate) fn from_resolved(resolved: &[(rustc_hir::HirId, bool, Span)]) -> Self {
+        let mut map = FxHashMap::default();
+        for (hir_id, _cast, span) in resolved {
+            map.entry((hir_id.owner.def_id, *hir_id)).or_insert(*span);
+        }
+        Self(map)
+    }
+
+    pub(crate) fn site_of(&self, fn_did: LocalDefId, hir_id: rustc_hir::HirId) -> Option<Span> {
+        self.0.get(&(fn_did, hir_id)).copied()
+    }
+}
+
+impl Subject {
+    /// **THE subject identity — one definition, three consumers.**
+    ///
+    /// `plan` stamps it into [`super::plan::Unplaceable::subject`], the driver
+    /// rebuilds it to subtract unplaceable decisions from the emitted set, and
+    /// it is the string rendering of the pair the artifact `Row` already keys
+    /// by: `fn_path` + `mir_local` (`artifact/mod.rs`). Those three must agree
+    /// or the accounting identity compares different populations, so there is
+    /// one function rather than three `format!`s.
+    ///
+    /// **The identity is `owner` + `mir_local`. The name is carried for
+    /// READABILITY and carries none of it.** Two subjects in one function can
+    /// render the same name:
+    ///
+    /// - **today** — `fn anon(_: *mut i32, _: *mut i32)` gives both parameters
+    ///   `param_name: None`, so a name-keyed identity renders `anon::<unnamed>`
+    ///   twice. Measured: both reach `Decision::Ref`, so this is on the emitting
+    ///   path, not a curiosity. With one of them unplaceable, the driver's
+    ///   `contains` check then skips the OTHER — the emitted source shows the
+    ///   rewrite while `emitted_count` reports 0, and
+    ///   `emitted + degraded + unplaceable == rows` fails 1 ≠ 2. It has never
+    ///   fired on the corpus only because `unplaceable == 0` there.
+    /// - **S3.1** — locals may legitimately share a name: `let p = …; let p = …;`
+    ///   binds two distinct locals, each with its own `var_debug_info` entry,
+    ///   both named `p`.
+    ///
+    /// `Local::as_u32` rather than `Local`'s `Debug` so the rendering matches
+    /// the artifact's `mir_local` exactly rather than approximately.
+    /// The span a human-facing site string points at: the declared type when
+    /// there is one, the binding otherwise. Never `None`, so attribution never
+    /// degrades along with the type.
+    pub(crate) fn attribution_span(&self) -> Span {
+        self.ty_span.unwrap_or(self.binding_span)
+    }
+
+    pub(crate) fn identity_key(&self, owner: &str) -> String {
+        format!(
+            "{owner}::{}#{}",
+            self.param_name.as_deref().unwrap_or("<unnamed>"),
+            self.local.as_u32()
+        )
+    }
+}
+
+/// Why a subject was not emitted.
+///
+/// A typed reason rather than a string: the counters S2b aggregates need to
+/// group by cause, and `CallSiteNotAdapted` in particular is **temporary** —
+/// S3's call-site adaptation retires it, and a free-text reason would make that
+/// transition invisible in the data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DegradeReason {
+    /// The verify loop took this subject's rewrite back after the emitted crate
+    /// failed to type-check, and its own function was attributed the error.
+    ///
+    /// **Its own reason key so the accounting identity survives the loop:** a
+    /// reverted subject moves from emitted to degraded, keeping
+    /// `emitted_final + degraded == row count`. Folding it into an existing
+    /// reason would make a loop-driven revert indistinguishable from a
+    /// decision-phase degradation, which is a different thing entirely — the
+    /// decision stands; only the emission was withdrawn.
+    RevertedAfterVerifyFailure,
+    /// Atomic signature-class finalization held this otherwise-emittable
+    /// subject because another required site/arm in the same class was not
+    /// ready.
+    SignatureClassHeld {
+        reason: String,
+    },
+    /// BO decided the slot is a raw pointer; leaving the source alone is the
+    /// decision, not a failure.
+    KindRaw,
+    /// The parameter intentionally keeps its raw presentation as the T2 side
+    /// of a same-object PAIR seam. Its class may still apply the safe sibling
+    /// signature edit and the call-level raw-view bridge atomically.
+    PairRawView,
+    /// Box wave-1 filter failure, preserving the exact first-failure class.
+    BoxFailure {
+        failure: box_facts::BoxPlanFailure,
+    },
+    /// The parameter is used in an operation that exists only on raw pointers.
+    RawPointerOperation {
+        op: String,
+    },
+    /// The function is referenced in-crate — called, address-taken, or cast to
+    /// a fn pointer — and use sites are not yet adapted. **Retired by S3.**
+    CallSiteNotAdapted,
+    /// The parameter is compared with `<`, `==`, … (F5).
+    ///
+    /// Blocking in both directions. The dangerous one is silent: the same
+    /// expression compares ADDRESSES on raw pointers and POINTEES on
+    /// references, so a rewritten bounds check type-checks, passes the gate,
+    /// and inverts. Refusing here is the only place that catches it before a
+    /// behavioral gate exists.
+    PtrComparison,
+    /// R739-1 (slicecursor relay 099). Every use of the subject only measures
+    /// its address — `offset_from`, a comparison, `is_null`, a cast to an
+    /// integer — so its value may be an end sentinel one past an allocation,
+    /// and a reference to it would be UB at creation
+    /// ([`EmitabilityFacts::address_observation_only`]).
+    AddressObservationOnly,
+    /// R261-3. The subject's own type reaches the io-domain -- a stream handle,
+    /// or an aggregate holding one. A `FILE*` promoted to `&mut FILE` claims
+    /// exclusive access to a handle libc holds its own pointer to, so the
+    /// boundary is permanent and by type, not only by argument position or by
+    /// the sealed identity list.
+    IoDomainType,
+    /// R272-1 / R280-1. A thin reference carries provenance for one element,
+    /// and this subject reaches a foreign position whose contract consumes more
+    /// than one — read to a NUL, to a stated count, or to a source-determined
+    /// length. The extent column of the pinned contract table decides.
+    ThinExtent,
+    /// R364-2 / R365-1. A thin reference carries provenance for one element,
+    /// and this subject is handed to a LOCAL callee parameter whose body
+    /// accesses past one — a `c_void` pointee cast away to a real width, or
+    /// pointer arithmetic. Sibling of [`ThinExtent`](Self::ThinExtent), which
+    /// decides the same question at FOREIGN positions from the contract table.
+    ///
+    /// Named for the ACCESS, not for a read: six of the twenty corpus sites are
+    /// eight-byte writes through a one-byte `&mut uint8_t`.
+    LocalCalleeAccessExtent {
+        access: Box<local_callee_extent::LocalCalleeAccess>,
+        count: Option<thin_counted::Hold>,
+    },
+    /// R631-4 (wave-6l relay 061). The parameter is read past a masked index
+    /// by a length known only at run time (brotli's ring-buffer readers,
+    /// `data[(ix & mask) + len]`): no companion at the signature carries the
+    /// buffer's true length, so any slice built here panics where C reads on.
+    /// `reader` is the chain from the parameter's function to the reader.
+    MaskedIndexRuntimeLength {
+        reader: String,
+    },
+    /// R271-1. The slot's pointee is `c_void`, a one-byte type carrying no
+    /// extent, so no reference form of it can carry the provenance its callee
+    /// accesses through. Held at any depth.
+    VoidPointee,
+    /// Structural: the subject has no depth-0 slot, or none in the model.
+    NoSlot,
+    /// The resolved parameter type is a pointer but the **declaration** is not
+    /// a syntactic `*mut`/`*const` — the C2Rust alias class, or a parameter
+    /// that is already a reference.
+    ///
+    /// **Renamed from `UnsupportedDeclShape` at S3.1** (register 4, reason honesty).
+    /// The old name asserted the opposite of the truth for its largest
+    /// population: a C2Rust alias declaration IS a pointer declaration, just not
+    /// one M1 can splice. The new name is true of every shape it carries —
+    /// `alias`, `reference`, `other` — and prejudges none of them.
+    ///
+    /// R-A: collect these, do not exclude them. They are real C pointer
+    /// parameters, so excluding them would shrink the universe artificially;
+    /// what they get instead is a decision and an attributed reason. Emitting
+    /// *through* an alias is a separate design question — the alias already
+    /// contains the `*mut`, so `&mut lil_value_t` would be wrong — and
+    /// conflating it with the collection fix would repeat this milestone's
+    /// pattern of bundling.
+    UnsupportedDeclShape {
+        shape: &'static str,
+    },
+    /// **The dissolution's residue** — the subject has no declared type, every
+    /// other gate has declined to speak, and the type would have to come from
+    /// the **callee's return type**.
+    ///
+    /// Its own key rather than `escapes-via-return`, which is a different
+    /// claim: that one says a converted reference would escape THROUGH a
+    /// return, this one says the declaration's type LIVES in one. Reusing it
+    /// would attribute to these subjects a hazard they do not carry.
+    ///
+    /// Return position is not in M1's subject universe at all, so this reason
+    /// is owed forward to S3.6-5 rather than to the locals-conversion slice.
+    ReturnNotAdapted,
+    /// **The dissolution's residue** — as [`Self::ReturnNotAdapted`], but the
+    /// type lives in a **pointee or struct field**: `(*s).f`, `&arr[i]`, `&x`,
+    /// `((*h).arr).as_mut_ptr()`. Owed to M3, not to this milestone.
+    PlaceReadPointee,
+    /// **The dissolution's residue** — as [`Self::ReturnNotAdapted`], but the
+    /// type is **coupled to another binding's**: a copy, pointer arithmetic off
+    /// another local, or a conditional over two statics. This is the one
+    /// residual class the registered locals-conversion follow-up owns, because
+    /// initializer edges in the co-conversion graph are exactly what would
+    /// resolve it.
+    CopySourceCoupled,
+    /// **The freed-slot gate.** The subject's binding is passed to a
+    /// deallocator, so emitting a reference form for it would hand codegen a
+    /// reference to freed memory.
+    ///
+    /// # Why this is its own reason and fires LAST
+    ///
+    /// Backlog S2-2 recorded that a leaked free's value kind is *observed, not
+    /// designed*: a freed slot can settle `Ref` in the model, and the census
+    /// measured 44 such subjects on the derived corpus. None of them reaches
+    /// `Decision::Ref` today — every one is stopped earlier, mostly by an
+    /// `as`-cast on the free argument or by having no declared type. That is an
+    /// **incidental** mitigation, not a discharge: it is a property of how
+    /// C2Rust happens to spell `free`, and `lodepng_free` already shows the
+    /// shape that survives it (`free(ptr)` with no cast, stopped only by
+    /// `call-site-not-adapted` — which **S3 retires**).
+    ///
+    /// So the gate is placed **last**, immediately before the `Ref` return: it
+    /// vetoes an emission nothing else stopped, and it displaces no existing
+    /// attribution. That ordering is what makes it a zero-movement change on
+    /// today's corpus and a live veto the moment S3 removes the reason that is
+    /// carrying it.
+    ///
+    /// Never folded into [`Self::KindOwning`]. Those are different claims —
+    /// "BO says this slot owns" versus "the program frees this binding" — and a
+    /// freed subject whose kind is `Ref` is exactly the case that has neither
+    /// name nor counter if they are merged.
+    FreedSlot,
+    /// The subject is a borrowed-slice candidate whose **uses** cannot all be
+    /// rewritten — some occurrence is not `*p.offset(e)`.
+    ///
+    /// Blocking for the whole subject, never partially applied: `&[T]` changes
+    /// the type at every occurrence, so rewriting the recognized uses and
+    /// leaving the rest is an ill-typed crate rather than a partial win.
+    SliceUseUnsupported,
+    /// Pointer movement used as a raw value requires the separate cursor wave.
+    SliceCursorUse,
+    CursorBaseModelRaw,
+    CursorBaseUnavailable,
+    /// R419-3 / R304-2: the subject is the source of a foreign site the
+    /// sibling-overlap instrument would hold `pending` (a risky sibling at the
+    /// same call); a delivered borrowed form there is a delivered held
+    /// subject, so the family refuses up front (`pending_sibling`).
+    PendingSiblingOverlap,
+    /// **S3.2′-5 — the offset may be negative, so no `&[T]` form may emit.**
+    ///
+    /// `*p.offset(e)` becomes `p[(e) as usize]`. Where `e` is negative at
+    /// runtime the cast wraps to a huge index and the bounds check panics:
+    /// memory-safe, and a **behaviour change** against a program that
+    /// legitimately indexed backwards. The `-2` arm authorised that position
+    /// while consulting no sign at all; this is the gate that closes it.
+    ///
+    /// **Its own key rather than folded into `SliceUseUnsupported`**, on the
+    /// `OptNeedsMutBinding` precedent: the occurrence *is* `*p.offset(e)`, so
+    /// the use shape is supported and nothing about it is unsupported. What
+    /// blocks it is the argument's sign, and the form that serves a negative
+    /// offset — `SliceCursor` — is an owed capability, not a missing use
+    /// rewrite. Two different owed items must not read as one.
+    ///
+    /// **The verdict is two-way, and the name says so.** `SignFacts` fuses
+    /// `Neg` and `Top` into one taint bit (`sign_facts.rs:7-24`), so a subject
+    /// counted here may be *unknown* rather than *provably negative* — the key
+    /// reads `neg-or-unknown` and never `negative` for that reason.
+    ///
+    /// **Fires in the `Form::Slice` arm only.** Placed there rather than
+    /// earlier because 61 of the 534 emitting `Ref` subjects also read
+    /// `neg-or-unknown`; they are thin, form no index, and a gate above form
+    /// selection would move every one of them.
+    SliceNegOrUnknownOffset,
+    /// The subject is a borrowed-slice candidate but is a **local**, so a slice
+    /// value would have to be CONSTRUCTED at its initializer.
+    ///
+    /// A parameter needs no construction — the caller supplies the slice, and on
+    /// this market no in-crate caller exists (every subject is
+    /// non-`referenced`). A local's initializer is a raw-pointer expression that
+    /// would need `from_raw_parts` and a length, which is a different mechanism
+    /// with a different soundness argument. Scoped out of this slice explicitly
+    /// and counted, rather than attempted.
+    SliceLocalConstruction,
+    /// **The subject's own use-edits NEST, so no flat splice can express them.**
+    ///
+    /// brotli's shape: `table = table.offset((*table).value as isize)`. The use
+    /// walk fires once per OCCURRENCE, so the self-advance source yields an edit
+    /// spanning the whole `offset` call and the plain deref inside its index
+    /// yields a second edit *within* that span.
+    ///
+    /// **Its own key rather than folded into `SliceUseUnsupported`**, on the
+    /// `SliceNegOrUnknownOffset` precedent: every occurrence here *is* a
+    /// supported shape — each would rewrite correctly in isolation. What blocks
+    /// the subject is that two correct rewrites overlap, which is a property of
+    /// the pair, not of either use. Two different owed items must not read as
+    /// one.
+    ///
+    /// **Degraded rather than resolved by picking a winner, because neither
+    /// choice is correct.** `index_text` renders the index with
+    /// `span_to_snippet`, so the outer replacement embeds the inner use's
+    /// ORIGINAL text — `(*table)`, which has no meaning on a `&[T]`. Dropping
+    /// the inner edit emits that stale text; dropping the outer leaves the
+    /// `offset` call. The rewrite is simply not expressible as byte splices, and
+    /// the honest response is to decline the subject.
+    ///
+    /// Resolving it properly means rendering the index from REWRITTEN text
+    /// rather than source — registered as a yield follow-up, not attempted here.
+    ///
+    /// **Fires LAST in its arm**, on the freed-slot placement rule: every
+    /// subject reaching it has passed every other gate, so its count is exactly
+    /// the population this defect costs and it can never displace another
+    /// reason.
+    NestedUseEdits,
+    /// **S3.2′-3 — positive evidence of nullness, so no plain form may emit.**
+    ///
+    /// The binding is initialized from a null literal. `Option` would serve it,
+    /// but only with the INITIALIZER rewritten to `None` — a construction-site
+    /// edit this slice does not own — so the disposition is an attributed
+    /// degrade.
+    ///
+    /// **Fires after every other gate, including the freed-slot veto**, so it
+    /// can only ever convert a would-be emission. That bounds its transitions
+    /// to the subjects that emit today, which is what the pre-registration
+    /// counts.
+    NullInit,
+    /// An optional subject carries a use the wrapper has no image for.
+    OptUseUnsupported,
+    /// A LOCAL cannot take an optional form without its initializer rewritten.
+    ///
+    /// `let p: Option<&i32> = <a raw pointer expression>` is `E0308` whatever
+    /// the uses do, so the blocker is the construction site and not the uses —
+    /// the same shape as [`Self::SliceLocalConstruction`], and its own key
+    /// because "slice" would misreport a thin optional.
+    ///
+    /// **Found by a fixture, not by the corpus**: every subject in this slice's
+    /// measured market is a parameter, so the corpus could not have exercised
+    /// this arm at all.
+    OptLocalConstruction,
+    /// **S3.6-1 step 2 — the subject's own reference can reach a RAW context.**
+    ///
+    /// `&mut T → *mut T` is an implicit coercion at a call argument, a
+    /// `static mut` store, a field store and a return (§5a, compiler-measured,
+    /// all four exit 0). So this flow presents as **nothing at all**: it is not
+    /// ill-typed, the verify loop has nothing to absorb, and no counter moves.
+    /// The record's E3b premise said such flows are ill-typed; that was refuted,
+    /// and this reason is the decision-time gate replacing the retracted revert
+    /// prediction.
+    ///
+    /// **`via` itemizes, and the key IS the block reason's key**, so the census
+    /// and the reason field speak ONE vocabulary and a join between them needs
+    /// no translation. A ruling asked for the population itemized; a shared
+    /// `silent-coercion` bucket would have made that unrecoverable.
+    ///
+    /// **Scope, stated:** only plain-`Ref` subjects can carry it, because only
+    /// they are class nodes. A `&mut [T]` or `Option<&mut T>` reaching a raw
+    /// context is the same hazard and is **not** gated here.
+    SilentCoercion {
+        via: co_conversion::BlockReason,
+    },
+    /// **S3.6-1 step 3 — the subject's CLASS cannot convert, though the subject
+    /// contributes no blocking fact of its own.**
+    ///
+    /// Conversion is a property of the connected component: converting a callee
+    /// parameter while the caller feeding it stays raw is `E0308`, so one
+    /// blocked member blocks the class, and a collateral member is blocked by
+    /// **transitivity**.
+    ///
+    /// **The variant names the INDIRECTION; the payload preserves the blocking
+    /// class's key.** Reporting the class's key directly would attribute to this
+    /// subject a hazard it does not carry — the third application of the
+    /// reason-honesty rule in this slice. The collateral itemization is read
+    /// from the census's `class_block` column: one vocabulary, two columns.
+    ClassBlocked {
+        via: co_conversion::BlockReason,
+    },
+    /// A mutable optional subject with more than one use needs `as_mut()`, and
+    /// `as_mut()` needs a `mut` binding this declaration does not have.
+    ///
+    /// Its own key rather than folded into `OptUseUnsupported`: the blocker is
+    /// the *binding mode*, one edit away, where a genuinely unsupported use is
+    /// a missing capability. Two different owed items must not read as one.
+    OptNeedsMutBinding,
+    /// **R575-6 — withdrawn to raw because the aliased-storage twin refused its
+    /// callers.** The subject is its function's only safe one, and every refused
+    /// call converts it beside a raw alias of its storage root (`f(s, &mut
+    /// (*s).field)` with `s` raw) into a callee that is no leaf. The hold protected
+    /// nothing that delivers; raw, the arguments coerce exactly as the input's
+    /// did. `seams` names the refused calls.
+    AliasedStorageWithdrawn {
+        seams: String,
+    },
+    /// Wave-6o relay 146 (R796-1, USER): a retained-alias hold. A formal the program also reaches
+    /// through a pointer it keeps in memory is held raw. The stop-gap's table of Miri-observed
+    /// formals (`observed:<run>`) is gone (S6a, D5); the retained-access rule and the plan give the
+    /// hold its `detail`.
+    RetainedAlias {
+        detail: String,
+    },
+    /// R857-2 / R858-4 (reading (A); fan-out 074): a lent formal handed to an
+    /// indirect call whose program-assigned target releases it
+    /// (`released_indirect`). `detail` names the site and the targets.
+    ReleasedThroughIndirectCall {
+        detail: String,
+    },
+    /// Relay 297 (main 186 §5): a caller's binding handed whole to a local formal a
+    /// settled-table hold made raw (`settled_holds`). `detail` names the formal.
+    IntoHeldFormal {
+        detail: String,
+    },
+    /// R829-1 / R855-1 (USER; main 184): the caller-side hold of a pending
+    /// sibling-overlap site, decided on the settled table (`pending_hold`): a
+    /// delivered source handed to a raw formal beside a risky raw sibling the pair
+    /// proof did not show disjoint keeps its raw form. `detail` names the site.
+    PairNotShownDisjoint {
+        detail: String,
+    },
+}
+
+impl DegradeReason {
+    /// Stable key for counter aggregation (S2b).
+    #[allow(
+        dead_code,
+        reason = "the aggregation that consumes this is S2b, the next slice. \
+                  Targeted rather than module-wide so the lint keeps working \
+                  everywhere else."
+    )]
+    pub(crate) fn key(&self) -> &'static str {
+        match self {
+            DegradeReason::RevertedAfterVerifyFailure => "reverted-after-verify-failure",
+            DegradeReason::SignatureClassHeld { .. } => "signature-class-held",
+            DegradeReason::KindRaw => "kind-raw",
+            DegradeReason::PairRawView => "pair-raw-view",
+            DegradeReason::BoxFailure { failure } => failure.key(),
+            DegradeReason::RawPointerOperation { .. } => "raw-pointer-operation",
+            DegradeReason::CallSiteNotAdapted => "call-site-not-adapted",
+            DegradeReason::PtrComparison => "ptr-comparison",
+            DegradeReason::AddressObservationOnly => "held:address-observation-only",
+            DegradeReason::IoDomainType => "held:io-domain:type",
+            DegradeReason::VoidPointee => "held:void-pointee",
+            DegradeReason::ThinExtent => "held:thin-extent",
+            DegradeReason::PendingSiblingOverlap => "pending-sibling-overlap",
+            DegradeReason::LocalCalleeAccessExtent { .. } => "held:local-callee-access-extent",
+            DegradeReason::MaskedIndexRuntimeLength { .. } => "held:masked-index-runtime-length",
+            DegradeReason::NoSlot => "no-slot",
+            DegradeReason::UnsupportedDeclShape { .. } => "unsupported-decl-shape",
+            DegradeReason::ReturnNotAdapted => "return-not-adapted",
+            DegradeReason::PlaceReadPointee => "place-read-pointee",
+            DegradeReason::CopySourceCoupled => "copy-source-coupled",
+            DegradeReason::FreedSlot => "freed-slot",
+            DegradeReason::SliceUseUnsupported => "slice-use-unsupported",
+            DegradeReason::SliceCursorUse => "slice-cursor-use",
+            DegradeReason::CursorBaseModelRaw => "cursor-base-model-raw",
+            DegradeReason::CursorBaseUnavailable => "cursor-base-unavailable",
+            DegradeReason::NestedUseEdits => "nested-use-edits",
+            DegradeReason::SliceNegOrUnknownOffset => "slice-neg-or-unknown-offset",
+            DegradeReason::SliceLocalConstruction => "slice-local-construction",
+            DegradeReason::NullInit => "null-init",
+            DegradeReason::OptUseUnsupported => "opt-use-unsupported",
+            DegradeReason::OptLocalConstruction => "opt-local-construction",
+            DegradeReason::OptNeedsMutBinding => "opt-needs-mut-binding",
+            DegradeReason::AliasedStorageWithdrawn { .. } => "aliased-storage-withdrawn",
+            DegradeReason::RetainedAlias { .. } => "held:retained-alias",
+            DegradeReason::ReleasedThroughIndirectCall { .. } => released_indirect::KEY,
+            DegradeReason::IntoHeldFormal { .. } => "held:into-held-formal",
+            DegradeReason::PairNotShownDisjoint { .. } => "held:pair-not-shown-disjoint",
+            // ONE vocabulary with the census, deliberately.
+            DegradeReason::SilentCoercion { via } => via.key(),
+            // Names the indirection: the class's key is payload, reported by
+            // the census and never conflated with a hazard this subject has.
+            DegradeReason::ClassBlocked { .. } => "class-blocked",
+        }
+    }
+
+    /// Stable typed payload accompanying a degradation key in diagnostic
+    /// ledgers. Most reasons need no second component; variants carrying a
+    /// concrete blocker preserve that blocker rather than flattening it away.
+    pub(crate) fn detail(&self) -> String {
+        match self {
+            DegradeReason::ClassBlocked { via } | DegradeReason::SilentCoercion { via } => {
+                via.key().to_owned()
+            }
+            DegradeReason::RawPointerOperation { op } => op.clone(),
+            DegradeReason::UnsupportedDeclShape { shape } => (*shape).to_owned(),
+            DegradeReason::BoxFailure { failure } => failure.detail(),
+            DegradeReason::SignatureClassHeld { reason } => reason.clone(),
+            DegradeReason::AliasedStorageWithdrawn { seams } => seams.clone(),
+            DegradeReason::RetainedAlias { detail } => detail.clone(),
+            DegradeReason::ReleasedThroughIndirectCall { detail } => detail.clone(),
+            DegradeReason::IntoHeldFormal { detail } => detail.clone(),
+            DegradeReason::PairNotShownDisjoint { detail } => detail.clone(),
+            DegradeReason::LocalCalleeAccessExtent { access, count } => {
+                thin_counted::hold_detail(access, *count)
+            }
+            DegradeReason::MaskedIndexRuntimeLength { reader } => reader.clone(),
+            _ => "-".to_owned(),
+        }
+    }
+}
+
+/// A degradation, **attributed**: subject, site and reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Degradation {
+    pub subject: String,
+    pub site: String,
+    pub reason: DegradeReason,
+}
+
+/// What M1 decided for one subject.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Decision {
+    /// A retained borrowed base and an independent checked element index.
+    Cursor {
+        mutable: bool,
+        plan: cursor_native::CursorPlan,
+    },
+    /// Emit a reference form: `&T` or `&mut T`.
+    Ref { mutable: bool },
+    /// An unannotated local whose borrowed type is supplied by a direct local
+    /// callee's E2 lifetime-bearing return.  It is semantically a reference,
+    /// but deliberately distinct from [`Ref`](Self::Ref): no local type span
+    /// exists and therefore no declaration splice may be planned.
+    InferredRef { mutable: bool, callee: LocalDefId },
+    /// **S3.2′-2 — emit a borrowed slice form: `&[T]` or `&mut [T]`.**
+    ///
+    /// Carries its use-site rewrites, because a slice form is the first M1
+    /// disposition that is **not declaration-only**: `p.offset(i)` does not
+    /// exist on `&[T]`, so the declaration edit alone yields an ill-typed
+    /// crate. The rewrites are computed HERE, where HIR and the analyses are
+    /// available, and handed to `plan` as data — E1's rule that no later phase
+    /// asks an analysis a question.
+    Slice {
+        mutable: bool,
+        uses: Vec<emitability::UseEdit>,
+    },
+    /// Two independently qualified borrowed slice levels.
+    NestedSlice {
+        mutable: bool,
+        inner_mutable: bool,
+        uses: Vec<emitability::UseEdit>,
+    },
+    /// **S3.2′-3 — emit an optional form: `Option<&T>`, `Option<&mut T>`, or
+    /// their slice twins.**
+    ///
+    /// Taken when a use-site `is_null` is present: the program itself says this
+    /// pointer may be null, and the nullability directive's optional form is
+    /// what a nullable pointer maps to. `slice` selects the fat twin, on
+    /// exactly the -2 authority rule — op-facts supply the need, fatness the
+    /// licence.
+    ///
+    /// Carries its use rewrites for the same reason `Slice` does, plus one more:
+    /// `p.is_null()` has no image on an `Option` and `*p` has no image either,
+    /// so **every** use of an optional subject moves, not only the arithmetic
+    /// ones.
+    Opt {
+        mutable: bool,
+        slice: bool,
+        uses: Vec<emitability::UseEdit>,
+    },
+    /// Box wave-1: a complete local construction/destruction plan.
+    Box(box_facts::BoxPlan),
+    /// Not emitted, with the reason ATTRIBUTED. **A first-class outcome.**
+    ///
+    /// §1.6 admits only conflict-non-increasing rewrites; everything outside
+    /// that envelope degrades *here*, with a subject and a site — never
+    /// silently, and never by an emitter discovering downstream that it cannot
+    /// proceed and reporting it as a property of the whole crate.
+    Degraded(Degradation),
+}
+
+/// The finished, immutable table handed to [`super::plan`].
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DecisionTable {
+    /// Relay 297: every settled-table hold's receipt, one per predicate that named
+    /// the subject (`settled_holds`).
+    pub(crate) settled_hold_receipts: Vec<settled_holds::SettledHoldReceipt>,
+    pub(crate) counted_void: counted_void::Contracts,
+    /// wave-6a W6A-T1: the admitted flexible-tail struct transactions.
+    pub(crate) flexible_tails: flexible_tail::Transactions,
+    /// wave-6a W6A-C1: Box-parameter chains (admitted / held).
+    pub(crate) box_params: box_param::Chains,
+    /// wave-6a W6A-A1: allocation-return certificates (admitted / held).
+    pub(crate) return_certificates: return_certificate::Certificates,
+    /// wave-6a: allocator-contract owners (admitted / held).
+    pub(crate) allocator_contracts: allocator_contract::Plans,
+    pub(crate) void_region: void_region::Contracts,
+    pub(crate) void_region_receivers: void_region::Receivers,
+    pub(crate) forward_slice_parameters: Vec<slice_forms::ForwardParameter>,
+    pub(crate) nested_receipts: Vec<nested_slice::Receipt>,
+    #[allow(dead_code)]
+    pub(crate) cursor_receipts: Vec<cursor_native::CursorReceipt>,
+    pub(crate) sibling_overlap_inventory: sibling_overlap::SiblingInventory,
+    pub(crate) declaration_pointees: declaration::DeclarationPointees,
+    pub(crate) declaration_patterns: declaration_pattern::PatternDeclarations,
+    pub(crate) input_interfaces: interface::InputInterfaces,
+    /// **R585-4** — the classes the family loop's predecessor stage held, set
+    /// before each stage is planned (empty at `Core`). A caller already held at
+    /// the predecessor is held on a wall of its own, not by this stage's new
+    /// transactions (`plan::class_split::keeps_interface_dependency`).
+    pub(crate) predecessor_held_classes:
+        std::collections::BTreeSet<crate::bo_rewriter::bridge_receipt::SignatureClassId>,
+    /// **R631-12** — the calls where L01¹⁰'s arm (a) admitted a read through a
+    /// received reborrow: the call's span, its caller, and the caller's MIR
+    /// local the reborrow lends (the loan's owner). The emission hoists those
+    /// reads while that subject is emitted in a reference form
+    /// (`arg_order_hoist`). Empty until the analysis exports them.
+    pub(crate) arg_order_hoists: rustc_hash::FxHashSet<(
+        (u32, u32),
+        rustc_span::def_id::LocalDefId,
+        rustc_middle::mir::Local,
+    )>,
+    pub entries: Vec<(Subject, Decision)>,
+    pub(crate) exposure: Option<exposure::ExposurePolicy>,
+    pub(crate) arm_requirements: FxHashMap<(LocalDefId, HirId), RequiredArmSet>,
+    /// Final E2 carrier; later phases consume it without origin facts.
+    pub(crate) lifetime_plan: lifetime::LifetimePlan,
+    pub(crate) return_interfaces: return_interface::ReturnInterfaces,
+    pub(crate) return_receivers: return_receiver::ReceiverMap,
+    /// Retained post-solve C-9 call-site emission plans. These are construction
+    /// outputs, carried beside the subject decisions so both the span planner
+    /// and the structural AST emitter consume the same typed population.
+    pub c9_marks: Vec<PlannedCopyMark>,
+    /// **S3.6-1 seam adapters.** Computed in this phase — it is the only phase
+    /// that may read an analysis — and handed to `plan` as data, exactly as
+    /// `Decision::Slice`'s use-edits are.
+    ///
+    /// Carried BESIDE `entries` rather than inside a `Decision` because a seam
+    /// belongs to a *pair*: the callee subject justifies it and the caller's
+    /// file receives it. Attaching it to either end alone would misplace one of
+    /// the two.
+    pub seams: seam::SeamPlan,
+    /// R-A storage presentations whose declaration is an existing `Opt`
+    /// decision but whose initializer also needs to become an Option value.
+    pub depth2_npo_storages: Vec<Depth2NpoStoragePlan>,
+    /// Item-2 raw-result definitions that construct settled local slices.
+    pub slice_constructions: Vec<construction::SliceConstructionPlan>,
+    pub retired_slice_constructions: Vec<super::mechanical_receipt::SliceConstructionReceiptPlan>,
+    pub slice_use_receipts: Vec<super::mechanical_receipt::SliceUseReceiptPlan>,
+    pub option_receipts: Vec<super::mechanical_receipt::OptionPresentationReceiptPlan>,
+    pub option_value_initializers: Vec<(LocalDefId, rustc_hir::HirId)>,
+    pub option_mut_bindings: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    pub option_composed_uses: Vec<((LocalDefId, rustc_hir::HirId), Span)>,
+    /// Relay 327: K21's compositions, for the containers joint (c) retires.
+    pub(crate) composed_use_edits: Vec<ComposedUseEdit>,
+    /// Contract-driven slice promotions, keyed by the exact compiler subject.
+    pub(crate) contract_extent_promotions:
+        FxHashMap<(LocalDefId, rustc_hir::HirId), contract_extent::Promotion>,
+    /// **W4-LIFT (R475-2)** — one receipt per caller lifted by an exact
+    /// licensed width, so the count is auditable at the census.
+    pub(crate) licensed_lifts: Vec<licensed_lift::LiftReceipt>,
+    /// **W4-B1 (R480-2)** — one row per subject the root-extent rule decided:
+    /// lifted with its evidence, or HELD with the reason no extent was found.
+    /// The held count is the seat's Decision A input.
+    pub(crate) root_extents: Vec<root_extent::RootExtentRow>,
+    /// **main 071c (a), report 057** — one row per root whose sole assignment
+    /// the slice-use inventory admitted as its construction, with the form the
+    /// subject ended in. The admission is made PRE-decision (main's STOP 2), so
+    /// without this row a census can see neither how often it fires nor whether
+    /// the subjects it fires on are delivered — which is exactly what the seat
+    /// asked to read at batch 28 and what no table could answer.
+    pub(crate) sized_assignments: Vec<(String, String, sized_assignment::SizedAssignment)>,
+    /// wave-6f: the finalized struct-field reference transactions.
+    pub field_transactions: field_reference::FieldTransactions,
+    /// **R425-3 (wave-5c).** For a parameter the reader chain decided `Slice`
+    /// on its OWN companion integer (`adler32(data, len)`), the index of that
+    /// companion. It is count evidence of the same class as the thin-count
+    /// proof — the accessing callee's indexes are bounded by exactly this
+    /// parameter — so R408-1's adjacency arm licenses it and the chain's
+    /// callers adapt with an evidence-backed extent instead of the fabricated
+    /// one.
+    pub(crate) slice_input_companions: FxHashMap<(LocalDefId, rustc_hir::HirId), usize>,
+    /// **R477-6 (wave-5c).** The subset of `slice_input_companions` whose
+    /// companion MASKS the index rather than counting elements: the licensed
+    /// length is `companion + 1`, and the site carries §77's fabricated-extent
+    /// receipt for the residue the mask does not bound (the callee's read
+    /// width at that index, and the allocation, which the signature does not
+    /// carry).
+    pub(crate) slice_input_mask_companions: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    /// **wave-6l relay 067 — the extent prover's companions.** A delivered
+    /// slice parameter no other producer licenses, whose adjacent integer the
+    /// prover shows bounds every access
+    /// (`extent_proof::prove_parameter_extent`), keyed as
+    /// `slice_input_companions`, with the premises the proof rests on.
+    pub(crate) extent_proof_companions:
+        rustc_hash::FxHashMap<(LocalDefId, rustc_hir::HirId), (usize, Vec<&'static str>)>,
+    /// **wave-6l relay 071 (R697-7).** The field-carried allocation length
+    /// (`field_alloc::Licences::length_at`) of a call argument, keyed by the
+    /// caller and the argument's span: the seam's `len-field-alloc` arm.
+    pub(crate) field_alloc_lengths: rustc_hash::FxHashMap<(LocalDefId, rustc_span::Span), String>,
+    /// **wave-6l relay 077 (R776-4).** Call-site arguments whose C string the
+    /// NUL-walk arm licenses `strlen + 1` for (`nul_walk_arm::sites`).
+    pub(crate) nul_walk_sites:
+        rustc_hash::FxHashMap<(LocalDefId, rustc_span::Span), nul_walk_arm::Site>,
+    /// **R491-7 (wave-5c).** Callee parameters whose body walks them to a NUL
+    /// with the EXACT extent licensed — the walk reaches the NUL on every path,
+    /// or the pointer is handed to a libc string function whose contract
+    /// requires a terminated string. A caller constructing a slice for one of
+    /// these takes `strlen(p) + 1` instead of §77's fallback.
+    pub(crate) nul_exact_parameters: rustc_hash::FxHashSet<(LocalDefId, usize)>,
+    /// **R622-1 / R628-2 (R416-5).** Callee parameters the body accesses past
+    /// their first element (offset / index, a `c_void` cast, or a bare
+    /// hand-on to one that does). The seam's `(Slice, Ref)` row refuses a
+    /// one-element `from_ref` / `from_mut` into any of them.
+    pub(crate) wide_access_parameters: rustc_hash::FxHashSet<(LocalDefId, usize)>,
+    /// **R491-7's caller-side clause (relay 060).** Subjects whose OWN body
+    /// hands the pointer to a libc string function, so the terminator is
+    /// established at this caller even where the callee's walk licenses only
+    /// the fallback. The length is then the string's own here, and the
+    /// fallback everywhere else.
+    pub(crate) nul_exact_callers: rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Depth2NpoStoragePlan {
+    pub(crate) node: (LocalDefId, rustc_hir::HirId),
+    pub(crate) init_span: Span,
+    pub(crate) replacement: String,
+    pub(crate) target: raw_boundary::Depth2Target,
+    pub(crate) unsafe_context: Option<super::mechanical_receipt::UnsafeContextPresentation>,
+}
+
+impl DecisionTable {
+    /// Structural self-consistency: the table covers exactly the subjects it
+    /// was given, once each.
+    ///
+    /// **This is not the coverage gate**, and the distinction is the lesson of
+    /// three failed rounds. Every check here compares the table against the
+    /// collector's own output, so none of them can detect a subject the
+    /// collector never produced. They catch two real but narrower defects: a
+    /// **duplicate subject** (which would otherwise plan two edits for one span
+    /// and surface only as an `apply` overlap rollback) and a **dropped
+    /// decision**.
+    ///
+    /// Detecting a subject that was never collected requires an instrument with
+    /// a different derivation — see [`coverage::reconcile`], which owns that
+    /// job and is the only thing in this module entitled to be called a
+    /// coverage gate.
+    pub(crate) fn is_self_consistent_over(&self, subjects: &[Subject]) -> Result<(), String> {
+        let mut seen = rustc_hash::FxHashSet::default();
+        for (subject, _) in &self.entries {
+            let key = (subject.fn_did.local_def_index.as_u32(), subject.local);
+            if !seen.insert(key) {
+                return Err(format!("duplicate decision for subject {}", subject.label));
+            }
+        }
+        for subject in subjects {
+            if !seen.contains(&(subject.fn_did.local_def_index.as_u32(), subject.local)) {
+                return Err(format!("no decision for subject {}", subject.label));
+            }
+        }
+        if self.entries.len() != subjects.len() {
+            return Err(format!(
+                "table has {} entries for {} subjects",
+                self.entries.len(),
+                subjects.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The envelope-demotion records. S2b aggregates these into the counters.
+    ///
+    /// C.2: coverage gaps no longer live here. A parameter no subject was
+    /// built for is now detected by the harness reconciliation as a
+    /// producer-B-only row, which is a property of the ARTIFACTS rather than of
+    /// this table — and S2b's coverage-class counters consume those artifacts.
+    pub(crate) fn degradations(&self) -> impl Iterator<Item = &Degradation> {
+        self.entries.iter().filter_map(|(_, d)| match d {
+            Decision::Degraded(record) => Some(record),
+            Decision::Ref { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_) => None,
+        })
+    }
+
+    // `emitted_count()` — a count of `Ref` DECISIONS — lived here until S2b.3
+    // made `emitted` count PLACEMENTS. It is deleted rather than kept behind an
+    // allow: it is orphaned by that change, and what it computes is now
+    // precisely the wrong number to report. Leaving it available is an
+    // invitation to re-adopt it.
+    //
+    // The placement-truth witnesses define themselves against it as a
+    // counterfactual, so their recorded mutation names the expression
+    // (`entries.iter().filter(|(_, d)| matches!(d, Decision::Ref { .. })).count()`)
+    // rather than a call, and stays runnable without it.
+}
+
+/// Build the decision table from BO's accepted model **and the A1 facts**.
+///
+/// The accepted model is the only BO input S1/S2a consume. `BoExport`
+/// (E-R2..E-R4) is opened by the driver but deliberately not read here: the
+/// reference arm needs no move point, no loan identity and no certificate, and
+/// consuming facts the arm does not use would make this phase's dependencies a
+/// lie.
+/// Everything `decide_one` reads, gathered once.
+///
+/// **Carried from S3.2′-3 and 2b, landed at the touch they named.** Both slices
+/// recorded this as owed "at the next natural touch of those signatures";
+/// S3.2′-5 was that touch and deliberately declined it, because a signature
+/// refactor inside a gate-only slice adds churn its must-not-move discipline
+/// could not cheaply verify. It lands here instead, alone, before any mechanism.
+///
+/// **Every field is a read-only borrow**, which is the phase-separation rule
+/// (E1) expressed in a type: the decision phase reads analyses and hands the
+/// next phase a finished value, so a context that could not be mutated is the
+/// honest shape for it.
+pub(crate) struct Ctx<'a, 'tcx> {
+    /// wave-6l relay 071: the field-carried allocation lengths.
+    // R823-3: unread while relay 071's narrowing is reverted (the masked hold
+    // reads it again in 56).
+    pub(crate) counted_void: &'a counted_void::Contracts,
+    /// wave-6a W6A-T1: flexible-tail struct transactions (derived once).
+    pub(crate) flexible_tails: &'a flexible_tail::Transactions,
+    pub(crate) box_params: &'a box_param::Chains,
+    pub(crate) return_certificates: &'a return_certificate::Certificates,
+    pub(crate) allocator_contracts: &'a allocator_contract::Plans,
+    pub(crate) void_region: &'a void_region::Contracts,
+    pub(crate) void_region_receivers: &'a void_region::Receivers,
+    pub(crate) io_domain: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    pub(crate) void_pointee: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    pub(crate) thin_extent: &'a rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>,
+    pub(crate) local_callee_extent:
+        &'a FxHashMap<(LocalDefId, rustc_hir::HirId), local_callee_extent::LocalCalleeAccess>,
+    pub(crate) contract_extent: &'a contract_extent_adapter::CandidateIndex,
+    pub(crate) declaration_pointees: &'a declaration::DeclarationPointees,
+    pub(crate) declaration_patterns: &'a declaration_pattern::PatternDeclarations,
+    pub(crate) input_interfaces: &'a interface::InputInterfaces,
+    pub(crate) return_receivers: Option<&'a return_receiver::ReceiverMap>,
+    pub(crate) tcx: TyCtxt<'tcx>,
+    pub(crate) family_policy: &'a super::additive::FamilyPolicy,
+    pub(crate) model: &'a FxHashMap<SlotRef, SlotKind>,
+    pub(crate) slots: &'a CrateSlots,
+    pub(crate) facts: &'a EmitabilityFacts,
+    pub(crate) fat: &'a super::fat_facts::FatFacts,
+    pub(crate) sign: &'a super::sign_facts::SignFacts,
+    pub(crate) slice_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::SliceUses>,
+    pub(crate) opt_uses: &'a FxHashMap<(LocalDefId, rustc_hir::HirId), emitability::OptUses>,
+    pub(crate) box_facts: &'a box_facts::BoxOwnershipFacts,
+    pub(crate) ownership_fields: &'a ownership_fields_hook::Inputs,
+    pub(crate) constructions: &'a construction::ConstructionFacts,
+    pub(crate) subjects: &'a [Subject],
+    /// **S3.6-1** — see [`RefGate`]. A mode rather than a fact, which is why it
+    /// is `Copy` and not a borrow like everything else here.
+    pub(crate) gate: RefGate,
+    /// **S3.6-1 step 2.** `None` while the classes are being BUILT — the
+    /// hypothetical pass must not consult a verdict derived from itself — and
+    /// `Some` on the production pass that consumes them.
+    pub(crate) coconv: Option<&'a co_conversion::CoConv>,
+    /// E2's pre-decision typed permits. `None` on the ordinary hypothetical
+    /// comparator; `Some` on the E2-aware hypothetical and final pass.
+    pub(crate) lifetime_eligibility: Option<&'a lifetime::LifetimeEligibility>,
+    /// Raw-boundary dispositions are absent on the hypothetical passes and
+    /// present on the single final pass. Address observations may be candidates
+    /// hypothetically but lift only when every boundary site is open.
+    pub(crate) raw_boundary: Option<&'a raw_boundary::RawBoundaryDispositionIndex>,
+    pub(crate) exposure: Option<&'a exposure::ExposurePolicy>,
+    /// wave-6f: field transaction candidates — store-escape discharges, load
+    /// permits and the stored form a converting field asks of its source.
+    pub(crate) field_reference: Option<&'a field_reference::FieldCandidates>,
+    /// Wave-6o (relay 096): locals read from a raw field the program writes
+    /// the null literal into — see [`raw_field_null`].
+    pub(crate) raw_field_null: &'a raw_field_null::NullFieldReads,
+}
+
+pub(crate) fn decide(ctx: &Ctx<'_, '_>, subjects: &[Subject]) -> DecisionTable {
+    decide_with_raw_fallbacks(ctx, subjects, &FxHashMap::default())
+}
+
+/// **R802-6's restore hold, narrowed (relay 273 R807-1, relay 275; main 170a).**
+/// The op the hold's receipt carries: the subject would have rendered the
+/// seam's one-element view into a wider formal.
+pub(crate) const RESTORE_HOLD_OP: &str = "seam-one-element-into-wider-formal";
+
+/// The subjects R802-6's restore hold must release: it holds a subject only
+/// where its callee formal is delivered fat in the same table. Where that formal
+/// is raw or thin, the hand-on renders no one-element view: a thin reference
+/// into a raw formal is g25's class, which R763-1 (b) does not hold.
+pub(crate) fn restore_holds_to_release(
+    entries: &[(Subject, Decision)],
+) -> rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)> {
+    // A formal the cursor family may still promote (its offsets may be
+    // negative) counts as fat: the hold stays where the view could render.
+    let fat = |decision: &Decision| match decision {
+        Decision::Slice { .. }
+        | Decision::Opt { slice: true, .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Cursor { .. } => true,
+        Decision::Degraded(record) => matches!(
+            record.reason,
+            DegradeReason::SliceNegOrUnknownOffset | DegradeReason::SliceCursorUse
+        ),
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Opt { slice: false, .. }
+        | Decision::Box(_) => false,
+    };
+    entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let Decision::Degraded(record) = decision else {
+                return None;
+            };
+            let DegradeReason::LocalCalleeAccessExtent { access, .. } = &record.reason else {
+                return None;
+            };
+            let local_callee_extent::AccessReason::PointerArithmetic { op } = &access.reason else {
+                return None;
+            };
+            if op != RESTORE_HOLD_OP {
+                return None;
+            }
+            let formal_is_fat = entries.iter().any(|(formal, decision)| {
+                formal.fn_did == access.callee_id
+                    && matches!(formal.kind, SubjectKind::Param { hir_index } if hir_index == access.parameter_index)
+                    && fat(decision)
+            });
+            (!formal_is_fat).then_some((subject.fn_did, subject.hir_id))
+        })
+        .collect()
+}
+
+thread_local! {
+    /// The subjects [`restore_holds_to_release`] released in the running
+    /// [`decide_with_raw_fallbacks`]; the hold in `decide_one_ladder` skips
+    /// them. Empty outside that call.
+    static RESTORE_HOLD_RELEASED: std::cell::RefCell<rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>> =
+        std::cell::RefCell::default();
+    /// The entry parameters [`entry_rule_releases`] released in the running
+    /// [`decide_with_raw_fallbacks`]: the thin-into-fat rule stands aside for
+    /// them (narrowing 2 (b), read on the settled table). Empty outside it.
+    static ENTRY_RULE_RELEASED: std::cell::RefCell<rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>> =
+        std::cell::RefCell::default();
+    /// The subjects [`lift_owner_releases`] released: wave-4's lifts claimed
+    /// them, but none delivered. Empty outside [`decide_with_raw_fallbacks`].
+    static LIFT_OWNER_RELEASED: std::cell::RefCell<rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)>> =
+        std::cell::RefCell::default();
+}
+
+/// **Narrowing 1's evidence declines, read on the settled table (R819-3 item 5;
+/// main 174).** W-C7 declines a subject on refuting evidence — a companion
+/// that does not bound the indexes (R423-6), a measured count that does not
+/// fit (`caller-count`) — and R423-6 rules that such a caller "stays raw and
+/// adapts under the addendum-77 receipt". The rule stands aside for it; where
+/// it settled THIN while the array formal it is handed to settled a slice, the
+/// thin form renders the one-element view (lodepng `addPaddingBits::in_0` into
+/// `readBitFromReversedStream`). It is held raw there, as the restore hold
+/// holds, with its own op. Returns `(index, hold)` pairs.
+fn evidence_decline_holds(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+) -> Vec<(usize, DegradeReason)> {
+    let takes_slice = |decision: &Decision| {
+        matches!(
+            decision,
+            Decision::Slice { .. }
+                | Decision::Opt { slice: true, .. }
+                | Decision::NestedSlice { .. }
+        )
+    };
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (subject, decision))| {
+            if !matches!(
+                decision,
+                Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Opt { slice: false, .. }
+            ) {
+                return None;
+            }
+            let declined = matches!(
+                slice_input::prove(ctx.tcx, subject, ctx.facts, ctx.fat),
+                Err(slice_input::Hold::CompanionNotIndexBound)
+            ) || matches!(
+                thin_counted::prove(ctx.tcx, subject, ctx.facts),
+                Err(thin_counted::Hold::CallerCount)
+            );
+            if !declined {
+                return None;
+            }
+            let (callee, index) = slice_input::fat_hand_on(subject, ctx.facts, ctx.fat)?;
+            let formal = entries.iter().find(|(formal, decision)| {
+                formal.fn_did == callee
+                    && formal.local.as_usize() == index + 1
+                    && takes_slice(decision)
+            })?;
+            let parameter_index = match formal.0.kind {
+                SubjectKind::Param { hir_index } => hir_index,
+                _ => index,
+            };
+            Some((
+                at,
+                DegradeReason::LocalCalleeAccessExtent {
+                    access: Box::new(local_callee_extent::LocalCalleeAccess {
+                        callee_id: callee,
+                        parameter_index,
+                        callee: ctx.tcx.def_path_str(callee.to_def_id()),
+                        parameter: formal
+                            .0
+                            .param_name
+                            .clone()
+                            .unwrap_or_else(|| "<unnamed>".to_owned()),
+                        access: if subject.mutable { "write" } else { "read" },
+                        reason: local_callee_extent::AccessReason::PointerArithmetic {
+                            op: EVIDENCE_DECLINE_HOLD_OP.to_owned(),
+                        },
+                        footprint_bytes: None,
+                    }),
+                    count: None,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The op of [`evidence_decline_holds`]' receipt.
+pub(crate) const EVIDENCE_DECLINE_HOLD_OP: &str = "evidence-declined-one-element-into-wider-formal";
+
+/// **Narrowing 1, read on the settled table (R819-3 item 5; main 174).** The rule
+/// stands aside for a subject in wave-4's local-callee or thin-extent set, whose
+/// licensed lift gives it an exact width. Where no lift delivered — the subject
+/// settled thin while the array formal it is handed to settled a slice — the
+/// thin form renders the one-element view (wave-6o's two-levels witness:
+/// `mid(core::slice::from_ref(indent))`), so the rule takes it after all. Read
+/// after the promotions, where the lifts deliver. W-C7's evidence declines
+/// (`CompanionNotIndexBound`, `caller-count`) are not released: R423-6 keeps
+/// such a caller raw.
+fn lift_owner_releases(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+) -> rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)> {
+    let takes_slice = |decision: &Decision| {
+        matches!(
+            decision,
+            Decision::Slice { .. }
+                | Decision::Opt { slice: true, .. }
+                | Decision::NestedSlice { .. }
+        )
+    };
+    entries
+        .iter()
+        .filter(|(subject, decision)| {
+            let key = (subject.fn_did, subject.hir_id);
+            matches!(
+                decision,
+                Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Opt { slice: false, .. }
+            ) && (ctx.local_callee_extent.contains_key(&key) || ctx.thin_extent.contains(&key))
+                && !matches!(
+                    slice_input::prove(ctx.tcx, subject, ctx.facts, ctx.fat),
+                    Err(slice_input::Hold::CompanionNotIndexBound)
+                )
+                && !matches!(
+                    thin_counted::prove(ctx.tcx, subject, ctx.facts),
+                    Err(thin_counted::Hold::CallerCount)
+                )
+                && slice_input::hands_on_to_fat(subject, ctx.facts, ctx.fat, ctx.family_policy)
+                && slice_input::fat_hand_on(subject, ctx.facts, ctx.fat).is_some_and(
+                    |(callee, index)| {
+                        entries.iter().any(|(formal, decision)| {
+                            formal.fn_did == callee
+                                && formal.local.as_usize() == index + 1
+                                && takes_slice(decision)
+                        })
+                    },
+                )
+        })
+        .map(|(subject, _)| (subject.fn_did, subject.hir_id))
+        .collect()
+}
+
+/// **Narrowing 2 (b), read on the settled table (R815-7 item 3; main 173a).** A
+/// parameter of a function whose callers the rule cannot see (W-C7's
+/// `IncompleteCallers`), where a known exposure policy gives the function no
+/// surface (the open world), keeps its thin form unless the formal it is handed
+/// to is delivered as a slice in the same table: there the thin form would be
+/// the one-element view the rule cures (g25 / g26), elsewhere the slice only
+/// changes a signature callers outside the program call (wave-6v's driver) or
+/// costs a cursor (slicecursor's `walk`). The released entries are decided
+/// again with the rule standing aside, to a fixpoint.
+fn entry_rule_releases(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+) -> rustc_hash::FxHashSet<(LocalDefId, rustc_hir::HirId)> {
+    let takes_slice = |decision: &Decision| {
+        matches!(
+            decision,
+            Decision::Slice { .. }
+                | Decision::Opt { slice: true, .. }
+                | Decision::NestedSlice { .. }
+        )
+    };
+    entries
+        .iter()
+        .filter(|(subject, decision)| {
+            let key = (subject.fn_did, subject.hir_id);
+            matches!(subject.kind, SubjectKind::Param { .. })
+                && takes_slice(decision)
+                && !ENTRY_RULE_RELEASED.with(|released| released.borrow().contains(&key))
+                && thin_counted::closed_calls(ctx.tcx, subject.fn_did, ctx.facts).is_err()
+                && ctx.exposure.is_some_and(|policy| {
+                    matches!(
+                        policy.plan(subject.fn_did),
+                        exposure::ExposureSurfacePlan::NotApplicable
+                    )
+                })
+                && slice_input::fat_hand_on(subject, ctx.facts, ctx.fat).is_some_and(
+                    |(callee, index)| {
+                        !entries.iter().any(|(formal, decision)| {
+                            formal.fn_did == callee
+                                && formal.local.as_usize() == index + 1
+                                && takes_slice(decision)
+                        })
+                    },
+                )
+        })
+        .map(|(subject, _)| (subject.fn_did, subject.hir_id))
+        .collect()
+}
+
+/// Clears [`RESTORE_HOLD_RELEASED`] when the decision pass begins and ends.
+struct RestoreHoldRelease;
+
+impl RestoreHoldRelease {
+    fn begin() -> Self {
+        RESTORE_HOLD_RELEASED.with(|released| released.borrow_mut().clear());
+        ENTRY_RULE_RELEASED.with(|released| released.borrow_mut().clear());
+        LIFT_OWNER_RELEASED.with(|released| released.borrow_mut().clear());
+        Self
+    }
+}
+
+impl Drop for RestoreHoldRelease {
+    fn drop(&mut self) {
+        RESTORE_HOLD_RELEASED.with(|released| released.borrow_mut().clear());
+        ENTRY_RULE_RELEASED.with(|released| released.borrow_mut().clear());
+        LIFT_OWNER_RELEASED.with(|released| released.borrow_mut().clear());
+    }
+}
+
+/// The op of [`one_element_holds`]' receipt (R1313-3).
+pub(crate) const ONE_ELEMENT_HOLD_OP: &str = "one-element-into-slice-formal";
+
+/// **R1313-3 (relay main/371 step B; main 254 §7 B2) — a one-element view never
+/// reaches a slice-decided formal.** R761-1 cut the seam's `(Slice, Ref)`
+/// refusal to element addresses and left shape (i), a thin subject handed bare
+/// or through a cast, "until 55's thin-into-fat rule delivers it as a slice".
+/// Where the rule does not (no `Arr` licence, a withdrawn slice stage, an entry
+/// it stands aside at), the thin form renders `core::slice::from_ref` /
+/// `from_mut` into a formal its callee accesses past one element: a panic on a
+/// UB-free input (`underhanded_c_nuke_lib`'s `spectral_contrast`, main 250).
+/// The subject is held raw here, on the settled table: its caller's pointer,
+/// which carries the caller's whole extent, then reaches the slice formal
+/// through the seam's `(Slice, Raw)` C arm with the evidence-backed or §77
+/// extent. Never the fallback view over the one-element reference: a
+/// FALLBACK-length slice built from a pointer derived from a one-element
+/// reference re-widens that reference (g25's class; §77 waives a length over a
+/// real allocation, not that).
+fn one_element_holds(
+    ctx: &Ctx<'_, '_>,
+    entries: &[(Subject, Decision)],
+    wide: &rustc_hash::FxHashSet<(LocalDefId, usize)>,
+) -> Vec<(usize, DegradeReason)> {
+    let takes_slice = |decision: &Decision| {
+        matches!(
+            decision,
+            Decision::Slice { .. }
+                | Decision::Opt { slice: true, .. }
+                | Decision::NestedSlice { .. }
+        )
+    };
+    entries
+        .iter()
+        .enumerate()
+        .filter_map(|(at, (subject, decision))| {
+            if !matches!(
+                decision,
+                Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Opt { slice: false, .. }
+            ) {
+                return None;
+            }
+            // The lowest `(callee, index)` the subject is handed to bare or
+            // through a cast, whose formal settled a slice and is accessed past
+            // one element: a stable receipt.
+            let (callee, index, formal) = ctx
+                .facts
+                .call_args
+                .iter()
+                .flat_map(|(&callee, calls)| {
+                    calls
+                        .iter()
+                        .filter(|call| call.caller == subject.fn_did)
+                        .flat_map(|call| &call.args)
+                        .filter(|arg| match arg.shape {
+                            emitability::ArgShape::BareLocal(binding)
+                            | emitability::ArgShape::CastOfLocal { binding, .. } => {
+                                binding == subject.hir_id
+                            }
+                            _ => false,
+                        })
+                        .map(move |arg| (callee, arg.index))
+                })
+                .filter(|(callee, index)| wide.contains(&(*callee, *index)))
+                .filter_map(|(callee, index)| {
+                    entries
+                        .iter()
+                        .find(|(formal, decision)| {
+                            formal.fn_did == callee
+                                && formal.local.as_usize() == index + 1
+                                && takes_slice(decision)
+                        })
+                        .map(|(formal, _)| (callee, index, formal))
+                })
+                .min_by_key(|(callee, index, _)| (callee.local_def_index.as_u32(), *index))?;
+            let parameter_index = match formal.kind {
+                SubjectKind::Param { hir_index } => hir_index,
+                SubjectKind::Local => index,
+            };
+            Some((
+                at,
+                DegradeReason::LocalCalleeAccessExtent {
+                    access: Box::new(local_callee_extent::LocalCalleeAccess {
+                        callee_id: callee,
+                        parameter_index,
+                        callee: ctx.tcx.def_path_str(callee.to_def_id()),
+                        parameter: formal
+                            .param_name
+                            .clone()
+                            .unwrap_or_else(|| "<unnamed>".to_owned()),
+                        access: if subject.mutable { "write" } else { "read" },
+                        reason: local_callee_extent::AccessReason::PointerArithmetic {
+                            op: ONE_ELEMENT_HOLD_OP.to_owned(),
+                        },
+                        footprint_bytes: None,
+                    }),
+                    count: None,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Emission-only fallback requests. The accepted model and its facts remain
+/// unchanged; every dependent form is decided again with these subjects raw.
+pub(crate) fn decide_with_raw_fallbacks(
+    ctx: &Ctx<'_, '_>,
+    subjects: &[Subject],
+    fallbacks: &FxHashMap<(LocalDefId, rustc_hir::HirId), DegradeReason>,
+) -> DecisionTable {
+    let _released = RestoreHoldRelease::begin();
+    let mut entries = subjects
+        .iter()
+        .map(|subject| {
+            let decision = match fallbacks.get(&(subject.fn_did, subject.hir_id)) {
+                Some(reason) => degrade(
+                    subject,
+                    EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                    reason.clone(),
+                ),
+                None => decide_one(ctx, subject),
+            };
+            (subject.clone(), decision)
+        })
+        .collect::<Vec<_>>();
+    // **R802-6's restore hold, narrowed (relay 273 R807-1; main 170a).** A
+    // held subject whose callee formal is not delivered fat is decided again
+    // without the hold, to a fixpoint: a released formal is thin, so the
+    // subjects handed to it are released in turn. Each round releases at least
+    // one subject the hold held, so it ends.
+    // The entry clause of the thin-into-fat rule is read on the same settled
+    // table (`entry_rule_releases`), in the same fixpoint.
+    loop {
+        let release = restore_holds_to_release(&entries);
+        let entries_released = entry_rule_releases(ctx, &entries);
+        if release.is_empty() && entries_released.is_empty() {
+            break;
+        }
+        RESTORE_HOLD_RELEASED
+            .with(|released| released.borrow_mut().extend(release.iter().copied()));
+        ENTRY_RULE_RELEASED.with(|released| {
+            released
+                .borrow_mut()
+                .extend(entries_released.iter().copied())
+        });
+        let release = release
+            .union(&entries_released)
+            .copied()
+            .collect::<rustc_hash::FxHashSet<_>>();
+        for (subject, decision) in entries.iter_mut() {
+            let key = (subject.fn_did, subject.hir_id);
+            if release.contains(&key) && !fallbacks.contains_key(&key) {
+                *decision = decide_one(ctx, subject);
+            }
+        }
+    }
+    option::inherit_wrapped_payloads(ctx, &mut entries);
+    construction_values::settle(ctx, &mut entries);
+    let cursor_receipts = cursor_native::promote(ctx, &mut entries);
+    // W4-LIFT (R475-2): a held caller whose callee parameter carries wave-6b's
+    // EXACT licensed width takes the slice form. After the other promotes, so a
+    // subject another family has already re-typed is not a candidate.
+    let licensed_lifts = licensed_lift::promote(ctx, &mut entries);
+    // W4-B1 (R480-2): the rows the callee's width cannot answer take their
+    // caller's ROOT extent, or stay held and are counted.
+    let root_extents = root_extent::promote(ctx, &mut entries);
+    // R481-1 (USER): the extent-lift waiver runs LAST, so a fabricated extent is
+    // never taken where the exact width, the mask companion or a root proved one.
+    let mut licensed_lifts = licensed_lifts;
+    licensed_lifts.extend(licensed_lift::promote_fallback(ctx, &mut entries));
+    // Narrowing 1 on the settled table (main 174): a lift-claimed subject no
+    // lift delivered is decided again with the rule free to take it.
+    let lift_released = lift_owner_releases(ctx, &entries);
+    if !lift_released.is_empty() {
+        LIFT_OWNER_RELEASED
+            .with(|released| released.borrow_mut().extend(lift_released.iter().copied()));
+        for (subject, decision) in entries.iter_mut() {
+            let key = (subject.fn_did, subject.hir_id);
+            if lift_released.contains(&key) && !fallbacks.contains_key(&key) {
+                *decision = decide_one(ctx, subject);
+            }
+        }
+    }
+    for (at, reason) in evidence_decline_holds(ctx, &entries) {
+        let (subject, decision) = &mut entries[at];
+        if !fallbacks.contains_key(&(subject.fn_did, subject.hir_id)) {
+            *decision = degrade(
+                subject,
+                EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                reason,
+            );
+        }
+    }
+    // R1313-3 (relay main/371 step B): B2's hold, after the settled table's every
+    // promotion (the formal's final form).
+    let wide = local_callee_extent::accessed_past_one_element(ctx.tcx, subjects, ctx.facts);
+    for (at, reason) in one_element_holds(ctx, &entries, &wide) {
+        let (subject, decision) = &mut entries[at];
+        if !fallbacks.contains_key(&(subject.fn_did, subject.hir_id)) {
+            *decision = degrade(
+                subject,
+                EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                reason,
+            );
+        }
+    }
+    let contract_extent_promotions = entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let nullable = match decision {
+                Decision::Slice { .. } => false,
+                Decision::Opt { slice: true, .. } => true,
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Cursor { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { slice: false, .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => return None,
+            };
+            let existing_slice = ctx
+                .facts
+                .raw_only_uses
+                .get(&(subject.fn_did, subject.hir_id))
+                .is_some_and(|uses| {
+                    uses.iter()
+                        .any(|(op, _)| emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str()))
+                        && ctx.fat.is_array(subject.fn_did, subject.local)
+                });
+            if existing_slice {
+                return None;
+            }
+            ctx.contract_extent
+                .promotion(subject, nullable, ctx.fat)
+                .map(|promotion| ((subject.fn_did, subject.hir_id), promotion))
+        })
+        .collect();
+    // The admission's receipt, joined to the form each subject ended in.
+    let sized_assignments: Vec<(String, String, sized_assignment::SizedAssignment)> = entries
+        .iter()
+        .flat_map(|(subject, decision)| {
+            let form = seam::form_of(decision).key().to_owned();
+            ctx.slice_uses
+                .get(&(subject.fn_did, subject.hir_id))
+                .map(|uses| uses.sized_assignments.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(move |admitted| (subject.label.clone(), form.clone(), admitted))
+        })
+        .collect();
+    let option_mut_bindings = entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let needed = match decision {
+                Decision::Cursor { mutable, plan } => {
+                    (plan.wrapper || (*mutable && !plan.bridges.is_empty())) && !subject.mut_binding
+                }
+                Decision::Opt { mutable, .. } => {
+                    ctx.family_policy
+                        .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option)
+                        && *mutable
+                        && !subject.mut_binding
+                        && ctx
+                            .opt_uses
+                            .get(&(subject.fn_did, subject.hir_id))
+                            .is_some_and(|uses| {
+                                uses.non_test_uses > 1
+                                    || uses
+                                        .sites
+                                        .iter()
+                                        .any(|site| site.operation == "deferred-boundary-or-copy")
+                            })
+                }
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => false,
+            };
+            needed.then_some((subject.fn_did, subject.hir_id))
+        })
+        .collect();
+    // W6S-17: a Box chain's formal spelled through a pointer alias is the
+    // chain's declaration at every family stage.
+    let alias_formals: rustc_hash::FxHashSet<_> = subjects
+        .iter()
+        .filter(|subject| box_param::alias_formal(ctx.box_params, subject))
+        .map(|subject| (subject.fn_did, subject.hir_id))
+        .collect();
+    DecisionTable {
+        settled_hold_receipts: Vec::new(),
+        counted_void: ctx.counted_void.clone(),
+        flexible_tails: ctx.flexible_tails.clone(),
+        box_params: ctx.box_params.clone(),
+        return_certificates: ctx.return_certificates.clone(),
+        allocator_contracts: ctx.allocator_contracts.clone(),
+        void_region: ctx.void_region.clone(),
+        void_region_receivers: ctx.void_region_receivers.clone(),
+        forward_slice_parameters: Vec::new(),
+        nested_receipts: Vec::new(),
+        cursor_receipts,
+        sibling_overlap_inventory: Default::default(),
+        input_interfaces: ctx.input_interfaces.clone(),
+        predecessor_held_classes: Default::default(),
+        arg_order_hoists: Default::default(),
+        declaration_patterns: ctx
+            .declaration_patterns
+            .iter()
+            .filter(|(node, _)| {
+                ctx.family_policy
+                    .enabled_for(**node, FamilyStage::Declaration)
+            })
+            .map(|(node, carrier)| (*node, carrier.clone()))
+            .collect(),
+        declaration_pointees: ctx
+            .declaration_pointees
+            .iter()
+            .filter(|(node, _)| {
+                ctx.family_policy
+                    .enabled_for(**node, FamilyStage::Declaration)
+                    || alias_formals.contains(*node)
+            })
+            .map(|(node, pointee)| (*node, pointee.clone()))
+            .collect(),
+        entries,
+        exposure: None,
+        arm_requirements: FxHashMap::default(),
+        lifetime_plan: Default::default(),
+        return_interfaces: Default::default(),
+        return_receivers: ctx.return_receivers.cloned().unwrap_or_default(),
+        c9_marks: Vec::new(),
+        // `decide` stays PURE over subjects; seams need the call graph and are
+        // filled by the driver, which is also where the analyses live.
+        seams: Default::default(),
+        depth2_npo_storages: Vec::new(),
+        slice_constructions: Vec::new(),
+        retired_slice_constructions: Vec::new(),
+        slice_use_receipts: Vec::new(),
+        option_receipts: Vec::new(),
+        option_value_initializers: Vec::new(),
+        option_mut_bindings,
+        option_composed_uses: Vec::new(),
+        composed_use_edits: Vec::new(),
+        contract_extent_promotions,
+        licensed_lifts,
+        root_extents,
+        sized_assignments,
+        field_transactions: Default::default(),
+        slice_input_companions: Default::default(),
+        slice_input_mask_companions: Default::default(),
+        extent_proof_companions: Default::default(),
+        field_alloc_lengths: Default::default(),
+        nul_walk_sites: Default::default(),
+        nul_exact_parameters: Default::default(),
+        wide_access_parameters: Default::default(),
+        nul_exact_callers: Default::default(),
+    }
+}
+
+pub(crate) fn plan_depth2_npo_storages(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    facts: &EmitabilityFacts,
+    constructions: &construction::ConstructionFacts,
+) -> Vec<Depth2NpoStoragePlan> {
+    let decisions = table
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<FxHashMap<_, _>>();
+    let labels = table
+        .entries
+        .iter()
+        .filter_map(|(subject, _)| {
+            subject
+                .param_name
+                .as_ref()
+                .map(|name| ((subject.fn_did, subject.hir_id), name.clone()))
+        })
+        .collect::<FxHashMap<_, _>>();
+    let mut plans = Vec::new();
+    for (subject, decision) in &table.entries {
+        if !matches!(subject.kind, SubjectKind::Local)
+            || !matches!(decision, Decision::Opt { slice: false, .. })
+        {
+            continue;
+        }
+        let node = (subject.fn_did, subject.hir_id);
+        let Some(target) = facts.depth2_npo_target(node) else {
+            continue;
+        };
+        let Some(&init_span) = constructions.init_spans.get(&node) else {
+            continue;
+        };
+        let Ok(init_text) = tcx.sess.source_map().span_to_snippet(init_span) else {
+            continue;
+        };
+        let method = if target.inner_mutability == raw_boundary::RawMutability::Mut {
+            "as_mut"
+        } else {
+            "as_ref"
+        };
+        let raw_inner = if target.inner_mutability == raw_boundary::RawMutability::Mut {
+            format!("*mut {}", target.inner_pointee)
+        } else {
+            format!("*const {}", target.inner_pointee)
+        };
+        let enclosing_unsafe_fn = tcx
+            .fn_sig(subject.fn_did.to_def_id())
+            .skip_binder()
+            .skip_binder()
+            .safety
+            .is_unsafe();
+        let (replacement, requires_unsafe) =
+            if matches!(subject.ctor, Some(construction::Construction::NullLit)) {
+                ("None".to_owned(), false)
+            } else if let Some(&source) = constructions.init_sources.get(&node) {
+                let source_node = (subject.fn_did, source);
+                let source_text = labels
+                    .get(&source_node)
+                    .cloned()
+                    .unwrap_or_else(|| init_text.clone());
+                match decisions.get(&source_node).copied() {
+                    Some(
+                        Decision::Ref { mutable: true }
+                        | Decision::InferredRef { mutable: true, .. },
+                    ) => {
+                        if target.inner_mutability == raw_boundary::RawMutability::Mut {
+                            (format!("Some(&mut *{source_text})"), false)
+                        } else {
+                            (format!("Some(&*{source_text})"), false)
+                        }
+                    }
+                    Some(
+                        Decision::Ref { mutable: false }
+                        | Decision::InferredRef { mutable: false, .. },
+                    ) => (format!("Some({source_text})"), false),
+                    Some(Decision::Opt { mutable: true, .. })
+                        if target.inner_mutability == raw_boundary::RawMutability::Mut =>
+                    {
+                        (format!("{source_text}.as_deref_mut()"), false)
+                    }
+                    Some(Decision::Opt { .. }) => (format!("{source_text}.as_deref()"), false),
+                    Some(
+                        Decision::Slice { .. }
+                        | Decision::NestedSlice { .. }
+                        | Decision::Cursor { .. }
+                        | Decision::Box(_),
+                    ) => {
+                        continue;
+                    }
+                    Some(Decision::Degraded(_)) | None => (
+                        super::mechanical_receipt::present_unsafe_text(
+                            format!("(({init_text}) as {raw_inner}).{method}()"),
+                            enclosing_unsafe_fn,
+                        ),
+                        true,
+                    ),
+                }
+            } else {
+                (
+                    super::mechanical_receipt::present_unsafe_text(
+                        format!("(({init_text}) as {raw_inner}).{method}()"),
+                        enclosing_unsafe_fn,
+                    ),
+                    true,
+                )
+            };
+        plans.push(Depth2NpoStoragePlan {
+            node,
+            init_span,
+            replacement,
+            target,
+            unsafe_context: requires_unsafe.then_some(
+                super::mechanical_receipt::UnsafeContextPresentation {
+                    unsafe_fn: enclosing_unsafe_fn,
+                    wrapper_inserted: !enclosing_unsafe_fn,
+                    edition: 2018,
+                    requires_unsafe: true,
+                },
+            ),
+        });
+    }
+    plans.sort_by_key(|plan| {
+        (
+            plan.node.0.local_def_index.as_u32(),
+            plan.init_span.lo().0,
+            plan.init_span.hi().0,
+        )
+    });
+    plans
+}
+
+/// **Refuse every use-edit NESTING, across the whole table.**
+///
+/// `apply` rejects overlapping edits, and a plan that produces them has not
+/// decided. Nesting arises two ways, and only a table-level pass sees both:
+///
+/// - **within one subject** — `table = table.offset((*table).value as isize)`
+///   yields an edit for the whole `offset` call and another for the `(*table)`
+///   inside its index;
+/// - **across two subjects** — `*new_id.offset(*block_ids.offset(i) as isize)`
+///   yields `new_id`'s edit containing `block_ids`'s.
+///
+/// A per-subject check sees only the first. Measured, not reasoned: it left 15
+/// of brotli's 17 collisions standing.
+///
+/// # Which subject is refused, and why it differs by case
+///
+/// **The INNER one** — and for the cross-subject case that is not merely the
+/// conservative pick, it is the *correct* one. `index_text` renders an index by
+/// `span_to_snippet`, so the outer replacement embeds the inner expression's
+/// ORIGINAL text. If the inner subject stays raw, that text stays valid:
+/// `new_id[(*block_ids.offset(i as isize)) as usize]` is well-typed exactly
+/// when `block_ids` is still a pointer. Refusing the inner subject therefore
+/// removes the collision *and* leaves the outer rewrite correct.
+///
+/// When inner and outer are the SAME subject the two coincide, and refusing it
+/// drops both edits — which is the only sound answer there, since the outer's
+/// embedded text would otherwise name a binding that is no longer a pointer.
+///
+/// # Fixpoint
+///
+/// Refusing a subject removes its edits, which can leave a formerly-inner edit
+/// with no container. The loop repeats until no nesting remains, so a chain
+/// `a ⊃ b ⊃ c` refuses `b` and `c` but keeps `a` — never more than the
+/// containment relation forces.
+pub(crate) fn refuse_nested_use_edits(tcx: TyCtxt<'_>, table: &mut DecisionTable) {
+    loop {
+        // (entry index, edit span) for every entry still emitting use-edits.
+        let mut edits: Vec<(usize, Span)> = Vec::new();
+        for (i, (_, decision)) in table.entries.iter().enumerate() {
+            edits.extend(use_edit_spans(decision).into_iter().map(|span| (i, span)));
+        }
+        // Outermost first at equal starts, so the container is seen before what
+        // it contains.
+        edits.sort_by_key(|(_, s)| (s.lo(), std::cmp::Reverse(s.hi())));
+
+        let mut nested: Option<((usize, Span), (usize, Span))> = None;
+        let mut open: Vec<(usize, Span)> = Vec::new();
+        for (entry, span) in edits {
+            while open.last().is_some_and(|(_, o)| o.hi() <= span.lo()) {
+                open.pop();
+            }
+            if let Some(outer) = open.last().copied()
+                && outer.1.contains(span)
+            {
+                nested = Some((outer, (entry, span)));
+                break;
+            }
+            open.push((entry, span));
+        }
+
+        let Some((outer, inner)) = nested else { return };
+        // **K21 — compose before refusing.** The container's replacement text
+        // carries the inner span's ORIGINAL text verbatim, because the outer
+        // rewrite only re-spells the parts that belong to ITS subject. So the
+        // composition is textual and checkable: splice the inner replacement
+        // into the outer one and drop the inner edit, whose work now lives
+        // inside its container. Where the inner text is not uniquely locatable
+        // the old refusal stands, which is what keeps a rewrite from landing on
+        // a use that was never the inner subject's.
+        if compose_nested_use_edit(tcx, table, outer, inner) {
+            continue;
+        }
+        let (entry, span) = inner;
+        let (subject, decision) = &mut table.entries[entry];
+        *decision = degrade(
+            subject,
+            EmitabilityFacts::site(tcx, span),
+            DegradeReason::NestedUseEdits,
+        );
+    }
+}
+
+/// **Relay 327 (main 222 §2.1, brotli's class #1498).** One K21 composition, kept
+/// so a container that is later retired gives the inner subject its own edit
+/// back: R556-4 joint (c) retires a Box owner's element edit under its base
+/// view (`retire_box_edits_under_base_views`), and the inner use composed into
+/// that edit (`*all_histograms.offset(*clusters.offset(j_0) as isize)`'s index)
+/// would otherwise be spelled nowhere.
+#[derive(Clone, Debug)]
+pub(crate) struct ComposedUseEdit {
+    pub(crate) outer: (LocalDefId, rustc_hir::HirId),
+    pub(crate) outer_span: Span,
+    pub(crate) inner: (LocalDefId, rustc_hir::HirId),
+    /// The inner span's input text, the splice key when two restored edits nest.
+    pub(crate) inner_source: String,
+    pub(crate) edit: ComposedInner,
+}
+
+/// The inner edit as it stood when K21 moved its text into the container.
+#[derive(Clone, Debug)]
+pub(crate) enum ComposedInner {
+    Use(emitability::UseEdit),
+    Box(box_facts::BoxExprEdit),
+}
+
+impl ComposedInner {
+    pub(crate) fn span(&self) -> Span {
+        match self {
+            ComposedInner::Use(edit) => edit.span,
+            ComposedInner::Box(edit) => edit.span,
+        }
+    }
+
+    fn replacement_mut(&mut self) -> &mut String {
+        match self {
+            ComposedInner::Use(edit) => &mut edit.replacement,
+            ComposedInner::Box(edit) => &mut edit.replacement,
+        }
+    }
+
+    /// Give the edit back to its subject's decision; false when the decision no
+    /// longer plans edits of that kind.
+    pub(crate) fn restore(self, decision: &mut Decision) -> bool {
+        match (self, decision) {
+            (
+                ComposedInner::Use(edit),
+                Decision::Slice { uses, .. }
+                | Decision::NestedSlice { uses, .. }
+                | Decision::Opt { uses, .. },
+            ) => {
+                uses.push(edit);
+                true
+            }
+            (ComposedInner::Box(edit), Decision::Box(plan)) => {
+                plan.expr_edits.push(edit);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The edits K21 composed into the containers at `retired` of `outer`, nested
+/// pairs among them composed again (the same textual splice, keyed by the
+/// inner's input text), in the order to restore.
+pub(crate) fn composed_inner_edits(
+    composed: &mut Vec<ComposedUseEdit>,
+    outer: (LocalDefId, rustc_hir::HirId),
+    retired: &[Span],
+) -> Vec<ComposedUseEdit> {
+    let (mut taken, kept): (Vec<_>, Vec<_>) = std::mem::take(composed)
+        .into_iter()
+        .partition(|record| record.outer == outer && retired.contains(&record.outer_span));
+    *composed = kept;
+    taken.sort_by_key(|record| {
+        let span = record.edit.span();
+        (span.lo(), std::cmp::Reverse(span.hi()))
+    });
+    let mut restored: Vec<ComposedUseEdit> = Vec::new();
+    for mut record in taken {
+        let span = record.edit.span();
+        let Some(container) = restored
+            .iter_mut()
+            .rev()
+            .find(|container| container.edit.span().contains(span))
+        else {
+            restored.push(record);
+            continue;
+        };
+        // Exactly one occurrence, as K21 itself requires; otherwise the inner
+        // stays unrestored (two edits over one interval would not apply).
+        if container
+            .edit
+            .replacement_mut()
+            .matches(record.inner_source.as_str())
+            .count()
+            == 1
+        {
+            let inner = std::mem::take(record.edit.replacement_mut());
+            let text = container
+                .edit
+                .replacement_mut()
+                .replace(record.inner_source.as_str(), &inner);
+            *container.edit.replacement_mut() = text;
+        }
+    }
+    restored
+}
+
+/// Splice one nested use edit into its container. Returns whether it composed.
+///
+/// Both edits keep their own subject: the outer subject's replacement simply
+/// grows to contain the inner subject's rewritten spelling, and the inner edit
+/// is removed so nothing tries to apply it a second time.
+fn compose_nested_use_edit(
+    tcx: TyCtxt<'_>,
+    table: &mut DecisionTable,
+    (outer_entry, outer_span): (usize, Span),
+    (inner_entry, inner_span): (usize, Span),
+) -> bool {
+    let Ok(inner_source) = tcx.sess.source_map().span_to_snippet(inner_span) else {
+        return false;
+    };
+    let Some(inner_replacement) = use_edit_replacement(&table.entries[inner_entry].1, inner_span)
+    else {
+        return false;
+    };
+    let Some(outer_replacement) = use_edit_replacement(&table.entries[outer_entry].1, outer_span)
+    else {
+        return false;
+    };
+    // Exactly one occurrence, or the splice could land on a use that was never
+    // this inner subject's.
+    if outer_replacement.matches(inner_source.as_str()).count() != 1 {
+        return false;
+    }
+    let composed = outer_replacement.replace(inner_source.as_str(), &inner_replacement);
+    let inner_edit = match &table.entries[inner_entry].1 {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => uses
+            .iter()
+            .find(|u| u.span == inner_span)
+            .cloned()
+            .map(ComposedInner::Use),
+        Decision::Box(plan) => plan
+            .expr_edits
+            .iter()
+            .find(|e| e.span == inner_span)
+            .cloned()
+            .map(ComposedInner::Box),
+        _ => None,
+    };
+    if !set_use_edit_replacement(&mut table.entries[outer_entry].1, outer_span, composed) {
+        return false;
+    }
+    if !drop_use_edit(&mut table.entries[inner_entry].1, inner_span) {
+        return false;
+    }
+    // Relay 327: kept for a container joint (c) retires later.
+    if let Some(edit) = inner_edit {
+        let key = |entry: usize| {
+            let subject = &table.entries[entry].0;
+            (subject.fn_did, subject.hir_id)
+        };
+        let record = ComposedUseEdit {
+            outer: key(outer_entry),
+            outer_span,
+            inner: key(inner_entry),
+            inner_source,
+            edit,
+        };
+        table.composed_use_edits.push(record);
+    }
+    true
+}
+
+/// The spans a decision's own use edits claim.
+///
+/// **Relay 037.** A `Box` decision's `expr_edits` are use edits too — the
+/// owner's element accesses, its initializer and its free-site drops — and the
+/// scan used to skip them (`Decision::Box(_) => &[]`). brotli's
+/// `BrotliHistogramReindex*` writes
+/// `*new_index.offset(*symbols.offset(i as isize) as isize)`, whose container
+/// is exactly such an owner access; with the container invisible, the two edits
+/// reached the class layer as two sites over one interval and the class held
+/// `intra-class-interval-overlap` (12 rows of the batch-9 census, 4 in each of
+/// the three Reindex classes). Making a Box container visible is the whole of
+/// the change: K21's composition then applies verbatim, because the owner's
+/// replacement carries the inner span's ORIGINAL text for the same reason a
+/// Slice one does — the element-access rendering re-spells only the parts that
+/// belong to ITS subject and copies the index expression from the source.
+fn use_edit_spans(decision: &Decision) -> Vec<Span> {
+    match decision {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => uses.iter().map(|u| u.span).collect(),
+        Decision::Box(plan) => plan.expr_edits.iter().map(|e| e.span).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The replacement a decision plans at `span`, if it plans one there.
+fn use_edit_replacement(decision: &Decision, span: Span) -> Option<String> {
+    match decision {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => uses
+            .iter()
+            .find(|u| u.span == span)
+            .map(|u| u.replacement.clone()),
+        Decision::Box(plan) => plan
+            .expr_edits
+            .iter()
+            .find(|e| e.span == span)
+            .map(|e| e.replacement.clone()),
+        _ => None,
+    }
+}
+
+/// Re-spell the edit at `span`; false when the decision plans none there.
+fn set_use_edit_replacement(decision: &mut Decision, span: Span, text: String) -> bool {
+    let target = match decision {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => uses
+            .iter_mut()
+            .find(|u| u.span == span)
+            .map(|u| &mut u.replacement),
+        Decision::Box(plan) => plan
+            .expr_edits
+            .iter_mut()
+            .find(|e| e.span == span)
+            .map(|e| &mut e.replacement),
+        _ => None,
+    };
+    match target {
+        Some(slot) => {
+            *slot = text;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Drop the edit at `span` — its work now lives inside its container.
+fn drop_use_edit(decision: &mut Decision, span: Span) -> bool {
+    match decision {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => {
+            uses.retain(|u| u.span != span);
+            true
+        }
+        Decision::Box(plan) => {
+            plan.expr_edits.retain(|e| e.span != span);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn degrade(subject: &Subject, site: String, reason: DegradeReason) -> Decision {
+    Decision::Degraded(Degradation {
+        subject: subject.label.clone(),
+        site,
+        reason,
+    })
+}
+
+/// **The dissolution's residual attribution.** Which owed capability an
+/// unspliceable subject is waiting on, from where its value comes from.
+///
+/// Reached only when every gate in [`decide_one_ladder`] has declined — that
+/// is, when the missing declaration is the *binding* constraint rather than one
+/// blocker among several. On the corpus that is 112 of 1,196 (measured
+/// 2026-08-12); the other 1,084 name a real gate and never arrive here.
+///
+/// The folds onto the three keys are by **type source**, not by construction
+/// spelling, and each was measured before it was written (micro-plan §1):
+/// `Alloc` is `strdup(url)`, whose type is the callee's return type;
+/// `ArrayDecay` is `((*h).next_symbol).as_mut_ptr()`, whose type is the
+/// field's element type; `Other` is, over all 19 on the corpus, either
+/// `q.offset(…)` off another local or a conditional over two statics.
+///
+/// `None` — no recognized initializer — folds to source-coupled: such a local
+/// takes its type from a later assignment, which is that claim. **Corpus-empty
+/// (0 of 1,196) and pinned as empty**, not asserted away.
+fn residual_reason(ctor: Option<&construction::Construction>) -> DegradeReason {
+    use construction::Construction as C;
+    match ctor {
+        Some(C::CallResult | C::Alloc { .. }) => DegradeReason::ReturnNotAdapted,
+        Some(C::PlaceRead | C::ArrayDecay | C::IndexAddr | C::AddrOf) => {
+            DegradeReason::PlaceReadPointee
+        }
+        Some(C::CopyOf | C::Other | C::StringLiteral { .. }) | None => {
+            DegradeReason::CopySourceCoupled
+        }
+        // The null-init gate above owns this class and fires before the
+        // residue can. Kept explicit rather than folded into an arm it does not
+        // belong to, so the ordering is legible where it matters.
+        Some(C::NullLit) => DegradeReason::NullInit,
+    }
+}
+
+/// **The dissolution's structural guarantee: a subject with no splice target
+/// cannot emit.**
+///
+/// Separate from the residue gate inside [`decide_one_ladder`], and both earn
+/// their place. That one is about ATTRIBUTION — it keeps the co-conversion gate
+/// from claiming 158 subjects it has nothing to say about. This one is about
+/// the LEDGER: today the `Slice` and `Opt` arms cannot reach an emission for a
+/// local because `slice-local-construction` and `opt-local-construction` fire
+/// first, but "zero decision flips" must not rest on those two gates staying
+/// where they are.
+///
+/// Corpus-unreachable by construction, which is precisely why it is witnessed
+/// through the `perturb` hook rather than by a sweep: a guard no test can break
+/// is not a guard.
+/// A safe form that is not optional.
+fn delivers_non_optional(decision: &Decision) -> bool {
+    match decision {
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::Cursor { .. }
+        | Decision::NestedSlice { .. } => true,
+        Decision::Box(plan) => !plan.optional,
+        Decision::Opt { .. } | Decision::Degraded(_) => false,
+    }
+}
+
+/// The subject's OWN nullability evidence (R824-2): a null literal at its
+/// construction, a null assignment to it, a null test of it, or a caller's
+/// null literal at its position. For an owner (`Box`), a null test is not
+/// counted: before the box it is the allocation's guard
+/// (`null-guard-before-box`), and the Box family decides `Option<Box>` from
+/// the same evidence; a null VALUE (a literal, an assignment, a caller's
+/// literal) still is, whichever Box producer planned it (the review's
+/// LOW/MED 6: `ownership_fields_constructor`'s fallback plans `optional:
+/// false` without reading it).
+fn own_nullable_evidence(ctx: &Ctx<'_, '_>, subject: &Subject, owner: bool) -> bool {
+    let key = (subject.fn_did, subject.hir_id);
+    subject.null_init
+        || ctx
+            .constructions
+            .init_hirs
+            .get(&key)
+            .is_some_and(|hir| emitability::is_zero_literal(ctx.tcx.hir_node(*hir).expect_expr()))
+        || ctx
+            .opt_uses
+            .get(&key)
+            .is_some_and(|uses| uses.null_assigned)
+        || null_assigned_in_body(ctx.tcx, subject)
+        || (!owner && null_tested(ctx, subject))
+        || option_ops::param_receives_null_literal(ctx.facts, subject)
+}
+
+fn null_tested(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    ctx.facts
+        .raw_only_uses
+        .get(&(subject.fn_did, subject.hir_id))
+        .is_some_and(|uses| uses.iter().any(|(op, _)| op == "is_null"))
+}
+
+/// R517-10's local: null-initialized, with no other null evidence and never
+/// handed on bare to a call (the declaration planner renders it `&mut []` /
+/// `&[]` until its assignment).
+fn declaration_owns_null_init(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    let key = (subject.fn_did, subject.hir_id);
+    matches!(subject.kind, SubjectKind::Local)
+        && subject.null_init
+        && !ctx.opt_uses.get(&key).is_some_and(|uses| uses.null_assigned)
+        && !null_assigned_in_body(ctx.tcx, subject)
+        && !null_tested(ctx, subject)
+        && !ctx.facts.call_args.values().flatten().any(|site| {
+            site.caller == subject.fn_did
+                && site
+                    .args
+                    .iter()
+                    .any(|arg| matches!(arg.shape, emitability::ArgShape::BareLocal(b) if b == subject.hir_id))
+        })
+}
+
+/// A null literal assigned to the subject's binding anywhere in its body.
+fn null_assigned_in_body(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
+    use rustc_hir::intravisit::{self, Visitor};
+    struct NullAssign<'tcx> {
+        binding: HirId,
+        found: bool,
+        _tcx: TyCtxt<'tcx>,
+    }
+    impl<'v> Visitor<'v> for NullAssign<'_> {
+        fn visit_expr(&mut self, expr: &'v rustc_hir::Expr<'v>) {
+            if let rustc_hir::ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = lhs.kind
+                && path.res == rustc_hir::def::Res::Local(self.binding)
+                && emitability::is_zero_literal(rhs)
+            {
+                self.found = true;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let Some(body) = tcx.hir_maybe_body_owned_by(subject.fn_did) else {
+        return false;
+    };
+    let mut visitor = NullAssign {
+        binding: subject.hir_id,
+        found: false,
+        _tcx: tcx,
+    };
+    visitor.visit_body(body);
+    visitor.found
+}
+
+/// Test-only: subjects (by label) whose Option stage a witness withdraws, the
+/// way an exclusion re-derivation would (R824-2's witnesses).
+#[cfg(test)]
+pub(crate) static FORCED_OPTION_WITHDRAWALS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Is the Option family stage enabled for this subject?
+fn option_stage_enabled(family_policy: &super::additive::FamilyPolicy, subject: &Subject) -> bool {
+    !forced_option_withdrawal(subject)
+        && family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option)
+}
+
+/// Is the Option stage WITHDRAWN for this subject: the run has reached the
+/// Option stage, and an exclusion re-derivation took it back (a stage not yet
+/// reached is not a withdrawal: earlier stages are candidates, not deliveries).
+pub(crate) fn option_stage_withdrawn(
+    family_policy: &super::additive::FamilyPolicy,
+    subject: &Subject,
+) -> bool {
+    forced_option_withdrawal(subject)
+        || (family_policy.stage >= FamilyStage::Option
+            && !family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Option))
+}
+
+fn forced_option_withdrawal(subject: &Subject) -> bool {
+    #[cfg(test)]
+    if FORCED_OPTION_WITHDRAWALS
+        .lock()
+        .is_ok_and(|labels| labels.contains(&subject.label))
+    {
+        return true;
+    }
+    let _ = subject;
+    false
+}
+
+fn decide_one(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
+    let decision = decide_one_ladder(ctx, subject);
+    // R824-2 (§29, R819-1): with the Option stage withdrawn, a subject whose
+    // OWN evidence is nullable is never delivered in a non-optional safe form
+    // (reference, slice, cursor or owner), whichever promotion produced it; it
+    // falls back to raw. Carried evidence on an indexed slot stays under
+    // R785-10. The exception is R517-10's null-initialized local, rendered
+    // `&mut []` / `&[]` until its assignment, when the initializer is its only
+    // null evidence and it is never handed on.
+    if option_stage_withdrawn(ctx.family_policy, subject)
+        && delivers_non_optional(&decision)
+        && own_nullable_evidence(
+            ctx,
+            subject,
+            match &decision {
+                Decision::Box(_) => true,
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::Cursor { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Degraded(_) => false,
+            },
+        )
+        && !declaration_owns_null_init(ctx, subject)
+    {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            DegradeReason::NullInit,
+        );
+    }
+    if subject.ty_span.is_some() {
+        return decision;
+    }
+    let typed_pattern = ctx
+        .family_policy
+        .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
+        && ctx
+            .declaration_patterns
+            .contains_key(&(subject.fn_did, subject.hir_id));
+    let receiver_node = (subject.fn_did, subject.hir_id);
+    let receiver = ctx
+        .return_receivers
+        .and_then(|receivers| receivers.plans.get(&receiver_node));
+    let receiver_failed = ctx
+        .return_receivers
+        .is_some_and(|receivers| receivers.failures.contains_key(&receiver_node));
+    // R410-9 (b): a string-literal construction types its own local.
+
+    // wave-4 R410-9 (b): a string-literal construction types its own local
+    // (`append_literal_local_declaration_plans`); a literal has no root to
+    // widen and no interface to move, so wave-6a's refusals do not apply.
+    let literal_construction = matches!(
+        ctx.constructions.by_binding.get(&receiver_node),
+        Some(construction::Construction::StringLiteral { .. })
+    );
+    // EXHAUSTIVE, not `matches!(.., Degraded(_))` — the import denylist rejects
+    // the bypass shape and is right to: a new emitting disposition must be a
+    // compile error here, because a form this veto does not name is a form that
+    // escapes it.
+    match decision {
+        Decision::NestedSlice { .. } => degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            DegradeReason::ReturnNotAdapted,
+        ),
+        Decision::Cursor { .. } => degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            DegradeReason::SliceCursorUse,
+        ),
+        // wave-4 R410-9 (b): a string-literal construction has no root to
+        // widen and no local-callee result to receive; it types its own local
+        // — unless its foreign site is a pending sibling-overlap hold
+        // (R419-3 / R304-2), where a delivered borrowed form is a delivered
+        // held subject.
+        Decision::Slice { mutable: false, .. } if literal_construction => {
+            // A string literal's referent is static: no frame binding is it.
+            // **R608-1 (STOP 2 approved):** and no sibling can WRITE it on a
+            // UB-free input (§28), so a literal-only binding is never a
+            // pending site — the terminal instrument reads the same predicate
+            // (`sibling_overlap::literal_source_exempt`).
+            if !construction::literal_only_binding(ctx.tcx, subject.fn_did, subject.hir_id)
+                && pending_sibling::pending_site(ctx.facts, receiver_node, true).is_some()
+            {
+                degrade(
+                    subject,
+                    EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                    DegradeReason::PendingSiblingOverlap,
+                )
+            } else {
+                decision
+            }
+        }
+        // wave-6a (relay 007 §3a, wave-6s2 006; R395-2): before any rule that
+        // types an unannotated slice local by its constructor — a receiver of
+        // a local callee is the return family's, a Ref-rooted construction
+        // widens — the refusal, then the receiver arms, answer first.
+        Decision::Slice { .. } | Decision::Opt { slice: true, .. }
+            if !receiver
+                .is_some_and(|receiver| receiver.receiver_form == seam::form_of(&decision))
+                // wave-6b × wave-6a: a region receiver is a receiver arm too.
+                && !void_region::receiver_form_matches(
+                    ctx.void_region_receivers,
+                    receiver_node,
+                    &decision,
+                )
+                && slice_local_construction::refuses(ctx, subject)
+                // R445-2: clause (d) of that refusal is a YIELD, not a
+                // refusal — the derived-view rule below types this subject.
+                && !source_typed_local::permits(ctx, subject)
+                // relay 035 (wave-6v 028 route (a)): a counted READ alias is
+                // DECLARATION-FREE — its type comes from the initializer the
+                // parameter's contract already rewrote — so this refusal has no
+                // claim on it. The arms below still decide its form; exempting
+                // it from them instead costs six of wave-6v's witnesses.
+                && !construction_values::counted_alias_needs_no_declaration(ctx, subject) =>
+        {
+            degrade(
+                subject,
+                EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                residual_reason(subject.ctor.as_ref()),
+            )
+        }
+        Decision::Slice { mutable, .. }
+            if receiver.is_some_and(|receiver| {
+                receiver.receiver_form == seam::Form::Slice { mutable }
+            }) =>
+        {
+            decision
+        }
+        Decision::Opt { mutable, slice, .. }
+            if receiver.is_some_and(|receiver| {
+                receiver.receiver_form == seam::Form::Opt { mutable, slice }
+            }) =>
+        {
+            decision
+        }
+        Decision::Ref { .. } if construction_values::permits(ctx, subject) => decision,
+        Decision::Ref { .. } if source_typed_local::permits(ctx, subject) => {
+            // A derived local takes the base's SLICE form, not a thin
+            // reference: its uses index past the first element.
+            source_typed_local::derived_form(ctx, subject).unwrap_or(decision)
+        }
+        Decision::Slice { .. } if slice_construction_values::permits(ctx, subject) => decision,
+        Decision::Ref { mutable } if raw_place_values::permits(ctx, subject, mutable) => decision,
+        // W6L-A8-1: a null-tested raw call result types its own local —
+        // `Option<&mut T>` from the pointer's own `as_mut()`, the callee's
+        // raw return untouched. The untied view's guard is the closed use
+        // vocabulary inside `call_result_option::value`.
+        Decision::Opt { slice: false, .. } if call_result_option::permits(ctx, subject) => decision,
+        Decision::Ref { mutable } => {
+            if receiver_failed {
+                degrade(
+                    subject,
+                    EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                    DegradeReason::ReturnNotAdapted,
+                )
+            } else if let Some(permit) = ctx.lifetime_eligibility.and_then(|eligibility| {
+                eligibility.inferred_permit((subject.fn_did, subject.hir_id))
+            }) {
+                Decision::InferredRef {
+                    mutable,
+                    callee: permit.callee(),
+                }
+            } else if ctx
+                .field_reference
+                .and_then(|fields| fields.load_permit((subject.fn_did, subject.hir_id)))
+                .is_some()
+            {
+                // wave-6f: the converting field supplies the local's type; the
+                // explicit declaration is planned by the field transaction.
+                Decision::Ref { mutable }
+            } else {
+                degrade(
+                    subject,
+                    EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                    residual_reason(subject.ctor.as_ref()),
+                )
+            }
+        }
+        Decision::InferredRef { .. } => decision,
+        Decision::Box(ref plan) if plan.inferred_binding => decision,
+        Decision::Opt { .. } if typed_pattern => decision,
+        // wave-6a W6A-B1: the sealed constructor types the initializer.
+        Decision::Slice { .. } | Decision::Opt { slice: true, .. }
+            if slice_local_construction::inferred_binding(ctx, subject, &decision) =>
+        {
+            decision
+        }
+        // Wave-6o: an unannotated null-initialized local receives its type —
+        // unless its site is a pending sibling-overlap row (relay 018 §1).
+        Decision::Opt { .. }
+            if null_init_declaration::pending_sibling_hold(ctx, subject, &decision) =>
+        {
+            degrade(
+                subject,
+                EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+                DegradeReason::PendingSiblingOverlap,
+            )
+        }
+        Decision::Opt { .. } if null_init_declaration::admits(ctx, subject, &decision) => decision,
+        Decision::Slice { mutable, .. }
+            if receiver.is_some_and(|receiver| {
+                receiver.receiver_form == seam::Form::Slice { mutable }
+            }) =>
+        {
+            decision
+        }
+        // wave-6b: an accessor-result local receives its region as a typed
+        // slice (declared explicitly, the raw result wrapped with the count).
+        Decision::Slice { .. }
+            if void_region::receiver_form_matches(
+                ctx.void_region_receivers,
+                receiver_node,
+                &decision,
+            ) =>
+        {
+            decision
+        }
+        Decision::Opt { mutable, slice, .. }
+            if receiver.is_some_and(|receiver| {
+                receiver.receiver_form == seam::Form::Opt { mutable, slice }
+            }) =>
+        {
+            decision
+        }
+        // wave-5d2: an unannotated local whose type its own initializer
+        // supplies keeps the form the ladder gave it — the residue below is
+        // for locals with no such source.
+        Decision::Slice { .. } if source_typed_local::permits(ctx, subject) => decision,
+        // W6F-5: the array field supplies the local's type; the explicit
+        // declaration is planned beside the slice construction.
+        Decision::Slice { mutable, .. }
+            if ctx.field_reference.is_some_and(|fields| {
+                fields.decayed_array_view((subject.fn_did, subject.hir_id), mutable)
+            }) =>
+        {
+            decision
+        }
+        // **R491-6 route (i): the counted READ alias delivers on its own
+        // declaration.** `counted_alias_needs_no_declaration` above lifts the
+        // receiver-form refusal, but lifting a refusal supplies no form: this
+        // subject has no receiver and no field permit either, so it fell to the
+        // residue below and degraded `copy-source-coupled` beside the very code
+        // it is the subject of (report 031, measured on the composed head).
+        // Its form is the contract's and so is every USE of it; what is its own
+        // is the initializer — `let a = P as *const B` → `P.unwrap_or(&[])` —
+        // one splice target, planned once, here instead of in the contract's
+        // `uses`, because the same span planned twice is the duplicate K21
+        // refuses. The yield belongs HERE, beneath every earlier arm: exempting
+        // the subject further up the ladder is what cost six lane witnesses in
+        // report 028.
+        Decision::Slice { mutable, .. }
+        | Decision::Opt {
+            mutable,
+            slice: true,
+            ..
+        } if counted_void::alias_declaration(ctx, subject).is_some() => {
+            let uses = counted_void::alias_declaration(ctx, subject)
+                .cloned()
+                .into_iter()
+                .collect();
+            Decision::Slice { mutable, uses }
+        }
+        Decision::Slice { .. } | Decision::Opt { .. } | Decision::Box(_) => degrade(
+            subject,
+            EmitabilityFacts::site(ctx.tcx, subject.attribution_span()),
+            residual_reason(subject.ctor.as_ref()),
+        ),
+        Decision::Degraded(_) => decision,
+    }
+}
+
+fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
+    let &Ctx {
+        tcx,
+        // R823-3: read again by the masked hold when the narrowing returns.
+        io_domain,
+        counted_void: _,
+        flexible_tails: _,
+        box_params: _,
+        return_certificates: _,
+        allocator_contracts: _,
+        void_region: _,
+        void_region_receivers: _,
+        void_pointee,
+        thin_extent,
+        local_callee_extent,
+        contract_extent,
+        declaration_pointees,
+        declaration_patterns,
+        input_interfaces: _,
+        return_receivers,
+        family_policy,
+        model,
+        slots,
+        facts,
+        fat,
+        sign,
+        slice_uses,
+        opt_uses,
+        box_facts,
+        ownership_fields: _,
+        constructions,
+        subjects,
+        gate,
+        coconv,
+        lifetime_eligibility,
+        raw_boundary,
+        exposure,
+        field_reference,
+        raw_field_null,
+    } = ctx;
+    let decl_site = EmitabilityFacts::site(tcx, subject.attribution_span());
+    // R261-3, before every other rung: a subject whose own type reaches the
+    // io-domain is held permanently. Placed first so no promotion path can
+    // reach a stream handle -- the argument-position interception only ever
+    // covered the call, never the binding.
+    if io_domain.contains(&(subject.fn_did, subject.hir_id)) {
+        return degrade(subject, decl_site, DegradeReason::IoDomainType);
+    }
+    let option_enabled = option_stage_enabled(family_policy, subject);
+    let depth2_npo = matches!(subject.kind, SubjectKind::Local)
+        .then(|| facts.depth2_npo_target((subject.fn_did, subject.hir_id)))
+        .flatten();
+
+    // The declaration family can name an alias pointee from this binding's
+    // compiler type. Every other shape keeps its prior refusal, including
+    // existing reference patterns. Passing this representation gate does not
+    // bypass the frozen kind, use, borrowing or lifetime gates below. Earlier
+    // family stages deliberately retain the pre-item alias disposition — all
+    // but a Box chain's formal (W6S-17), whose declaration is the chain's.
+    let alias_supported = subject.decl_shape == DeclShape::Alias
+        && (family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
+            || box_param::alias_formal(ctx.box_params, subject))
+        && declaration_pointees.contains_key(&(subject.fn_did, subject.hir_id));
+    if subject.decl_shape != DeclShape::RawPtr && !alias_supported {
+        return degrade(
+            subject,
+            decl_site,
+            DegradeReason::UnsupportedDeclShape {
+                shape: subject.decl_shape.key(),
+            },
+        );
+    }
+
+    let Some(universe) = slots.fn_local_slots.get(&subject.fn_did) else {
+        return degrade(subject, decl_site, DegradeReason::NoSlot);
+    };
+    let Some(slot_id) = universe.slot_for_local_depth(subject.local, 0) else {
+        return degrade(subject, decl_site, DegradeReason::NoSlot);
+    };
+
+    // wave-6a W6A-A1: a subject an allocation-return certificate plans is a
+    // Box on the certificate's evidence (relay wave-6a/005 §1).
+    if let Some(decision) = return_certificate::planned(ctx, subject) {
+        return decision;
+    }
+    // wave-6a: a contract-rooted allocation local is a Box on the pinned
+    // allocator contract's evidence (R409-1/3), or its typed hold.
+    if let Some(decision) = allocator_contract::planned(ctx, subject, &decl_site) {
+        return decision;
+    }
+    // wave-6a W6A-C1 (A1-c): a consuming FORMAL a chain plans is a Box on the
+    // chain's evidence whatever the model says of it (R410-5 §1 extended to
+    // the formal every caller moves a certified owner into); a chain's
+    // LOCAL members keep the owning arm's path below.
+    if matches!(subject.kind, SubjectKind::Param { .. })
+        && let Some(plan) = ctx.box_params.plans.get(&(subject.fn_did, subject.hir_id))
+    {
+        return Decision::Box(plan.clone());
+    }
+    // wave-6a W6A-C2: a caller local of a STORE chain is a Box on the chain's
+    // source proof — the model calls an allocation handed to C storage Raw,
+    // which is the licensing wall R410-5 §1 names, not evidence against.
+    if ctx
+        .box_params
+        .store_members
+        .contains(&(subject.fn_did, subject.hir_id))
+        && let Some(plan) = ctx.box_params.plans.get(&(subject.fn_did, subject.hir_id))
+    {
+        return Decision::Box(plan.clone());
+    }
+
+    // R631-4 (wave-6l): a parameter read past a masked index by a runtime
+    // length stays raw under its typed hold — a slice built on any companion
+    // at this signature panics where C reads on (R544-6: not yield).
+    if let SubjectKind::Param { hir_index } = subject.kind
+        && matches!(
+            model.get(&SlotRef::Local(subject.fn_did, slot_id)),
+            Some(SlotKind::Ref)
+        )
+        && let Some(reader) = masked_runtime::held(tcx, subject.fn_did, hir_index)
+    // R823-3 (main 174a): relay 071's narrowing (held only where a root
+    // would take a fabricated length) is reverted for the frame head — on
+    // brotli a reader released on a real root whose plan did not complete
+    // took its whole class down (net −18, five Box owners). The hold keeps
+    // its pre-071 reach; the narrowing returns in 56 with that fixed
+    // (R822-3). `len-field-alloc` stays.
+    {
+        return degrade(
+            subject,
+            decl_site,
+            DegradeReason::MaskedIndexRuntimeLength { reader },
+        );
+    }
+
+    // BO's kind first: it is the authority on WHETHER a reference is sound.
+    match model.get(&SlotRef::Local(subject.fn_did, slot_id)) {
+        Some(SlotKind::Ref) => {}
+        // wave-6f G: a local loaded from a transaction-controlled ARRAY of
+        // pointers reads a slot the model does not register (locals' arrays
+        // have no slots; the read is opaque provenance, not raw evidence) —
+        // its value is exactly the Ref-model subject the transaction stored.
+        Some(SlotKind::Raw)
+            if field_reference
+                .is_some_and(|fields| fields.array_load_lift((subject.fn_did, subject.hir_id))) => {
+        }
+        // A certificate's refusal is the reason of record for a subject it
+        // refused, but it is written on the SETTLED table
+        // (`return_certificate::relabel_refused`, R528-3), never here.
+        Some(SlotKind::Raw) => return degrade(subject, decl_site, DegradeReason::KindRaw),
+        Some(SlotKind::Owning) => {
+            // Item 5 opens borrowed declaration forms. Owning alias emission
+            // remains in the separately chartered Box family.
+            if alias_supported {
+                return degrade(
+                    subject,
+                    decl_site,
+                    DegradeReason::UnsupportedDeclShape { shape: "alias" },
+                );
+            }
+            let owning_slot = SlotRef::Local(subject.fn_did, slot_id);
+            let prior = box_facts.plan_for_subject(
+                tcx,
+                subject,
+                owning_slot,
+                constructions,
+                slots,
+                subjects,
+            );
+            // wave-6a W6A-T1: a flexible-tail transaction supplies the plan.
+            let prior = flexible_tail::override_plan(ctx, subject, prior);
+            // wave-6a W6A-C1: a Box-parameter chain supplies the plan or the typed hold.
+            let prior = box_param::override_plan(ctx, subject, prior);
+            match ownership_fields_hook::plan(ctx, subject, owning_slot, prior) {
+                Ok(plan) => return Decision::Box(plan),
+                // **wave-6a W6A-A9 — a proven lend is not this family's
+                // subject** (relay wave-6a/043 §A9). Every owning producer
+                // above has had its refusal — the Box plan, the flexible-tail
+                // transaction, the parameter chain and the ownership-fields
+                // hook — and none of them owns this formal. Its body says why:
+                // the callee never frees it, never stores it and never moves
+                // it on, so nothing here releases the allocation and the
+                // caller keeps the owner. The arm declines the ownership claim
+                // rather than degrading on it, and the borrowing arms below
+                // decide under their own gates. A9 sits LAST on purpose: it
+                // must not pre-empt a producer that would deliver.
+                Err(_) if box_param::lend_leaves_owning(ctx, subject) => {}
+                Err(failure) => {
+                    return degrade(subject, decl_site, DegradeReason::BoxFailure { failure });
+                }
+            }
+        }
+        None => return degrade(subject, decl_site, DegradeReason::NoSlot),
+    }
+
+    // **R271-1 — void pointees, after the owning arm and before every borrowing
+    // one.** `c_void` carries no extent, so no REFERENCE form of it can carry
+    // the provenance its callee accesses through: `&c_void` is a one-byte claim
+    // over memory the callee reads at whatever width it casts to.
+    //
+    // The owning arm above is deliberately not covered. A void allocation
+    // becomes `Box<[u8]>` with the malloc byte count as its length, which is a
+    // real extent and therefore sound — the seat kept that arm as is, and this
+    // hold sits below it so it cannot pre-empt it.
+    let counted = counted_void::active(ctx, subject);
+    // wave-6b: a void parameter whose body REINTERPRETS the buffer at a proven
+    // region (accessor chain, width reader) is a byte slice over that region.
+    let region = void_region::active(ctx, subject);
+    // R609-4 (a): the read side of two byte-region formals that are not proven
+    // disjoint at some call stays raw; its write-side peer keeps the region.
+    if void_region::pair_raw_view(ctx, subject) {
+        return degrade(subject, decl_site, DegradeReason::PairRawView);
+    }
+    if counted.is_none()
+        && region.is_none()
+        && void_pointee.contains(&(subject.fn_did, subject.hir_id))
+    {
+        return degrade(subject, decl_site, DegradeReason::VoidPointee);
+    }
+
+    // A1 emitability: BO says a reference is SOUND; these say whether one can
+    // actually be EMITTED. Both are decision-phase questions, which is the
+    // whole point — S1 let them fall through to an anonymous gate failure.
+    // **S3.2′-2 — the borrowed-slice arm.** A raw-only use is not automatically
+    // a degradation any more: if EVERY such use is arithmetic and fatness
+    // independently concludes array, the subject wants a slice form rather than
+    // a reference.
+    //
+    // The authority split is deliberate and measured (micro-plan §1):
+    // **op-facts supply the NEED** — this pointer indexes, so a slice is the
+    // form — and **fatness supplies the LICENSE**, since `Arr` is evidence
+    // forced down the lattice while `Ptr` is an unconstrained default that
+    // licenses nothing. Fatness ALONE would convert 138 subjects that already
+    // emit thin references, inventing a length for pointers that never index.
+    //
+    // `all` over the whole use vector, never the first: a subject carrying both
+    // `offset` and `is_null` must not read as arithmetic because the walk met
+    // `offset` first.
+    let raw_uses = facts.raw_only_uses.get(&(subject.fn_did, subject.hir_id));
+    // **S3.2′-3 — the OPTIONAL arm shares this block**, because both forms are
+    // selected from the same fact: the set of raw-only uses. A subject the
+    // program itself null-tests is nullable *by the program's own evidence*, and
+    // the nullability directive's optional form is what it maps to.
+    //
+    // The disjunctive authority (micro-plan §1) is why `is_null` alone is
+    // enough. It runs opposite to -2's conjunction on purpose: there the unsafe
+    // direction was ADOPTING a form (fatness alone would invent a length), here
+    // it is REFUSING one (an optional costs ergonomics, never soundness).
+    // Relay 139: the slot is used as an array (pointer arithmetic among its raw uses).
+    let indexed = raw_uses.is_some_and(|uses| {
+        uses.iter()
+            .any(|(op, _)| emitability::SLICE_ARITHMETIC_OPS.contains(&&**op))
+    });
+    // R819-1 (§29): the nullability evidence, read whether or not the Option
+    // stage is enabled; a withdrawn stage removes the optional form, never the
+    // evidence (see the null-init gate below).
+    let nullable_evidence = constructions
+            .init_hirs
+            .get(&(subject.fn_did, subject.hir_id))
+            .is_some_and(|hir| emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr()))
+            || opt_uses
+                .get(&(subject.fn_did, subject.hir_id))
+                .is_some_and(|uses| uses.null_assigned)
+            // Wave-6o: a caller's null-literal argument is the parameter's
+            // construction-site null literal.
+            || option_ops::param_receives_null_literal(facts, subject)
+            // Wave-6o (relay 139, R785-10): nullability CARRIED from elsewhere
+            // never makes a slot that is used as an array optional: no
+            // optional-slice arm renders its `.offset` or its index (batch 54:
+            // lodepng `palette#51`, brotli `literal_costs#5` / `cost_dist#7`).
+            // Such a slot keeps the form its own evidence gives it; a NULL
+            // reaching its indexing is the input's UB (§28).
+            || (!indexed
+                // Wave-6o (relay 096): a read of a raw field the program writes
+                // null into carries that null literal one field away.
+                && (raw_field_null.contains(&(subject.fn_did, subject.hir_id))
+                // Wave-6o (relay 113): an exported formal handed on to a callee
+                // that null-tests it carries that test one call down.
+                || option_ops::exported_param_handed_to_null_tested_formal(tcx, facts, subject)
+                // Wave-6o (relay 125): a caller's actual with its own nullability
+                // evidence, at a formal the callee does not dereference itself.
+                || option_ops::param_receives_nullable_actual(
+                    tcx,
+                    facts,
+                    opt_uses,
+                    &|node| {
+                        constructions.init_hirs.get(&node).is_some_and(|hir| {
+                            emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr())
+                        })
+                    },
+                    subject,
+                )));
+    let nullable_value = option_enabled && nullable_evidence;
+    let mut form = match raw_uses {
+        Some(uses) => {
+            let arith = |op: &str| emitability::SLICE_ARITHMETIC_OPS.contains(&op);
+            let all_arithmetic = uses.iter().all(|(op, _)| arith(op));
+            let is_array = fat.is_array(subject.fn_did, subject.local);
+            let null_tested = uses.iter().any(|(op, _)| op == "is_null");
+            let has_arithmetic = uses.iter().any(|(op, _)| arith(op));
+            // Everything that is not the null test must be arithmetic: any other
+            // raw-only method (`read`, `copy_to`, …) has no image under the
+            // wrapper, and admitting it would be the mixed-use hazard again.
+            let rest_arithmetic = uses.iter().all(|(op, _)| op == "is_null" || arith(op));
+
+            // Wave-6o (relay 027 / R450-9): a destination assigned a forward
+            // computed view of a FAT base inherits that base's twin — the
+            // suffix carries the base's own length, so the fat optional is
+            // evidence-backed here exactly as fatness licenses it below.
+            let inherits_fat_twin = option_ops::assigned_forward_view_of_a_fat_base(
+                ctx.tcx,
+                subject,
+                ctx.subjects,
+                ctx.fat,
+                ctx.opt_uses,
+            );
+            if all_arithmetic && is_array && !nullable_value {
+                Form::Slice
+            } else if (null_tested || nullable_value)
+                && rest_arithmetic
+                && (option_enabled || !subject.null_init)
+                // Item 4 owns None at exact null initializers/assignments.
+                // A thin optional has no image for arithmetic; the fat twin does,
+                // and fatness is the licence for it — the -2 rule, unchanged.
+                && (!has_arithmetic || is_array || inherits_fat_twin)
+            {
+                Form::Opt {
+                    slice: (has_arithmetic && is_array)
+                        || counted.is_some_and(|c| c.handle.is_none())
+                        || inherits_fat_twin,
+                }
+            } else {
+                let (op, span) = uses.first().expect("a recorded use vector is non-empty");
+                return degrade(
+                    subject,
+                    EmitabilityFacts::site(tcx, *span),
+                    DegradeReason::RawPointerOperation { op: op.clone() },
+                );
+            }
+        }
+        None if nullable_value => Form::Opt {
+            slice: counted.is_some_and(|c| c.handle.is_none()),
+        },
+        None if counted.is_some_and(|c| c.handle.is_some()) => Form::Plain,
+        None if counted.is_some_and(|c| c.nullable) => Form::Opt { slice: true },
+        None if counted.is_some() => Form::Slice,
+        None if region.is_some() => Form::Slice,
+        // Relay 324 (R975-1): a formal with no raw use of its own whose copy
+        // walks it (S39's raw view of a reference source: a copy the model
+        // keeps Raw) — the copy's walk is the need, fatness the licence, the -2
+        // rule unchanged. A formal with nullability evidence keeps the thin
+        // path and its null-init gate (R819-1: with its Option stage withdrawn
+        // it falls back to raw).
+        None if matches!(subject.kind, SubjectKind::Param { .. })
+            && !nullable_evidence
+            && fat.is_array(subject.fn_did, subject.local)
+            && self::local_callee_extent::walked_by_a_copy(
+                tcx,
+                (subject.fn_did, subject.hir_id),
+                facts,
+                &|copy| {
+                    subjects
+                        .iter()
+                        .find(|s| s.fn_did == subject.fn_did && s.hir_id == copy)
+                        .and_then(|s| universe.slot_for_local_depth(s.local, 0))
+                        .is_some_and(|slot| {
+                            matches!(
+                                model.get(&SlotRef::Local(subject.fn_did, slot)),
+                                Some(SlotKind::Raw)
+                            )
+                        })
+                },
+            ) =>
+        {
+            Form::Slice
+        }
+        None => Form::Plain,
+    };
+    // R422-5 (wave-4 × wave-6v): a subject the counted-void route claims —
+    // a twin, a counted view, or a handled void call — is never a
+    // contract-extent candidate; the libc row is the lend oracle's evidence
+    // at typed positions, and one site has one owner.
+    let contract_form = match form {
+        _ if counted.is_some() => None,
+        Form::Plain => Some(contract_extent::CurrentForm::Ref {
+            mutable: subject.mutable,
+            nullable: false,
+        }),
+        Form::Opt { slice: false } => Some(contract_extent::CurrentForm::Ref {
+            mutable: subject.mutable,
+            nullable: true,
+        }),
+        Form::Slice | Form::Opt { slice: true } => None,
+    };
+    // R407-14: a contract-alone promotion (every use a READ-ONLY NUL-terminated
+    // contract position) takes the SHARED slice form: the contract's access is
+    // positive evidence of the read, where the conservative mutability of an
+    // unmodelled libc call is only the absence of one; `&mut` -> `&` never
+    // widens a permission.
+    let mut contract_alone = false;
+    if let Some(contract_form) = contract_form
+        && let contract_extent::Selection::Promote(promotion) =
+            contract_extent.select(subject, contract_form, Some(SlotKind::Ref), fat)
+        // R419-3 / R304-2 at this arm: a contract-alone promotion is the one
+        // contract delivery whose first census is still ahead, and urlparser's
+        // `get_part::format#2` sits at `sscanf(fmt_url, format, tmp)` — a
+        // NUL-terminated read whose scanf tail WRITES the sibling `tmp`, so the
+        // site is pending and the promotion would deliver a held subject. The
+        // promotion is simply not taken there; the ladder's own thin-extent
+        // gate then holds the subject under its existing reason, which is the
+        // class the pinned libc control carries for it.
+        //
+        // A LITERAL construction is left to the literal rule's own refusal in
+        // `decide_one` (the typed `pending-sibling-overlap`), so one subject
+        // never receives two refusals for one site.
+        && !(promotion.contract_alone
+            && !matches!(
+                constructions.by_binding.get(&(subject.fn_did, subject.hir_id)),
+                Some(construction::Construction::StringLiteral { .. })
+            )
+            && pending_sibling::pending_site(
+                facts,
+                (subject.fn_did, subject.hir_id),
+                matches!(subject.kind, SubjectKind::Param { .. }),
+            )
+            .is_some())
+    {
+        contract_alone = promotion.contract_alone;
+        form = if matches!(
+            contract_form,
+            contract_extent::CurrentForm::Ref { nullable: true, .. }
+        ) {
+            Form::Opt { slice: true }
+        } else {
+            Form::Slice
+        };
+    }
+    let counted = thin_counted::enabled_proof(tcx, subject, facts, family_policy, exposure);
+    let supplied = slice_input::enabled_proof(tcx, subject, facts, fat, family_policy);
+    if (counted.is_some() || supplied.is_some()) && matches!(form, Form::Plain | Form::Slice) {
+        form = Form::Slice;
+    }
+    // **The gate of 55 (main 169) — the rule and its hold stand aside where an
+    // earlier arm owns the subject:** the local-callee and thin-extent holds
+    // (wave-4's licensed lifts give such a subject an exact width where the
+    // rule would fabricate one), and W-C7's declines on refuting evidence (a
+    // companion that does not bound the indexes, R423-6; a measured count that
+    // does not fit the array, the thin-count rule's `caller-count`).
+    let owned_elsewhere = || {
+        let key = (subject.fn_did, subject.hir_id);
+        local_callee_extent.contains_key(&key)
+            || thin_extent.contains(&key)
+            || matches!(
+                slice_input::prove(tcx, subject, facts, fat),
+                Err(slice_input::Hold::CompanionNotIndexBound)
+            )
+            || matches!(
+                thin_counted::prove(tcx, subject, facts),
+                Err(thin_counted::Hold::CallerCount)
+            )
+    };
+    // **Narrowing 2 of the gate of 55 (main 170) — the rule alone stands
+    // aside:**
+    // (b) at a parameter of a function whose callers it cannot see (W-C7's
+    //     `IncompleteCallers`: exported, public, address-taken or never
+    //     called) where no exposure surface owns the function, and only where
+    //     the formal it is handed to is NOT delivered as a slice in the settled
+    //     table (`entry_rule_releases`, main 173a). A slice there would change a
+    //     signature that callers outside the program call (wave-6v's driver,
+    //     `slerp(&q, 0.5)`) or cost a cursor; where the formal is a slice, the
+    //     thin form is the one-element view the rule cures (g25 / g26). In the
+    //     census world every function with a converting parameter has a surface
+    //     plan, so this reads the open world; a pass with no exposure policy
+    //     reads nothing.
+    // (c) at a view `root.offset(e)` of an allocation the model calls
+    //     Owning, handed to a formal that takes the slice form. The
+    //     ownership-fields native bundle renders that view from its Box owner
+    //     itself, and a slice view costs the owner its Box (class_split's clean
+    //     twin; wave-5d2 026 measured the same trade for R453-4's arm). Where
+    //     the formal's offsets may be negative (heman's `edt_with_payload::z`)
+    //     the same holds once the native refresh delivers the other owners:
+    //     a slice view into the raw formal has no carrier and withdraws every
+    //     owner of the function (wave-6a relay 151), so the rule stands aside
+    //     there too.
+    let rule_stands_aside = || {
+        // (b) is read on the settled table (`entry_rule_releases`, main 173a).
+        let unseen_entry = ENTRY_RULE_RELEASED.with(|released| {
+            released
+                .borrow()
+                .contains(&(subject.fn_did, subject.hir_id))
+        });
+        let bundle_view = matches!(subject.kind, SubjectKind::Local)
+            && slice_input::fat_hand_on(subject, facts, fat).is_some()
+            && slice_input::offset_view_root(tcx, subject.fn_did, subject.hir_id).is_some_and(
+                |root| {
+                    subjects.iter().any(|owner| {
+                        owner.fn_did == subject.fn_did
+                            && owner.hir_id == root
+                            && slots
+                                .fn_local_slots
+                                .get(&owner.fn_did)
+                                .and_then(|universe| universe.slot_for_local_depth(owner.local, 0))
+                                .is_some_and(|slot| {
+                                    model.get(&SlotRef::Local(owner.fn_did, slot))
+                                        == Some(&SlotKind::Owning)
+                                })
+                    })
+                },
+            );
+        unseen_entry || bundle_view
+    };
+    // **R758-1 (2) / R763-1 (a) — the thin-into-fat hand-on** (main 147 §2):
+    // a subject handed bare to an array formal is used as an array, so its
+    // thin form takes the fat twin. Not where the counted route owns it.
+    if counted.is_none()
+        && supplied.is_none()
+        && matches!(form, Form::Plain | Form::Opt { slice: false })
+        && slice_input::hands_on_to_fat(subject, facts, fat, family_policy)
+        && (!owned_elsewhere()
+            || LIFT_OWNER_RELEASED.with(|released| {
+                released
+                    .borrow()
+                    .contains(&(subject.fn_did, subject.hir_id))
+            }))
+        && !rule_stands_aside()
+    {
+        form = match form {
+            Form::Opt { .. } => Form::Opt { slice: true },
+            _ => Form::Slice,
+        };
+    }
+    // **R802-6 (main 166 §2) — the thin form is no fallback for a fat
+    // hand-on.** Where the slice stage is not available to this subject (a
+    // stage before it, or the exclusion re-derivation's withdrawal of it), the
+    // rule above cannot give the fat twin, and the predecessor profile's thin
+    // form is the one-element view the array formal reads past (bzip2's
+    // `mainSimpleSort::{block, quadrant}` restored to `from_ref(block)` into
+    // `mainGtU`). The subject is held raw under the local-callee extent hold,
+    // the same claim as its sibling below. Narrowed (relay 273 R807-1; main
+    // 170a): only where the formal is delivered fat, so the view would render;
+    // `decide_with_raw_fallbacks` releases the others.
+    if counted.is_none()
+        && supplied.is_none()
+        && matches!(form, Form::Plain | Form::Opt { slice: false })
+        && !family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::SliceUse)
+        && let Some((callee, index)) = slice_input::fat_hand_on(subject, facts, fat)
+        && !owned_elsewhere()
+        && !RESTORE_HOLD_RELEASED.with(|released| {
+            released
+                .borrow()
+                .contains(&(subject.fn_did, subject.hir_id))
+        })
+    {
+        let formal = ctx
+            .subjects
+            .iter()
+            .find(|formal| formal.fn_did == callee && formal.local.as_usize() == index + 1);
+        let parameter = formal
+            .and_then(|formal| formal.param_name.clone())
+            .unwrap_or_else(|| "<unnamed>".to_owned());
+        let parameter_index = match formal.map(|formal| formal.kind) {
+            Some(SubjectKind::Param { hir_index }) => hir_index,
+            _ => index,
+        };
+        return degrade(
+            subject,
+            decl_site,
+            DegradeReason::LocalCalleeAccessExtent {
+                access: Box::new(local_callee_extent::LocalCalleeAccess {
+                    callee_id: callee,
+                    parameter_index,
+                    callee: tcx.def_path_str(callee.to_def_id()),
+                    parameter,
+                    access: if subject.mutable { "write" } else { "read" },
+                    reason: local_callee_extent::AccessReason::PointerArithmetic {
+                        op: RESTORE_HOLD_OP.to_owned(),
+                    },
+                    footprint_bytes: None,
+                }),
+                count: None,
+            },
+        );
+    }
+    if let Some(receiver) = return_receivers
+        .and_then(|receivers| receivers.plans.get(&(subject.fn_did, subject.hir_id)))
+    {
+        // Existing raw-use classification above still rejects unsupported
+        // operations. The actual borrowed return supplies the remaining
+        // presentation, including Option when q has no local null test.
+        let incompatible = match (receiver.receiver_form, &form) {
+            (seam::Form::Opt { slice: false, .. }, Form::Slice | Form::Opt { slice: true }) => true,
+            (seam::Form::Slice { .. }, Form::Opt { .. }) => true,
+            _ => false,
+        };
+        if incompatible {
+            return degrade(subject, decl_site, DegradeReason::ReturnNotAdapted);
+        }
+        form = match receiver.receiver_form {
+            seam::Form::NestedSlice { .. } | seam::Form::Cursor { .. } => {
+                return degrade(subject, decl_site, DegradeReason::ReturnNotAdapted);
+            }
+            seam::Form::Slice { .. } => Form::Slice,
+            seam::Form::Opt { slice, .. } => Form::Opt { slice },
+            seam::Form::Raw | seam::Form::Ref { .. } => form,
+        };
+    }
+    // **wave-6f (W6F-1).** A subject stored into a converting FAT field carries
+    // that buffer: its own body has no arithmetic (the field's readers do), so
+    // form selection above chose the thin form. The field's op-facts supply the
+    // need and the subject's own fatness the licence — the S3.2′-2 authority
+    // split, with the field standing in for the subject's uses. Without the
+    // licence the form stays thin and the finalizer refuses the store rather
+    // than widening a one-element claim.
+    if matches!(form, Form::Plain)
+        && let Some(required) = field_reference
+            .and_then(|fields| fields.required_store_form((subject.fn_did, subject.hir_id)))
+        && matches!(
+            required,
+            seam::Form::Slice { .. } | seam::Form::Opt { slice: true, .. }
+        )
+        && fat.is_array(subject.fn_did, subject.local)
+    {
+        form = Form::Slice;
+    }
+    // **R739-1 (slicecursor relay 099).** A subject that is only ever MEASURED
+    // — `offset_from`, compared, null-tested, cast to an integer, and nothing
+    // else — may hold an end sentinel one past its allocation, and no
+    // reference form may claim an element there. Ahead of the comparison gate: a
+    // comparison the address arm would open is held before any view is
+    // rendered for it or for its partner.
+    if let Some(span) = facts.address_observation_only(tcx, (subject.fn_did, subject.hir_id)) {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, span),
+            DegradeReason::AddressObservationOnly,
+        );
+    }
+    if let Some(span) = facts.ptr_comparisons.get(&(subject.fn_did, subject.hir_id)) {
+        let node = (subject.fn_did, subject.hir_id);
+        let address_candidate = facts.is_value_observation_candidate(node);
+        let address_open = thin_counted::covers_comparison(counted.as_ref(), *span)
+            || address_candidate
+                && (coconv.is_none()
+                    || raw_boundary.is_some_and(|raw_boundary| raw_boundary.opens_address(node)));
+        if !address_open {
+            return degrade(
+                subject,
+                EmitabilityFacts::site(tcx, *span),
+                DegradeReason::PtrComparison,
+            );
+        }
+    }
+    // **S3.6-0 recorded the reference KIND; S3.6-1 makes the gate a MODE.**
+    //
+    // Under the former `RefGate::BlockAll` — task 2's setting and every setting
+    // before it, **deleted at M-3 as measured-dead** — any reference degraded,
+    // adaptable or pinned alike, exactly as at S3.6-0. Under the surviving
+    // [`RefGate::LiftAdaptable`] the
+    // adaptable population passes and the pinned population still blocks, which
+    // is the hypothetical `co_conversion` builds its node set from.
+    // wave-6b: a reference from inside a sibling accessor's replaced chain
+    // expression is deleted with that chain and pins nothing.
+    let refs_outside_regions: Vec<(emitability::RefKind, Span)> = facts
+        .referenced
+        .get(&subject.fn_did)
+        .map(|refs| {
+            refs.iter()
+                .filter(|(_, span)| {
+                    region.is_none()
+                        || !void_region::covers_sibling(ctx.void_region, subject.fn_did, *span)
+                })
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(refs) = (!refs_outside_regions.is_empty()).then_some(&refs_outside_regions)
+        && let Some((_kind, span)) = refs.first()
+    {
+        let surface_handles = exposure.is_some_and(|policy| {
+            !matches!(
+                policy.plan(subject.fn_did),
+                exposure::ExposureSurfacePlan::NotApplicable
+            )
+        });
+        let blocks = match gate {
+            RefGate::LiftAdaptable => {
+                !emitability::RefKind::is_adaptable(refs)
+                    && !surface_handles
+                    && !pinned_local::exempt(subject)
+            }
+        };
+        if blocks {
+            return degrade(
+                subject,
+                EmitabilityFacts::site(tcx, *span),
+                DegradeReason::CallSiteNotAdapted,
+            );
+        }
+    }
+
+    // LAST — see `DegradeReason::FreedSlot`. A veto on emission, not a
+    // reordering: every subject that reaches here passed every other test, so
+    // this arm can only ever convert a `Ref` into a `freed-slot` degradation and
+    // can never displace another reason. That is what makes it measurable as
+    // zero decision movement rather than merely asserted to be.
+    if let Some(span) = subject.freed_at {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, span),
+            DegradeReason::FreedSlot,
+        );
+    }
+
+    // PAIR selects a raw callee endpoint before the form-specific renderers.
+    // A late A5 obligation can concern a borrowed slice or Option as well as
+    // a thin reference; all still pass the model and ordinary gates above.
+    if coconv.is_some_and(|cc| cc.is_pair_raw_view((subject.fn_did, subject.hir_id))) {
+        return degrade(subject, decl_site, DegradeReason::PairRawView);
+    }
+
+    // **S3.2′-3 — the null-init gate.** Positive evidence of nullness, so no
+    // PLAIN form may emit.
+    //
+    // Placed after every degrade arm, including the freed veto, so it can only
+    // ever convert a subject that would otherwise emit. That is what bounds its
+    // transitions to the emitting population and makes the pre-registered count
+    // a count rather than an estimate — the same construction that made the
+    // freed gate's zero movement structural.
+    if matches!(form, Form::Plain) {
+        // R819-1 (§29): a subject with nullability evidence, its own or carried,
+        // is never a non-optional reference. With its Option stage withdrawn it
+        // falls back to raw, not to the plain form.
+        if (subject.null_init
+            || (option_stage_withdrawn(family_policy, subject) && nullable_evidence))
+            && depth2_npo.is_none()
+        {
+            return degrade(subject, decl_site, DegradeReason::NullInit);
+        }
+        // **LAST, on the freed-slot placement rule.** Every subject reaching
+        // here passed every other test, so this arm can only convert a would-be
+        // emission and can never displace another reason.
+        //
+        // Only the subject's OWN blocking fact gates. Class collateral is not
+        // consulted: while the referenced gate still blocks, a blocked
+        // classmate is not converting either, so nothing is jointly decided
+        // yet. Collateral becomes load-bearing at the lift, not before.
+        // **THE RESIDUE, and it must precede the class gate.**
+        //
+        // Not a preference — an attribution requirement. The co-conversion node
+        // set is built from the HYPOTHETICAL decision, in which a subject with
+        // no splice target still degrades, so an unannotated local is **never a
+        // node**: 0 of 1,196, against 2,609 of the annotated 4,819 (measured
+        // 2026-08-12). `admits` therefore returns false for every one of them
+        // and the gate below falls into its not-a-node arm, which reports
+        // `call-site-not-adapted`.
+        //
+        // That arm's own comment predicts this case — *"an unreachable arm that
+        // falls through is how a subject escapes its own gate once the premise
+        // stops holding"* — and the dissolution is where the premise stops
+        // holding. Without this placement 158 subjects would be attributed to a
+        // gate that is not blocking them, 121 of them in functions that are not
+        // even pinned.
+        // R410-9 (b): a string-literal construction types its own local
+        // (`append_literal_local_declaration_plans`), so it is a splice target.
+        let literal_construction = matches!(
+            constructions
+                .by_binding
+                .get(&(subject.fn_did, subject.hir_id)),
+            Some(construction::Construction::StringLiteral { .. })
+        );
+        if subject.ty_span.is_none()
+            && !construction_values::permits(ctx, subject)
+            && !source_typed_local::permits(ctx, subject)
+            && !slice_construction_values::permits(ctx, subject)
+            && !raw_place_values::permits(ctx, subject, subject.mutable)
+            // W6L-A8-1: a null-tested call result types itself through `as_mut()`.
+            && !call_result_option::permits(ctx, subject)
+            && !literal_construction
+            && !(family_policy
+                .enabled_for((subject.fn_did, subject.hir_id), FamilyStage::Declaration)
+                && declaration_patterns.contains_key(&(subject.fn_did, subject.hir_id)))
+            && !lifetime_eligibility.is_some_and(|eligibility| {
+                eligibility
+                    .inferred_permit((subject.fn_did, subject.hir_id))
+                    .is_some()
+            })
+            // wave-6f: a local loaded from a converting field takes its type
+            // from the field, exactly as an inferred local takes it from a
+            // callee's return.
+            && field_reference
+                .and_then(|fields| fields.load_permit((subject.fn_did, subject.hir_id)))
+                .is_none()
+            // W6F-5: a local that decays an INLINE ARRAY FIELD to a pointer
+            // takes its type from that field — element type and length both.
+            && !field_reference.is_some_and(|fields| {
+                fields.decayed_array_view((subject.fn_did, subject.hir_id), subject.mutable)
+            })
+        {
+            return degrade(subject, decl_site, residual_reason(subject.ctor.as_ref()));
+        }
+        // **R272-1 / R280-1, route (A).** A thin reference is a one-element
+        // claim, and this subject is handed to a foreign position whose
+        // contract consumes more than one element — to the NUL, to a stated
+        // count, or to whatever the source turns out to be. Miri confirms the
+        // `strlen` shape is UB under Stacked Borrows.
+        //
+        // **Placed before the class gate, and that placement is measured.**
+        // At the thin-`Ref` return it reached the right subjects — the corpus
+        // witness removed exactly the census's 11 buffer and 2 rgba thin
+        // references — but every one of them reported `call-site-not-adapted`
+        // instead, and `held:thin-extent` never appeared in a receipt. The
+        // hold changes the HYPOTHETICAL, so co-conversion drops the subject
+        // from its node set, and the class gate's not-a-node arm below fires
+        // first. A typed refusal must not be reported as an untyped one.
+        //
+        // It is still inside the `Form::Plain` arm and guarded on
+        // `depth2_npo.is_none()`, so it can only ever convert a would-be thin
+        // `Decision::Ref`: slices, Options of slices, depth-2 NPO Options and
+        // `Box` all keep their own extent and are untouched. That preserves
+        // the property the freed-slot and null-init gates were placed for —
+        // a gate that only converts a would-be emission is what makes a
+        // pre-registered count a count.
+        if depth2_npo.is_none() && thin_extent.contains(&(subject.fn_did, subject.hir_id)) {
+            return degrade(subject, decl_site, DegradeReason::ThinExtent);
+        }
+        // **R364-2 / R365-1 — the same rule at a LOCAL callee.** The sibling
+        // above reads a pinned FOREIGN contract; this one reads the callee's
+        // own body, because a local callee has no contract row and its
+        // parameter's access is visible instead.
+        //
+        // **Placed beside its sibling, and the alternative was measured.** A
+        // hold that only ever converts a would-be emission is the better shape
+        // in general, so this one was first written at the last point before
+        // `Decision::Ref`. That is WRONG here, for the reason the note above
+        // records: the hold changes the HYPOTHETICAL, so co-conversion drops
+        // the subject from its node set either way, and placed last the refusal
+        // arrives as the UNTYPED `call-site-not-adapted` instead. Measured on
+        // the suite — the same expectations move under both placements, and
+        // only this one reports them typed.
+        if depth2_npo.is_none()
+            && let Some(access) = local_callee_extent.get(&(subject.fn_did, subject.hir_id))
+        {
+            return degrade(
+                subject,
+                decl_site,
+                DegradeReason::LocalCalleeAccessExtent {
+                    access: Box::new(access.clone()),
+                    count: thin_counted::missing_evidence(
+                        tcx,
+                        subject,
+                        facts,
+                        family_policy,
+                        exposure,
+                    ),
+                },
+            );
+        }
+        // **S3.6-1 step 3 — THE CLASS GATE, and it consults `admits`.**
+        //
+        // That is what UNIFORM means: the class verdict governs every node, not
+        // only those the `referenced` gate would have blocked. A subject whose
+        // function nothing calls is decided by its class exactly like one whose
+        // function is called — no vintage exemption.
+        if let Some(cc) = coconv {
+            let key = (subject.fn_did, subject.hir_id);
+            if !cc.admits(key) {
+                let reason = match cc.node_block(key) {
+                    Some(via) => DegradeReason::SilentCoercion { via },
+                    None => match cc.class_block(key) {
+                        Some(via) => DegradeReason::ClassBlocked { via },
+                        // Not a node. Unreachable through the pipeline —
+                        // production and the hypothetical differ ONLY by
+                        // `coconv` — and attributed rather than silently
+                        // emitted, because an unreachable arm that falls
+                        // through is how a subject escapes its own gate once
+                        // the premise stops holding.
+                        None => {
+                            // Relay main/371 step 5 (A4): say why it is reached.
+                            if cfg!(test)
+                                && std::env::var("CRAT_BO_CSNA_DEBUG").as_deref() == Ok("on")
+                            {
+                                eprintln!(
+                                    "[call-site-not-adapted] {}: not a co-conversion node (no class, no node block); the hypothetical decided {}",
+                                    subject.label,
+                                    cc.hypothetical_form(key)
+                                );
+                            }
+                            DegradeReason::CallSiteNotAdapted
+                        }
+                    },
+                };
+                return degrade(subject, decl_site, reason);
+            }
+        }
+        if depth2_npo.is_some() {
+            let uses = opt_uses
+                .get(&(subject.fn_did, subject.hir_id))
+                .cloned()
+                .unwrap_or_default();
+            if let Some(span) = uses.unsupported {
+                return degrade(
+                    subject,
+                    EmitabilityFacts::site(tcx, span),
+                    DegradeReason::OptUseUnsupported,
+                );
+            }
+            if !option_enabled && subject.mutable && uses.non_test_uses > 1 && !subject.mut_binding
+            {
+                return degrade(subject, decl_site, DegradeReason::OptNeedsMutBinding);
+            }
+            return Decision::Opt {
+                mutable: subject.mutable,
+                slice: false,
+                uses: uses.rewrites,
+            };
+        }
+        return Decision::Ref {
+            mutable: subject.mutable,
+        };
+    }
+
+    if let Form::Opt { slice } = form {
+        // The Option value planner needs a real initializer identity. Existing
+        // depth-2 layout carriers retain their separate ownership.
+        if matches!(subject.kind, SubjectKind::Local)
+            && depth2_npo.is_none()
+            && (!option_enabled
+                || (slice
+                    && !family_policy.enabled_for(
+                        (subject.fn_did, subject.hir_id),
+                        FamilyStage::SliceConstruction,
+                    ))
+                || !construction::slice_constructor_available(
+                    constructions,
+                    (subject.fn_did, subject.hir_id),
+                ))
+        {
+            return degrade(subject, decl_site, DegradeReason::OptLocalConstruction);
+        }
+        let uses = opt_uses
+            .get(&(subject.fn_did, subject.hir_id))
+            .cloned()
+            .unwrap_or_default();
+        if let Some(span) = uses.unsupported {
+            return degrade(
+                subject,
+                EmitabilityFacts::site(tcx, span),
+                DegradeReason::OptUseUnsupported,
+            );
+        }
+        // The idiom rule, from the corpus (micro-plan §9c): multiplicity ×
+        // mutability. One use of a mutable optional takes `unwrap()` — g02's
+        // ratified text, and the move is fine exactly once. More than one needs
+        // `as_mut()`. G15 schedules its required mutable binding atomically
+        // with the Option declaration and use edits.
+        if !option_enabled && subject.mutable && uses.non_test_uses > 1 && !subject.mut_binding {
+            return degrade(subject, decl_site, DegradeReason::OptNeedsMutBinding);
+        }
+        // **S3.2′-5 hardening — LAST in this arm**, the same placement rule the
+        // plain-slice twin uses, so it can only ever convert a would-be `Opt`
+        // emission and never displace `OptUseUnsupported`.
+        //
+        // **Gated on `slice`** — the narrowest arm that owns the hazard. The
+        // index is what can wrap, and only the FAT twin forms one: form
+        // selection admits `Opt { slice: false }` only under
+        // `!has_arithmetic || is_array` with `slice = has_arithmetic &&
+        // is_array`, so a thin optional has no arithmetic at all. Gating the
+        // whole arm would additionally degrade any thin optional whose sign
+        // lookup MISSES, because `may_be_negative` folds `None` conservatively
+        // — the 61-thin-`Ref` mistake in a second place.
+        //
+        // Reason key **shared** with the plain arm by ruling: the hazard and
+        // the owed capability are the same, and the subject's own outcome keeps
+        // the two arms attributable in the facts join.
+        // **R464-3 — the compare-only admission.** The export is two-valued
+        // (`Neg` and `Top` share one bit), so a forward-only walk whose limit
+        // is computed by a non-literal offset is refused for a sign nothing
+        // reads through. Admitted where the owner's MIR says every offset that
+        // moves the read window takes a non-negative literal, and every
+        // non-literal one produces a value that is only compared or
+        // null-tested. A variable ADVANCING offset keeps the refusal.
+        if slice
+            && sign.may_be_negative(subject.fn_did, subject.local)
+            && compare_only_offset::every_advancing_offset_is_a_non_negative_literal(
+                tcx,
+                subject.fn_did,
+                subject.local,
+            )
+            .is_err()
+        {
+            return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
+        }
+        if let Some(site) = uses.return_handoffs.first()
+            && lifetime_eligibility.is_some_and(|eligibility| {
+                eligibility
+                    .return_permit((subject.fn_did, subject.hir_id))
+                    .is_none()
+            })
+        {
+            return degrade(
+                subject,
+                EmitabilityFacts::site(tcx, site.span),
+                DegradeReason::OptUseUnsupported,
+            );
+        }
+        // Wave-6o (R402-8): the thin-extent holds, LAST in this arm on the
+        // same placement rule — only a would-be thin `Opt` emission converts.
+        if !slice
+            && depth2_npo.is_none()
+            && let Some(reason) =
+                option_thin_extent::hold(subject, thin_extent, local_callee_extent, || {
+                    thin_counted::missing_evidence(tcx, subject, facts, family_policy, exposure)
+                })
+        {
+            return degrade(subject, decl_site, reason);
+        }
+        return Decision::Opt {
+            mutable: subject.mutable && !contract_alone,
+            slice,
+            uses: wave5r::optional_uses(tcx, subject, slice, uses.rewrites),
+        };
+    }
+
+    // Item 2 owns the local slice VALUE at its initializer. Absence of a typed
+    // initializer identity still fails closed under the historical reason;
+    // otherwise the sealed construction plan carries evidence or §77 fallback.
+    if matches!(subject.kind, SubjectKind::Local)
+        && (!family_policy.enabled_for(
+            (subject.fn_did, subject.hir_id),
+            FamilyStage::SliceConstruction,
+        ) || !construction::slice_constructor_available(
+            constructions,
+            (subject.fn_did, subject.hir_id),
+        ))
+    {
+        return degrade(subject, decl_site, DegradeReason::SliceLocalConstruction);
+    }
+    let uses = slice_uses
+        .get(&(subject.fn_did, subject.hir_id))
+        .cloned()
+        .unwrap_or_default();
+    let uses = thin_counted::slice_uses(counted.as_ref(), uses);
+    if let Some(span) = uses.unsupported {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, span),
+            if family_policy.enabled_for((subject.fn_did, subject.hir_id), FamilyStage::SliceUse)
+                && uses.unsupported_is_cursor
+            {
+                DegradeReason::SliceCursorUse
+            } else {
+                DegradeReason::SliceUseUnsupported
+            },
+        );
+    }
+    // The same gate as the plain arm: a slice form is still not an optional one,
+    // so positive evidence of nullness blocks it too. Unreachable on the current
+    // corpus — every null-initialized slice candidate is a local and degrades
+    // above — and kept as the backstop that keeps the rule "no plain form on
+    // positive null evidence" true of every form rather than of one.
+    if subject.null_init {
+        return degrade(subject, decl_site, DegradeReason::NullInit);
+    }
+    // **S3.2′-5 — LAST in this arm**, on the freed-slot placement rule: every
+    // subject reaching here has passed every other test, so this can only ever
+    // convert a would-be `Slice` emission and can never displace another
+    // reason. That is what makes its movement measurable as a pre-registered
+    // count rather than merely asserted to be bounded.
+    //
+    // The same verdict the self-advance gate reads at `mod.rs:1799` — one sign
+    // authority, no parallel notion. `may_be_negative` folds a lookup miss to
+    // the conservative side, so an unanalyzed local is refused rather than
+    // emitted on absent evidence.
+    // Composition (wave-6v2): a lane hook may rebind `counted` above; the void
+    // contract is read again here so a counted byte view without arithmetic
+    // (no sign fact) is not refused on a lookup miss.
+    // **R471-4 — the plain twin takes the compare-only fact too.** It was
+    // withheld at R465-4 because admitting here takes `fragment::input`
+    // (brotli's compress-fragment core loop) out of the refusal that
+    // `slicecursor_fragment_fast_core_loop` pins as the CURSOR family's
+    // hand-off point. Report 031 measured the trade before deciding it: 14
+    // brotli rows plus binn's `IsValidBinnHeader::pbuf` are refused ONLY
+    // here; all 18 rows of that shape read `emission=unchanged` in the cursor
+    // family's own records, so the hand-off is to nobody; and of the 81 rows
+    // the cursor family DOES deliver, this fact admits exactly one, whose
+    // sign is `nonneg` — so this gate never reads it and the cursor family
+    // loses nothing. The one red is that pinned witness, restated as a
+    // dichotomy by slicecursor (relay 044 §2).
+    if counted.is_none()
+        && counted_void::active(ctx, subject).is_none()
+        && region.is_none()
+        && sign.may_be_negative(subject.fn_did, subject.local)
+        && compare_only_offset::every_advancing_offset_is_a_non_negative_literal(
+            tcx,
+            subject.fn_did,
+            subject.local,
+        )
+        .is_err()
+    {
+        return degrade(subject, decl_site, DegradeReason::SliceNegOrUnknownOffset);
+    }
+    if let Some(site) = uses.return_handoffs.first()
+        && lifetime_eligibility.is_some_and(|eligibility| {
+            eligibility
+                .return_permit((subject.fn_did, subject.hir_id))
+                .is_none()
+        })
+    {
+        return degrade(
+            subject,
+            EmitabilityFacts::site(tcx, site.span),
+            DegradeReason::SliceUseUnsupported,
+        );
+    }
+    Decision::Slice {
+        // Composition arm (wave-4 R407-14 x wave-6b): a delivered region carries
+        // its own mutability; otherwise wave-4's NUL-contract-alone narrowing.
+        // **W6S-12 (R490-4).** A subject whose only rewritten uses are W6S-8
+        // bridges at foreign `*const T` formals is READ through every one of
+        // them; the `*mut` in the C signature is the input's artifact, not a
+        // permission this program needs. Taking the shared form is what lets
+        // a caller with a literal origin supply the view at all — libtree's
+        // `print_line::color_bold`, whose seam was refused `shared-to-mut`.
+        // Narrowing only: `&mut` -> `&` never widens a permission, and the
+        // conjunct is exact (at least one such bridge, and no other rewrite).
+        mutable: region.map_or(
+            subject.mutable
+                && !contract_alone
+                && !(uses.foreign_const_bridges > 0 && uses.other_rewrites == 0),
+            |region| region.mutable,
+        ),
+        uses: uses.rewrites,
+    }
+}
+
+#[cfg(test)]
+mod residual_tests {
+    use super::{construction::Construction as C, *};
+
+    /// **The residual fold table, exhaustively.** Every `Construction` variant
+    /// plus the no-recognized-initializer case names an owed capability.
+    ///
+    /// A pure function tested as one. The end-to-end witness in `emit_tests`
+    /// covers only the four classes that can actually REACH the residue in a
+    /// small fixture — `Alloc` cannot, because BO settles a `malloc` local
+    /// `Owning` or `Raw` and `kind-*` fires first — so a fold witnessed only
+    /// there would be a fold no mutation can break for the other five.
+    ///
+    /// The list is written out rather than iterated over a variant list,
+    /// because there is no such list: the *compiler* enforces exhaustiveness
+    /// inside `residual_reason`, and this enforces that each arm sends its
+    /// class where the measured witness says it goes (micro-plan §1).
+    ///
+    /// *Mutation-tested:* collapsing any two arms of `residual_reason` fails
+    /// the class whose key was swallowed; making the `None` arm return
+    /// `ReturnNotAdapted` fails the last row.
+    #[test]
+    fn every_construction_class_names_an_owed_capability() {
+        let alloc = C::Alloc {
+            callee: "malloc".to_owned(),
+            size: "4".to_owned(),
+            count: None,
+        };
+        for (ctor, want) in [
+            (Some(&C::CallResult), "return-not-adapted"),
+            (Some(&alloc), "return-not-adapted"),
+            (Some(&C::PlaceRead), "place-read-pointee"),
+            (Some(&C::ArrayDecay), "place-read-pointee"),
+            (Some(&C::IndexAddr), "place-read-pointee"),
+            (Some(&C::AddrOf), "place-read-pointee"),
+            (Some(&C::CopyOf), "copy-source-coupled"),
+            (Some(&C::Other), "copy-source-coupled"),
+            (Some(&C::NullLit), "null-init"),
+            // No recognized initializer: the type would come from a later
+            // assignment, which IS the source-coupled claim. Corpus-empty
+            // (0 of 1,196) and pinned as empty rather than asserted away.
+            (None, "copy-source-coupled"),
+        ] {
+            assert_eq!(
+                residual_reason(ctor).key(),
+                want,
+                "{ctor:?} must name the capability that would unblock it — a \
+                 residual key routes an owed item to a slice, and two owed \
+                 items must not read as one"
+            );
+        }
+    }
+}
+
+/// Which form `decide_one` selected, before the gates that can still refuse it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Form {
+    /// `&T` / `&mut T`.
+    Plain,
+    /// `&[T]` / `&mut [T]`.
+    Slice,
+    /// `Option<…>`; `slice` picks the fat twin.
+    Opt { slice: bool },
+}
+
+#[cfg(test)]
+mod self_consistency_tests {
+    //! Witnesses for [`DecisionTable::is_self_consistent_over`] — and for what
+    //! it deliberately does **not** do.
+    //!
+    //! The dropped-subject arm that used to live here has moved to
+    //! [`super::coverage`], where it belongs: detecting a subject the collector
+    //! never produced needs an instrument with a different derivation, and this
+    //! check has none — every comparison in it is against the collector's own
+    //! output. Keeping a "coverage" test next to a self-comparison is how three
+    //! rounds of unfailable gates read as covered.
+
+    use super::*;
+
+    fn subject(local: u32, label: &str) -> Subject {
+        Subject {
+            fn_did: rustc_hir::def_id::CRATE_DEF_ID,
+            local: Local::from_u32(local),
+            hir_id: rustc_hir::CRATE_HIR_ID,
+            param_name: Some(label.rsplit("::").next().unwrap_or(label).to_owned()),
+            kind: SubjectKind::Param {
+                hir_index: local as usize - 1,
+            },
+            ptr_depth: 1,
+            label: label.to_owned(),
+            ty_span: Some(rustc_span::DUMMY_SP),
+            binding_span: rustc_span::DUMMY_SP,
+            pointee_span: Some(rustc_span::DUMMY_SP),
+            decl_shape: DeclShape::RawPtr,
+            mutable: true,
+            freed_at: None,
+            len_recovered: false,
+            null_init: false,
+            mut_binding: false,
+            ctor: None,
+        }
+    }
+
+    fn table(entries: Vec<Subject>) -> DecisionTable {
+        DecisionTable {
+            settled_hold_receipts: Vec::new(),
+            counted_void: Default::default(),
+            flexible_tails: Default::default(),
+            box_params: Default::default(),
+            return_certificates: Default::default(),
+            allocator_contracts: Default::default(),
+            void_region: Default::default(),
+            void_region_receivers: Default::default(),
+            forward_slice_parameters: Vec::new(),
+            nested_receipts: Vec::new(),
+            cursor_receipts: Vec::new(),
+            sibling_overlap_inventory: Default::default(),
+            declaration_pointees: Default::default(),
+            declaration_patterns: Default::default(),
+            input_interfaces: Default::default(),
+            predecessor_held_classes: Default::default(),
+            arg_order_hoists: Default::default(),
+            exposure: None,
+            arm_requirements: FxHashMap::default(),
+            seams: Default::default(),
+            c9_marks: Vec::new(),
+            lifetime_plan: Default::default(),
+            return_interfaces: Default::default(),
+            return_receivers: Default::default(),
+            depth2_npo_storages: Vec::new(),
+            slice_constructions: Vec::new(),
+            retired_slice_constructions: Vec::new(),
+            slice_use_receipts: Vec::new(),
+            option_receipts: Vec::new(),
+            option_value_initializers: Vec::new(),
+            option_mut_bindings: rustc_hash::FxHashSet::default(),
+            option_composed_uses: Vec::new(),
+            composed_use_edits: Vec::new(),
+            contract_extent_promotions: Default::default(),
+            licensed_lifts: Vec::new(),
+            root_extents: Vec::new(),
+            sized_assignments: Vec::new(),
+            field_transactions: Default::default(),
+            slice_input_companions: Default::default(),
+            slice_input_mask_companions: Default::default(),
+            extent_proof_companions: Default::default(),
+            field_alloc_lengths: Default::default(),
+            nul_walk_sites: Default::default(),
+            nul_exact_parameters: Default::default(),
+            wide_access_parameters: Default::default(),
+            nul_exact_callers: Default::default(),
+            entries: entries
+                .into_iter()
+                .map(|s| (s, Decision::Ref { mutable: true }))
+                .collect(),
+        }
+    }
+
+    /// A table that covers its subjects, once each, is self-consistent.
+    ///
+    /// **Positive control, and no deletion mutation fails it** — recorded
+    /// rather than dressed up. A test asserting that a checker *accepts* valid
+    /// input cannot be broken by deleting one of that checker's rejection arms;
+    /// only making the function unconditionally reject would fail it. Its job is
+    /// to prove the three negatives below are not passing because
+    /// `is_self_consistent_over` errors on everything.
+    #[test]
+    fn matching_entries_are_self_consistent() {
+        let subjects = vec![subject(1, "f::a"), subject(2, "f::b")];
+        assert!(
+            table(subjects.clone())
+                .is_self_consistent_over(&subjects)
+                .is_ok()
+        );
+    }
+
+    /// A duplicate subject is caught before it can plan two edits for one span
+    /// — which `apply` would otherwise surface only as an overlap rollback.
+    ///
+    /// *Mutation-tested (Rider 0, deletion first):* deleting the `seen.insert`
+    /// arm makes this pass.
+    #[test]
+    fn a_duplicate_subject_is_rejected() {
+        let subjects = vec![subject(1, "f::a")];
+        let dup = table(vec![subject(1, "f::a"), subject(1, "f::a")]);
+        let err = dup
+            .is_self_consistent_over(&subjects)
+            .expect_err("a duplicate decision must be rejected");
+        assert!(err.contains("duplicate"), "wrong failure arm: {err}");
+    }
+
+    /// A subject with no decision is caught.
+    ///
+    /// *Mutation-tested (Rider 0, deletion first):* deleting the
+    /// `for subject in subjects` arm makes this pass — the length check alone
+    /// does not catch it, because the perturbation changes membership without
+    /// changing the count.
+    #[test]
+    fn a_subject_with_no_decision_is_rejected() {
+        let subjects = vec![subject(1, "f::a"), subject(2, "f::b")];
+        // Same cardinality, different membership: `f::b` has no decision and
+        // `f::c` has one for a subject that was never handed in.
+        let skewed = table(vec![subject(1, "f::a"), subject(3, "f::c")]);
+        let err = skewed
+            .is_self_consistent_over(&subjects)
+            .expect_err("a subject with no decision must be rejected");
+        assert!(err.contains("no decision for"), "wrong failure arm: {err}");
+    }
+}

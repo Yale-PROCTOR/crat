@@ -1,0 +1,3895 @@
+//! **A1 emitability facts.** Static preconditions for emitting a reference,
+//! gathered from HIR before any decision is made.
+//!
+//! # Why this exists
+//!
+//! S1 decided `Ref` on the BO slot kind alone and let the emitted crate fail
+//! the type-check gate. That produced one anonymous whole-crate string with no
+//! site and no subject, which is useless as attribution and — worse — made the
+//! envelope-demotion counters wrong by construction: a parameter that was
+//! decided `Ref` and then killed at the gate is recorded as a *success* by the
+//! decision phase.
+//!
+//! A1 moves those preconditions to where the decision is made, so a subject
+//! that cannot be emitted is degraded **with its own site and reason**.
+//!
+//! # What is modelled at S2a
+//!
+//! 1. **Raw-pointer-only operations on the parameter** (`p.is_null()`,
+//!    `p.offset(..)`, and friends). A `&T` has no such method, so emitting a
+//!    reference makes the body ill-typed. This is the g02 class.
+//! 2. **In-crate callers.** `plan` rewrites a signature but not its call sites,
+//!    so any direct in-crate call makes the crate ill-typed. This is the g06
+//!    class, and it is a *temporary* precondition: S3 adds call-site
+//!    adaptation, at which point this fact stops forcing a degradation.
+
+use rustc_hash::FxHashMap;
+use rustc_hir::{
+    Expr, ExprKind, HirId, Mutability, QPath,
+    def::Res,
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
+use rustc_middle::ty::TyCtxt;
+use rustc_span::Span;
+
+use super::raw_boundary::{
+    ForeignCallArgFact, RawMutability, RawTargetType, raw_target_type, symbol_key,
+};
+
+/// Methods that exist on raw pointers and not on references.
+///
+/// Deliberately a small, exact list rather than a heuristic: a false positive
+/// here degrades a parameter that could have been emitted (a lost rewrite), and
+/// a false negative lets the old anonymous gate failure back in. Both are
+/// visible, which is why the list is allowed to grow from evidence rather than
+/// from guessing.
+const RAW_ONLY_METHODS: &[&str] = &[
+    "is_null",
+    "offset",
+    "wrapping_offset",
+    "add",
+    "sub",
+    "wrapping_add",
+    "wrapping_sub",
+    "offset_from",
+    "read",
+    "write",
+    "read_volatile",
+    "write_volatile",
+    "copy_to",
+    "copy_from",
+    "as_ref",
+    "as_mut",
+];
+/// **How a local `fn` is referred to — S3.6-0.**
+///
+/// The single `referenced` boolean this replaces was widened deliberately (F1:
+/// matching only `Call` missed the callback-table shape), and that widening is
+/// exactly what made the adaptable/pinned split unmeasurable: the map kept
+/// spans, not kinds, so three populations with three different adaptation
+/// stories were indistinguishable.
+///
+/// **The decision layer still treats all three identically** — any reference
+/// degrades `call-site-not-adapted`, unchanged. This records *which*, so the
+/// split can be measured before any capability is scoped against it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RefKind {
+    /// The path is the callee of a direct call — **adaptable**: every site is
+    /// visible and rewritable.
+    Call,
+    /// The operand of a cast to a fn pointer — **pins** the signature to the
+    /// cast's target type.
+    FnPtrCast,
+    /// Any other path reference: stored in a table, passed as an argument,
+    /// returned. **Pins** the signature to whatever consumes it.
+    AddrTaken,
+}
+
+impl RefKind {
+    #[cfg(test)]
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            RefKind::Call => "call",
+            RefKind::FnPtrCast => "fnptr-cast",
+            RefKind::AddrTaken => "addr-taken",
+        }
+    }
+
+    /// A function is adaptable only if EVERY reference to it is a direct call.
+    /// One pinning reference is enough to fix the signature.
+    pub(crate) fn is_adaptable(refs: &[(RefKind, Span)]) -> bool {
+        !refs.is_empty() && refs.iter().all(|(k, _)| *k == RefKind::Call)
+    }
+}
+
+/// **What a call site actually supplies at one argument position — S3.6-1.**
+///
+/// The gate that blocks the adaptable population is a *signature* fact
+/// (`referenced`), but adapting a call site is an *argument* question, and no
+/// argument fact existed: the `Call` arm bound its arguments to `_`, so the
+/// index, the span, the shape and the caller were all discarded at the exact
+/// site that could have recorded them.
+///
+/// **The classification is by outermost operator**, which is what decides the
+/// edit. `&mut *p.offset(1)` is an address-of, not arithmetic — the arithmetic
+/// is inside the place being borrowed and does not reach the argument's own
+/// form.
+///
+/// # The checked/unchecked distinction this domain has to carry
+///
+/// Banked rule (2026-08-09): the compiler sees aliasing through **real places**
+/// and is **blind through a raw-pointer deref**. [`Self::BareLocal`] and
+/// [`Self::AddrOf`] land in the CHECKED region — a mistake there is an
+/// `E0499`/`E0502`, i.e. a revert. A bridge that borrows through a raw base
+/// lands in the UNCHECKED region, where the same mistake compiles. That is why
+/// no shape here constructs such a bridge: the reborrow arm is **parked**.
+// No `Ord`: `HirId` has none, and nothing needs it — the census sorts the
+// rendered `key()` strings, not the shapes themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArgShape {
+    /// A bare path resolving to a local binding. **The dominant shape**, and the
+    /// propagation edge: whether it needs an edit depends entirely on whether
+    /// that binding converts too, which is what makes conversion joint.
+    BareLocal(HirId),
+    /// `&mut e` / `&e`, already written. Needs no edit either way — `&mut T`
+    /// coerces to `*mut T` today and satisfies `&mut T`/`&T` after.
+    ///
+    /// **`base` is the borrowed place's ROOT binding, and it is what makes the
+    /// within-site overlap gate possible at all.** Overlap is not textual
+    /// identity: brotli's
+    /// `BrotliDecoderHuffmanTreeGroupInit(s, &mut (*s).literal_hgroup, …)`
+    /// passes `s` at one `*mut` position and a place *inside* `*s` at another.
+    /// Without the root this arm carries nothing to see that with, and the gate
+    /// would let a certain-overlap class through.
+    ///
+    /// `None` when the operand is not rooted at a local binding (a static, a
+    /// temporary). `None` is **not** "no overlap" — the gate must treat an
+    /// unknown root conservatively.
+    AddrOf {
+        mutable: bool,
+        base: Option<HirId>,
+        /// Did the walk to `base` traverse a **deref**?
+        ///
+        /// **P2's visibility split turns on this.** `&mut x` on a local is a
+        /// real place whatever happens. `&mut (*s).g` is a place *through* `s`
+        /// — and §5a measured that the compiler CATCHES overlap when that base
+        /// is a reference and is BLIND when it is a raw pointer. So the same
+        /// expression is checked or unchecked depending on whether `s` itself
+        /// converts, which cannot be asked without knowing a deref happened.
+        through_deref: bool,
+    },
+    /// `&mut e as *mut T` — the cast is the only thing to remove.
+    AddrOfCast { mutable: bool, inner: Span },
+    /// `q as *mut T` where `q` is a local binding.
+    CastOfLocal { binding: HirId, inner: Span },
+    /// A nameable expression whose resolved type is a raw pointer: an offset,
+    /// field read, call result, array `.as_ptr()`/`.as_mut_ptr()`, or a cast not
+    /// covered by the two peel-only arms above.
+    ///
+    /// The whole argument remains the adapter's subtree. `root` is best-effort
+    /// overlap evidence; `None` stays conservative wherever a mutable borrow is
+    /// involved.
+    RawExpr { root: Option<HirId> },
+    /// A null pointer literal. **Blocks**: `&mut T` cannot represent null.
+    NullLit,
+    /// Any other cast.
+    Cast { inner: Span },
+    /// Anything else — a call result, an index, a field, arithmetic.
+    Other,
+}
+
+impl ArgShape {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            ArgShape::BareLocal(_) => "bare-local",
+            ArgShape::AddrOf { mutable: true, .. } => "addr-of-mut",
+            ArgShape::AddrOf { mutable: false, .. } => "addr-of",
+            ArgShape::AddrOfCast { mutable: true, .. } => "addr-of-mut-cast",
+            ArgShape::AddrOfCast { mutable: false, .. } => "addr-of-cast",
+            ArgShape::CastOfLocal { .. } => "cast-of-local",
+            ArgShape::RawExpr { .. } => "raw-expr",
+            ArgShape::NullLit => "null-lit",
+            ArgShape::Cast { .. } => "cast",
+            ArgShape::Other => "other",
+        }
+    }
+
+    /// The **place root** this argument reads or borrows, when it is a local
+    /// binding.
+    ///
+    /// This is the key the within-site overlap gate compares. Two argument
+    /// positions at one call site sharing a root **may alias**, and after
+    /// conversion that is `E0499` (or `E0502` — demoting one side to shared
+    /// does *not* rescue it, measured). A shared root is a MAY-overlap, so
+    /// blocking on it costs yield and never soundness.
+    ///
+    /// Shapes that cannot convert at all return `None` and are irrelevant here:
+    /// they block on their own account before overlap is asked about.
+    pub(crate) fn place_root(self) -> Option<HirId> {
+        match self {
+            ArgShape::BareLocal(id) | ArgShape::CastOfLocal { binding: id, .. } => Some(id),
+            ArgShape::AddrOf { base, .. } => base,
+            ArgShape::RawExpr { root } => root,
+            _ => None,
+        }
+    }
+}
+
+/// Walk a place expression down to the local binding it is rooted at.
+///
+/// `(*s).literal_hgroup` roots at `s`; `v[i].f` roots at `v`; a static or a
+/// temporary roots at nothing. Deref is included deliberately — that is the
+/// C2Rust shape, and stopping at it would make every `(*p).field` argument look
+/// unrelated to `p`.
+pub(crate) fn place_root(expr: &Expr<'_>) -> (Option<HirId>, bool) {
+    let mut cur = expr;
+    let mut through_deref = false;
+    loop {
+        match &cur.kind {
+            ExprKind::Unary(rustc_hir::UnOp::Deref, base) => {
+                through_deref = true;
+                cur = base;
+            }
+            ExprKind::Field(base, _)
+            | ExprKind::Index(base, _, _)
+            | ExprKind::AddrOf(_, _, base)
+            | ExprKind::Cast(base, _)
+            | ExprKind::DropTemps(base) => cur = base,
+            ExprKind::MethodCall(_, receiver, _, _) => cur = receiver,
+            _ => return (BodyFacts::resolved_local(cur), through_deref),
+        }
+    }
+}
+
+/// One argument at one call site.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Arg {
+    /// The callee's **0-based parameter index**, which is `SubjectKind::Param`'s
+    /// `hir_index` — the same key, so the join needs no translation.
+    pub index: usize,
+    pub span: Span,
+    pub shape: ArgShape,
+    pub source_type: String,
+    pub target: Option<super::raw_boundary::RawTargetType>,
+    /// Exact variable-local storage under `&mut local` (optionally beneath raw
+    /// casts). Projections, dereferences, fields, and temporaries are absent.
+    pub direct_storage: Option<(HirId, Span)>,
+    pub adapter_operand_span: Span,
+    pub adapter_operand_mutability: Option<super::raw_boundary::RawMutability>,
+    /// Exact Rust array receiver of `.as_ptr()` / `.as_mut_ptr()`. Every
+    /// element of an array value is initialized before this expression exists.
+    pub initialized_array_elements: Option<u64>,
+    /// W-C6: `Some(blind)` when the argument is c2rust's `&a[0]` over a
+    /// declared array; the seam's overlap gate then reads the array place's
+    /// visibility instead of treating the raw spelling as blind.
+    pub array_start_blind: Option<bool>,
+    /// **R625** — the argument points at element 0 of a `[T; N]` whose `T` is
+    /// the argument's own pointee: `N` elements from the pointer are the
+    /// array. See [`array_extent`].
+    pub array_extent: Option<u64>,
+    /// Exact syntactic place identity after peeling address/cast wrappers.
+    /// Distinct field projections remain distinct even when `place_root` is
+    /// the same aggregate local.
+    pub place_identity: Option<String>,
+    /// R473-2: `&x` / `&mut x` over a LOCAL binding path. See
+    /// [`address_root_facts`].
+    pub address_root_local: bool,
+    /// R473-2: that local's own type is a raw pointer, so the root is a
+    /// pointer subject and keeps its decision path.
+    pub address_root_raw_pointer: bool,
+    /// R557-4: `&mut *X.offset(i)` / `&*X.offset(i)` over a local `X` — the
+    /// owner binding (`box_facts::box_element_address`). An element of `X`,
+    /// never `X` itself.
+    pub element_of: Option<HirId>,
+    /// **R641-2 (2)** — the argument borrows an ELEMENT of something larger:
+    /// see [`element_address`].
+    pub element_address: bool,
+    /// **R674-9** — the argument is `&*P` / `&mut *P` with `P` a raw pointer:
+    /// the span of `P`. See [`deref_pointer`].
+    pub deref_pointer: Option<Span>,
+    /// **R808-5 / R810-2 / R812** — the locals whose referents the argument
+    /// provably lies inside, nearest first: `&mut (*X).f…` (or `&mut *X`, or
+    /// the array decay `((*X).arr).as_mut_ptr()`), or a bare local whose one
+    /// definition is such an address (brotli's decoder, `br = &mut (*s).br`);
+    /// and, through a root local whose own one definition lies inside `Y`,
+    /// `Y` too (`h = &mut (*s).arena.header`). See [`inside_of`].
+    pub inside_of: Vec<HirId>,
+    /// **R838 (era-5c 148)** — the argument's pointer value is LOADED FROM
+    /// MEMORY: a static's contents, a dereference, a field or element read
+    /// through a pointer or of a static, pointer arithmetic on such a value, or
+    /// a local one of whose definitions is one. A5's origin evidence calls such
+    /// a value's origin complete and private, which stores in other bodies make
+    /// false. See [`loaded_from_memory`].
+    pub loaded_from_memory: bool,
+    /// Report 137 §5 (with the independent review's correction): the argument
+    /// is `&mut l` over a scalar local `l` whose address the body takes
+    /// nowhere else, at a call no loop repeats. See
+    /// [`super::loaded_operand::address_taken_once_here`].
+    pub address_once_here: bool,
+    /// R864-1 (b): the array this argument decays (`X.as_mut_ptr()` /
+    /// `X.as_ptr()`), and whether that is a local or a static by value. See
+    /// [`super::array_decay::decay_root`].
+    pub array_decay: Option<super::array_decay::DecayRoot>,
+    /// R866-1 (fan-out 083): the argument is a reborrow `&mut *x` / `&*x` of
+    /// the local `x` (under casts): the same pointer as `x` itself.
+    pub reborrow_of: Option<HirId>,
+    /// Relay 371 step 3: a `CastOfLocal` / `AddrOfCast` argument whose cast keeps
+    /// the pointee (`super::identity_cast`).
+    pub identity_cast: Option<super::identity_cast::IdentityCast>,
+}
+
+/// **R641-2 (2) — the address of an element, read from the HIR.** `&place` /
+/// `&mut place`, under any casts, whose place's OUTERMOST projection is an
+/// index (`buf[k]`, `(*s).buf[k]`) or a dereference (`*p`, `*p.offset(k)`):
+/// the borrow names one element of an allocation that may run on, so a
+/// one-element claim over it is narrower than its referent. A local or a field
+/// place is one whole object (golden g24): a UB-free input (§28) cannot index
+/// past it on that path.
+pub(crate) fn element_address(expr: &Expr<'_>) -> bool {
+    let ExprKind::AddrOf(_, _, mut place) = peel_casts(expr).kind else {
+        return false;
+    };
+    while let ExprKind::DropTemps(inner) = place.kind {
+        place = inner;
+    }
+    matches!(
+        place.kind,
+        ExprKind::Index(..) | ExprKind::Unary(rustc_hir::UnOp::Deref, _)
+    )
+}
+
+/// **R674-9 — the raw pointer under an element address.** C2Rust's `&a[k]` is
+/// `&*a.offset(k)`: the borrow is of one element, but the pointer it
+/// dereferences carries the whole allocation's provenance. No casts: a cast
+/// changes what the pointer counts.
+pub(crate) fn deref_pointer(
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    expr: &Expr<'_>,
+) -> Option<Span> {
+    let ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, _, place) = expr.kind else {
+        return None;
+    };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) = place.kind else {
+        return None;
+    };
+    typeck.expr_ty(pointer).is_raw_ptr().then_some(pointer.span)
+}
+
+/// **R808-5 / R810-2 / R812 — a place inside another's referent, proven by
+/// syntax.** The locals whose referents the argument lies inside, nearest
+/// first (empty when nothing is proven; nothing here says two pointers do NOT
+/// overlap):
+/// * an address of a place reached by dereferencing `X` — `&mut (*X).f`,
+///   `&mut *X`, or the array decay `((*X).arr).as_mut_ptr()`, through casts;
+/// * a bare local whose only definition is its `let` initializer, that
+///   initializer being such an address;
+/// * then, while the root `X` is itself such a local, the local its one
+///   definition lies inside (`h = &mut (*s).arena.header`), bounded.
+/// R838 (era-5c 148): is the argument's pointer value loaded from memory?
+pub(crate) fn loaded_from_memory(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> bool {
+    fn read_from_memory(tcx: TyCtxt<'_>, place: &Expr<'_>) -> bool {
+        // A place in memory others write: under a dereference, or a static.
+        let mut place = place;
+        loop {
+            place = match place.kind {
+                ExprKind::Unary(rustc_hir::UnOp::Deref, _) => return true,
+                ExprKind::Field(base, _)
+                | ExprKind::Index(base, _, _)
+                | ExprKind::DropTemps(base) => base,
+                ExprKind::Path(QPath::Resolved(None, path)) => {
+                    return matches!(
+                        path.res,
+                        Res::Def(rustc_hir::def::DefKind::Static { .. }, _)
+                    );
+                }
+                _ => {
+                    let _ = tcx;
+                    return false;
+                }
+            };
+        }
+    }
+    fn loaded(tcx: TyCtxt<'_>, body: &rustc_hir::Body<'_>, expr: &Expr<'_>, depth: usize) -> bool {
+        let expr = peel_casts(expr);
+        match expr.kind {
+            ExprKind::DropTemps(inner) => loaded(tcx, body, inner, depth),
+            // An address is computed, not loaded.
+            ExprKind::AddrOf(..) => false,
+            ExprKind::MethodCall(segment, receiver, _, _) => {
+                match segment.ident.name.as_str() {
+                    "as_mut_ptr" | "as_ptr" => false,
+                    // Pointer arithmetic keeps the base's origin.
+                    "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add"
+                    | "wrapping_sub" | "cast" | "cast_mut" | "cast_const" => {
+                        loaded(tcx, body, receiver, depth)
+                    }
+                    _ => false,
+                }
+            }
+            ExprKind::Path(QPath::Resolved(None, path)) => match path.res {
+                Res::Def(rustc_hir::def::DefKind::Static { .. }, _) => true,
+                // A local: loaded if any of its definitions is.
+                Res::Local(binding) if depth < 8 => definitions(body, binding)
+                    .into_iter()
+                    .any(|value| loaded(tcx, body, value, depth + 1)),
+                _ => false,
+            },
+            ExprKind::Unary(rustc_hir::UnOp::Deref, _)
+            | ExprKind::Field(..)
+            | ExprKind::Index(..) => read_from_memory(tcx, expr),
+            _ => false,
+        }
+    }
+    fn definitions<'b>(body: &'b rustc_hir::Body<'b>, binding: HirId) -> Vec<&'b Expr<'b>> {
+        struct Defs<'b> {
+            binding: HirId,
+            found: Vec<&'b Expr<'b>>,
+        }
+        impl<'b> rustc_hir::intravisit::Visitor<'b> for Defs<'b> {
+            fn visit_local(&mut self, local: &'b rustc_hir::LetStmt<'b>) {
+                if let rustc_hir::PatKind::Binding(_, id, _, None) = local.pat.kind
+                    && id == self.binding
+                    && let Some(init) = local.init
+                {
+                    self.found.push(init);
+                }
+                rustc_hir::intravisit::walk_local(self, local);
+            }
+
+            fn visit_expr(&mut self, expr: &'b Expr<'b>) {
+                if let ExprKind::Assign(lhs, rhs, _) = expr.kind
+                    && let ExprKind::Path(QPath::Resolved(None, path)) = lhs.kind
+                    && path.res == Res::Local(self.binding)
+                {
+                    self.found.push(rhs);
+                }
+                rustc_hir::intravisit::walk_expr(self, expr);
+            }
+        }
+        let mut defs = Defs {
+            binding,
+            found: Vec::new(),
+        };
+        rustc_hir::intravisit::Visitor::visit_body(&mut defs, body);
+        defs.found
+    }
+    let Some(body) = tcx.hir_maybe_body_owned_by(owner) else {
+        return false;
+    };
+    loaded(tcx, body, expr, 0)
+}
+
+pub(crate) fn inside_of(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> Vec<HirId> {
+    fn place_root(mut place: &Expr<'_>) -> Option<HirId> {
+        loop {
+            place = match place.kind {
+                ExprKind::Field(base, _) | ExprKind::DropTemps(base) => base,
+                ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) => {
+                    let ExprKind::Path(QPath::Resolved(None, path)) = peel_casts(pointer).kind
+                    else {
+                        return None;
+                    };
+                    let Res::Local(root) = path.res else { return None };
+                    return Some(root);
+                }
+                _ => return None,
+            };
+        }
+    }
+    fn address_root(expr: &Expr<'_>) -> Option<HirId> {
+        match peel_casts(expr).kind {
+            ExprKind::AddrOf(rustc_hir::BorrowKind::Ref, _, place) => place_root(place),
+            ExprKind::MethodCall(segment, receiver, [], _)
+                if matches!(segment.ident.name.as_str(), "as_mut_ptr" | "as_ptr") =>
+            {
+                place_root(receiver)
+            }
+            _ => None,
+        }
+    }
+    // The one definition of a local, when it is such an address.
+    let defined_inside = |binding: HirId| -> Option<HirId> {
+        let rustc_hir::Node::LetStmt(local) = tcx.parent_hir_node(binding) else {
+            return None;
+        };
+        let root = address_root(local.init?)?;
+        struct Assigned {
+            binding: HirId,
+            found: bool,
+        }
+        impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for Assigned {
+            fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+                if let ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) = expr.kind
+                    && let ExprKind::Path(QPath::Resolved(None, path)) = lhs.kind
+                    && path.res == Res::Local(self.binding)
+                {
+                    self.found = true;
+                }
+                rustc_hir::intravisit::walk_expr(self, expr);
+            }
+        }
+        let mut assigned = Assigned {
+            binding,
+            found: false,
+        };
+        rustc_hir::intravisit::Visitor::visit_body(&mut assigned, tcx.hir_body_owned_by(owner));
+        (!assigned.found).then_some(root)
+    };
+    let first = address_root(expr).or_else(|| {
+        let ExprKind::Path(QPath::Resolved(None, path)) = peel_casts(expr).kind else {
+            return None;
+        };
+        let Res::Local(binding) = path.res else { return None };
+        defined_inside(binding)
+    });
+    let mut chain = Vec::new();
+    let mut next = first;
+    while let Some(root) = next {
+        if chain.contains(&root) || chain.len() >= 8 {
+            break;
+        }
+        chain.push(root);
+        next = defined_inside(root);
+    }
+    chain
+}
+
+/// One direct call to a local `fn`, with everything adaptation needs.
+///
+/// Grouped **by site** rather than flattened per `(callee, index)` because the
+/// duplicate-argument gate is a *within-site* question — "do two pointer
+/// parameters of this call receive the same place?" — and a flattened map
+/// cannot answer it. The per-index view is a cheap projection of this one;
+/// the reverse is not true.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CallSite {
+    pub caller: LocalDefId,
+    pub span: Span,
+    pub args: Vec<Arg>,
+}
+
+/// Wave-2's two body positions. Kept beside [`CallSite`] because both are HIR
+/// expression facts consumed by the same adapter synthesizer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyAdapterContext {
+    LocalInitializer,
+    AssignmentRhs,
+}
+
+impl BodyAdapterContext {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::LocalInitializer => "local-initializer",
+            Self::AssignmentRhs => "assignment-rhs",
+        }
+    }
+}
+
+/// One exact scalar-reference adapter candidate in a function body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct BodyAdapterSite {
+    pub owner: LocalDefId,
+    pub destination: HirId,
+    pub rhs_span: Span,
+    pub shape: ArgShape,
+    pub context: BodyAdapterContext,
+    /// Calls/method calls are deliberately not adapted in wave 2. This bit is
+    /// carried from the HIR classification rather than rediscovered from text.
+    pub side_effecting: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AddressOperand {
+    pub node: (LocalDefId, HirId),
+    pub span: Span,
+    pub target: RawTargetType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AddressObservationFact {
+    pub owner: LocalDefId,
+    pub span: Span,
+    pub op: &'static str,
+    pub target_type: String,
+    pub operands: Vec<AddressOperand>,
+}
+
+/// Exact syntax a return seam may consume after its native origin permit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReturnExprShape {
+    Other,
+    ConstantReslice {
+        receiver_hir: HirId,
+        receiver_span: Span,
+        offset: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReturnSiteFact {
+    pub hir_id: HirId,
+    pub owner: LocalDefId,
+    pub span: Span,
+    pub root: Option<HirId>,
+    pub source_shape: &'static str,
+    pub source_type: RawTargetType,
+    pub expression_shape: ReturnExprShape,
+}
+
+fn return_expression_shape<'tcx>(tcx: TyCtxt<'tcx>, expression: &Expr<'tcx>) -> ReturnExprShape {
+    if let Some(shape) = super::slice_passon::c2rust_constant_reslice_return(tcx, expression) {
+        return shape;
+    }
+    let ExprKind::MethodCall(_, receiver, arguments, _) = expression.kind else {
+        return ReturnExprShape::Other;
+    };
+    let ExprKind::Path(QPath::Resolved(_, path)) = receiver.kind else {
+        return ReturnExprShape::Other;
+    };
+    if !matches!(path.res, Res::Local(_)) {
+        return ReturnExprShape::Other;
+    }
+    let typeck = tcx.typeck(expression.hir_id.owner.def_id);
+    let Some(method) = typeck.type_dependent_def_id(expression.hir_id) else {
+        return ReturnExprShape::Other;
+    };
+    if !typeck.expr_ty(receiver).is_raw_ptr()
+        || tcx.crate_name(method.krate).as_str() != "core"
+        || tcx.item_name(method).as_str() != "offset"
+    {
+        return ReturnExprShape::Other;
+    }
+    let [argument] = arguments else { return ReturnExprShape::Other };
+    let ExprKind::Lit(literal) = argument.kind else { return ReturnExprShape::Other };
+    let rustc_ast::LitKind::Int(offset, _) = literal.node else {
+        return ReturnExprShape::Other;
+    };
+    let Ok(offset) = u64::try_from(offset.get()) else { return ReturnExprShape::Other };
+    ReturnExprShape::ConstantReslice {
+        receiver_hir: receiver.hir_id,
+        receiver_span: receiver.span,
+        offset,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AddressUseClass {
+    ValueOnly,
+    AccessOnly,
+    Both,
+    Neither,
+}
+
+impl AddressUseClass {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::ValueOnly => "value-only",
+            Self::AccessOnly => "access-only",
+            Self::Both => "both",
+            Self::Neither => "neither",
+        }
+    }
+}
+
+/// A call anywhere in the right-hand side, not only at its top: a cast or a
+/// field read of a call result still runs the call (heman's
+/// `heman_image_texel(..) as *mut kmVec3`, whose call the receiver-input
+/// planner owns), so the body rule leaves it to the planners that adapt calls.
+fn body_side_effecting(expr: &Expr<'_>) -> bool {
+    struct Calls(bool);
+    impl<'v> Visitor<'v> for Calls {
+        fn visit_expr(&mut self, expr: &'v Expr<'v>) {
+            if matches!(expr.kind, ExprKind::Call(..) | ExprKind::MethodCall(..)) {
+                self.0 = true;
+            } else {
+                rustc_hir::intravisit::walk_expr(self, expr);
+            }
+        }
+    }
+    let mut calls = Calls(false);
+    calls.visit_expr(expr);
+    calls.0
+}
+
+/// Peel `as` casts to reach the underlying operand.
+///
+/// C2Rust writes null as `0 as *mut T` but also as `0 as libc::c_int as *mut T`,
+/// so a single-level test would classify the second as an ordinary cast and let
+/// a null through the gate that exists to stop it.
+pub(crate) fn peel_casts<'e>(mut expr: &'e Expr<'e>) -> &'e Expr<'e> {
+    while let ExprKind::Cast(inner, _) = &expr.kind {
+        expr = inner;
+    }
+    expr
+}
+
+pub(crate) fn is_zero_literal(expr: &Expr<'_>) -> bool {
+    matches!(
+        &peel_casts(expr).kind,
+        ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v == 0)
+    )
+}
+
+/// **The shape of a use that has no slice image** (report 058).
+///
+/// Deliberately syntactic and coarse: the point is to say which FAMILY of use
+/// blocks the corpus's widest wall, not to describe any one site. A local
+/// callee's argument is separated from a foreign one because only the first can
+/// be answered by converting the callee, and an assignment target is separated
+/// from everything else because that is the shape main's admission already
+/// covers.
+pub(crate) fn unsupported_use_shape(tcx: TyCtxt<'_>, use_expr: &Expr<'_>) -> &'static str {
+    let rustc_hir::Node::Expr(parent) = tcx.parent_hir_node(use_expr.hir_id) else {
+        return "not-an-expression";
+    };
+    match parent.kind {
+        ExprKind::Assign(lhs, _, _) if lhs.hir_id == use_expr.hir_id => "assignment-target",
+        ExprKind::Assign(..) => "assignment-source",
+        ExprKind::Call(callee, _) => {
+            let local = match tcx
+                .typeck(callee.hir_id.owner.def_id)
+                .expr_ty(callee)
+                .kind()
+            {
+                rustc_middle::ty::TyKind::FnDef(definition, _) => definition
+                    .as_local()
+                    .is_some_and(|local| tcx.hir_node_by_def_id(local).body_id().is_some()),
+                _ => false,
+            };
+            if local {
+                "local-callee-argument"
+            } else {
+                "foreign-callee-argument"
+            }
+        }
+        ExprKind::MethodCall(_, receiver, _, _) if receiver.hir_id == use_expr.hir_id => {
+            "method-receiver"
+        }
+        ExprKind::MethodCall(..) => "method-argument",
+        ExprKind::Cast(..) => "cast",
+        ExprKind::Ret(_) => "return",
+        ExprKind::Binary(..) => "binary",
+        ExprKind::AddrOf(..) => "address-of",
+        ExprKind::Unary(rustc_hir::UnOp::Deref, _) => "deref",
+        ExprKind::Field(..) => "field-of",
+        ExprKind::Index(..) => "index",
+        ExprKind::Struct(..) => "struct-literal",
+        _ => "other",
+    }
+}
+
+/// **R556-4 — an owner's element address**, `&mut *X.offset(k)` / `&*X.offset(k)`,
+/// with the two spans joint (c)'s seam anchors on. The shape itself is
+/// [`super::box_facts::box_element_address`]'s (R557-4: one classifier, wave-6a's);
+/// this only locates, inside the address it accepted, the element place and the
+/// owner's own path node.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnerElementAddress {
+    /// The binding `X` whose element is addressed.
+    pub(crate) root: HirId,
+    /// `&mut` rather than `&`.
+    pub(crate) mutable: bool,
+    /// The base path `X` inside the argument.
+    pub(crate) base: rustc_span::Span,
+    /// The element place `*X.offset(k)`.
+    pub(crate) element: rustc_span::Span,
+}
+
+/// [`super::box_facts::box_element_address`] with the spans joint (c) needs: the
+/// `AddrOf`'s operand, and the first path to the owner inside it (the receiver —
+/// a method call walks its receiver before its index).
+pub(crate) fn owner_element_address<'tcx>(expr: &'tcx Expr<'tcx>) -> Option<OwnerElementAddress> {
+    let (root, _index, mutable) = super::box_facts::box_element_address(expr)?;
+    let ExprKind::AddrOf(_, _, element) = &expr.kind else {
+        return None;
+    };
+    struct FirstPath {
+        root: HirId,
+        found: Option<rustc_span::Span>,
+    }
+    impl<'tcx> Visitor<'tcx> for FirstPath {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if self.found.is_some() {
+                return;
+            }
+            if let ExprKind::Path(QPath::Resolved(None, path)) = &expr.kind
+                && path.res == Res::Local(self.root)
+            {
+                self.found = Some(expr.span);
+                return;
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut first = FirstPath { root, found: None };
+    first.visit_expr(element);
+    Some(OwnerElementAddress {
+        root,
+        mutable,
+        base: first.found?,
+        element: element.span,
+    })
+}
+
+/// [`owner_element_address`] of the argument expression at `span` in `owner`'s body.
+pub(crate) fn owner_element_address_at(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    span: rustc_span::Span,
+) -> Option<OwnerElementAddress> {
+    struct V {
+        span: rustc_span::Span,
+        found: Option<OwnerElementAddress>,
+    }
+    impl<'tcx> Visitor<'tcx> for V {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if self.found.is_none() && expr.span == self.span {
+                self.found = owner_element_address(expr);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut v = V { span, found: None };
+    v.visit_body(tcx.hir_body_owned_by(owner));
+    v.found
+}
+
+/// Classify an argument expression by its **outermost** operator and resolved
+/// type. The type check is what keeps `Other` fail-closed: wave 1 admits a
+/// complex expression only when rustc says the expression itself is a raw
+/// pointer, never because its spelling merely resembles one.
+pub(crate) fn classify_arg(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> ArgShape {
+    let raw_pointer = matches!(
+        tcx.typeck(expr.hir_id.owner.def_id).expr_ty(expr).kind(),
+        rustc_middle::ty::TyKind::RawPtr(..)
+    );
+    if raw_pointer
+        && let ExprKind::Call(callee, arguments) = &peel_casts(expr).kind
+        && arguments.is_empty()
+        && let rustc_middle::ty::TyKind::FnDef(definition, _) = *tcx
+            .typeck(callee.hir_id.owner.def_id)
+            .expr_ty(callee)
+            .kind()
+        && ["ptr_null", "ptr_null_mut"]
+            .into_iter()
+            .any(|item| tcx.is_diagnostic_item(rustc_span::Symbol::intern(item), definition))
+    {
+        // Compiler-identified, argument-free null constructors are pure None
+        // values. A same-spelled user function keeps its ordinary call.
+        return ArgShape::NullLit;
+    }
+    if let Some(start) = super::array_start::idiom(tcx, expr) {
+        return ArgShape::RawExpr { root: start.root };
+    }
+    match &expr.kind {
+        // Casts first: both the null form and the strip-the-cast forms are
+        // casts, and testing the operand is the only way to tell them apart.
+        ExprKind::Cast(inner, _) => {
+            if is_zero_literal(inner) {
+                ArgShape::NullLit
+            } else if let ExprKind::AddrOf(_, mutability, _) = &peel_casts(expr).kind
+                && matches!(
+                    tcx.typeck(expr.hir_id.owner.def_id)
+                        .expr_ty(peel_casts(expr))
+                        .kind(),
+                    rustc_middle::ty::TyKind::Ref(..)
+                )
+            {
+                ArgShape::AddrOfCast {
+                    mutable: matches!(mutability, Mutability::Mut),
+                    inner: peel_casts(expr).span,
+                }
+            } else if let Some(binding) = BodyFacts::resolved_local(peel_casts(expr)) {
+                ArgShape::CastOfLocal {
+                    binding,
+                    inner: peel_casts(expr).span,
+                }
+            } else if raw_pointer {
+                ArgShape::RawExpr {
+                    root: place_root(expr).0,
+                }
+            } else {
+                ArgShape::Cast { inner: inner.span }
+            }
+        }
+        // Raw borrows retain a raw-pointer value; only an ordinary borrow
+        // supplies the reference form used by address-view glue.
+        ExprKind::AddrOf(_, mutability, operand) if !raw_pointer => {
+            let (base, through_deref) = place_root(operand);
+            ArgShape::AddrOf {
+                mutable: matches!(mutability, Mutability::Mut),
+                base,
+                through_deref,
+            }
+        }
+        _ => match BodyFacts::resolved_local(expr) {
+            Some(binding) => ArgShape::BareLocal(binding),
+            // A bare `0` with no cast still cannot become a reference.
+            None if is_zero_literal(expr) => ArgShape::NullLit,
+            None if raw_pointer => ArgShape::RawExpr {
+                root: place_root(expr).0,
+            },
+            None => ArgShape::Other,
+        },
+    }
+}
+
+/// R451: the `T` of a `size_of::<T>()` call written as this expression, under
+/// any casts and grouping. Read from the call's own instantiation, so a type
+/// alias (`pub type binn = binn_struct`) resolves exactly as the operand's
+/// pointee does and the two are comparable as types.
+fn size_of_type_argument<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    expr: &Expr<'_>,
+) -> Option<rustc_middle::ty::Ty<'tcx>> {
+    let ExprKind::Call(callee, arguments) = peel_casts(expr).kind else {
+        return None;
+    };
+    if !arguments.is_empty() {
+        return None;
+    }
+    let rustc_middle::ty::TyKind::FnDef(definition, args) = *typeck.expr_ty(callee).kind() else {
+        return None;
+    };
+    if !matches!(
+        tcx.def_path_str(definition).as_str(),
+        "std::mem::size_of" | "core::mem::size_of"
+    ) {
+        return None;
+    }
+    args.types().next()
+}
+
+/// **wave-6l (R608-1, STOP 3): the count's VALUE, in bytes, where it is a
+/// compile-time constant** — integer literals, `size_of::<T>()` (its layout
+/// size) and their products (`*`, `wrapping_mul`). heman's `kmVec4Assign`
+/// copies `size_of::<c_float>() * 4` bytes of a `kmVec4`, four `f32`s: the
+/// spelling names another type, the value is the pointee's own size, so the
+/// claim is exactly one element.
+///
+/// **Every node's value must fit that node's own type**, casts included: a
+/// narrowing or sign-changing cast (`255u16 as i8 as u16`) and a wrapping
+/// product both CHANGE the value, and a value this walk cannot state exactly
+/// answers `None` — a wrong constant would release the thin-extent hold.
+fn constant_byte_count<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: rustc_hir::def_id::LocalDefId,
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    expr: &Expr<'_>,
+) -> Option<u64> {
+    let value = match expr.kind {
+        ExprKind::Cast(inner, _) | ExprKind::DropTemps(inner) => {
+            constant_byte_count(tcx, owner, typeck, inner)?
+        }
+        ExprKind::Lit(literal) => match literal.node {
+            rustc_ast::LitKind::Int(value, _) => u64::try_from(value.get()).ok()?,
+            _ => return None,
+        },
+        ExprKind::Call(..) => {
+            let ty = size_of_type_argument(tcx, typeck, expr)?;
+            type_size(tcx, owner, ty)?
+        }
+        ExprKind::Binary(op, left, right) if op.node == rustc_hir::BinOpKind::Mul => {
+            constant_byte_count(tcx, owner, typeck, left)?
+                .checked_mul(constant_byte_count(tcx, owner, typeck, right)?)?
+        }
+        ExprKind::MethodCall(segment, receiver, [argument], _)
+            if segment.ident.name.as_str() == "wrapping_mul" =>
+        {
+            constant_byte_count(tcx, owner, typeck, receiver)?
+                .checked_mul(constant_byte_count(tcx, owner, typeck, argument)?)?
+        }
+        _ => return None,
+    };
+    let max = match typeck.expr_ty(expr).kind() {
+        rustc_middle::ty::TyKind::Uint(kind) => match kind.bit_width() {
+            Some(bits) => u64::MAX >> (64 - bits.min(64)),
+            None => u64::MAX >> (64 - tcx.data_layout.pointer_size.bits().min(64)),
+        },
+        rustc_middle::ty::TyKind::Int(kind) => match kind.bit_width() {
+            Some(bits) => u64::MAX >> (65 - bits.min(64)),
+            None => u64::MAX >> (65 - tcx.data_layout.pointer_size.bits().min(64)),
+        },
+        _ => return None,
+    };
+    (value <= max).then_some(value)
+}
+
+/// A sized type's layout size in bytes; `None` for anything without one.
+pub(crate) fn type_size<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: rustc_hir::def_id::LocalDefId,
+    ty: rustc_middle::ty::Ty<'tcx>,
+) -> Option<u64> {
+    let typing_env = rustc_middle::ty::TypingEnv::post_analysis(tcx, owner);
+    tcx.layout_of(typing_env.as_query_input(ty))
+        .ok()
+        .filter(|layout| layout.is_sized())
+        .map(|layout| layout.size.bytes())
+}
+
+/// R866-1: `&mut *x` / `&*x` over a local `x`, under casts: the local.
+fn reborrow_of(expr: &Expr<'_>) -> Option<HirId> {
+    let ExprKind::AddrOf(_, _, inner) = peel_casts(expr).kind else {
+        return None;
+    };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) = inner.kind else {
+        return None;
+    };
+    BodyFacts::resolved_local(peel_casts(pointer))
+}
+
+fn direct_mutable_storage(expr: &Expr<'_>) -> Option<(HirId, Span)> {
+    let peeled = peel_casts(expr);
+    let ExprKind::AddrOf(_, Mutability::Mut, storage) = peeled.kind else {
+        return None;
+    };
+    let ExprKind::Path(QPath::Resolved(_, path)) = storage.kind else {
+        return None;
+    };
+    let Res::Local(binding) = path.res else {
+        return None;
+    };
+    Some((binding, storage.span))
+}
+
+/// R473-2: is this argument `&x` / `&mut x` over a LOCAL binding, and is that
+/// local's own type a raw pointer?
+///
+/// The address of a live local is a sound reference, so such a root needs no
+/// entry in the hypothetical decision table — a non-pointer local is not a
+/// pointer subject, and asking it for a decision asks for a fact it cannot
+/// have. The second component is the exclusion: a raw-pointer local IS a
+/// pointer subject and keeps its decision path, so the admission must not
+/// answer a decision question with a syntactic one.
+///
+/// Projections, dereferences, casts and temporaries are all absent by
+/// construction (`AddrOf` directly over a resolved local path), which is why
+/// the caller-frame claim holds: `&mut (*p).f` would be only as live as `p`.
+fn address_root_facts(
+    typeck: &rustc_middle::ty::TypeckResults<'_>,
+    expr: &Expr<'_>,
+) -> (bool, bool) {
+    let ExprKind::AddrOf(_, _, place) = expr.kind else {
+        return (false, false);
+    };
+    let ExprKind::Path(QPath::Resolved(_, path)) = place.kind else {
+        return (false, false);
+    };
+    if !matches!(path.res, Res::Local(_)) {
+        return (false, false);
+    }
+    (true, typeck.expr_ty(place).is_raw_ptr())
+}
+
+fn initialized_array_decay(tcx: TyCtxt<'_>, owner: LocalDefId, expr: &Expr<'_>) -> Option<u64> {
+    let expr = peel_casts(expr);
+    let ExprKind::MethodCall(segment, receiver, _, _) = expr.kind else { return None };
+    if !matches!(segment.ident.name.as_str(), "as_ptr" | "as_mut_ptr") {
+        return None;
+    }
+    let mut ty = tcx.typeck(owner).expr_ty(receiver);
+    while let rustc_middle::ty::TyKind::Ref(_, inner, _) = ty.kind() {
+        ty = *inner;
+    }
+    let rustc_middle::ty::TyKind::Array(_, length) = ty.kind() else { return None };
+    length.try_to_target_usize(tcx)
+}
+
+/// **R625 — the extent a fixed-size array gives a pointer to its element 0.**
+/// `X.as_ptr()` / `X.as_mut_ptr()`, optionally `.offset(0)` / `.add(0)` on
+/// that, optionally under `&*` / `&mut *` or casts that keep the pointee, with
+/// `X: [T; N]` (through references) and `T` the argument's own pointee: the
+/// `N` elements from the pointer are exactly the array, so a slice of them is
+/// the object's bounds. A cast that changes the pointee (`[u32; 4]` read as
+/// bytes) is refused, as is any start other than a literal 0.
+///
+/// **R645-4:** a byte-string literal is a `&[u8; N]` too (the one literal
+/// typed a reference to an array). Its C2Rust spelling
+/// `b"…\0" as *const u8 as *const c_char` ends at a one-byte pointee, so the
+/// argument's `N` elements are the literal's `N` bytes; a wider pointee is
+/// refused.
+pub(crate) fn array_extent<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    expr: &Expr<'_>,
+) -> Option<u64> {
+    let typeck = tcx.typeck(owner);
+    let pointee = |ty: rustc_middle::ty::Ty<'tcx>| -> Option<rustc_middle::ty::Ty<'tcx>> {
+        match ty.kind() {
+            rustc_middle::ty::TyKind::RawPtr(inner, _)
+            | rustc_middle::ty::TyKind::Ref(_, inner, _) => Some(*inner),
+            _ => None,
+        }
+    };
+    let target = pointee(typeck.expr_ty(expr))?;
+    let one_byte = |ty: rustc_middle::ty::Ty<'tcx>| {
+        matches!(
+            ty.kind(),
+            rustc_middle::ty::TyKind::Uint(rustc_middle::ty::UintTy::U8)
+                | rustc_middle::ty::TyKind::Int(rustc_middle::ty::IntTy::I8)
+        )
+    };
+    let zero = |e: &Expr<'_>| {
+        let mut e = e;
+        while let ExprKind::Cast(inner, _) = e.kind {
+            e = inner;
+        }
+        matches!(e.kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v.get() == 0))
+    };
+    let mut e = expr;
+    loop {
+        match e.kind {
+            // A cast that keeps the pointee (mutability only) is transparent.
+            ExprKind::Cast(inner, _)
+                if pointee(typeck.expr_ty(inner)).is_some_and(|t| t == target) =>
+            {
+                e = inner
+            }
+            ExprKind::AddrOf(_, _, inner) => match inner.kind {
+                ExprKind::Unary(rustc_hir::UnOp::Deref, place) => e = place,
+                _ => return None,
+            },
+            ExprKind::MethodCall(segment, receiver, [offset], _)
+                if matches!(segment.ident.name.as_str(), "offset" | "add") && zero(offset) =>
+            {
+                e = receiver
+            }
+            ExprKind::MethodCall(segment, receiver, [], _)
+                if matches!(segment.ident.name.as_str(), "as_ptr" | "as_mut_ptr") =>
+            {
+                let mut ty = typeck.expr_ty(receiver);
+                while let rustc_middle::ty::TyKind::Ref(_, inner, _) = ty.kind() {
+                    ty = *inner;
+                }
+                // Every step above keeps the pointee, so the array's element
+                // is the argument's pointee.
+                let rustc_middle::ty::TyKind::Array(_, length) = ty.kind() else {
+                    return None;
+                };
+                return length.try_to_target_usize(tcx);
+            }
+            // R645-4: a byte string read through casts as one-byte elements.
+            ExprKind::Cast(..) if one_byte(target) => {
+                let mut inner = e;
+                while let ExprKind::Cast(next, _) = inner.kind {
+                    inner = next;
+                }
+                let ExprKind::Lit(_) = inner.kind else { return None };
+                let array = pointee(typeck.expr_ty(inner))?;
+                let rustc_middle::ty::TyKind::Array(_, length) = array.kind() else {
+                    return None;
+                };
+                return length.try_to_target_usize(tcx);
+            }
+            _ => return None,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct EmitabilityFacts {
+    /// `callee -> reference spans`. Non-empty means a signature change would
+    /// break an unadapted USE — not only a call.
+    ///
+    /// **F1:** this was `ExprKind::Call` only, which missed the C2Rust
+    /// callback-table shape (`descent as unsafe extern "C" fn(..)`): the
+    /// function is never *called* directly, so its signature was rewritten
+    /// while a fn-item cast still referred to the old type, and the crate died
+    /// at the anonymous whole-crate gate — the exact class A1 exists to retire.
+    /// Any path reference to a local fn now counts, which subsumes direct
+    /// calls, address-taking, and fn-pointer casts uniformly.
+    pub referenced: FxHashMap<LocalDefId, Vec<(RefKind, Span)>>,
+    /// `(fn, param HirId) -> every raw-only use, in HIR walk order`.
+    ///
+    /// **A `Vec`, not a first-wins entry, since S3.2′-2.** Attribution still
+    /// takes `.first()` — the reported op and site are unchanged, byte for byte.
+    /// What the vector adds is the question the slice arm has to ask and a
+    /// first-wins map cannot answer: *are ALL of this subject's raw-only uses
+    /// arithmetic?*
+    ///
+    /// The hazard is concrete. A subject carrying both `offset` and `is_null`
+    /// records whichever the walk met first. If that is `offset`, a first-wins
+    /// reading says "arithmetic, emit a slice" — and `p.is_null()` on `&[T]`
+    /// does not compile. The slice arm needs the whole set or it is unsound.
+    pub raw_only_uses: FxHashMap<(LocalDefId, HirId), Vec<(String, Span)>>,
+    /// **F5:** `(fn, param HirId) -> comparison span`.
+    ///
+    /// A pointer comparison is a blocking precondition in BOTH directions, and
+    /// the second is the dangerous one: `p > limit` on two raw pointers
+    /// compares ADDRESSES, while the same expression on two references
+    /// compares POINTEES. That version type-checks, passes the gate, and
+    /// silently inverts a bounds check — so it must be refused at decision
+    /// time, not discovered by a behavioral test that does not exist yet.
+    pub ptr_comparisons: FxHashMap<(LocalDefId, HirId), Span>,
+    /// Value-observing pointer comparisons, with both operand identities. These
+    /// are address sinks only; arithmetic/deref uses never enter this vector.
+    pub address_observations: Vec<AddressObservationFact>,
+    /// Original raw-pointer return expressions, including explicit `return`
+    /// operands and function-body tail expressions.
+    pub return_sites: Vec<ReturnSiteFact>,
+    /// **S3.6-1** — `callee -> every direct call site, with its arguments`.
+    ///
+    /// Recorded here rather than derived later, because it is not derivable
+    /// later: this is the third time a quantity absent at collection time
+    /// proved unrecoverable by post-hoc joining (S3.6-0's `ref_kinds`, the
+    /// failed name-keyed `#[no_mangle]` join, and now the argument facts).
+    ///
+    /// **Only direct calls appear.** A function reached by a fn-pointer cast has
+    /// no visible argument list, which is exactly why it is `pinned` and not
+    /// this slice's business.
+    ///
+    /// **The decision layer must not read this at task 0** — the S3.6-0 pattern
+    /// that makes zero corpus delta structural rather than lucky.
+    pub call_args: FxHashMap<LocalDefId, Vec<CallSite>>,
+    /// Resolved arguments to non-body callees. Unlike [`call_args`], every row
+    /// carries the exact callee identity and raw target type needed by the
+    /// raw-boundary contract gate.
+    pub foreign_call_args: Vec<ForeignCallArgFact>,
+    /// Item-E wave 2's exact, allowlisted body positions. An empty entry for a
+    /// ninth function is the scope control; no downstream name filter exists.
+    pub body_adapters: Vec<BodyAdapterSite>,
+    /// R815-6 / R819-1 (the scope's certificate): for each exported entry
+    /// nothing in the program calls, its raw-pointer formals the body never
+    /// assigns, and the formal pairs its provided test aliases (R767).
+    pub outside_entry_formals: FxHashMap<LocalDefId, super::outside_byte_view::EntryFormals>,
+}
+
+/// The local binding a path expression names, if it names one.
+pub(crate) fn resolved_local_of(expr: &Expr<'_>) -> Option<HirId> {
+    let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind else {
+        return None;
+    };
+    match path.res {
+        Res::Local(hir_id) => Some(hir_id),
+        _ => None,
+    }
+}
+
+/// Gather A1 facts for the whole crate in one HIR pass per function body.
+pub(crate) fn collect(tcx: TyCtxt<'_>, functions: &[LocalDefId]) -> EmitabilityFacts {
+    let mut facts = EmitabilityFacts::default();
+    let local: Vec<LocalDefId> = functions.to_vec();
+    // EVERY body in the crate, not only the functions under consideration:
+    // a `static` initializer holding a callback table references functions
+    // (F1) and would otherwise never be visited at all.
+    for owner in tcx.hir_body_owners() {
+        let body = tcx.hir_body_owned_by(owner);
+        let tail = (tcx.def_kind(owner) == rustc_hir::def::DefKind::Fn)
+            .then(|| match &body.value.kind {
+                ExprKind::Block(block, _) => block.expr.map(|expr| expr.hir_id),
+                _ => Some(body.value.hir_id),
+            })
+            .flatten();
+        let mut visitor = BodyFacts {
+            tcx,
+            fn_did: owner,
+            locals: &local,
+            tail,
+            facts: &mut facts,
+        };
+        visitor.visit_body(body);
+    }
+    facts.outside_entry_formals = super::outside_byte_view::entry_formals(tcx, &facts);
+    facts
+}
+
+/// Note the absent `tcx`: this visitor works entirely on HIR nodes and
+/// resolutions. It *did* carry a `TyCtxt` that nothing ever read — dead weight
+/// that the module-wide `allow(dead_code)` hid, and that the lint reported the
+/// moment the blanket came off.
+struct BodyFacts<'a, 'tcx> {
+    /// **S3.6-0** — carried solely to read a path expression's PARENT node, so
+    /// a reference to a local `fn` can be classified `Call` / `FnPtrCast` /
+    /// `AddrTaken`. Nothing else in this visitor consults it.
+    tcx: TyCtxt<'tcx>,
+    fn_did: LocalDefId,
+    locals: &'a [LocalDefId],
+    tail: Option<HirId>,
+    facts: &'a mut EmitabilityFacts,
+}
+
+impl BodyFacts<'_, '_> {
+    /// The `HirId` of the binding a path expression resolves to, if it is a
+    /// local. That is how a use is attributed to a specific parameter rather
+    /// than to a name that might be shadowed.
+    fn resolved_local(expr: &Expr<'_>) -> Option<HirId> {
+        resolved_local_of(expr)
+    }
+
+    fn address_operand(&self, expr: &Expr<'_>) -> Option<AddressOperand> {
+        let expr = peel_casts(expr);
+        let hir_id = Self::resolved_local(expr)?;
+        let target = raw_target_type(self.tcx, self.tcx.typeck(self.fn_did).expr_ty(expr))?;
+        Some(AddressOperand {
+            node: (self.fn_did, hir_id),
+            span: expr.span,
+            target,
+        })
+    }
+
+    fn owned_by_call_argument(&self, expr: &Expr<'_>) -> bool {
+        let mut child = expr.hir_id;
+        for _ in 0..4 {
+            let rustc_hir::Node::Expr(parent) = self.tcx.parent_hir_node(child) else {
+                return false;
+            };
+            match &parent.kind {
+                ExprKind::Call(_, args) if args.iter().any(|arg| arg.hir_id == child) => {
+                    return true;
+                }
+                ExprKind::DropTemps(inner) if inner.hir_id == child => child = parent.hir_id,
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    fn exact_place_identity(expr: &Expr<'_>) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                Res::Local(hir_id) => Some(format!("local:{}", hir_id.local_id.as_u32())),
+                _ => None,
+            },
+            ExprKind::AddrOf(_, _, inner)
+            | ExprKind::Cast(inner, _)
+            | ExprKind::DropTemps(inner) => Self::exact_place_identity(inner),
+            ExprKind::Unary(rustc_hir::UnOp::Deref, inner) => {
+                Some(format!("{}/*", Self::exact_place_identity(inner)?))
+            }
+            ExprKind::Field(base, field) => Some(format!(
+                "{}/field:{}",
+                Self::exact_place_identity(base)?,
+                field.name
+            )),
+            _ => None,
+        }
+    }
+}
+
+/// R475-3, for the sites that already carry the resolved operand span: the recorded type
+/// follows the ADAPTER OPERAND, so the form and the text the bridge renders describe the
+/// same expression. When the operand is the whole argument nothing changes.
+fn operand_source_type_ty<'tcx>(
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    arg: &'tcx Expr<'tcx>,
+    whole: rustc_middle::ty::Ty<'tcx>,
+    operand: Span,
+) -> String {
+    fn find<'tcx>(e: &'tcx Expr<'tcx>, want: Span) -> Option<&'tcx Expr<'tcx>> {
+        if e.span == want {
+            return Some(e);
+        }
+        match &e.kind {
+            ExprKind::Unary(_, inner)
+            | ExprKind::AddrOf(_, _, inner)
+            | ExprKind::Cast(inner, _)
+            | ExprKind::DropTemps(inner) => find(inner, want),
+            ExprKind::MethodCall(_, receiver, _, _) => find(receiver, want),
+            ExprKind::Field(base, _) | ExprKind::Index(base, _, _) => find(base, want),
+            _ => None,
+        }
+    }
+    if operand != arg.span
+        && let Some(expr) = find(arg, operand)
+    {
+        return format!("{:?}", typeck.expr_ty(expr));
+    }
+    format!("{whole:?}")
+}
+
+/// **R475-3 — the doubled view.** When the adapter operand is a W-C6 array start, the
+/// text the bridge renders over is `A.as_ptr()`, which is ALREADY a raw pointer, while
+/// `expr_ty(arg)` describes the whole `&*A.as_ptr().offset(0)` — a reference. The form
+/// was derived from one expression and the text taken from the other, so a position
+/// needing a raw pointer rendered a SECOND view onto a receiver that had already produced
+/// one (brotli `BuildAndStoreHuffmanTree` ×3: `(h[i].data_).as_ptr().as_ptr()`).
+///
+/// The recorded type follows the operand, so the form and the text describe the same
+/// expression. Every other shape keeps the whole argument's type, unchanged.
+fn operand_source_type<'tcx>(
+    typeck: &rustc_middle::ty::TypeckResults<'tcx>,
+    arg: &'tcx Expr<'tcx>,
+    operand: Option<Span>,
+) -> String {
+    fn find<'tcx>(e: &'tcx Expr<'tcx>, want: Span) -> Option<&'tcx Expr<'tcx>> {
+        if e.span == want {
+            return Some(e);
+        }
+        match &e.kind {
+            ExprKind::Unary(_, inner)
+            | ExprKind::AddrOf(_, _, inner)
+            | ExprKind::Cast(inner, _)
+            | ExprKind::DropTemps(inner) => find(inner, want),
+            ExprKind::MethodCall(_, receiver, _, _) => find(receiver, want),
+            ExprKind::Field(base, _) | ExprKind::Index(base, _, _) => find(base, want),
+            _ => None,
+        }
+    }
+    let expr = operand
+        .filter(|operand| *operand != arg.span)
+        .and_then(|operand| find(arg, operand))
+        .unwrap_or(arg);
+    format!("{:?}", typeck.expr_ty(expr))
+}
+
+impl<'tcx> Visitor<'tcx> for BodyFacts<'_, 'tcx> {
+    fn visit_stmt(&mut self, stmt: &'tcx rustc_hir::Stmt<'tcx>) {
+        if let rustc_hir::StmtKind::Let(local) = stmt.kind
+            && matches!(local.pat.kind, rustc_hir::PatKind::Binding(..))
+            && let Some(init) = local.init
+        {
+            self.facts.body_adapters.push(BodyAdapterSite {
+                owner: self.fn_did,
+                destination: local.pat.hir_id,
+                rhs_span: init.span,
+                shape: classify_arg(self.tcx, init),
+                context: BodyAdapterContext::LocalInitializer,
+                side_effecting: body_side_effecting(init),
+            });
+        }
+        rustc_hir::intravisit::walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+        let explicit_return = matches!(
+            self.tcx.parent_hir_node(expr.hir_id),
+            rustc_hir::Node::Expr(parent)
+                if matches!(parent.kind, ExprKind::Ret(Some(value)) if value.hir_id == expr.hir_id)
+        );
+        if (self.tail == Some(expr.hir_id) || explicit_return)
+            && let Some(source_type) =
+                raw_target_type(self.tcx, self.tcx.typeck(self.fn_did).expr_ty(expr))
+        {
+            let shape = classify_arg(self.tcx, expr);
+            // W6L-1 wave 2: `&*(*p).field.as_ptr().offset(k) as *const T` is
+            // an `AddrOfCast` argument shape, which roots at nothing for
+            // argument purposes; as a RETURN expression its root is the
+            // borrowed place's base, exactly as `place_root` reads it.
+            let root = shape.place_root().or_else(|| match &peel_casts(expr).kind {
+                ExprKind::AddrOf(_, _, operand) => place_root(operand).0,
+                _ => None,
+            });
+            self.facts.return_sites.push(ReturnSiteFact {
+                hir_id: expr.hir_id,
+                owner: self.fn_did,
+                span: expr.span,
+                // wave-6s2: the C2Rust constant-reslice return roots at its place too.
+                root: root
+                    .or_else(|| super::slice_passon::c2rust_constant_reslice_root(self.tcx, expr)),
+                source_shape: shape.key(),
+                source_type,
+                expression_shape: return_expression_shape(self.tcx, expr),
+            });
+        }
+        if let ExprKind::Assign(lhs, rhs, _) = expr.kind
+            && let Some(destination) = Self::resolved_local(lhs)
+        {
+            self.facts.body_adapters.push(BodyAdapterSite {
+                owner: self.fn_did,
+                destination,
+                rhs_span: rhs.span,
+                shape: classify_arg(self.tcx, rhs),
+                context: BodyAdapterContext::AssignmentRhs,
+                side_effecting: body_side_effecting(rhs),
+            });
+        }
+        match &expr.kind {
+            // (1) raw-pointer-only method on a local
+            ExprKind::MethodCall(segment, receiver, args, _) => {
+                let method = segment.ident.name.to_string();
+                let receiver_node = Self::resolved_local(receiver).map(|hir| (self.fn_did, hir));
+                if matches!(method.as_str(), "addr")
+                    && let Some(operand) = self.address_operand(receiver)
+                {
+                    self.facts
+                        .address_observations
+                        .push(AddressObservationFact {
+                            owner: self.fn_did,
+                            span: expr.span,
+                            op: "ptr-to-int",
+                            target_type: format!(
+                                "{:?}",
+                                self.tcx.typeck(self.fn_did).expr_ty(expr)
+                            ),
+                            operands: vec![operand],
+                        });
+                } else if method == "offset_from"
+                    && let [right] = args
+                    && let Some(left) = self.address_operand(receiver)
+                    && let Some(right) = self.address_operand(right)
+                {
+                    self.facts
+                        .address_observations
+                        .push(AddressObservationFact {
+                            owner: self.fn_did,
+                            span: expr.span,
+                            op: "difference",
+                            target_type: format!(
+                                "{:?}",
+                                self.tcx.typeck(self.fn_did).expr_ty(expr)
+                            ),
+                            operands: vec![left, right],
+                        });
+                } else if RAW_ONLY_METHODS.contains(&method.as_str())
+                    && let Some((_, hir_id)) = receiver_node
+                {
+                    self.facts
+                        .raw_only_uses
+                        .entry((self.fn_did, hir_id))
+                        .or_default()
+                        .push((method, expr.span));
+                } else if let Some(hir_id) = super::cast_offset::arithmetic_of(
+                    self.tcx,
+                    self.fn_did,
+                    &method,
+                    receiver,
+                    args,
+                ) {
+                    // R1313-2 (relay main/371 step 2): arithmetic through the
+                    // subject's own cast is the subject's arithmetic, unless it
+                    // is a constant range inside its pointee.
+                    self.facts
+                        .raw_only_uses
+                        .entry((self.fn_did, hir_id))
+                        .or_default()
+                        .push((method, expr.span));
+                }
+            }
+            // (2) ANY reference to a local fn — call, address-taken, or the
+            // operand of a fn-pointer cast. F1: matching only `Call` missed the
+            // callback-table shape entirely.
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                if let Res::Def(rustc_hir::def::DefKind::Fn, def_id) = path.res
+                    && let Some(local_did) = def_id.as_local()
+                    && self.locals.contains(&local_did)
+                {
+                    // **S3.6-0** — the KIND, read from the parent node. The
+                    // decision layer ignores it (any reference still
+                    // degrades); it exists so the adaptable/pinned split is
+                    // measurable at all.
+                    let kind = match self.tcx.parent_hir_node(expr.hir_id) {
+                        rustc_hir::Node::Expr(parent) => match parent.kind {
+                            ExprKind::Call(callee, _) if callee.hir_id == expr.hir_id => {
+                                RefKind::Call
+                            }
+                            ExprKind::Cast(..) => RefKind::FnPtrCast,
+                            _ => RefKind::AddrTaken,
+                        },
+                        _ => RefKind::AddrTaken,
+                    };
+                    self.facts
+                        .referenced
+                        .entry(local_did)
+                        .or_default()
+                        .push((kind, expr.span));
+                }
+            }
+            // (5) **S3.6-1** — a DIRECT call to a local fn, with its arguments.
+            //
+            // Separate from arm (2), which classifies the callee PATH by its
+            // parent. That arm answers "is this function referenced, and how";
+            // this one answers "what is supplied to it", and only the direct-call
+            // shape has an answer at all.
+            ExprKind::Call(callee, args) => {
+                // wave-6f (W6F-2): a call through a FUNCTION POINTER is a raw
+                // seam like an extern call — the callee is unknown, so its
+                // retention is unknown (the T2 tier), and every argument
+                // position is recorded exactly as a foreign argument is.
+                let direct = matches!(
+                    &callee.kind,
+                    ExprKind::Path(QPath::Resolved(_, path))
+                        if matches!(path.res, Res::Def(rustc_hir::def::DefKind::Fn, _))
+                );
+                if !direct
+                    && let rustc_middle::ty::TyKind::FnPtr(sig_tys, header) =
+                        self.tcx.typeck(self.fn_did).expr_ty(callee).kind()
+                {
+                    let sig = sig_tys.with(*header).skip_binder();
+                    let typeck = self.tcx.typeck(self.fn_did);
+                    let symbol = super::raw_boundary::indirect_symbol_key(sig);
+                    for (index, arg) in args.iter().enumerate() {
+                        let source_ty = typeck.expr_ty(arg);
+                        let Some(target) = sig
+                            .inputs()
+                            .get(index)
+                            .copied()
+                            .and_then(|ty| raw_target_type(self.tcx, ty))
+                        else {
+                            continue;
+                        };
+                        let shape = classify_arg(self.tcx, arg);
+                        let adapter_operand_span = match shape {
+                            ArgShape::AddrOfCast { inner, .. }
+                            | ArgShape::CastOfLocal { inner, .. } => inner,
+                            _ => arg.span,
+                        };
+                        let adapter_operand_mutability =
+                            match typeck.expr_ty(peel_casts(arg)).kind() {
+                                rustc_middle::ty::TyKind::RawPtr(_, mutability) => {
+                                    Some(if mutability.is_mut() {
+                                        super::raw_boundary::RawMutability::Mut
+                                    } else {
+                                        super::raw_boundary::RawMutability::Const
+                                    })
+                                }
+                                _ => None,
+                            };
+                        // Composition arm: the fields the direct foreign-call fact gained
+                        // in this batch (wave-4 #1b's contract count, wave-6r's unused
+                        // return, wave-6v2's operand pointee, the deref-rooting flag),
+                        // computed as the direct site computes them; an indirect callee
+                        // has no libc contract row, so its count is `None`.
+                        let root_through_deref = place_root(arg).1;
+                        let return_unused = match self.tcx.parent_hir_node(expr.hir_id) {
+                            rustc_hir::Node::Stmt(stmt) => {
+                                matches!(stmt.kind, rustc_hir::StmtKind::Semi(_))
+                            }
+                            rustc_hir::Node::LetStmt(local) => {
+                                matches!(local.pat.kind, rustc_hir::PatKind::Wild)
+                            }
+                            _ => false,
+                        };
+                        let operand_pointee = match typeck.expr_ty(peel_casts(arg)).kind() {
+                            rustc_middle::ty::TyKind::RawPtr(pointee, _) => format!("{pointee:?}"),
+                            _ => String::new(),
+                        };
+                        self.facts.foreign_call_args.push(ForeignCallArgFact {
+                            caller: self.fn_did,
+                            callee: symbol.clone(),
+                            call_span: expr.span,
+                            argument_index: index,
+                            argument_span: arg.span,
+                            root: shape.place_root(),
+                            root_through_deref,
+                            shape: shape.key(),
+                            source_type: operand_source_type_ty(
+                                typeck,
+                                arg,
+                                source_ty,
+                                adapter_operand_span,
+                            ),
+                            target,
+                            direct_storage: direct_mutable_storage(arg),
+                            adapter_operand_span,
+                            adapter_operand_mutability,
+                            contract_count: None,
+                            address_root_local: address_root_facts(typeck, arg).0,
+                            address_root_raw_pointer: address_root_facts(typeck, arg).1,
+                            return_unused,
+                            operand_pointee,
+                        });
+                    }
+                }
+                if let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind
+                    && let Res::Def(rustc_hir::def::DefKind::Fn, def_id) = path.res
+                {
+                    let defining_crate = self.tcx.crate_name(def_id.krate);
+                    let ptr_eq = matches!(defining_crate.as_str(), "core" | "std")
+                        && self.tcx.def_path_str(def_id).ends_with("::ptr::eq");
+                    if ptr_eq
+                        && args.len() == 2
+                        && let Some(left) = self.address_operand(&args[0])
+                        && let Some(right) = self.address_operand(&args[1])
+                    {
+                        self.facts
+                            .address_observations
+                            .push(AddressObservationFact {
+                                owner: self.fn_did,
+                                span: expr.span,
+                                op: "ptr-eq",
+                                target_type: "bool".to_owned(),
+                                operands: vec![left, right],
+                            });
+                    }
+                    if let Some(local_did) = def_id.as_local()
+                        && self.locals.contains(&local_did)
+                    {
+                        let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
+                        let typeck = self.tcx.typeck(self.fn_did);
+                        self.facts
+                            .call_args
+                            .entry(local_did)
+                            .or_default()
+                            .push(CallSite {
+                                caller: self.fn_did,
+                                span: expr.span,
+                                args: args
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, arg)| {
+                                        let target = sig
+                                            .inputs()
+                                            .get(index)
+                                            .copied()
+                                            .and_then(|ty| raw_target_type(self.tcx, ty));
+                                        let shape = classify_arg(self.tcx, arg);
+                                        let array_start = super::array_start::idiom(self.tcx, arg);
+                                        let adapter_operand_span = match shape {
+                                            ArgShape::AddrOfCast { inner, .. }
+                                            | ArgShape::CastOfLocal { inner, .. } => inner,
+                                            _ => {
+                                                array_start.as_ref().map_or(arg.span, |s| s.operand)
+                                            }
+                                        };
+                                        let adapter_operand_mutability = array_start
+                                            .as_ref()
+                                            .map(|s| s.mutability)
+                                            .or(match typeck.expr_ty(peel_casts(arg)).kind() {
+                                                rustc_middle::ty::TyKind::RawPtr(_, mutability) => {
+                                                    Some(if mutability.is_mut() {
+                                                        super::raw_boundary::RawMutability::Mut
+                                                    } else {
+                                                        super::raw_boundary::RawMutability::Const
+                                                    })
+                                                }
+                                                _ => None,
+                                            });
+                                        Arg {
+                                            index,
+                                            span: arg.span,
+                                            shape,
+                                            source_type: operand_source_type(
+                                                typeck,
+                                                arg,
+                                                array_start.as_ref().map(|s| s.operand),
+                                            ),
+                                            target,
+                                            direct_storage: direct_mutable_storage(arg),
+                                            adapter_operand_span,
+                                            adapter_operand_mutability,
+                                            initialized_array_elements: initialized_array_decay(
+                                                self.tcx,
+                                                self.fn_did,
+                                                arg,
+                                            ),
+                                            array_start_blind: array_start
+                                                .as_ref()
+                                                .map(|s| s.blind),
+                                            array_extent: array_extent(self.tcx, self.fn_did, arg),
+                                            place_identity: Self::exact_place_identity(arg),
+                                            address_root_local: address_root_facts(typeck, arg).0,
+                                            address_root_raw_pointer: address_root_facts(
+                                                typeck, arg,
+                                            )
+                                            .1,
+                                            element_of: super::box_facts::box_element_address(arg)
+                                                .map(|(owner, _, _)| owner),
+                                            element_address: element_address(arg),
+                                            deref_pointer: deref_pointer(typeck, arg),
+                                            inside_of: inside_of(self.tcx, self.fn_did, arg),
+                                            loaded_from_memory: loaded_from_memory(
+                                                self.tcx,
+                                                self.fn_did,
+                                                arg,
+                                            ),
+                                            address_once_here: direct_mutable_storage(arg)
+                                                .is_some_and(|(local, _)| {
+                                                    super::loaded_operand::address_taken_once_here(
+                                                        self.tcx,
+                                                        self.fn_did,
+                                                        local,
+                                                        peel_casts(arg).hir_id,
+                                                    )
+                                                }),
+                                            array_decay: super::array_decay::decay_root(
+                                                self.tcx,
+                                                self.fn_did,
+                                                arg,
+                                            ),
+                                            reborrow_of: reborrow_of(arg),
+                                            identity_cast: match shape {
+                                                ArgShape::CastOfLocal { .. }
+                                                | ArgShape::AddrOfCast { .. } => {
+                                                    super::identity_cast::of(
+                                                        self.tcx,
+                                                        self.fn_did,
+                                                        arg,
+                                                    )
+                                                }
+                                                _ => None,
+                                            },
+                                        }
+                                    })
+                                    .collect(),
+                            });
+                    } else if !ptr_eq {
+                        let sig = self.tcx.fn_sig(def_id).skip_binder().skip_binder();
+                        let typeck = self.tcx.typeck(self.fn_did);
+                        let symbol = symbol_key(self.tcx, def_id, self.locals);
+                        for (index, arg) in args.iter().enumerate() {
+                            let source_ty = typeck.expr_ty(arg);
+                            let target = sig
+                                .inputs()
+                                .get(index)
+                                .copied()
+                                .and_then(|ty| raw_target_type(self.tcx, ty))
+                                .or_else(|| {
+                                    sig.c_variadic
+                                        .then(|| raw_target_type(self.tcx, source_ty))
+                                        .flatten()
+                                });
+                            let Some(target) = target else {
+                                continue;
+                            };
+                            let shape = classify_arg(self.tcx, arg);
+                            let root_through_deref = place_root(arg).1;
+                            let array_start = super::array_start::idiom(self.tcx, arg);
+                            let adapter_operand_span = match shape {
+                                ArgShape::AddrOfCast { inner, .. }
+                                | ArgShape::CastOfLocal { inner, .. } => inner,
+                                _ => array_start.as_ref().map_or(arg.span, |s| s.operand),
+                            };
+                            let adapter_operand_mutability = array_start
+                                .as_ref()
+                                .map(|s| s.mutability)
+                                .or(match typeck.expr_ty(peel_casts(arg)).kind() {
+                                    rustc_middle::ty::TyKind::RawPtr(_, mutability) => {
+                                        Some(if mutability.is_mut() {
+                                            super::raw_boundary::RawMutability::Mut
+                                        } else {
+                                            super::raw_boundary::RawMutability::Const
+                                        })
+                                    }
+                                    _ => None,
+                                });
+                            let contract_count = super::raw_boundary_contracts::classify_contract(
+                                &symbol, index, &target,
+                            )
+                            .ok()
+                            .and_then(|contract| {
+                                let count_index = contract.count_argument_index?;
+                                let count = args.get(count_index)?;
+                                let mut expression = self
+                                    .tcx
+                                    .sess
+                                    .source_map()
+                                    .span_to_snippet(count.span)
+                                    .ok()?;
+                                // Wave-4 #1b (R386-3): `fwrite` / `fread` state
+                                // `size * nmemb` bytes; a unit element size is
+                                // the count itself, anything else is composed
+                                // and stays a BYTE count for the units gate.
+                                if let Some(size_index) = contract.size_argument_index {
+                                    let size = args.get(size_index)?;
+                                    let size_text = self
+                                        .tcx
+                                        .sess
+                                        .source_map()
+                                        .span_to_snippet(size.span)
+                                        .ok()?;
+                                    let unit = size_text.trim() == "1"
+                                        || size_text.trim().strip_prefix('1').is_some_and(|rest| {
+                                            rest.trim_start().starts_with("as ")
+                                        });
+                                    if !unit {
+                                        expression =
+                                            format!("({}) * ({expression})", size_text.trim());
+                                    }
+                                }
+                                let one_pointee = contract.size_argument_index.is_none()
+                                    && match typeck.expr_ty(peel_casts(arg)).kind() {
+                                        rustc_middle::ty::TyKind::RawPtr(pointee, _) => {
+                                            size_of_type_argument(self.tcx, typeck, count)
+                                                == Some(*pointee)
+                                                // wave-6l (R608-1, STOP 3): the
+                                                // count's value, not its
+                                                // spelling, is the claim — at a
+                                                // BYTE count only.
+                                                || contract.extent
+                                                    == super::raw_boundary_contracts::ArgumentExtent::ByteCount
+                                                    && type_size(self.tcx, self.fn_did, *pointee)
+                                                    .filter(|size| *size > 0)
+                                                    .is_some_and(|size| {
+                                                        constant_byte_count(
+                                                            self.tcx,
+                                                            self.fn_did,
+                                                            typeck,
+                                                            count,
+                                                        ) == Some(size)
+                                                    })
+                                        }
+                                        _ => false,
+                                    };
+                                let operand_pointee_bytes =
+                                    match typeck.expr_ty(peel_casts(arg)).kind() {
+                                        rustc_middle::ty::TyKind::RawPtr(pointee, _) => {
+                                            type_size(self.tcx, self.fn_did, *pointee)
+                                        }
+                                        _ => None,
+                                    };
+                                Some(super::raw_boundary::ContractCountOperandFact {
+                                    argument_index: count_index,
+                                    span: count.span,
+                                    expression,
+                                    exact: contract.count_is_exact,
+                                    one_pointee,
+                                    constant_bytes: (contract.size_argument_index.is_none()
+                                        && contract.extent
+                                            == super::raw_boundary_contracts::ArgumentExtent::ByteCount)
+                                        .then(|| {
+                                            constant_byte_count(self.tcx, self.fn_did, typeck, count)
+                                        })
+                                        .flatten(),
+                                    operand_pointee_bytes,
+                                })
+                            });
+                            let return_unused = match self.tcx.parent_hir_node(expr.hir_id) {
+                                rustc_hir::Node::Stmt(stmt) => {
+                                    matches!(stmt.kind, rustc_hir::StmtKind::Semi(_))
+                                }
+                                rustc_hir::Node::LetStmt(local) => {
+                                    matches!(local.pat.kind, rustc_hir::PatKind::Wild)
+                                }
+                                _ => false,
+                            };
+                            let operand_pointee = match typeck.expr_ty(peel_casts(arg)).kind() {
+                                rustc_middle::ty::TyKind::RawPtr(pointee, _) => {
+                                    format!("{pointee:?}")
+                                }
+                                _ => String::new(),
+                            };
+                            self.facts.foreign_call_args.push(ForeignCallArgFact {
+                                caller: self.fn_did,
+                                callee: symbol.clone(),
+                                call_span: expr.span,
+                                argument_index: index,
+                                argument_span: arg.span,
+                                // wave-6s: a borrowed computed view under
+                                // casts (`&mut *p.offset(e) as *mut T as
+                                // *mut c_void`) roots at `p` like the bare
+                                // raw expression does; the suffix view is
+                                // rendered on this site's own seam.
+                                root: shape.place_root().or_else(|| {
+                                    matches!(shape, ArgShape::AddrOfCast { .. })
+                                        .then(|| place_root(arg).0)
+                                        .flatten()
+                                }),
+                                root_through_deref,
+                                shape: shape.key(),
+                                source_type: operand_source_type_ty(
+                                    typeck,
+                                    arg,
+                                    source_ty,
+                                    adapter_operand_span,
+                                ),
+                                target,
+                                direct_storage: direct_mutable_storage(arg),
+                                adapter_operand_span,
+                                adapter_operand_mutability,
+                                contract_count,
+                                address_root_local: address_root_facts(typeck, arg).0,
+                                address_root_raw_pointer: address_root_facts(typeck, arg).1,
+                                return_unused,
+                                operand_pointee,
+                            });
+                        }
+                    }
+                }
+            }
+            // (4) pointer comparison — F5.
+            ExprKind::Binary(op, lhs, rhs) => {
+                use rustc_hir::BinOpKind::*;
+                if matches!(op.node, Lt | Le | Gt | Ge | Eq | Ne) {
+                    let operands = [lhs, rhs]
+                        .into_iter()
+                        .filter_map(|side| self.address_operand(side))
+                        .collect::<Vec<_>>();
+                    // Wave-6o: an EQUALITY against a raw-typed expression that
+                    // is not a local (a call result, a field) is still a value
+                    // observation of the one local operand; the other side
+                    // stays raw text. Ordering stays two-sided (cursor shapes).
+                    let one_sided_equality = operands.len() == 1
+                        && matches!(op.node, Eq | Ne)
+                        && [lhs, rhs].into_iter().all(|side| {
+                            raw_target_type(self.tcx, self.tcx.typeck(self.fn_did).expr_ty(side))
+                                .is_some()
+                        });
+                    if operands.len() == 2 || one_sided_equality {
+                        let op = match op.node {
+                            Lt => "lt",
+                            Le => "le",
+                            Gt => "gt",
+                            Ge => "ge",
+                            Eq => "eq",
+                            Ne => "ne",
+                            _ => unreachable!(),
+                        };
+                        self.facts
+                            .address_observations
+                            .push(AddressObservationFact {
+                                owner: self.fn_did,
+                                span: expr.span,
+                                op,
+                                target_type: "bool".to_owned(),
+                                operands,
+                            });
+                    }
+                    for side in [lhs, rhs] {
+                        if let Some(hir_id) = Self::resolved_local(side) {
+                            self.facts
+                                .ptr_comparisons
+                                .entry((self.fn_did, hir_id))
+                                .or_insert(expr.span);
+                        }
+                    }
+                }
+            }
+            // (3) pointer-to-integer is a terminal value observation; every
+            // other cast remains raw-only. Integer-to-pointer never enters the
+            // address arm because its source is not a raw-pointer local.
+            ExprKind::Cast(inner, _) => {
+                let owned_by_call_boundary = self.owned_by_call_argument(expr);
+                if !owned_by_call_boundary && let Some(operand) = self.address_operand(inner) {
+                    let typeck = self.tcx.typeck(self.fn_did);
+                    let pointer_to_integer = matches!(
+                        typeck.expr_ty(expr).kind(),
+                        rustc_middle::ty::TyKind::Int(_) | rustc_middle::ty::TyKind::Uint(_)
+                    );
+                    let pointer_to_pointer = matches!(
+                        typeck.expr_ty(expr).kind(),
+                        rustc_middle::ty::TyKind::RawPtr(..)
+                    );
+                    if pointer_to_integer || pointer_to_pointer {
+                        self.facts
+                            .address_observations
+                            .push(AddressObservationFact {
+                                owner: self.fn_did,
+                                span: expr.span,
+                                op: if pointer_to_integer {
+                                    "ptr-to-int"
+                                } else {
+                                    "ptr-cast"
+                                },
+                                target_type: format!("{:?}", typeck.expr_ty(expr)),
+                                operands: vec![operand],
+                            });
+                    } else {
+                        self.facts
+                            .raw_only_uses
+                            .entry(operand.node)
+                            .or_default()
+                            .push(("as-cast".to_owned(), expr.span));
+                    }
+                }
+            }
+            _ => {}
+        }
+        intravisit::walk_expr(self, expr);
+    }
+}
+
+impl EmitabilityFacts {
+    /// Render a span as `file:line:col` so a degradation record can leave the
+    /// compiler session. Sites are for humans and for counters, not for lookup.
+    pub(crate) fn site(tcx: TyCtxt<'_>, span: Span) -> String {
+        tcx.sess.source_map().span_to_diagnostic_string(span)
+    }
+
+    pub(crate) fn raw_boundary_argument_paths(
+        &self,
+    ) -> rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)> {
+        let mut out = rustc_hash::FxHashSet::default();
+        for fact in &self.foreign_call_args {
+            if let Some(root) = fact
+                .direct_storage
+                .map(|(storage, _)| storage)
+                .or(fact.root)
+            {
+                out.insert((
+                    fact.caller,
+                    root,
+                    fact.argument_span.lo().0,
+                    fact.argument_span.hi().0,
+                ));
+            }
+        }
+        for calls in self.call_args.values() {
+            for call in calls {
+                for argument in &call.args {
+                    if argument.target.is_some()
+                        && let Some(root) = argument
+                            .direct_storage
+                            .map(|(storage, _)| storage)
+                            .or_else(|| argument.shape.place_root())
+                    {
+                        out.insert((
+                            call.caller,
+                            root,
+                            argument.span.lo().0,
+                            argument.span.hi().0,
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn depth2_npo_target(
+        &self,
+        node: (LocalDefId, HirId),
+    ) -> Option<super::raw_boundary::Depth2Target> {
+        let mut targets = self
+            .foreign_call_args
+            .iter()
+            .filter_map(|fact| {
+                (fact.caller == node.0
+                    && fact.direct_storage.map(|(storage, _)| storage) == Some(node.1))
+                .then(|| fact.target.depth2.clone())
+                .flatten()
+            })
+            .chain(self.call_args.values().flat_map(|calls| {
+                calls.iter().flat_map(|call| {
+                    call.args.iter().filter_map(|argument| {
+                        (call.caller == node.0
+                            && argument.direct_storage.map(|(storage, _)| storage) == Some(node.1))
+                        .then(|| argument.target.as_ref()?.depth2.clone())
+                        .flatten()
+                    })
+                })
+            }))
+            .filter(|target| target.thin);
+        let first = targets.next()?;
+        targets.all(|target| target == first).then_some(first)
+    }
+
+    pub(crate) fn is_value_observation_candidate(&self, node: (LocalDefId, HirId)) -> bool {
+        self.address_observations.iter().any(|observation| {
+            observation
+                .operands
+                .iter()
+                .any(|operand| operand.node == node)
+        })
+    }
+
+    pub(crate) fn address_use_class(&self, node: (LocalDefId, HirId)) -> AddressUseClass {
+        let value = self.is_value_observation_candidate(node);
+        let access = self.raw_only_uses.get(&node).is_some_and(|uses| {
+            uses.iter()
+                .any(|(op, _)| !matches!(op.as_str(), "is_null" | "addr" | "offset_from"))
+        });
+        match (value, access) {
+            (true, false) => AddressUseClass::ValueOnly,
+            (false, true) => AddressUseClass::AccessOnly,
+            (true, true) => AddressUseClass::Both,
+            (false, false) => AddressUseClass::Neither,
+        }
+    }
+
+    /// **R739-1 (slicecursor relay 099): the subject is only ever measured.**
+    /// Every use of the local in its own body is an operand of an address
+    /// observation that measures it — a difference (`offset_from`), a
+    /// comparison, `ptr::eq`, a cast to an integer — or the receiver of
+    /// `is_null`, and at least one use measures. Returns the first measuring
+    /// observation's span.
+    ///
+    /// Such a value may be an END SENTINEL: brotli's
+    /// `EmitUncompressedMetaBlock(input, input.offset(input_size), ..)` hands
+    /// `end` one past the end of `input`. A reference there asserts a
+    /// dereferenceable element that does not exist — UB at its creation, which
+    /// the UB-free C input does not have — so the subject is held raw.
+    ///
+    /// `ptr-cast` is not a measurement (`*(p as *const u32)` reads through it).
+    /// Any other use — a dereference, a call argument, a store, an assignment,
+    /// a use inside a closure — answers `None`, so the subject is untouched.
+    pub(crate) fn address_observation_only(
+        &self,
+        tcx: TyCtxt<'_>,
+        node: (LocalDefId, HirId),
+    ) -> Option<Span> {
+        const MEASURES: &[&str] = &[
+            "difference",
+            "ptr-to-int",
+            "ptr-eq",
+            "eq",
+            "ne",
+            "lt",
+            "le",
+            "gt",
+            "ge",
+        ];
+        let measuring = self
+            .address_observations
+            .iter()
+            .filter(|observation| {
+                observation.owner == node.0
+                    && MEASURES.contains(&observation.op)
+                    && observation
+                        .operands
+                        .iter()
+                        .any(|operand| operand.node == node)
+            })
+            .collect::<Vec<_>>();
+        let first = measuring.first()?.span;
+        let measured = measuring
+            .iter()
+            .flat_map(|observation| observation.operands.iter())
+            .filter(|operand| operand.node == node)
+            .map(|operand| operand.span)
+            .collect::<rustc_hash::FxHashSet<_>>();
+
+        struct Uses<'a, 'tcx> {
+            tcx: TyCtxt<'tcx>,
+            local: HirId,
+            measured: &'a rustc_hash::FxHashSet<Span>,
+            in_closure: bool,
+            other: bool,
+        }
+        impl<'tcx> Visitor<'tcx> for Uses<'_, 'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+                if BodyFacts::resolved_local(expr) == Some(self.local) {
+                    let null_test = matches!(
+                        self.tcx.parent_hir_node(expr.hir_id),
+                        rustc_hir::Node::Expr(Expr {
+                            kind: ExprKind::MethodCall(segment, receiver, [], _),
+                            ..
+                        }) if segment.ident.name.as_str() == "is_null"
+                            && receiver.hir_id == expr.hir_id
+                    );
+                    if self.in_closure || !(self.measured.contains(&expr.span) || null_test) {
+                        self.other = true;
+                    }
+                }
+                if let ExprKind::Closure(closure) = expr.kind {
+                    let outer = std::mem::replace(&mut self.in_closure, true);
+                    self.visit_body(self.tcx.hir_body(closure.body));
+                    self.in_closure = outer;
+                }
+                intravisit::walk_expr(self, expr);
+            }
+        }
+        let mut uses = Uses {
+            tcx,
+            local: node.1,
+            measured: &measured,
+            in_closure: false,
+            other: false,
+        };
+        uses.visit_body(tcx.hir_body_owned_by(node.0));
+        (!uses.other).then_some(first)
+    }
+}
+
+#[cfg(test)]
+mod address_use_tests {
+    use rustc_hir::{CRATE_HIR_ID, def_id::CRATE_DEF_ID};
+
+    use super::*;
+
+    #[test]
+    fn addr_n1_value_and_access_is_both_never_value_only() {
+        let node = (CRATE_DEF_ID, CRATE_HIR_ID);
+        let mut facts = EmitabilityFacts::default();
+        facts.address_observations.push(AddressObservationFact {
+            owner: CRATE_DEF_ID,
+            span: rustc_span::DUMMY_SP,
+            op: "ptr-to-int",
+            target_type: "usize".to_owned(),
+            operands: vec![AddressOperand {
+                node,
+                span: rustc_span::DUMMY_SP,
+                target: RawTargetType {
+                    rendered: "*const i32".to_owned(),
+                    pointee: "i32".to_owned(),
+                    mutability: RawMutability::Const,
+                    depth2: None,
+                },
+            }],
+        });
+        facts
+            .raw_only_uses
+            .insert(node, vec![("offset".to_owned(), rustc_span::DUMMY_SP)]);
+        assert_eq!(facts.address_use_class(node), AddressUseClass::Both);
+    }
+}
+
+/// The arithmetic ops a borrowed-slice form can absorb.
+///
+/// A strict subset of [`RAW_ONLY_METHODS`], and deliberately narrower than the
+/// §1(g) op table: only the two the addressable market actually carries. Adding
+/// a member is adding a rewrite rule, so the list grows from evidence like its
+/// parent does.
+pub(crate) const SLICE_ARITHMETIC_OPS: &[&str] = &["offset", "offset_from"];
+
+/// One rewritable use of a slice subject: the span to replace, and the text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UseEdit {
+    pub span: Span,
+    pub replacement: String,
+    pub bridge_kind: &'static str,
+}
+
+/// What a subject's uses permit.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SliceUses {
+    pub rewrites: Vec<UseEdit>,
+    pub raw_uses: Vec<SliceRawUse>,
+    pub return_handoffs: Vec<ReturnSiteFact>,
+    /// A use that is **not** `*p.offset(e)`.
+    ///
+    /// Any such use blocks the whole subject. `&[T]` changes the type at every
+    /// occurrence, so a rewrite that fixes the uses it recognizes and leaves the
+    /// rest is not a partial win — it is an ill-typed crate.
+    pub unsupported: Option<Span>,
+    pub unsupported_is_cursor: bool,
+    /// **What the blocking use IS** (wave-4 report 058). `slice-use-unsupported`
+    /// is 85 of the corpus's 172 refusals — its widest wall by a distance — and
+    /// until now no table said what the uses behind it are. Main is being asked
+    /// whether the sole-assignment admission generalises; that is a question
+    /// about this distribution, so the distribution is measured rather than
+    /// argued.
+    pub unsupported_shape: Option<&'static str>,
+    /// wave-6s: computed sub-views (`&*p.offset(e)`, `p.offset(e) as *const T`)
+    /// that are themselves a raw-boundary argument. The raw use above carries
+    /// the boundary; this carries the suffix the seam must render.
+    pub computed_argument_views: Vec<super::slice_forms::ComputedArgumentView>,
+    /// **W6S-12 (R490-4).** How many of this subject's rewrites are W6S-8
+    /// bridges at a foreign `*const T` formal, and how many rewrites are
+    /// anything else. A subject whose ONLY uses are `*const` foreign
+    /// arguments is read through every one of them, so its slice form is the
+    /// SHARED one — whatever the declared `*mut` of the C signature says.
+    pub foreign_const_bridges: u32,
+    pub other_rewrites: u32,
+    /// **main 071c (a) — the assignment that IS the construction**, admitted
+    /// here rather than counted as an unsupported use. Condition 4's receipt:
+    /// the span and the evidence it matched, so a census can audit the
+    /// admission instead of inferring it from a subject that stopped being
+    /// held.
+    pub sized_assignments: Vec<super::sized_assignment::SizedAssignment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SliceRawUse {
+    pub hir_id: HirId,
+    pub span: Span,
+    pub boundary_span: Option<Span>,
+    pub source_shape: &'static str,
+    pub target: RawTargetType,
+    pub native_element: bool,
+    pub destination: Option<HirId>,
+    pub contract: Option<String>,
+}
+
+/// Is `rhs` this binding's own pointer arithmetic — the right-hand side of a
+/// self-advance?
+fn self_advance_rhs(tcx: TyCtxt<'_>, rhs: &Expr<'_>, key: (LocalDefId, HirId)) -> Option<()> {
+    let ExprKind::MethodCall(seg, receiver, _, _) = &rhs.kind else {
+        return None;
+    };
+    if !SLICE_ARITHMETIC_OPS.contains(&seg.ident.name.to_string().as_str()) {
+        return None;
+    }
+    let _ = tcx;
+    self_advance_lhs(receiver, key).then_some(())
+}
+
+/// Does this expression name the binding `key` refers to?
+fn self_advance_lhs(expr: &Expr<'_>, key: (LocalDefId, HirId)) -> bool {
+    matches!(
+        &expr.kind,
+        ExprKind::Path(QPath::Resolved(_, path)) if matches!(path.res, Res::Local(id) if id == key.1)
+    )
+}
+
+/// The index expression's source text, **typed as a `usize`**.
+///
+/// C2Rust writes `p.offset(i as isize)`; the `as isize` exists only to satisfy
+/// `offset`, so stripping it recovers the author's index rather than inventing
+/// a conversion.
+///
+/// # Stripping is not enough, and the corpus said so
+///
+/// The real idiom is a **double** cast — `p.offset(1 as libc::c_int as isize)` —
+/// so stripping the outer cast leaves a `c_int`, and a slice indexed by `i32` is
+/// `error[E0277]`. Measured: all 14 decided slices reverted, taking two sibling
+/// `Ref` emissions down with them, because revert granularity is per function.
+///
+/// So the stripped expression's TYPE decides. Already `usize` — the shape
+/// g11/g12 pin — renders bare, which is what keeps the ratified golden text
+/// untouched rather than bending spec around a defect. Anything else is
+/// parenthesised and cast: parenthesised because `i + 1 as usize` parses as
+/// `i + (1 as usize)`.
+///
+/// **S3.2′-3: lifted out of the slice collector unchanged**, so the optional
+/// slice twin renders indices by the same rule rather than by a second copy of
+/// it. One canonicalizer, the standing rule.
+/// **W6S-14 (R554-3).** Where [`index_text`]'s text comes from, and whether it
+/// is wrapped `(…) as usize`: the SPAN of the expression whose source is the
+/// index, so a view can render it later with another subject's edits inside
+/// it applied (`*block_ids.offset(i)` → `block_ids[i]`). Same rule, same
+/// order as [`index_text`].
+pub(crate) fn index_parts(tcx: TyCtxt<'_>, arg: &Expr<'_>) -> (Span, bool) {
+    let usize_or_literal = |expr: &Expr<'_>| {
+        matches!(&expr.kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(..)))
+            || tcx
+                .typeck(expr.hir_id.owner.def_id)
+                .expr_ty_adjusted_opt(expr)
+                .is_some_and(|t| {
+                    matches!(
+                        t.kind(),
+                        rustc_middle::ty::TyKind::Uint(rustc_middle::ty::UintTy::Usize)
+                    )
+                })
+    };
+    if let ExprKind::Cast(inner, ty) = &arg.kind
+        && let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, p)) = &ty.kind
+        && p.segments
+            .last()
+            .is_some_and(|s| s.ident.name.as_str() == "isize")
+    {
+        return (inner.span, !usize_or_literal(inner));
+    }
+    (arg.span, !usize_or_literal(arg))
+}
+
+pub(crate) fn index_text(tcx: TyCtxt<'_>, arg: &Expr<'_>) -> Option<String> {
+    /// Is this expression already a `usize`?
+    ///
+    /// Asked of the type checker rather than of the syntax: `i`, `n as usize`
+    /// and a `usize`-returning call are all bare-renderable and no syntactic
+    /// test recognises the three.
+    fn is_usize(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> bool {
+        let owner = expr.hir_id.owner.def_id;
+        tcx.typeck(owner)
+            .expr_ty_adjusted_opt(expr)
+            .is_some_and(|t| {
+                matches!(
+                    t.kind(),
+                    rustc_middle::ty::TyKind::Uint(rustc_middle::ty::UintTy::Usize)
+                )
+            })
+    }
+
+    /// A non-negative integer LITERAL indexes bare.
+    ///
+    /// **S3.2′-2b.** `p.offset(1)`'s argument is an `isize` literal, so the
+    /// type test below renders it `(1) as usize` — correct, and not what any
+    /// human writes or what the ratified golden text says. A literal is
+    /// representable as a `usize` when it is non-negative, and a negative one
+    /// cannot reach here: the sign verdict gates that class to `SliceCursor`.
+    ///
+    /// This is a rendering rule, not a typing one, so it lives with the other
+    /// rendering rules rather than as a special case at the reslice position —
+    /// the same index expression must render the same way in every position.
+    fn is_bare_literal(expr: &Expr<'_>) -> bool {
+        matches!(&expr.kind, ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(..)))
+    }
+
+    let sm = tcx.sess.source_map();
+    if let ExprKind::Cast(inner, ty) = &arg.kind
+        && let rustc_hir::TyKind::Path(rustc_hir::QPath::Resolved(_, p)) = &ty.kind
+        && p.segments
+            .last()
+            .is_some_and(|s| s.ident.name.as_str() == "isize")
+    {
+        let text = sm.span_to_snippet(inner.span).ok()?;
+        return Some(if is_usize(tcx, inner) || is_bare_literal(inner) {
+            text
+        } else {
+            format!("({text}) as usize")
+        });
+    }
+    let text = sm.span_to_snippet(arg.span).ok()?;
+    Some(if is_usize(tcx, arg) || is_bare_literal(arg) {
+        text
+    } else {
+        format!("({text}) as usize")
+    })
+}
+
+/// How many of a binding's uses are **not** the null test.
+///
+/// The multiplicity half of the idiom rule, needed *before* the collector runs
+/// because it decides which accessor the collector substitutes. Counting the
+/// same walk twice is the price of that ordering, and it is a cheap HIR pass —
+/// the alternative is a collector that rewrites its own output after the fact.
+pub(crate) fn non_test_use_count(tcx: TyCtxt<'_>, fn_did: LocalDefId, binding: HirId) -> usize {
+    struct V<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        binding: HirId,
+        count: &'a mut usize,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind
+                && let Res::Local(hir_id) = path.res
+                && hir_id == self.binding
+            {
+                let is_null_test = matches!(
+                    self.tcx.parent_hir_node(expr.hir_id),
+                    rustc_hir::Node::Expr(p)
+                        if matches!(
+                            &p.kind,
+                            ExprKind::MethodCall(seg, receiver, _, _)
+                                if receiver.hir_id == expr.hir_id
+                                    && seg.ident.name.as_str() == "is_null"
+                        )
+                );
+                if !is_null_test {
+                    *self.count += 1;
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+        return 0;
+    };
+    let mut count = 0;
+    let mut v = V {
+        tcx,
+        binding,
+        count: &mut count,
+    };
+    v.visit_body(tcx.hir_body(body_id));
+    count
+}
+
+/// The two spellings one optional subject needs, because `unwrap()` and
+/// `as_mut()` unwrap to different depths.
+///
+/// `Option<&T>::unwrap()` yields `&T` — one deref to the pointee.
+/// `Option<&mut T>::as_mut().unwrap()` yields `&mut &mut T` — two. So the
+/// dereferencing position needs an extra `*` in the second case, while the
+/// indexing position needs none in either (indexing auto-derefs). Carrying both
+/// spellings is what keeps that asymmetry out of the call sites.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Accessor {
+    /// Substituted for the binding at a `*p` position.
+    pub deref: String,
+    /// The base, for `…[i]`.
+    pub index: String,
+}
+
+/// **S3.2′-3 — what an OPTIONAL subject's uses permit.**
+///
+/// Same all-or-nothing contract as [`SliceUses`], and for a stronger reason:
+/// `Option<&T>` changes the type at *every* occurrence, including the plain
+/// `*p` a reference form left alone. There is no partial optional rewrite.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OptUses {
+    pub rewrites: Vec<UseEdit>,
+    pub return_handoffs: Vec<ReturnSiteFact>,
+    /// A use with no image under the wrapper.
+    pub unsupported: Option<Span>,
+    /// Uses that are not the null test — the multiplicity half of the idiom
+    /// rule (micro-plan §9c).
+    pub non_test_uses: usize,
+    pub assignments: Vec<OptAssignment>,
+    pub null_assigned: bool,
+    pub sites: Vec<OptUseSite>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OptAssignment {
+    pub rhs: HirId,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct OptUseSite {
+    pub hir_id: HirId,
+    pub span: Span,
+    pub operation: &'static str,
+}
+
+fn bare_parameter_return<'a>(
+    expression: &Expr<'_>,
+    node: (LocalDefId, HirId),
+    return_sites: &'a [ReturnSiteFact],
+    parameter_nodes: Option<&rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
+) -> Option<&'a ReturnSiteFact> {
+    if !parameter_nodes.is_some_and(|parameters| parameters.contains(&node)) {
+        return None;
+    }
+    let mut sites = return_sites.iter().filter(|site| {
+        site.owner == node.0
+            && site.root == Some(node.1)
+            && site.source_shape == "bare-local"
+            && site.span == expression.span
+    });
+    let site = sites.next()?;
+    sites.next().is_none().then_some(site)
+}
+
+fn parameter_reslice_return<'a>(
+    expression: &Expr<'_>,
+    node: (LocalDefId, HirId),
+    return_sites: &'a [ReturnSiteFact],
+    parameter_nodes: Option<&rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
+) -> Option<&'a ReturnSiteFact> {
+    if !parameter_nodes.is_some_and(|parameters| parameters.contains(&node)) {
+        return None;
+    }
+    let mut sites = return_sites.iter().filter(|site| {
+        site.owner == node.0
+            && site.root == Some(node.1)
+            && matches!(site.expression_shape,
+                ReturnExprShape::ConstantReslice { receiver_hir, receiver_span, .. }
+                    if receiver_hir == expression.hir_id && receiver_span == expression.span)
+    });
+    let site = sites.next()?;
+    sites.next().is_none().then_some(site)
+}
+
+/// Collect, per binding, the uses an **optional** form must rewrite.
+///
+/// # The two ratified idioms, and why the choice is not stylistic
+///
+/// - `Option<&T>` is `Copy`, so `unwrap()` may be spelled at every use.
+/// - `Option<&mut T>` is **not**. `unwrap()` moves it — fine exactly once, which
+///   is g02's ratified text, and ill-typed twice. More than one use therefore
+///   takes `as_mut()`, which is g05's.
+///
+/// # One substitution, three positions
+///
+/// The edit replaces the **binding's own path expression**, not the enclosing
+/// expression, so a single replacement text serves every dereferencing position:
+///
+/// | source | replacement of `p` | result |
+/// |---|---|---|
+/// | `*p` | `p.unwrap()` | `*p.unwrap()` |
+/// | `*p = e` | `p.unwrap()` | `*p.unwrap() = e` |
+/// | `(*p).f` | `p.unwrap()` | `(*p.unwrap()).f` |
+/// | `*p` (mut, multi-use) | `*p.as_mut().unwrap()` | `**p.as_mut().unwrap()` |
+///
+/// The null test is the one exception: it replaces the whole call, because
+/// `is_null` and `is_none` are different names — and `!p.is_null()` collapses to
+/// `p.is_some()`, g05's spelling, rather than the correct-but-graceless
+/// `!p.is_none()`.
+pub(crate) fn collect_opt_uses(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    accessor_of: &FxHashMap<(LocalDefId, HirId), Accessor>,
+    fat: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    deferred_uses: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+) -> FxHashMap<(LocalDefId, HirId), OptUses> {
+    collect_opt_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        accessor_of,
+        fat,
+        raw_boundary_arguments,
+        deferred_uses,
+        true,
+        &[],
+        None,
+    )
+}
+
+/// Return-aware family collector. Bare parameter returns are retained as
+/// typed handoffs; the decision layer still requires the exact return permit.
+pub(crate) fn collect_opt_uses_with_returns(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    accessor_of: &FxHashMap<(LocalDefId, HirId), Accessor>,
+    fat: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    deferred_uses: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    return_sites: &[ReturnSiteFact],
+    parameter_nodes: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+) -> FxHashMap<(LocalDefId, HirId), OptUses> {
+    collect_opt_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        accessor_of,
+        fat,
+        raw_boundary_arguments,
+        deferred_uses,
+        true,
+        return_sites,
+        Some(parameter_nodes),
+    )
+}
+
+/// The pre-item-4 collector: keep core Option/NPO and raw-argument handling,
+/// without the newer assignment, copied-value or projected-use behavior.
+pub(crate) fn collect_opt_uses_before_family(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    accessor_of: &FxHashMap<(LocalDefId, HirId), Accessor>,
+    fat: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    deferred_uses: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+) -> FxHashMap<(LocalDefId, HirId), OptUses> {
+    collect_opt_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        accessor_of,
+        fat,
+        raw_boundary_arguments,
+        deferred_uses,
+        false,
+        &[],
+        None,
+    )
+}
+
+fn collect_opt_uses_with_family(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    accessor_of: &FxHashMap<(LocalDefId, HirId), Accessor>,
+    fat: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    deferred_uses: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    expanded: bool,
+    return_sites: &[ReturnSiteFact],
+    parameter_nodes: Option<&rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
+) -> FxHashMap<(LocalDefId, HirId), OptUses> {
+    struct V<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        fn_did: LocalDefId,
+        out: &'a mut FxHashMap<(LocalDefId, HirId), OptUses>,
+        name_of: &'a FxHashMap<(LocalDefId, HirId), String>,
+        accessor_of: &'a FxHashMap<(LocalDefId, HirId), Accessor>,
+        fat: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+        raw_boundary_arguments: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+        deferred_uses: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+        expanded: bool,
+        return_sites: &'a [ReturnSiteFact],
+        parameter_nodes: Option<&'a rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if self.expanded
+                && let ExprKind::Assign(lhs, rhs, _) = expr.kind
+                && let ExprKind::Path(QPath::Resolved(_, path)) = lhs.kind
+                && let Res::Local(binding) = path.res
+                && self.name_of.contains_key(&(self.fn_did, binding))
+            {
+                let entry = self.out.entry((self.fn_did, binding)).or_default();
+                entry.assignments.push(OptAssignment {
+                    rhs: rhs.hir_id,
+                    span: rhs.span,
+                });
+                entry.null_assigned |= is_zero_literal(rhs);
+            }
+            if let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind
+                && let Res::Local(hir_id) = path.res
+                && self.name_of.contains_key(&(self.fn_did, hir_id))
+            {
+                let key = (self.fn_did, hir_id);
+                if let Some(site) =
+                    bare_parameter_return(expr, key, self.return_sites, self.parameter_nodes)
+                {
+                    let entry = self.out.entry(key).or_default();
+                    entry.return_handoffs.push(site.clone());
+                    entry.sites.push(OptUseSite {
+                        hir_id: expr.hir_id,
+                        span: site.span,
+                        operation: "handoff-return",
+                    });
+                    entry.non_test_uses += 1;
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                if self.expanded
+                    && super::option_ops::collect_raw_return(self.tcx, expr, key, self.out)
+                {
+                    return;
+                }
+                if self.expanded
+                    && super::option_ops::collect_address_observation(self.tcx, expr, key, self.out)
+                {
+                    return;
+                }
+                if self.expanded
+                    && matches!(self.tcx.parent_hir_node(expr.hir_id),
+                    rustc_hir::Node::Expr(parent) if matches!(parent.kind,
+                        ExprKind::Assign(lhs, _, _) if lhs.hir_id == expr.hir_id))
+                {
+                    return; // the destination-owned RHS operation is above
+                }
+                // R607-1 leg B: the self arm of `x = if c { A } else { x };`
+                // keeps its Option value; the value planner renders the other
+                // arm (`option::plan_values`), so this use needs no edit.
+                if self.expanded
+                    && super::option_ops::self_branch_other(self.tcx, expr, hir_id).is_some()
+                {
+                    self.out.entry(key).or_default().sites.push(OptUseSite {
+                        hir_id: expr.hir_id,
+                        span: expr.span,
+                        operation: "self-branch-value",
+                    });
+                    return;
+                }
+                // A boundary on `(*p).field` owns the projected pointer value.
+                // Evaluating that value still requires opening the Option at
+                // `p`; leave its one native use edit beneath the outer adapter.
+                let dereferences_root = self.expanded
+                    && matches!(
+                        self.tcx.parent_hir_node(expr.hir_id),
+                        rustc_hir::Node::Expr(parent)
+                            if matches!(parent.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                    );
+                let deferred = self.raw_boundary_arguments.contains(&(
+                    self.fn_did,
+                    hir_id,
+                    expr.span.lo().0,
+                    expr.span.hi().0,
+                )) || (self.expanded
+                    && self.deferred_uses.contains(&(
+                        self.fn_did,
+                        hir_id,
+                        expr.span.lo().0,
+                        expr.span.hi().0,
+                    )));
+                if deferred && !dereferences_root {
+                    let entry = self.out.entry(key).or_default();
+                    entry.non_test_uses += 1;
+                    if self.expanded {
+                        entry.sites.push(OptUseSite {
+                            hir_id: expr.hir_id,
+                            span: expr.span,
+                            operation: "deferred-boundary-or-copy",
+                        });
+                    }
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                let classified = self.classify(expr, key);
+                let entry = self.out.entry(key).or_default();
+                match classified {
+                    Some((edit, is_non_test)) => {
+                        if self.expanded {
+                            entry.sites.push(OptUseSite {
+                                hir_id: expr.hir_id,
+                                span: edit.span,
+                                operation: if is_non_test {
+                                    "required-dereference"
+                                } else {
+                                    "null-test"
+                                },
+                            });
+                        }
+                        entry.rewrites.push(edit);
+                        entry.non_test_uses += usize::from(is_non_test);
+                    }
+                    None => {
+                        if self.expanded {
+                            let operation = match self.tcx.parent_hir_node(expr.hir_id) {
+                                rustc_hir::Node::Expr(parent) => match parent.kind {
+                                    ExprKind::MethodCall(segment, _, _, _)
+                                        if SLICE_ARITHMETIC_OPS
+                                            .contains(&segment.ident.name.as_str()) =>
+                                    {
+                                        "excluded-cursor"
+                                    }
+                                    ExprKind::Ret(_) => "handoff-return",
+                                    _ => "handoff-use",
+                                },
+                                _ => "handoff-use",
+                            };
+                            entry.sites.push(OptUseSite {
+                                hir_id: expr.hir_id,
+                                span: expr.span,
+                                operation,
+                            });
+                        }
+                        entry.non_test_uses += 1;
+                        if entry.unsupported.is_none() {
+                            entry.unsupported = Some(expr.span);
+                        }
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    impl V<'_, '_> {
+        /// `Some((edit, is_a_non_test_use))`, or `None` for a use with no image.
+        fn classify(
+            &self,
+            use_expr: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<(UseEdit, bool)> {
+            let name = self.name_of.get(&key)?;
+            let accessor = self.accessor_of.get(&key)?;
+            let rustc_hir::Node::Expr(p) = self.tcx.parent_hir_node(use_expr.hir_id) else {
+                return None;
+            };
+            match &p.kind {
+                ExprKind::MethodCall(seg, receiver, _, _)
+                    if receiver.hir_id == use_expr.hir_id
+                        && seg.ident.name.as_str() == "is_null" =>
+                {
+                    if let rustc_hir::Node::Expr(not) = self.tcx.parent_hir_node(p.hir_id)
+                        && matches!(not.kind, ExprKind::Unary(rustc_hir::UnOp::Not, _))
+                    {
+                        return Some((
+                            UseEdit {
+                                span: not.span,
+                                replacement: format!("{name}.is_some()"),
+                                bridge_kind: "raw-op-is-none",
+                            },
+                            false,
+                        ));
+                    }
+                    Some((
+                        UseEdit {
+                            span: p.span,
+                            replacement: format!("{name}.is_none()"),
+                            bridge_kind: "raw-op-is-none",
+                        },
+                        false,
+                    ))
+                }
+                ExprKind::Unary(rustc_hir::UnOp::Deref, _) => Some((
+                    UseEdit {
+                        span: use_expr.span,
+                        replacement: accessor.deref.clone(),
+                        bridge_kind: "subject-use",
+                    },
+                    true,
+                )),
+                // **The fat twin's arithmetic position.** `*p.offset(e)` on an
+                // `Option<&[T]>` is `p.unwrap()[e]` — the -2 rewrite with the
+                // wrapper's accessor in front of it, which is why the index is
+                // rendered by the SAME `index_text` and not a second copy.
+                //
+                // Admitted only for subjects fatness licensed: on a thin
+                // optional this position has no image, and falling through to
+                // `None` is the correct refusal.
+                ExprKind::MethodCall(seg, receiver, args, _)
+                    if receiver.hir_id == use_expr.hir_id
+                        && self.fat.contains(&key)
+                        && SLICE_ARITHMETIC_OPS.contains(&seg.ident.name.to_string().as_str()) =>
+                {
+                    let [arg] = args else { return None };
+                    let rustc_hir::Node::Expr(deref) = self.tcx.parent_hir_node(p.hir_id) else {
+                        return None;
+                    };
+                    if !matches!(deref.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) {
+                        return None;
+                    }
+                    // -2's accept-set restoration carries over verbatim: a
+                    // BORROW of the deref is a third position, and it is not in
+                    // scope here either.
+                    if matches!(
+                        self.tcx.parent_hir_node(deref.hir_id),
+                        rustc_hir::Node::Expr(e) if matches!(e.kind, ExprKind::AddrOf(..))
+                    ) {
+                        return None;
+                    }
+                    let index = index_text(self.tcx, arg)?;
+                    Some((
+                        UseEdit {
+                            span: deref.span,
+                            replacement: format!("{}[{index}]", accessor.index),
+                            bridge_kind: "subject-use",
+                        },
+                        true,
+                    ))
+                }
+                _ => None,
+            }
+        }
+    }
+
+    let mut out = FxHashMap::default();
+    for &fn_did in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
+        let mut v = V {
+            tcx,
+            fn_did,
+            out: &mut out,
+            name_of,
+            accessor_of,
+            fat,
+            raw_boundary_arguments,
+            deferred_uses,
+            expanded,
+            return_sites,
+            parameter_nodes,
+        };
+        v.visit_body(tcx.hir_body(body_id));
+    }
+    out
+}
+
+/// Collect, per binding, the `*p.offset(e)` uses and whether anything else uses
+/// the binding at all.
+///
+/// **Total over uses, not over recognized uses** — the distinction is the whole
+/// soundness argument. The walk visits every path expression resolving to a
+/// local and classifies it; a use that does not match the rewritable shape sets
+/// `unsupported` rather than being skipped.
+pub(crate) fn collect_slice_uses(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    mutable_of: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
+    collect_slice_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        mutable_of,
+        advance_ok,
+        raw_boundary_arguments,
+        true,
+        &[],
+        None,
+    )
+}
+
+pub(crate) fn collect_slice_uses_with_returns(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    mutable_of: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    return_sites: &[ReturnSiteFact],
+    parameter_nodes: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
+    collect_slice_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        mutable_of,
+        advance_ok,
+        raw_boundary_arguments,
+        true,
+        return_sites,
+        Some(parameter_nodes),
+    )
+}
+
+/// Reuse the native slice walker with item-3 raw-boundary/cursor collection
+/// disabled, preserving the pre-family unsupported-use reason and edits.
+pub(crate) fn collect_slice_uses_before_family(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    mutable_of: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
+    collect_slice_uses_with_family(
+        tcx,
+        functions,
+        name_of,
+        mutable_of,
+        advance_ok,
+        raw_boundary_arguments,
+        false,
+        &[],
+        None,
+    )
+}
+
+fn collect_slice_uses_with_family(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    name_of: &FxHashMap<(LocalDefId, HirId), String>,
+    mutable_of: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    advance_ok: &rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+    raw_boundary_arguments: &rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+    expanded: bool,
+    return_sites: &[ReturnSiteFact],
+    parameter_nodes: Option<&rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
+) -> FxHashMap<(LocalDefId, HirId), SliceUses> {
+    struct V<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        fn_did: LocalDefId,
+        out: &'a mut FxHashMap<(LocalDefId, HirId), SliceUses>,
+        name_of: &'a FxHashMap<(LocalDefId, HirId), String>,
+        mutable_of: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+        /// Subjects a self-advance may be emitted for: **non-negative sign**
+        /// (the negative class is `SliceCursor`'s, S3.2′-5's) **and** a `mut`
+        /// binding (`p = …` needs one). Both gates are decided where the facts
+        /// live and handed here as one set.
+        advance_ok: &'a rustc_hash::FxHashSet<(LocalDefId, HirId)>,
+        raw_boundary_arguments: &'a rustc_hash::FxHashSet<(LocalDefId, HirId, u32, u32)>,
+        expanded: bool,
+        return_sites: &'a [ReturnSiteFact],
+        parameter_nodes: Option<&'a rustc_hash::FxHashSet<(LocalDefId, HirId)>>,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind
+                && let Res::Local(hir_id) = path.res
+            {
+                let key = (self.fn_did, hir_id);
+                if self.name_of.contains_key(&key)
+                    && let Some(site) =
+                        bare_parameter_return(expr, key, self.return_sites, self.parameter_nodes)
+                            .or_else(|| {
+                                parameter_reslice_return(
+                                    expr,
+                                    key,
+                                    self.return_sites,
+                                    self.parameter_nodes,
+                                )
+                            })
+                {
+                    self.out
+                        .entry(key)
+                        .or_default()
+                        .return_handoffs
+                        .push(site.clone());
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                // Item 3: this exact operand is owned by the existing boundary
+                // planner. Its final T1/T2/R-B verdict still gates the class;
+                // the slice-use collector must not preempt it with a use wall.
+                if self.expanded
+                    && let Some((site, edit)) = self.raw_use(expr, key)
+                {
+                    let entry = self.out.entry(key).or_default();
+                    entry.raw_uses.push(site);
+                    if let Some(edit) = edit {
+                        entry.rewrites.push(edit);
+                    }
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                // R1313-2 (relay main/371 step 2): a place reached through the
+                // subject's own cast is the byte view's element.
+                if let Some(edit) = self.cast_offset_place(expr, key) {
+                    let entry = self.out.entry(key).or_default();
+                    entry.other_rewrites += 1;
+                    entry.rewrites.push(edit);
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                // R1313-2: the same spine as a boundary argument is the byte
+                // view's computed suffix (A5's collision closes on it).
+                if self.expanded
+                    && let Some((site, view)) = self.cast_offset_argument(expr, key)
+                {
+                    let entry = self.out.entry(key).or_default();
+                    entry.raw_uses.push(site);
+                    entry.computed_argument_views.push(view);
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                // wave-6s: a computed sub-view that is itself a boundary
+                // argument keeps the boundary's own disposition; only the
+                // rendering changes, to the suffix view of the delivered base.
+                // Relay 371 step 4 (A3): a delta is forward when its spelling is
+                // (wave-6s's rule), when it is a constant that evaluates
+                // non-negative (`sk.offset(SPX_N as isize)`, a `const` path), or
+                // when it is a plain signed counter and the subject's own sign
+                // verdict is non-negative (`advance_ok` carries it): C's
+                // `x.offset(i as isize)` over a counter the analysis proves never
+                // negative. Other spellings keep R394-2.
+                if self.expanded
+                    && let Some((site, view)) = super::slice_forms::computed_argument_view_with(
+                        self.tcx,
+                        expr,
+                        key,
+                        self.raw_boundary_arguments,
+                        |delta| {
+                            super::cast_offset::forward(self.tcx, delta)
+                                || (super::slice_forms::signed_counter(self.tcx, delta)
+                                    && self.advance_ok.contains(&key))
+                        },
+                    )
+                {
+                    let entry = self.out.entry(key).or_default();
+                    entry.raw_uses.push(site);
+                    entry.computed_argument_views.push(view);
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                // wave-6s: the same view copied into a local; the receipt
+                // planner renders it by the destination's form.
+                if self.expanded
+                    && let Some((site, view)) =
+                        super::slice_forms::computed_body_copy_view(self.tcx, expr, key)
+                {
+                    let entry = self.out.entry(key).or_default();
+                    entry.raw_uses.push(site);
+                    entry.computed_argument_views.push(view);
+                    intravisit::walk_expr(self, expr);
+                    return;
+                }
+                // Classify BEFORE taking the entry: `classify` reads `self`, and
+                // holding the map entry across it would be a borrow conflict.
+                let classified = self.classify(expr, key);
+                let cursor = if self.expanded && classified.is_none() {
+                    self.cursor_use(expr, key)
+                } else {
+                    None
+                };
+                // W6S-12: is this admitted use a W6S-8 bridge at a foreign
+                // `*const T` formal? Read before the entry is taken, because
+                // the helper borrows `self`.
+                let foreign_const = classified
+                    .as_ref()
+                    .and_then(|edit| edit.as_ref())
+                    .and(self.foreign_argument_is_shared(expr, key));
+                let admitted = super::sized_assignment::admit(
+                    self.tcx,
+                    expr,
+                    key,
+                    self.mutable_of.contains(&key),
+                );
+                let entry = self.out.entry(key).or_default();
+                if let Some(admitted) = admitted {
+                    entry.sized_assignments.push(admitted);
+                }
+                match classified {
+                    // **S3.2′-2b — three outcomes, not two.** The self-advance
+                    // assignment's TARGET (`p` on the left of `p = p.offset(1)`)
+                    // is a use that is in scope and needs NO edit: the binding
+                    // keeps its name. Folding it into the reject arm would make
+                    // the whole subject unsupported; folding it into the accept
+                    // arm would need an edit it does not have.
+                    Some(Some(edit)) => {
+                        match foreign_const {
+                            Some(true) => entry.foreign_const_bridges += 1,
+                            _ => entry.other_rewrites += 1,
+                        }
+                        entry.rewrites.push(edit);
+                    }
+                    Some(None) => {}
+                    None => {
+                        if entry.unsupported.is_none() {
+                            entry.unsupported = Some(expr.span);
+                            entry.unsupported_is_cursor = cursor.is_some();
+                            entry.unsupported_shape = Some(unsupported_use_shape(self.tcx, expr));
+                        }
+                        if let Some(cursor) = cursor {
+                            entry.raw_uses.push(cursor);
+                        }
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    impl<'tcx> V<'_, 'tcx> {
+        /// R1313-2: `*(x as *mut U).offset(e)` read or written, on a slice
+        /// subject — `bytemuck::cast_slice{_mut}::<u32, u8>(x)[e]`, or `x[e]`
+        /// for an identity cast. A borrowed place is the argument form's; a
+        /// write needs a mutable subject; a delta that may be negative has no
+        /// index.
+        fn cast_offset_place(
+            &self,
+            use_expr: &'tcx Expr<'tcx>,
+            key: (LocalDefId, HirId),
+        ) -> Option<UseEdit> {
+            let name = self.name_of.get(&key)?;
+            let spine = super::cast_offset::spine(self.tcx, key.0, use_expr)?;
+            let rustc_hir::Node::Expr(deref) = self.tcx.parent_hir_node(spine.call.hir_id) else {
+                return None;
+            };
+            if !matches!(deref.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                || !super::cast_offset::forward(self.tcx, spine.delta)
+            {
+                return None;
+            }
+            let written = match self.tcx.parent_hir_node(deref.hir_id) {
+                rustc_hir::Node::Expr(parent) => match parent.kind {
+                    ExprKind::AddrOf(..) => return None,
+                    ExprKind::Assign(lhs, _, _) | ExprKind::AssignOp(_, lhs, _) => {
+                        lhs.hir_id == deref.hir_id
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if written && !self.mutable_of.contains(&key) {
+                return None;
+            }
+            let index = index_text(self.tcx, spine.delta)?;
+            Some(UseEdit {
+                span: deref.span,
+                replacement: format!("{}[{index}]", spine.view.base(name, written)),
+                bridge_kind: "subject-use",
+            })
+        }
+
+        /// R1313-2: `&mut *(x as *mut U).offset(e)` (or the bare arithmetic)
+        /// as a registered boundary argument — wave-6s's computed suffix, read
+        /// through the byte view. The view's root stays the subject's own path.
+        fn cast_offset_argument(
+            &self,
+            use_expr: &'tcx Expr<'tcx>,
+            key: (LocalDefId, HirId),
+        ) -> Option<(SliceRawUse, super::slice_forms::ComputedArgumentView)> {
+            let spine = super::cast_offset::spine(self.tcx, key.0, use_expr)?;
+            let (mut site, mut view) = super::slice_forms::computed_argument_view_with(
+                self.tcx,
+                spine.cast,
+                key,
+                self.raw_boundary_arguments,
+                |delta| super::cast_offset::forward(self.tcx, delta),
+            )?;
+            site.hir_id = use_expr.hir_id;
+            site.span = use_expr.span;
+            view.use_span = use_expr.span;
+            view.byte_view = Some(spine.view);
+            Some((site, view))
+        }
+
+        fn cursor_use(
+            &self,
+            expression: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<SliceRawUse> {
+            self.name_of.get(&key)?;
+            let mut operand = expression;
+            loop {
+                let rustc_hir::Node::Expr(parent) = self.tcx.parent_hir_node(operand.hir_id) else {
+                    return None;
+                };
+                match parent.kind {
+                    ExprKind::Cast(inner, _) if inner.hir_id == operand.hir_id => operand = parent,
+                    ExprKind::MethodCall(segment, receiver, _, _)
+                        if receiver.hir_id == operand.hir_id
+                            && matches!(
+                                segment.ident.name.as_str(),
+                                "offset"
+                                    | "add"
+                                    | "sub"
+                                    | "wrapping_offset"
+                                    | "wrapping_add"
+                                    | "wrapping_sub"
+                            ) =>
+                    {
+                        return Some(SliceRawUse {
+                            hir_id: expression.hir_id,
+                            span: expression.span,
+                            boundary_span: None,
+                            source_shape: "cursor",
+                            target: raw_target_type(
+                                self.tcx,
+                                self.tcx.typeck(key.0).expr_ty(operand),
+                            )?,
+                            native_element: false,
+                            destination: None,
+                            contract: None,
+                        });
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        fn raw_use(
+            &self,
+            use_expr: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<(SliceRawUse, Option<UseEdit>)> {
+            let name = self.name_of.get(&key)?;
+            let mut operand = use_expr;
+            loop {
+                if self.raw_boundary_arguments.contains(&(
+                    key.0,
+                    key.1,
+                    operand.span.lo().0,
+                    operand.span.hi().0,
+                )) {
+                    let target = raw_target_type(
+                        self.tcx,
+                        self.tcx.typeck(key.0).expr_ty_adjusted(operand),
+                    )?;
+                    let parent = self.tcx.parent_hir_node(use_expr.hir_id);
+                    let element = match parent {
+                        rustc_hir::Node::Expr(deref)
+                            if matches!(deref.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) =>
+                        {
+                            Some(UseEdit {
+                                span: deref.span,
+                                replacement: format!("{name}[0]"),
+                                bridge_kind: "subject-use",
+                            })
+                        }
+                        _ => None,
+                    };
+                    return Some((
+                        SliceRawUse {
+                            hir_id: use_expr.hir_id,
+                            span: use_expr.span,
+                            boundary_span: Some(operand.span),
+                            source_shape: classify_arg(self.tcx, operand).key(),
+                            target,
+                            native_element: element.is_some(),
+                            destination: None,
+                            contract: None,
+                        },
+                        element,
+                    ));
+                }
+                match self.tcx.parent_hir_node(operand.hir_id) {
+                    rustc_hir::Node::Expr(parent) => match parent.kind {
+                        ExprKind::MethodCall(segment, receiver, arguments, _)
+                            if segment.ident.name.as_str() == "offset_from"
+                                && (receiver.hir_id == operand.hir_id
+                                    || arguments
+                                        .iter()
+                                        .any(|arg| arg.hir_id == operand.hir_id)) =>
+                        {
+                            let typeck = self.tcx.typeck(key.0);
+                            let callee = typeck.type_dependent_def_id(parent.hir_id)?;
+                            if !typeck.expr_ty(receiver).is_raw_ptr()
+                                || self.tcx.crate_name(callee.krate).as_str() != "core"
+                            {
+                                return None;
+                            }
+                            let mut target = raw_target_type(self.tcx, typeck.expr_ty(operand))?;
+                            target.mutability = RawMutability::Const;
+                            target.rendered = format!("*const {}", target.pointee);
+                            return Some((
+                                SliceRawUse {
+                                    hir_id: use_expr.hir_id,
+                                    span: use_expr.span,
+                                    boundary_span: None,
+                                    source_shape: "pointer-distance",
+                                    target,
+                                    native_element: false,
+                                    destination: None,
+                                    contract: Some(format!(
+                                        "core-pointer-distance-no-retention:{}",
+                                        self.tcx.def_path_str(callee)
+                                    )),
+                                },
+                                Some(UseEdit {
+                                    span: use_expr.span,
+                                    replacement: format!("{name}.as_ptr()"),
+                                    bridge_kind: "subject-use",
+                                }),
+                            ));
+                        }
+                        ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == operand.hir_id => {
+                            let target =
+                                raw_target_type(self.tcx, self.tcx.typeck(key.0).expr_ty(lhs))?;
+                            let destination = match lhs.kind {
+                                ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+                                    Res::Local(binding) => Some(binding),
+                                    _ => None,
+                                },
+                                _ => None,
+                            };
+                            return Some((
+                                SliceRawUse {
+                                    hir_id: use_expr.hir_id,
+                                    span: use_expr.span,
+                                    boundary_span: None,
+                                    source_shape: if destination.is_some() {
+                                        "body-copy"
+                                    } else {
+                                        "field-store"
+                                    },
+                                    target,
+                                    native_element: false,
+                                    destination,
+                                    contract: None,
+                                },
+                                None,
+                            ));
+                        }
+                        ExprKind::Cast(inner, _)
+                        | ExprKind::AddrOf(_, _, inner)
+                        | ExprKind::Unary(rustc_hir::UnOp::Deref, inner)
+                        | ExprKind::Field(inner, _)
+                            if inner.hir_id == operand.hir_id =>
+                        {
+                            operand = parent
+                        }
+                        // Pointer arithmetic is never traversed to obtain a
+                        // boundary operand. Those uses stay in the cursor set.
+                        _ => return None,
+                    },
+                    rustc_hir::Node::LetStmt(local)
+                        if local.init.is_some_and(|init| init.hir_id == operand.hir_id) =>
+                    {
+                        let target =
+                            raw_target_type(self.tcx, self.tcx.typeck(key.0).pat_ty(local.pat))?;
+                        let discarded = matches!(local.pat.kind, rustc_hir::PatKind::Wild);
+                        if discarded && target.mutability != RawMutability::Const {
+                            return None;
+                        }
+                        if !discarded && !matches!(local.pat.kind, rustc_hir::PatKind::Binding(..))
+                        {
+                            return None;
+                        }
+                        return Some((
+                            SliceRawUse {
+                                hir_id: use_expr.hir_id,
+                                span: use_expr.span,
+                                boundary_span: None,
+                                source_shape: if discarded {
+                                    "raw-discard"
+                                } else {
+                                    "body-copy"
+                                },
+                                target,
+                                native_element: false,
+                                destination: (!discarded).then_some(local.pat.hir_id),
+                                contract: None,
+                            },
+                            discarded.then(|| UseEdit {
+                                span: use_expr.span,
+                                replacement: format!("{name}.as_ptr()"),
+                                bridge_kind: "subject-use",
+                            }),
+                        ));
+                    }
+                    _ => return None,
+                }
+            }
+        }
+
+        /// `*p.offset(e)` — and nothing else — yields an edit.
+        fn classify(
+            &self,
+            use_expr: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<Option<UseEdit>> {
+            let name = self.name_of.get(&key)?;
+            let parent = self.tcx.parent_hir_node(use_expr.hir_id);
+            let rustc_hir::Node::Expr(call) = parent else {
+                return None;
+            };
+
+            // **W6S-8 (R479-5) — a FOREIGN raw-pointer formal takes the
+            // slice's own pointer.** libtree's `fputs(color_bold, stdout)`:
+            // the boundary planner owns the operands it collected as
+            // foreign-call-argument facts (`raw_use` short-circuits above),
+            // but the ones it did not reach this walk, which had no arm for a
+            // call argument — so the subject degraded at the very site the
+            // bridge exists for. Addendum 130's bridge, rendered here: no
+            // extent is fabricated, because a raw pointer carries none, and
+            // the subject keeps its slice form.
+            if let Some(edit) = self.foreign_pointer_argument(use_expr, call, key, name) {
+                return Some(Some(edit));
+            }
+
+            // **W6S-11 — the array-local view root.** The right-hand side is
+            // rendered here rather than by a source subject's plan, because an
+            // array local has no subject: the array's own name IS the view.
+            if let Some((span, replacement)) = super::slice_forms::assignment_from_array_root(
+                self.tcx,
+                use_expr,
+                key,
+                self.mutable_of.contains(&key),
+            ) {
+                return Some(Some(UseEdit {
+                    span,
+                    replacement,
+                    bridge_kind: "subject-use",
+                }));
+            }
+
+            // **S3.2′-2b — the PLAIN dereference.** `*p` with no arithmetic
+            // under it. On `&[T]` its image is `p[0]`, and it is admitted here
+            // because the census showed it never occurs alone: every subject it
+            // would unblock also self-advances, which is why the two positions
+            // were ratified as one bundle.
+            if matches!(call.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) {
+                // -2's accept-set restoration, unchanged: a BORROW of the deref
+                // is a third position and is still out of scope.
+                if matches!(
+                    self.tcx.parent_hir_node(call.hir_id),
+                    rustc_hir::Node::Expr(e) if matches!(e.kind, ExprKind::AddrOf(..))
+                ) {
+                    return None;
+                }
+                return Some(Some(UseEdit {
+                    span: call.span,
+                    replacement: format!("{name}[0]"),
+                    bridge_kind: "subject-use",
+                }));
+            }
+
+            // **S3.2′-2b — the self-advance TARGET.** `p` on the left of
+            // `p = p.offset(1)`. In scope, and it needs no edit: the binding
+            // keeps its name. Admitted only when the right-hand side is this
+            // same binding's own arithmetic, so an assignment FROM anything
+            // else stays unsupported.
+            if let ExprKind::Assign(lhs, rhs, _) = &call.kind
+                && lhs.hir_id == use_expr.hir_id
+            {
+                // wave-6s2 (W6S2-5): the destination of a forward computed view
+                // copied by assignment is in scope and needs no edit of its
+                // own — the right-hand side is the source's (or the Option
+                // value planner's) to render.
+                if super::slice_passon::assignment_from_computed_view(self.tcx, use_expr, key)
+                    // wave-6s (W6S-7): the same assignment under this lane's
+                    // own sign authority, which admits the C2Rust double-cast
+                    // literal the narrower walk refuses.
+                    || super::slice_forms::assignment_from_forward_view(self.tcx, use_expr, key)
+                {
+                    return Some(None);
+                }
+                // **main 071c (a), wave-4: the assignment IS the
+                // construction.** A null-declared binding whose SOLE assignment
+                // reads the very field its extent evidence names is not writing
+                // to a slice — it is building one, and the right-hand side
+                // carries the construction so the crate stays well typed.
+                if let Some(admitted) = super::sized_assignment::admit(
+                    self.tcx,
+                    use_expr,
+                    key,
+                    self.mutable_of.contains(&key),
+                ) {
+                    return Some(Some(UseEdit {
+                        span: admitted.value_span,
+                        replacement: admitted.value,
+                        bridge_kind: "sized-assignment",
+                    }));
+                }
+                // wave-6l (R608-1): every assignment stores a string literal,
+                // so each builds its own evidence-backed slice.
+                if let Some((span, replacement)) = super::sized_assignment::admit_literal(
+                    self.tcx,
+                    use_expr,
+                    key,
+                    self.mutable_of.contains(&key),
+                ) {
+                    return Some(Some(UseEdit {
+                        span,
+                        replacement,
+                        bridge_kind: "literal-assignment",
+                    }));
+                }
+                if !self.advance_ok.contains(&key) {
+                    return None;
+                }
+                return self_advance_rhs(self.tcx, rhs, key).map(|_| None);
+            }
+
+            let ExprKind::MethodCall(seg, receiver, args, _) = &call.kind else {
+                return None;
+            };
+            if receiver.hir_id != use_expr.hir_id
+                || !SLICE_ARITHMETIC_OPS.contains(&seg.ident.name.to_string().as_str())
+            {
+                return None;
+            }
+            let [arg] = args else { return None };
+            let rustc_hir::Node::Expr(deref) = self.tcx.parent_hir_node(call.hir_id) else {
+                return None;
+            };
+
+            // **S3.2′-2b — the self-advance SOURCE.** `p.offset(e)` on the right
+            // of `p = …`. Its image is the reslice, and the `&mut` form is the
+            // naive reborrow — compiler-witnessed on the pinned toolchain, so no
+            // `mem::take` is needed. Under the NON-NEGATIVE sign verdict only;
+            // the negative class is `SliceCursor`'s, which S3.2′-5 owns.
+            if let ExprKind::Assign(lhs, rhs, _) = &deref.kind
+                && rhs.hir_id == call.hir_id
+                && lhs.hir_id != use_expr.hir_id
+                && self_advance_lhs(lhs, key)
+                && self.advance_ok.contains(&key)
+            {
+                let index = index_text(self.tcx, arg)?;
+                let amp = if self.mutable_of.contains(&key) {
+                    "&mut "
+                } else {
+                    "&"
+                };
+                return Some(Some(UseEdit {
+                    span: call.span,
+                    replacement: format!("{amp}{name}[{index}..]"),
+                    bridge_kind: "subject-use",
+                }));
+            }
+
+            if !matches!(deref.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _)) {
+                return None;
+            }
+            // **SCOPE RESTORATION.** Amendment 1 authorises exactly two
+            // positions — the deref READ and the deref WRITE. A BORROW of the
+            // deref is a third, and this classifier accepted it because it
+            // tested the deref's shape without testing its context.
+            //
+            // Measured on the corpus: `lodepng_chunk_data` reads
+            // `return &mut *chunk.offset(8) as *mut c_uchar`, and rewriting it
+            // gave `error[E0596]: cannot borrow chunk[_] as mutable, as it is
+            // behind a & reference`.
+            //
+            // **Scope is whatever the classifier accepts.** The approved scope
+            // and the accept-set are the same object, so the accept-set is
+            // witnessed against the scope — positive controls for both
+            // authorised positions, a negative control for each known
+            // neighbour (borrow-of-deref, rebind, self-advance).
+            if let rustc_hir::Node::Expr(borrow) = self.tcx.parent_hir_node(deref.hir_id)
+                && let ExprKind::AddrOf(_, mutability, _) = borrow.kind
+            {
+                // Relay 371 step 4 (A3): a borrow that is dereferenced at once,
+                // `*(&mut *p.offset(e))`, names the element place itself, `p[e]`.
+                // Any other borrow of the element stays refused.
+                let rustc_hir::Node::Expr(place) = self.tcx.parent_hir_node(borrow.hir_id) else {
+                    return None;
+                };
+                if !matches!(place.kind, ExprKind::Unary(rustc_hir::UnOp::Deref, _))
+                    || (mutability == Mutability::Mut && !self.mutable_of.contains(&key))
+                {
+                    return None;
+                }
+                let index = self.index_text(arg)?;
+                return Some(Some(UseEdit {
+                    span: place.span,
+                    replacement: format!("{name}[{index}]"),
+                    bridge_kind: "subject-use",
+                }));
+            }
+            let index = self.index_text(arg)?;
+            Some(Some(UseEdit {
+                span: deref.span,
+                replacement: format!("{name}[{index}]"),
+                bridge_kind: "subject-use",
+            }))
+        }
+
+        /// [`classify`]'s foreign-call arm: `s.as_ptr()` / `s.as_mut_ptr()`
+        /// at a foreign callee's raw-pointer formal, or nothing.
+        ///
+        /// Every refusal here is a position another family owns: a `*mut T`
+        /// formal under a SHARED subject would be `&T -> &mut T`; a formal
+        /// whose pointee is not the subject's element is a reinterpretation
+        /// (the void-region family's evidence); a formal that is itself a
+        /// pointer is depth-2 (the nested family's); the variadic tail has no
+        /// declared formal to read. A LOCAL callee — one with a body — keeps
+        /// the c-raw-slice path it already has (R410-9(b)'s own test).
+        fn foreign_pointer_argument(
+            &self,
+            use_expr: &Expr<'_>,
+            call: &Expr<'_>,
+            key: (LocalDefId, HirId),
+            name: &str,
+        ) -> Option<UseEdit> {
+            use rustc_middle::ty::TyKind;
+            let ExprKind::Call(callee, arguments) = call.kind else {
+                return None;
+            };
+            let index = arguments
+                .iter()
+                .position(|argument| argument.hir_id == use_expr.hir_id)?;
+            let typeck = self.tcx.typeck(key.0);
+            let TyKind::FnDef(callee_did, _) = *typeck.expr_ty(callee).kind() else {
+                return None;
+            };
+            // Foreign = an `extern` block item, or any callee with no body.
+            // The same test R410-9(b) uses to tell a libc callee from a local
+            // one — and it must be the BODY, not the DefId's crate: C2Rust
+            // declares `fputs` in the crate's own `extern "C"` block, so a
+            // locality test alone calls it local.
+            let foreign = self.tcx.is_foreign_item(callee_did)
+                || self
+                    .tcx
+                    .hir_get_if_local(callee_did)
+                    .and_then(|node| node.body_id())
+                    .is_none();
+            if !foreign {
+                return None;
+            }
+            let signature = self.tcx.fn_sig(callee_did).skip_binder().skip_binder();
+            // The variadic tail declares no formal; nothing to read a
+            // permission or a pointee from.
+            let formal = signature.inputs().get(index)?;
+            let TyKind::RawPtr(formal_pointee, formal_mutability) = formal.kind() else {
+                return None;
+            };
+            // Depth-2 is the nested family's position, not a slice's pointer.
+            if formal_pointee.is_raw_ptr() {
+                return None;
+            }
+            let TyKind::RawPtr(subject_pointee, _) = typeck.expr_ty(use_expr).kind() else {
+                return None;
+            };
+            // The element type is the subject's; a formal that changes it is a
+            // reinterpretation and never this arm's.
+            if subject_pointee != formal_pointee {
+                return None;
+            }
+            let accessor = match formal_mutability {
+                Mutability::Not => "as_ptr",
+                // A shared subject may not supply a pointer the callee writes.
+                Mutability::Mut if self.mutable_of.contains(&key) => "as_mut_ptr",
+                Mutability::Mut => return None,
+            };
+            Some(UseEdit {
+                span: use_expr.span,
+                replacement: format!("{name}.{accessor}()"),
+                bridge_kind: "subject-use",
+            })
+        }
+
+        /// **W6S-12** — does this use sit at a foreign callee's `*const T`
+        /// formal? `Some(true)` for a shared foreign formal, `Some(false)` for
+        /// a mutable one, `None` when the use is not a foreign argument at
+        /// all. Only the permission is read here; the rendering is
+        /// [`Self::foreign_pointer_argument`]'s.
+        fn foreign_argument_is_shared(
+            &self,
+            use_expr: &Expr<'_>,
+            key: (LocalDefId, HirId),
+        ) -> Option<bool> {
+            use rustc_middle::ty::TyKind;
+            let rustc_hir::Node::Expr(call) = self.tcx.parent_hir_node(use_expr.hir_id) else {
+                return None;
+            };
+            let ExprKind::Call(callee, arguments) = call.kind else {
+                return None;
+            };
+            let index = arguments
+                .iter()
+                .position(|argument| argument.hir_id == use_expr.hir_id)?;
+            let typeck = self.tcx.typeck(key.0);
+            let TyKind::FnDef(callee_did, _) = *typeck.expr_ty(callee).kind() else {
+                return None;
+            };
+            let foreign = self.tcx.is_foreign_item(callee_did)
+                || self
+                    .tcx
+                    .hir_get_if_local(callee_did)
+                    .and_then(|node| node.body_id())
+                    .is_none();
+            if !foreign {
+                return None;
+            }
+            let signature = self.tcx.fn_sig(callee_did).skip_binder().skip_binder();
+            let TyKind::RawPtr(_, mutability) = signature.inputs().get(index)?.kind() else {
+                return None;
+            };
+            Some(matches!(mutability, Mutability::Not))
+        }
+
+        /// The index expression's source text, **typed as a `usize`**.
+        ///
+        /// C2Rust writes `p.offset(i as isize)`; the `as isize` exists only to
+        /// satisfy `offset`, so stripping it recovers the author's index rather
+        /// than inventing a conversion.
+        ///
+        /// # Stripping is not enough, and the corpus said so
+        ///
+        /// The real idiom is a **double** cast — `p.offset(1 as libc::c_int as
+        /// isize)` — so stripping the outer cast leaves a `c_int`, and a slice
+        /// indexed by `i32` is `error[E0277]`. Measured: all 14 decided slices
+        /// reverted, taking two sibling `Ref` emissions down with them, because
+        /// revert granularity is per function.
+        ///
+        /// So the stripped expression's TYPE decides. Already `usize` — the
+        /// shape g11/g12 pin — renders bare, which is what keeps the ratified
+        /// golden text untouched rather than bending spec around a defect.
+        /// Anything else is parenthesised and cast: parenthesised because
+        /// `i + 1 as usize` parses as `i + (1 as usize)`.
+        fn index_text(&self, arg: &Expr<'_>) -> Option<String> {
+            index_text(self.tcx, arg)
+        }
+    }
+
+    let mut out = FxHashMap::default();
+    for &fn_did in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
+        let mut v = V {
+            tcx,
+            fn_did,
+            out: &mut out,
+            name_of,
+            mutable_of,
+            advance_ok,
+            raw_boundary_arguments,
+            expanded,
+            return_sites,
+            parameter_nodes,
+        };
+        v.visit_body(tcx.hir_body(body_id));
+    }
+    out
+}

@@ -1,0 +1,2665 @@
+//! **S3.6-1 task 2 — co-conversion classes.**
+//!
+//! # Why conversion is a property of a CLASS and not of a subject
+//!
+//! Converting a callee parameter while the caller passes a bare local that
+//! stays raw does not lose precision — it does not compile (`E0308`, measured,
+//! micro-plan §4). So a callee parameter and the caller binding feeding it are
+//! joined by an **undirected** edge, and the unit of decision is the connected
+//! component.
+//!
+//! # The measured shape, and the risk inversion that fixed the design
+//!
+//! The coupling does not globally collapse: mean class size 2.1, 89.5 % of
+//! nodes in unblocked classes. But the *reason* the class test is the mechanism
+//! is not yield, it is safety. rustc's borrow checker is **blind through a
+//! raw-pointer deref** (§5a, compiler-measured): `two_mut(&mut *p, &mut *p)`
+//! compiles with zero diagnostics where `two_mut(&mut v, &mut v)` is `E0499`.
+//! Full co-conversion keeps the aliasing in the region the compiler checks — a
+//! mistake there costs a revert. A reborrow bridge would move the same case
+//! into the region it cannot check, where a mistake is silent UB. That is why
+//! the bridge arm is **parked** (g22, unratified) and why no shape in
+//! [`ArgShape`] can construct one.
+//!
+//! # What this module does at task 2, and what it deliberately does not
+//!
+//! It **computes**. Nothing here is consulted by [`super::decide_one`]: the
+//! production call site passed `RefGate::BlockAll`, so the corpus cannot
+//! move. Zero delta is a property of the code — the S3.6-0 pattern — and task 3
+//! is where the verdict becomes load-bearing.
+//!
+//! ⚠ **STALE SINCE S3.6-1, AND THE VARIANT IS GONE (X-3, closed 2026-08-18).**
+//! Production has passed `RefGate::LiftAdaptable` since S3.6-1; the claim above
+//! describes task 2 only, and it cost one wrong calibration run before it was
+//! caught. `BlockAll` was deleted at M-3 as measured-dead, and this note is its
+//! other direction — one fact, both places, closed together.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    Expr, ExprKind, HirId, QPath,
+    def::Res,
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
+use rustc_middle::ty::TyCtxt;
+use rustc_span::Span;
+
+use super::{
+    Arm, Decision, DecisionTable, RequiredArmSet, Subject, SubjectKind,
+    a5_site_proof::{A5PeerProof, A5ProofSiteKey, A5SeamProofIndex, A5SiteProofVerdict},
+    emitability::{ArgShape, EmitabilityFacts, RefKind},
+    lifetime::LifetimeEligibility,
+    raw_boundary::{
+        RawBoundaryDispositionIndex, RawTargetType, RetentionSummaries, RetentionVerdict,
+    },
+};
+use crate::analyses::borrow_ownership::{
+    overlap_producer::PlannedCopyMark, param_overlap::PairSide,
+};
+
+/// A node's identity — the same `(owner, binding)` key A1's emitability gates
+/// use, so a call argument that resolves to `Res::Local(b)` needs no
+/// translation to find the subject it names.
+pub(crate) type NodeKey = (LocalDefId, HirId);
+
+/// Why a class may not convert.
+///
+/// One variant per distinct owed capability or hazard, never a shared
+/// "blocked": a cast argument is one edit away in task 4, a null literal is a
+/// permanent block, and a silent coercion into a raw parameter is a soundness
+/// gate. Collapsing them would make the census unable to answer the only
+/// question it exists to answer — *what would it take to unblock this?*
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockReason {
+    /// A call site supplies a bare local that will **not** convert, so the
+    /// callee's parameter cannot either: `E0308` (H5, measured).
+    ///
+    /// The bridge that would fix it — `f(&mut *r)` — is **parked**.
+    ArgStaysRaw,
+    /// The member's own binding is passed to a callee parameter that does not
+    /// convert. **`&mut T → *mut T` is an implicit coercion**, so this compiles
+    /// at exit 0 and produces no counter movement at all (§5a, measured) — the
+    /// record's E3b premise, refuted.
+    ///
+    /// It therefore needs a **decision-time** gate; there is no compile-time
+    /// backstop to catch it if the test is wrong. Banked rule 2, 2026-08-09.
+    FlowsIntoRawParam,
+    /// The same silent coercion, into a **pinned** callee — one whose signature
+    /// is fixed by a fn-pointer cast and which M1 will never adapt.
+    ///
+    /// Its own variant rather than folded into [`Self::FlowsIntoRawParam`]:
+    /// that one is unblockable by a later slice of the same ladder, this one
+    /// waits on the M2/M3 pinned population.
+    FlowsIntoPinnedCallee,
+    /// The member's converting binding is `as`-cast at a call site
+    /// (`q as *mut T`). A reference casts to a raw pointer silently, so this is
+    /// [`Self::FlowsIntoRawParam`] wearing a cast.
+    CastOfConvertingLocal,
+    /// The argument is `&mut e as *mut T` or `q as *mut T` — the **cast-strip**
+    /// form, whose edit arm is **task 4's** and is not built yet.
+    ArgCastFormUnbuilt,
+    /// A null literal. `&mut T` cannot represent null (`E0308`, H4 measured);
+    /// the form that serves it is `Option`, i.e. a different arm.
+    ArgNullLiteral,
+    /// A shared borrow (`&e`) at a position that must become `&mut T`.
+    ArgSharedIntoMut,
+    /// A cast, a call result, an index, arithmetic — no adaptation form exists.
+    ArgUnadaptableShape,
+    /// The member's binding is **borrowed** at a call site (`f(&mut *r)`) and
+    /// the parameter it reaches does not convert.
+    ///
+    /// Today `&mut *r` on a raw `r` already coerces to `*mut T`. After `r`
+    /// converts, the same expression reborrows a **reference**, so the raw
+    /// pointer the callee keeps can outlive the borrow. **S3.6-1's conversion
+    /// changes the case's character**, which puts it inside banked rule 2
+    /// rather than outside it — the gap the adversarial review named (P1).
+    BorrowedIntoRawParam,
+    /// The member's reference can leave through a **`return`**.
+    EscapesViaReturn,
+    /// … through an argument to a callee the class machinery cannot see —
+    /// `extern` block entries and anything not a direct call to a local `fn`.
+    EscapesViaForeignArg,
+    /// … through a store into a place projection (`(*t).f = p`).
+    EscapesViaFieldStore,
+    /// … through a store into a `static mut`.
+    EscapesViaStaticStore,
+    /// Two argument positions at one call site may name overlapping places, and
+    /// both would become references: `E0499`.
+    ///
+    /// **Demoting one side to shared does not rescue it** — `E0502`, measured
+    /// (H6) — so there is no mutability re-assignment that saves the class.
+    ///
+    /// A shared place ROOT is a *may*-overlap, and an UNKNOWN root is treated
+    /// as one: blocking costs yield and never soundness.
+    /// **R808-5 / R810-2.** At a call, one argument is provably a place
+    /// inside another argument's referent (`br = &mut (*s).br` beside `s`) and
+    /// the callee writes through one of them: a protected reference on either
+    /// side beside the other (`&mut` or a raw view) is undefined under Tree
+    /// Borrows (wave-6o 112b). Both positions stay raw, as in the input.
+    ProvenOverlap,
+    /// **R833-1 (USER).** At a call inside the program, a pair that is not
+    /// shown disjoint has one member as the raw view; its peer, the primary,
+    /// keeps its raw form too (no reference beside a raw view of what may be
+    /// the same object). The pair row names the site.
+    PairNotShownDisjoint,
+    DuplicatePlaceRoot,
+}
+
+impl BlockReason {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            BlockReason::ArgStaysRaw => "arg-stays-raw",
+            BlockReason::FlowsIntoRawParam => "flows-into-raw-param",
+            BlockReason::FlowsIntoPinnedCallee => "flows-into-pinned-callee",
+            BlockReason::CastOfConvertingLocal => "cast-of-converting-local",
+            BlockReason::ArgCastFormUnbuilt => "arg-cast-form-unbuilt",
+            BlockReason::ArgNullLiteral => "arg-null-literal",
+            BlockReason::ArgSharedIntoMut => "arg-shared-into-mut",
+            BlockReason::ArgUnadaptableShape => "arg-unadaptable-shape",
+            BlockReason::BorrowedIntoRawParam => "borrowed-into-raw-param",
+            BlockReason::EscapesViaReturn => "escapes-via-return",
+            BlockReason::EscapesViaForeignArg => "escapes-via-foreign-arg",
+            BlockReason::EscapesViaFieldStore => "escapes-via-field-store",
+            BlockReason::EscapesViaStaticStore => "escapes-via-static-store",
+            BlockReason::ProvenOverlap => "pair-proven-overlap",
+            BlockReason::PairNotShownDisjoint => "pair-not-shown-disjoint",
+            BlockReason::DuplicatePlaceRoot => "duplicate-place-root",
+        }
+    }
+}
+
+/// **P2 — how the within-site overlap gate treats two node positions.**
+///
+/// A measurement parameter, not a policy. ⚠ **The `RootDisjoint` baseline this
+/// doc used to name was deleted at M-3 as measured-dead**; production is
+/// [`Self::BlindOnly`], ruled 2026-08-10 on the split census. The per-node lesson applies to this estimate too —
+/// blocking a node blocks its class, so neither option can be costed by
+/// counting positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlapRule {
+    /// **PRODUCTION, ruled 2026-08-10 on the split census.** Block a pair only
+    /// where the compiler cannot see it: at least one side is a place reached
+    /// through a base that stays RAW after conversion, or has an unknown root.
+    ///
+    /// Measured, class-level: this costs **8** admissible nodes against the
+    /// unsound baseline and **zero** additional regression — the 8 all sit in
+    /// the gate-blocked population. Maximal conservatism costs **391** and
+    /// turns the slice negative (net −137). Banked rule 1 in one line:
+    /// conservatism belongs where the compiler cannot see, and nowhere else.
+    ///
+    /// The other pairs are in the **checked** region — if they really alias,
+    /// borrowck answers `E0499`/`E0502`, which costs a revert. Yield, not
+    /// soundness.
+    BlindOnly,
+    /// Block every mutable pair regardless of roots — maximal conservatism.
+    #[allow(dead_code)]
+    AllPairs,
+}
+
+/// One connected component.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Class {
+    /// Members in subject-collection order — **not** a `HashSet`. D19: a report
+    /// whose order permutes between runs is not comparable, and the union-find
+    /// this is derived from tracks members in a `HashSet`.
+    pub members: Vec<NodeKey>,
+    /// `None` means every member's every call site supplies a compatible
+    /// argument. **One blocked member blocks the class**, which the measured
+    /// structure says is affordable — and which libzahl says is not free: one
+    /// duplicated-argument site (`zadd(a, a, …)`) blocks a 104-node class.
+    pub blocked: Option<BlockReason>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgeForm {
+    Raw,
+    Ref,
+    Slice,
+    NestedSlice,
+    Cursor,
+    Optional,
+    Box,
+}
+
+impl EdgeForm {
+    fn of(decision: &Decision) -> Self {
+        match decision {
+            Decision::Ref { .. } | Decision::InferredRef { .. } => Self::Ref,
+            Decision::Slice { .. } => Self::Slice,
+            Decision::NestedSlice { .. } => Self::NestedSlice,
+            Decision::Cursor { .. } => Self::Cursor,
+            Decision::Opt { .. } => Self::Optional,
+            Decision::Box(_) => Self::Box,
+            Decision::Degraded(_) => Self::Raw,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Raw => "raw",
+            Self::Ref => "ref",
+            Self::Slice => "slice",
+            Self::NestedSlice => "nested-slice",
+            Self::Cursor => "cursor",
+            Self::Optional => "optional",
+            Self::Box => "box",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EdgeRoute {
+    ZeroSyntax,
+    ArmA,
+    ArmC,
+    Glue,
+}
+
+impl EdgeRoute {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::ZeroSyntax => "zero-syntax",
+            Self::ArmA => "arm-a",
+            Self::ArmC => "arm-c",
+            Self::Glue => "glue",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct EdgeObligation {
+    pub(crate) source: NodeKey,
+    pub(crate) target: NodeKey,
+    pub(crate) caller: LocalDefId,
+    pub(crate) callee: LocalDefId,
+    pub(crate) argument_index: usize,
+    pub(crate) span: Span,
+    pub(crate) source_form: EdgeForm,
+    pub(crate) target_form: EdgeForm,
+    pub(crate) route: EdgeRoute,
+}
+
+#[derive(Clone, Debug)]
+struct EdgeCandidate {
+    source: NodeKey,
+    target: NodeKey,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    argument_index: usize,
+    span: Span,
+    source_form: EdgeForm,
+    target_form: EdgeForm,
+}
+
+/// One site-local result of the ruled argument-pair proof stage. The callee
+/// parameter remains the semantic subject; `source_node` identifies the
+/// caller-side safe value whose explicit raw view is emitted for `RawView`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairRole {
+    Clear,
+    Primary,
+    RawView,
+    Blocked,
+}
+
+impl PairRole {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Primary => "primary",
+            Self::RawView => "raw-view",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairTier {
+    None,
+    T2,
+    Blocked,
+}
+
+impl PairTier {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::None => "-",
+            Self::T2 => "T2",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PairSiteDecision {
+    pub(crate) caller: LocalDefId,
+    pub(crate) callee: LocalDefId,
+    pub(crate) argument_index: usize,
+    pub(crate) span: Span,
+    pub(crate) call_span: Span,
+    pub(crate) subject: NodeKey,
+    pub(crate) source_node: Option<NodeKey>,
+    pub(crate) target: Option<RawTargetType>,
+    pub(crate) source_shape: &'static str,
+    pub(crate) role: PairRole,
+    pub(crate) tier: PairTier,
+    pub(crate) verdict: A5SiteProofVerdict,
+    pub(crate) reason: String,
+    pub(crate) peer_receipts: String,
+    /// R833-1: the argument positions at this call whose proof against this
+    /// position is not clear (the peers the pair rule must hold).
+    pub(crate) unproven_peers: Vec<usize>,
+    /// A5-owned whole-call carrier; ordinary PAIR rows leave this absent.
+    pub(crate) a5_fallback: Option<A5ProofSiteKey>,
+}
+
+impl PairSiteDecision {
+    pub(crate) fn atom_id(&self) -> String {
+        format!(
+            "pair-site:{}:{}:{}:{}:{}",
+            self.caller.local_def_index.as_u32(),
+            self.callee.local_def_index.as_u32(),
+            self.argument_index,
+            self.span.lo().0,
+            self.subject.1.local_id.as_u32(),
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_pair_roles(
+    entries: &[(usize, usize, A5SiteProofVerdict, bool)],
+) -> BTreeMap<usize, PairRole> {
+    resolve_pair_roles_with_rule(entries).0
+}
+
+/// [`resolve_pair_roles`], plus the positions whose role the **forced cover** (R573-4) chose,
+/// so their receipts can name it (`pair-forced-cover`).
+pub(crate) fn resolve_pair_roles_with_rule(
+    entries: &[(usize, usize, A5SiteProofVerdict, bool)],
+) -> (BTreeMap<usize, PairRole>, BTreeSet<usize>) {
+    let mut rule = BTreeSet::new();
+    let mut vertices = BTreeSet::new();
+    let mut overlap = BTreeMap::<usize, BTreeSet<usize>>::new();
+    let mut positive = BTreeSet::new();
+    for &(left, right, verdict, positive_retention) in entries {
+        vertices.extend([left, right]);
+        if positive_retention {
+            positive.insert(left);
+        }
+        match verdict {
+            A5SiteProofVerdict::Clear => {}
+            A5SiteProofVerdict::Overlapping => {
+                overlap.entry(left).or_default().insert(right);
+                overlap.entry(right).or_default().insert(left);
+            }
+            A5SiteProofVerdict::Undeterminable => {
+                overlap.entry(left).or_default().insert(right);
+                overlap.entry(right).or_default().insert(left);
+            }
+        }
+    }
+    let mut roles = vertices
+        .iter()
+        .map(|&index| (index, PairRole::Clear))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeSet::new();
+    for &start in overlap.keys() {
+        if seen.contains(&start) {
+            continue;
+        }
+        let mut stack = vec![start];
+        let mut component = BTreeSet::new();
+        while let Some(index) = stack.pop() {
+            if !component.insert(index) {
+                continue;
+            }
+            stack.extend(overlap.get(&index).into_iter().flatten().copied());
+        }
+        seen.extend(component.iter().copied());
+        // A raw-view vertex may not have positive-retention evidence. Choose
+        // the lowest canonical index whose removal leaves every raw view
+        // admissible; if none exists, the entire component remains blocked.
+        let primary = component.iter().copied().find(|candidate| {
+            component
+                .iter()
+                .all(|index| index == candidate || !positive.contains(index))
+        });
+        let Some(primary) = primary else {
+            // **R573-4 — the forced cover.** One primary with every other member raw is one
+            // admissible assignment, not the only one. The invariants are: every overlapping
+            // pair has a raw side, no raw side retains, and the primaries are pairwise clear
+            // (which the first gives). A retaining vertex can never be the raw side, so its
+            // non-retaining neighbours are FORCED raw. If they cover every edge of the
+            // component, they are the raw views and the rest keep their safe forms; if not,
+            // there is no admissible assignment and the component stays blocked. Reached only
+            // where the single-primary rule found none (brotli's `InitOrStitchToPreviousBlock`,
+            // a star around a `*const u8` with two retaining leaves).
+            let forced = component
+                .iter()
+                .copied()
+                .filter(|index| {
+                    !positive.contains(index)
+                        && overlap
+                            .get(index)
+                            .into_iter()
+                            .flatten()
+                            .any(|neighbour| positive.contains(neighbour))
+                })
+                .collect::<BTreeSet<_>>();
+            let covers = component.iter().all(|index| {
+                overlap
+                    .get(index)
+                    .into_iter()
+                    .flatten()
+                    .all(|neighbour| forced.contains(index) || forced.contains(neighbour))
+            });
+            for &index in &component {
+                roles.insert(
+                    index,
+                    if !covers || forced.is_empty() {
+                        PairRole::Blocked
+                    } else if forced.contains(&index) {
+                        PairRole::RawView
+                    } else {
+                        PairRole::Primary
+                    },
+                );
+            }
+            if covers && !forced.is_empty() {
+                rule.extend(component.iter().copied());
+            }
+            continue;
+        };
+        for index in component {
+            roles.insert(
+                index,
+                if index == primary {
+                    PairRole::Primary
+                } else {
+                    PairRole::RawView
+                },
+            );
+        }
+    }
+    (roles, rule)
+}
+
+/// The finished class structure. **Measurement at task 2; the gate at task 3.**
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CoConv {
+    class_of: FxHashMap<NodeKey, usize>,
+    classes: Vec<Class>,
+    /// The reason a node CONTRIBUTED, as opposed to the one its class carries.
+    ///
+    /// Kept separately because they answer different questions: the class
+    /// reason says why the component cannot convert, this one says which member
+    /// is responsible. A census with only the first cannot be acted on.
+    node_block: FxHashMap<NodeKey, BlockReason>,
+    edges: Vec<EdgeObligation>,
+    pair_sites: Vec<PairSiteDecision>,
+    /// Relay main/371 step 5 (A4): the hypothetical's form of every subject (with the reason when
+    /// it degraded), so the class gate's fall-through can say why a subject production takes thin is
+    /// not a node.
+    hypothetical_form: FxHashMap<NodeKey, String>,
+}
+
+impl CoConv {
+    /// The hypothetical's form of `key` (`absent` when the hypothetical has no row for it).
+    pub(crate) fn hypothetical_form(&self, key: NodeKey) -> &str {
+        self.hypothetical_form
+            .get(&key)
+            .map_or("absent", String::as_str)
+    }
+
+    /// Would this subject convert, given its class? **Task 3's entry point.**
+    ///
+    /// A subject that is not a node at all answers `false`: it did not reach
+    /// the gate under the hypothetical, so nothing about the class structure
+    /// can license it.
+    pub(crate) fn admits(&self, key: NodeKey) -> bool {
+        self.class_of.contains_key(&key) && !self.node_block.contains_key(&key)
+    }
+
+    /// The reason this subject's CLASS carries, as opposed to the one the
+    /// subject itself contributed. Step 3's collateral arm reads this: a
+    /// subject blocked through a class edge carries no hazard of its own, so
+    /// the reason field names the indirection and keeps the class's key as
+    /// payload.
+    pub(crate) fn class_block(&self, key: NodeKey) -> Option<BlockReason> {
+        self.class_of(key).and_then(|id| self.classes[id].blocked)
+    }
+
+    pub(crate) fn class_of(&self, key: NodeKey) -> Option<usize> {
+        self.class_of.get(&key).copied()
+    }
+
+    pub(crate) fn classes(&self) -> &[Class] {
+        &self.classes
+    }
+
+    pub(crate) fn node_block(&self, key: NodeKey) -> Option<BlockReason> {
+        self.node_block.get(&key).copied()
+    }
+
+    pub(crate) fn pair_sites(&self) -> &[PairSiteDecision] {
+        &self.pair_sites
+    }
+
+    pub(crate) fn is_pair_raw_view(&self, key: NodeKey) -> bool {
+        self.pair_sites
+            .iter()
+            .any(|site| site.subject == key && site.role == PairRole::RawView)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn edge_routes(&self, key: NodeKey) -> Vec<&'static str> {
+        let mut routes = self
+            .edges
+            .iter()
+            .filter(|edge| edge.source == key || edge.target == key)
+            .map(|edge| edge.route.key())
+            .collect::<Vec<_>>();
+        routes.sort_unstable();
+        routes.dedup();
+        routes
+    }
+
+    pub(crate) fn required_arms(&self, key: NodeKey) -> RequiredArmSet {
+        let mut arms = RequiredArmSet::default();
+        if self.class_of(key).is_some_and(|id| {
+            self.classes[id].members.len() > 1 || self.classes[id].blocked.is_some()
+        }) {
+            arms.insert(Arm::D4);
+        }
+        for edge in self
+            .edges
+            .iter()
+            .filter(|edge| edge.source == key || edge.target == key)
+        {
+            match edge.route {
+                // R401-4 (wave-6s report 004/005): the C adapter is the seam
+                // edit owned by the CONVERTED callee's class, and it is applied
+                // whether or not the caller's class is ready; charging the raw
+                // source side too held every caller with a degraded argument
+                // (`blocked-subject:<reason>` + `missing-required-arm:c`) and
+                // withdrew the callee through restoration. Only the target
+                // requires the arm.
+                EdgeRoute::ArmC if edge.target == key => arms.insert(Arm::C),
+                EdgeRoute::ArmC => {}
+                EdgeRoute::Glue => arms.insert(Arm::Glue),
+                EdgeRoute::ZeroSyntax | EdgeRoute::ArmA => {}
+            }
+        }
+        if self.pair_sites.iter().any(|site| site.subject == key) {
+            arms.insert(Arm::Pair);
+        }
+        arms
+    }
+
+    pub(crate) fn pair_receipts_tsv(&self, tcx: TyCtxt<'_>) -> String {
+        let mut out = String::from(
+            "caller\tcallee\targument_index\tsubject\tsite\tverdict\trole\ttier\treason\tpeer_receipts\n",
+        );
+        for row in &self.pair_sites {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}:{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                tcx.def_path_str(row.caller.to_def_id()),
+                tcx.def_path_str(row.callee.to_def_id()),
+                row.argument_index,
+                tcx.def_path_str(row.subject.0.to_def_id()),
+                row.subject.1.local_id.as_u32(),
+                super::emitability::EmitabilityFacts::site(tcx, row.span),
+                row.verdict.key(),
+                row.role.key(),
+                row.tier.key(),
+                row.reason,
+                row.peer_receipts,
+            ));
+        }
+        out
+    }
+
+    pub(crate) fn edge_receipts_tsv(&self, tcx: TyCtxt<'_>, subjects: &[Subject]) -> String {
+        let mut out = String::from(
+            "caller\tcallee\targument_index\tsource\ttarget\tsource_subject\ttarget_subject\tsource_form\ttarget_form\troute\tsite\n",
+        );
+        let subject_identity = |key: NodeKey| {
+            subjects
+                .iter()
+                .find(|subject| subject.fn_did == key.0 && subject.hir_id == key.1)
+                .map(|subject| {
+                    let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+                    subject.identity_key(&owner)
+                })
+                .unwrap_or_else(|| "temporary".to_owned())
+        };
+        for edge in &self.edges {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}:{}\t{}:{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                tcx.def_path_str(edge.caller.to_def_id()),
+                tcx.def_path_str(edge.callee.to_def_id()),
+                edge.argument_index,
+                tcx.def_path_str(edge.source.0.to_def_id()),
+                edge.source.1.local_id.as_u32(),
+                tcx.def_path_str(edge.target.0.to_def_id()),
+                edge.target.1.local_id.as_u32(),
+                subject_identity(edge.source),
+                subject_identity(edge.target),
+                edge.source_form.key(),
+                edge.target_form.key(),
+                edge.route.key(),
+                super::emitability::EmitabilityFacts::site(tcx, edge.span),
+            ));
+        }
+        out
+    }
+}
+
+/// A tiny disjoint-set over dense node ids.
+///
+/// Not [`crate::utils::dsa::union_find::UnionFind`]: that one carries a
+/// `HashSet` of members per root, and iterating it to build the census would
+/// reintroduce exactly the nondeterministic report ordering D19 bans. Members
+/// are derived here by one deterministic pass over the node order instead.
+struct Dsu(Vec<usize>);
+
+impl Dsu {
+    fn new(n: usize) -> Self {
+        Self((0..n).collect())
+    }
+
+    fn find(&mut self, mut x: usize) -> usize {
+        while self.0[x] != x {
+            self.0[x] = self.0[self.0[x]];
+            x = self.0[x];
+        }
+        x
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.find(a), self.find(b));
+        if ra != rb {
+            self.0[rb] = ra;
+        }
+    }
+}
+
+#[cfg(test)]
+/// Build the classes from the **hypothetical** decision table.
+///
+/// `hypothetical` must be the table produced under
+/// [`super::RefGate::LiftAdaptable`] — i.e. the answer to *"what would convert
+/// if the gate were lifted for the adaptable population?"*. It is produced by
+/// the real [`super::decide_one`] and never by a replay of it: micro-plan §1b
+/// measured what a replay costs, reporting 2,133 against a true 2,075 because
+/// `facts.tsv` alone cannot see the freed, `ctor` and fatness exits. That
+/// retraction is this function's contract, not a footnote.
+pub(crate) fn build(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+) -> CoConv {
+    build_with_c9_marks(facts, subjects, hypothetical, escapes, overlap, &[])
+}
+
+pub(crate) fn retained_c9_shared_params(
+    marks: &[PlannedCopyMark],
+    site: &super::emitability::CallSite,
+    callee: LocalDefId,
+) -> FxHashSet<usize> {
+    marks
+        .iter()
+        .filter(|mark| c9_mark_matches(mark, site, callee))
+        .filter_map(|mark| {
+            let params = mark.key.pair.params();
+            let shared = match mark.key.shared_side {
+                PairSide::Left => params.first(),
+                PairSide::Right => params.second(),
+            };
+            usize::try_from(shared).ok()?.checked_sub(1)
+        })
+        .collect()
+}
+
+fn c9_mark_matches(
+    mark: &PlannedCopyMark,
+    site: &super::emitability::CallSite,
+    callee: LocalDefId,
+) -> bool {
+    let mark_span = mark.call_span.source_callsite();
+    let site_span = site.span.source_callsite();
+    mark.caller_did == site.caller
+        && (mark_span.contains(site_span) || site_span.contains(mark_span))
+        && mark.key.pair.function() == callee.local_def_index.as_u32()
+}
+
+#[cfg(test)]
+pub(crate) fn build_with_c9_marks(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedCopyMark],
+) -> CoConv {
+    build_with_c9_marks_and_lifetimes(
+        facts,
+        subjects,
+        hypothetical,
+        escapes,
+        overlap,
+        c9_marks,
+        &LifetimeEligibility::default(),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn build_with_c9_marks_and_lifetimes(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedCopyMark],
+    lifetime_eligibility: &LifetimeEligibility,
+) -> CoConv {
+    build_with_c9_marks_lifetimes_and_raw_boundary(
+        facts,
+        subjects,
+        hypothetical,
+        escapes,
+        overlap,
+        c9_marks,
+        lifetime_eligibility,
+        &RawBoundaryDispositionIndex::default(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_with_c9_marks_lifetimes_and_raw_boundary(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedCopyMark],
+    lifetime_eligibility: &LifetimeEligibility,
+    raw_boundary: &RawBoundaryDispositionIndex,
+) -> CoConv {
+    build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
+        facts,
+        subjects,
+        hypothetical,
+        escapes,
+        overlap,
+        c9_marks,
+        lifetime_eligibility,
+        raw_boundary,
+        None,
+        &RetentionSummaries::default(),
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_and_pair_proofs(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedCopyMark],
+    lifetime_eligibility: &LifetimeEligibility,
+    raw_boundary: &RawBoundaryDispositionIndex,
+    a5_site_proofs: Option<&A5SeamProofIndex>,
+    retention: &RetentionSummaries,
+) -> CoConv {
+    build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_roles(
+        facts,
+        subjects,
+        hypothetical,
+        escapes,
+        overlap,
+        c9_marks,
+        lifetime_eligibility,
+        raw_boundary,
+        a5_site_proofs,
+        retention,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_roles(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+    hypothetical: &DecisionTable,
+    escapes: &[Escape],
+    overlap: OverlapRule,
+    c9_marks: &[PlannedCopyMark],
+    lifetime_eligibility: &LifetimeEligibility,
+    raw_boundary: &RawBoundaryDispositionIndex,
+    a5_site_proofs: Option<&A5SeamProofIndex>,
+    retention: &RetentionSummaries,
+    a5_roles: &[PairSiteDecision],
+) -> CoConv {
+    // ---- 1. the node set: subjects that would emit a PLAIN reference ----
+    //
+    // Slice and optional forms are deliberately excluded. `&mut [T]` and
+    // `Option<&mut T>` are not `&mut T`, so passing one where the other is
+    // expected is `E0308`; a class mixing forms is not a class. They keep their
+    // own arms and their own slices (-2 / -3), which is also why lifting the
+    // gate is reported as an ENTRY count for them and a yield count only here.
+    let mut order: Vec<NodeKey> = Vec::new();
+    let mut wants_mut: FxHashMap<NodeKey, bool> = FxHashMap::default();
+    for (subject, decision) in &hypothetical.entries {
+        // EXHAUSTIVE (S3.0, ruling 5), and **the standing guard caught this
+        // site**: an `if let Decision::Ref` compiled clean and would have
+        // silently classified a fourth disposition as "not a node" — the same
+        // shape that once dropped a subject from `emitted_subjects` entirely.
+        // A `match` makes the next disposition a compile error here.
+        let mutable = match decision {
+            Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => *mutable,
+            Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_) => continue,
+        };
+        let key = (subject.fn_did, subject.hir_id);
+        order.push(key);
+        wants_mut.insert(key, mutable);
+    }
+    // Subjects that convert, but **not to `&mut T`**. Not nodes — a class
+    // mixing forms is not a class — but their positions must be told apart from
+    // positions that stay raw, because the two fail in different regions.
+    let other_form: FxHashSet<NodeKey> = hypothetical
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| match decision {
+            Decision::Slice { .. } | Decision::Opt { .. } => Some((subject.fn_did, subject.hir_id)),
+            Decision::Cursor { plan, .. } if plan.wrapper && plan.parameter => {
+                Some((subject.fn_did, subject.hir_id))
+            }
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_) => None,
+        })
+        .collect();
+    let decision_of = hypothetical
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<FxHashMap<_, _>>();
+    let hypothetical_form = decision_of
+        .iter()
+        .map(|(key, decision)| {
+            let form = match decision {
+                Decision::Ref { .. } | Decision::InferredRef { .. } => "ref".to_owned(),
+                Decision::Slice { .. } => "slice".to_owned(),
+                Decision::NestedSlice { .. } => "nested-slice".to_owned(),
+                Decision::Opt { .. } => "opt".to_owned(),
+                Decision::Box(_) => "box".to_owned(),
+                Decision::Cursor { .. } => "cursor".to_owned(),
+                Decision::Degraded(degradation) => {
+                    format!("degraded:{}", degradation.reason.key())
+                }
+            };
+            (*key, form)
+        })
+        .collect::<FxHashMap<_, _>>();
+    let index: FxHashMap<NodeKey, usize> = order.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+    let converts: FxHashSet<NodeKey> = order.iter().copied().collect();
+
+    // Every parameter POSITION that is a subject at all — node or not. The
+    // distinction is load-bearing: a position that is not a subject carries no
+    // pointer to convert, while a position that is a subject and not a node is
+    // a parameter that stays raw, which is what makes an argument into it a
+    // silent coercion rather than a non-event.
+    let mut param_key: FxHashMap<(LocalDefId, usize), NodeKey> = FxHashMap::default();
+    for subject in subjects {
+        if let SubjectKind::Param { hir_index } = subject.kind {
+            param_key.insert(
+                (subject.fn_did, hir_index),
+                (subject.fn_did, subject.hir_id),
+            );
+        }
+    }
+
+    // R808-5: whether a parameter position is written in its callee's extent.
+    let param_written: FxHashMap<NodeKey, bool> = subjects
+        .iter()
+        .filter(|subject| matches!(subject.kind, SubjectKind::Param { .. }))
+        .map(|subject| ((subject.fn_did, subject.hir_id), subject.mutable))
+        .collect();
+
+    let mut dsu = Dsu::new(order.len());
+    let mut pending_unions = Vec::new();
+    let mut node_block: FxHashMap<NodeKey, BlockReason> = FxHashMap::default();
+    let mut edge_candidates = Vec::<EdgeCandidate>::new();
+    let mut pair_sites = Vec::<PairSiteDecision>::new();
+    /// First reason wins, so the census is deterministic under a node that
+    /// contributes two.
+    fn block(node_block: &mut FxHashMap<NodeKey, BlockReason>, key: NodeKey, reason: BlockReason) {
+        node_block.entry(key).or_insert(reason);
+    }
+
+    // ---- 1b. THE ESCAPE GATE — P1, and it runs FIRST ----
+    //
+    // An escape is a property of the node alone, unconditional, and no later
+    // slice of this ladder retires it. The reason-honesty rule therefore names
+    // it before any call-site reason: a census must never name a reason whose
+    // removal would not unblock the class.
+    //
+    // **One variant per shape, by ruling**, so the population stays separately
+    // attributable and the conservative scope is reversible by a ruling rather
+    // than by archaeology.
+    for escape in escapes {
+        if !converts.contains(&escape.subject) {
+            continue;
+        }
+        if escape.kind == EscapeKind::ForeignArg
+            && (raw_boundary.opens_span(escape.subject, escape.span)
+                // wave-6f (W6F-2): the escape's own site carries a receipted
+                // bridge; the node's other sites are the seam's.
+                || raw_boundary.opens_escape_site(escape.subject, escape.span))
+        {
+            continue;
+        }
+        let Some(reason) = escape_block_reason(escape, lifetime_eligibility) else {
+            continue;
+        };
+        block(&mut node_block, escape.subject, reason);
+    }
+
+    // ---- 1c. R808-5 / R810-2 — a proven overlap blocks both positions ----
+    //
+    // At a call, one argument is provably a place inside the referent of
+    // another argument's local (brotli's decoder: `br = &mut (*s).br` beside
+    // `s`). Neither side may keep a reference while the callee writes through
+    // one of them: both `&mut`, or the state `&mut` beside the reader as a raw
+    // view, is undefined under Tree Borrows (wave-6o 112b), and a callee that
+    // reborrows the whole state conflicts a protected reader too. The fact is a
+    // fact about the callee's two FORMALS, so it travels with them when the
+    // callee hands both on bare (`ReadDistance(s, br)` → `ReadDistanceInternal
+    // (safe, s, br)`). Every position counts, converting or not.
+    let (proven_overlap, proven_callees) = proven_overlaps(facts, subjects);
+    for &(callee, inner, outer) in &proven_overlap {
+        let callee = proven_callees[&callee];
+        let keys = [outer, inner].map(|index| param_key.get(&(callee, index)).copied());
+        if keys
+            .iter()
+            .flatten()
+            .any(|key| param_written.get(key).copied().unwrap_or(true))
+        {
+            for key in keys.into_iter().flatten() {
+                block(&mut node_block, key, BlockReason::ProvenOverlap);
+            }
+        }
+    }
+
+    // ---- 2. edges and argument admissibility, in ONE pass over call sites ----
+    //
+    // Callees sorted: `FxHashMap` iteration order is not stable across runs,
+    // and "the first reason a node contributed" would permute with it.
+    let mut callees: Vec<&LocalDefId> = facts.call_args.keys().collect();
+    callees.sort_unstable_by_key(|d| d.local_def_index.as_u32());
+
+    for callee in callees {
+        // PINNED means referenced by something that is not a direct call.
+        // Deliberately not `is_none_or`: a callee with recorded arguments is
+        // referenced by construction, but a fallback that labelled an
+        // unreferenced function "pinned" would put a wrong owed capability in
+        // the census — the M2/M3 population is not where such a node waits.
+        let pinned = facts
+            .referenced
+            .get(callee)
+            .is_some_and(|refs| !RefKind::is_adaptable(refs));
+        for site in &facts.call_args[callee] {
+            let marked_shared = retained_c9_shared_params(c9_marks, site, *callee);
+            // **The within-site overlap gate runs FIRST**, and the ordering is
+            // not cosmetic — it is reason honesty.
+            //
+            // A site like `aliased(q, q)` where `q` itself stays raw satisfies
+            // TWO blocking rules: the argument does not convert, and the two
+            // positions share a place root. First-reason-wins would report
+            // `arg-stays-raw`, which reads as *"convert `q` and this
+            // unblocks"* — and that is false, because converting `q` is
+            // exactly what makes the overlap an `E0499`.
+            //
+            // The rule the census has to satisfy: **never name a reason whose
+            // removal would not unblock the class.** The overlap is
+            // unconditional and no later slice retires it, so it is named
+            // first. Measured on the g21 fixture, which reported the wrong
+            // reason until this pass was split out.
+            // `blind` = the compiler cannot see an overlap at this position
+            // after conversion. §5a measured the rule: a borrow rooted at a
+            // REAL place (a local, or a place through a REFERENCE) is checked;
+            // one rooted through a RAW-pointer deref compiles with zero
+            // diagnostics. So `&mut (*s).g` is checked exactly when `s` itself
+            // converts, and an unknown root is treated as blind.
+            struct PairPosition {
+                key: NodeKey,
+                argument_index: usize,
+                span: Span,
+                root: Option<HirId>,
+                mutable: bool,
+                blind: bool,
+                source_node: Option<NodeKey>,
+                target: Option<RawTargetType>,
+                source_shape: &'static str,
+                place_identity: Option<String>,
+            }
+            let node_positions: Vec<PairPosition> = site
+                .args
+                .iter()
+                .filter_map(|arg| {
+                    if marked_shared.contains(&arg.index) {
+                        return None;
+                    }
+                    let key = param_key
+                        .get(&(*callee, arg.index))
+                        .copied()
+                        .filter(|k| converts.contains(k))?;
+                    let blind = match arg.shape {
+                        // A reborrow built over an arbitrary raw expression is
+                        // outside borrowck's place reasoning. Keep the existing
+                        // overlap contract: one mutable position makes an
+                        // unknown/may-overlap pair refuse.
+                        ArgShape::RawExpr { .. } => true,
+                        ArgShape::AddrOf { base: None, .. } => true,
+                        ArgShape::AddrOf {
+                            base: Some(b),
+                            through_deref: true,
+                            ..
+                        } => !converts.contains(&(b.owner.def_id, b)),
+                        _ => false,
+                    };
+                    Some(PairPosition {
+                        key,
+                        argument_index: arg.index,
+                        span: arg.span,
+                        root: arg.shape.place_root(),
+                        mutable: wants_mut[&key],
+                        blind,
+                        source_node: arg.shape.place_root().map(|root| (site.caller, root)),
+                        target: arg.target.clone(),
+                        source_shape: arg.shape.key(),
+                        place_identity: arg.place_identity.clone(),
+                    })
+                })
+                .collect();
+            let mut pair_edges = Vec::<(usize, usize, A5PeerProof)>::new();
+            for i in 0..node_positions.len() {
+                for j in (i + 1)..node_positions.len() {
+                    let a = &node_positions[i];
+                    let b = &node_positions[j];
+                    // Two SHARED borrows of one place are legal, so a conflict
+                    // needs at least one `&mut`; H6 measured that demoting the
+                    // other side to shared does not rescue it.
+                    if !a.mutable && !b.mutable {
+                        continue;
+                    }
+                    // R864-1 (b) (wave-5d 145a): two locals copied from one
+                    // array are distinct roots of one object.
+                    let decay = |index: usize| {
+                        site.args
+                            .iter()
+                            .find(|argument| argument.index == index)
+                            .and_then(|argument| argument.array_decay)
+                    };
+                    let same_array = matches!(
+                        (decay(a.argument_index), decay(b.argument_index)),
+                        (Some(x), Some(y)) if x == y && x != super::array_decay::DecayRoot::Other
+                    );
+                    let same_root =
+                        same_array || !matches!((a.root, b.root), (Some(x), Some(y)) if x != y);
+                    let conflicts = match overlap {
+                        OverlapRule::BlindOnly => same_root || a.blind || b.blind,
+                        OverlapRule::AllPairs => true,
+                    };
+                    if conflicts {
+                        if let Some(proofs) = a5_site_proofs {
+                            let mut proof = proofs.lookup(
+                                site.caller.local_def_index.as_u32(),
+                                callee.local_def_index.as_u32(),
+                                a.argument_index,
+                                b.argument_index,
+                                a.span,
+                                b.span,
+                            );
+                            let exact_same_place =
+                                a.place_identity.is_some() && a.place_identity == b.place_identity;
+                            if exact_same_place
+                                && proof.verdict == A5SiteProofVerdict::Clear
+                                && proof.reason != "projection-disjoint"
+                            {
+                                proof.verdict = A5SiteProofVerdict::Overlapping;
+                                proof.reason = "same-place-root";
+                                proof.family = "same-object-identity";
+                            }
+                            // R833-1 / R819-1 (b): an entry's own formals are
+                            // disjoint by scope here too, so the pair rule never
+                            // holds a pair the seam's certificate proves.
+                            // R838: the classifier's proof over an operand loaded
+                            // from memory is not taken (era-5c 148).
+                            super::loaded_operand::read_loaded_operands(
+                                site,
+                                *callee,
+                                a.argument_index,
+                                b.argument_index,
+                                &mut proof,
+                                |callee, index| {
+                                    matches!(
+                                        retention.get(callee, index),
+                                        Some(RetentionVerdict::NoRetain { .. })
+                                    )
+                                },
+                            );
+                            // R864-1 (b): two decays of one array are never
+                            // disjoint; the classifier's proof over a decay is
+                            // not taken (fan-out 081).
+                            super::array_decay::read_array_decays(
+                                site,
+                                a.argument_index,
+                                b.argument_index,
+                                &mut proof,
+                            );
+                            proofs.certify_refused(
+                                &mut proof,
+                                site.caller.local_def_index.as_u32(),
+                                callee.local_def_index.as_u32(),
+                                a.argument_index,
+                                b.argument_index,
+                                a.span,
+                                b.span,
+                            );
+                            super::outside_byte_view::read_under_p8(
+                                facts,
+                                site,
+                                a.argument_index,
+                                b.argument_index,
+                                &mut proof,
+                            );
+                            pair_edges.push((i, j, proof));
+                        } else {
+                            block(&mut node_block, a.key, BlockReason::DuplicatePlaceRoot);
+                            block(&mut node_block, b.key, BlockReason::DuplicatePlaceRoot);
+                        }
+                    }
+                }
+            }
+            if let Some(proofs) = a5_site_proofs
+                && !pair_edges.is_empty()
+            {
+                let role_entries = pair_edges
+                    .iter()
+                    .flat_map(|(left, right, proof)| {
+                        let l = &node_positions[*left];
+                        let r = &node_positions[*right];
+                        [
+                            (
+                                l.argument_index,
+                                r.argument_index,
+                                proof.verdict,
+                                matches!(
+                                    retention.get(*callee, l.argument_index),
+                                    Some(RetentionVerdict::Retains { .. })
+                                ),
+                            ),
+                            (
+                                r.argument_index,
+                                l.argument_index,
+                                proof.verdict,
+                                matches!(
+                                    retention.get(*callee, r.argument_index),
+                                    Some(RetentionVerdict::Retains { .. })
+                                ),
+                            ),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let (roles, forced_cover) = resolve_pair_roles_with_rule(&role_entries);
+                for position in &node_positions {
+                    let Some(&initial_role) = roles.get(&position.argument_index) else {
+                        continue;
+                    };
+                    let mut role = initial_role;
+                    let incident = pair_edges
+                        .iter()
+                        .filter(|(left, right, _)| {
+                            node_positions[*left].argument_index == position.argument_index
+                                || node_positions[*right].argument_index == position.argument_index
+                        })
+                        .collect::<Vec<_>>();
+                    let verdict = if incident
+                        .iter()
+                        .any(|(_, _, proof)| proof.verdict == A5SiteProofVerdict::Undeterminable)
+                    {
+                        A5SiteProofVerdict::Undeterminable
+                    } else if incident
+                        .iter()
+                        .any(|(_, _, proof)| proof.verdict == A5SiteProofVerdict::Overlapping)
+                    {
+                        A5SiteProofVerdict::Overlapping
+                    } else {
+                        A5SiteProofVerdict::Clear
+                    };
+                    let peer_receipts = incident
+                        .iter()
+                        .map(|(left, right, proof)| {
+                            proof.receipt(
+                                node_positions[*left].argument_index,
+                                node_positions[*right].argument_index,
+                            )
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .join(";");
+                    let unproven_peers = incident
+                        .iter()
+                        .filter(|(_, _, proof)| proof.verdict != A5SiteProofVerdict::Clear)
+                        .map(|(left, right, _)| {
+                            let (left, right) = (
+                                node_positions[*left].argument_index,
+                                node_positions[*right].argument_index,
+                            );
+                            if left == position.argument_index {
+                                right
+                            } else {
+                                left
+                            }
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let copy_candidate = incident.iter().any(|(left, right, _)| {
+                        node_positions[*left].mutable != node_positions[*right].mutable
+                    });
+                    let positive_retention = incident.iter().any(|(left, right, _)| {
+                        [*left, *right].into_iter().any(|index| {
+                            matches!(
+                                retention.get(*callee, node_positions[index].argument_index,),
+                                Some(RetentionVerdict::Retains { .. })
+                            )
+                        })
+                    });
+                    let (mut tier, mut reason) = match role {
+                        PairRole::RawView => {
+                            match retention.get(*callee, position.argument_index) {
+                                Some(RetentionVerdict::Retains { .. }) => {
+                                    (PairTier::Blocked, "pair-positive-retention".to_owned())
+                                }
+                                Some(RetentionVerdict::NoRetain { .. }) => (
+                                    PairTier::T2,
+                                    if copy_candidate {
+                                        "held-no-proof:c9-effect-carrier-absent;pair-t2".to_owned()
+                                    } else {
+                                        "pair-t2-same-object".to_owned()
+                                    },
+                                ),
+                                Some(RetentionVerdict::Unknown { reason, .. }) => (
+                                    PairTier::T2,
+                                    format!("held-no-proof:{};pair-t2", reason.key()),
+                                ),
+                                None => (
+                                    PairTier::T2,
+                                    "held-no-proof:retention-unavailable;pair-t2".to_owned(),
+                                ),
+                            }
+                        }
+                        PairRole::Blocked => (
+                            PairTier::Blocked,
+                            if positive_retention {
+                                "pair-positive-retention".to_owned()
+                            } else if verdict == A5SiteProofVerdict::Undeterminable {
+                                incident
+                                    .iter()
+                                    .filter(|(_, _, proof)| {
+                                        proof.verdict == A5SiteProofVerdict::Undeterminable
+                                    })
+                                    .map(|(_, _, proof)| proof.reason)
+                                    .collect::<BTreeSet<_>>()
+                                    .into_iter()
+                                    .collect::<Vec<_>>()
+                                    .join(";")
+                            } else {
+                                "pair-primary-ambiguous".to_owned()
+                            },
+                        ),
+                        PairRole::Clear | PairRole::Primary => {
+                            (PairTier::None, "pair-proof-accepted".to_owned())
+                        }
+                    };
+                    if tier == PairTier::Blocked {
+                        role = PairRole::Blocked;
+                    } else if forced_cover.contains(&position.argument_index) {
+                        reason.push_str(";pair-forced-cover");
+                    }
+                    if role == PairRole::RawView {
+                        let source_decision = position
+                            .source_node
+                            .and_then(|node| decision_of.get(&node).copied());
+                        let template_available = position.target.as_ref().is_some_and(|target| {
+                            super::raw_boundary::pair_raw_view_expression(
+                                source_decision,
+                                target,
+                                "__crat_pair_source",
+                                position.source_shape,
+                            )
+                            .is_some()
+                        });
+                        if !template_available {
+                            role = PairRole::Blocked;
+                            tier = PairTier::Blocked;
+                            reason = "pair-raw-view-template-unavailable".to_owned();
+                        }
+                    }
+                    if matches!(role, PairRole::RawView | PairRole::Blocked) {
+                        block(
+                            &mut node_block,
+                            position.key,
+                            BlockReason::DuplicatePlaceRoot,
+                        );
+                    }
+                    pair_sites.push(PairSiteDecision {
+                        caller: site.caller,
+                        callee: *callee,
+                        argument_index: position.argument_index,
+                        span: position.span,
+                        call_span: site.span,
+                        subject: position.key,
+                        source_node: position.source_node,
+                        target: position.target.clone(),
+                        source_shape: position.source_shape,
+                        role,
+                        tier,
+                        verdict,
+                        reason,
+                        peer_receipts,
+                        unproven_peers,
+                        a5_fallback: None,
+                    });
+                }
+                let _ = proofs;
+            }
+
+            for arg in &site.args {
+                // The retained C-9 temp replaces this argument with a fresh
+                // shared reference. It therefore contributes neither a
+                // duplicate-root conflict nor a caller/callee conversion
+                // edge at this site. Every other witness remains unchanged.
+                if marked_shared.contains(&arg.index) {
+                    continue;
+                }
+                let callee_subject = param_key.get(&(*callee, arg.index)).copied();
+                let callee_node = callee_subject.filter(|k| converts.contains(k));
+                // This exact late A5 endpoint will stay raw. Its materialized
+                // carrier owns the cast, so neither end owes cast stripping.
+                // The proof key and call identity keep ordinary cast gates
+                // unchanged at every unlicensed position.
+                let late_a5_raw_cast = matches!(
+                    arg.shape,
+                    ArgShape::CastOfLocal { .. } | ArgShape::AddrOfCast { .. }
+                ) && a5_roles.iter().any(|role| {
+                    role.caller == site.caller
+                        && role.callee == *callee
+                        && role.argument_index == arg.index
+                        && role.call_span == site.span
+                        && role.span.source_callsite() == arg.span.source_callsite()
+                        && Some(role.subject) == callee_subject
+                        && role.role == PairRole::RawView
+                        && role.tier == PairTier::T2
+                        && role.a5_fallback.is_some_and(|key| {
+                            key.caller == site.caller
+                                && key.callee == callee.to_def_id()
+                                && key.argument_index == arg.index
+                                && key.slot_depth == 0
+                        })
+                });
+
+                // The CALLER side of this argument: the binding whose own
+                // conversion this argument would carry.
+                // `via_borrow` distinguishes `f(r)` from `f(&mut *r)`. Both
+                // put `r`'s value in front of the callee, but only the first
+                // can form a class EDGE — a reborrow's type is not the
+                // binding's, so joining them would be a category error. The
+                // borrow case is a P1 hazard and nothing else.
+                let (caller_binding, via_borrow) = match arg.shape {
+                    ArgShape::BareLocal(b) | ArgShape::CastOfLocal { binding: b, .. } => {
+                        (Some(b), false)
+                    }
+                    ArgShape::AddrOf { base: Some(b), .. } => (Some(b), true),
+                    _ => (None, false),
+                };
+                let caller_subject = caller_binding
+                    .map(|b| (b.owner.def_id, b))
+                    .filter(|key| decision_of.contains_key(key));
+                let caller_node = caller_subject.filter(|k| converts.contains(k));
+                // Relay 371 step 3: an identity cast is the argument itself (a
+                // strengthening one stays the cast form's).
+                let identity_strip = arg
+                    .identity_cast
+                    .as_ref()
+                    .is_some_and(super::identity_cast::admitted);
+                if !via_borrow
+                    && let (Some(source), Some(target)) = (caller_subject, callee_subject)
+                {
+                    edge_candidates.push(EdgeCandidate {
+                        source,
+                        target,
+                        caller: site.caller,
+                        callee: *callee,
+                        argument_index: arg.index,
+                        span: arg.span,
+                        source_form: EdgeForm::of(decision_of[&source]),
+                        target_form: EdgeForm::of(decision_of[&target]),
+                    });
+                }
+
+                // (a) the CALLER-side gate — banked rule 2. A converting
+                // binding that reaches a parameter which stays raw coerces
+                // SILENTLY, so it is caught here or not at all.
+                if let Some(caller) = caller_node {
+                    let reaches_a_converting_param = callee_node.is_some();
+                    if !reaches_a_converting_param {
+                        if raw_boundary.opens_argument(caller, arg.span, arg.index) {
+                            continue;
+                        }
+                        // The three arms are DISJOINT, not merely ordered: a
+                        // pinned callee's parameters degrade
+                        // `call-site-not-adapted` even under `LiftAdaptable`,
+                        // so they are never `other_form` either.
+                        // A target converting to another safe form is that
+                        // family's adapter question (W-C4), whether the
+                        // argument is the binding or a borrow through it; only
+                        // a target that STAYS raw makes a borrow a P1 hazard.
+                        let reason = if callee_subject.is_some_and(|k| other_form.contains(&k)) {
+                            continue;
+                        } else if via_borrow {
+                            BlockReason::BorrowedIntoRawParam
+                        } else if pinned {
+                            BlockReason::FlowsIntoPinnedCallee
+                        } else {
+                            BlockReason::FlowsIntoRawParam
+                        };
+                        block(&mut node_block, caller, reason);
+                    } else if matches!(arg.shape, ArgShape::CastOfLocal { .. })
+                        && !late_a5_raw_cast
+                        && !identity_strip
+                    {
+                        // The parameter converts, but the argument casts the
+                        // binding on the way in — `q as *mut T` where `q` is
+                        // now `&mut T` is a silent coercion in the other
+                        // direction, and stripping the cast is task 4's arm.
+                        block(&mut node_block, caller, BlockReason::CastOfConvertingLocal);
+                    }
+                }
+
+                // (b) the CALLEE-side gate — the admissibility table.
+                let Some(callee_key) = callee_node else {
+                    continue;
+                };
+                match arg.shape {
+                    ArgShape::BareLocal(_) => match caller_node {
+                        // The edge. Undirected: converting either alone is
+                        // `E0308`, so neither end is the cause of the other.
+                        Some(caller) => pending_unions.push((callee_key, caller)),
+                        None if caller_subject.is_some() => {}
+                        None => block(&mut node_block, callee_key, BlockReason::ArgStaysRaw),
+                    },
+                    // `&mut e` satisfies `&mut T` and `&T` alike; `&e` satisfies
+                    // only `&T`. Both already coerce to the raw form today,
+                    // which is why this arm needs no edit in either direction.
+                    ArgShape::AddrOf { mutable, .. } => {
+                        if wants_mut[&callee_key] && !mutable {
+                            block(&mut node_block, callee_key, BlockReason::ArgSharedIntoMut);
+                        }
+                    }
+                    // Relay 371 step 3: the strip -- the bare argument's rule for
+                    // `q as *mut T`, the borrow's for `&mut e as *mut T`.
+                    ArgShape::CastOfLocal { .. } if identity_strip && !late_a5_raw_cast => {
+                        match caller_node {
+                            Some(caller) => pending_unions.push((callee_key, caller)),
+                            None if caller_subject.is_some() => {}
+                            None => block(&mut node_block, callee_key, BlockReason::ArgStaysRaw),
+                        }
+                    }
+                    ArgShape::AddrOfCast { mutable, .. } if identity_strip && !late_a5_raw_cast => {
+                        if wants_mut[&callee_key] && !mutable {
+                            block(&mut node_block, callee_key, BlockReason::ArgSharedIntoMut);
+                        }
+                    }
+                    ArgShape::AddrOfCast { .. } | ArgShape::CastOfLocal { .. } => {
+                        if !late_a5_raw_cast {
+                            block(&mut node_block, callee_key, BlockReason::ArgCastFormUnbuilt);
+                        }
+                    }
+                    // Wave 1's type-aware, nameable raw-expression arm. It
+                    // forms no caller/callee class edge: an offset/call/field
+                    // expression is a value at this site, not the caller
+                    // binding's kind identity. The seam and the unchanged
+                    // whole-site overlap gate decide its presentation.
+                    ArgShape::RawExpr { .. } => {}
+                    ArgShape::NullLit => {
+                        block(&mut node_block, callee_key, BlockReason::ArgNullLiteral);
+                    }
+                    ArgShape::Cast { .. } | ArgShape::Other => {
+                        block(
+                            &mut node_block,
+                            callee_key,
+                            BlockReason::ArgUnadaptableShape,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // Late seam A5 obligations enter the same parameter-role mechanism before
+    // either global role consistency or caller/callee unions are finalized.
+    // One exact call argument has one row even when both producers observe it.
+    let a5_subjects = a5_roles
+        .iter()
+        .filter(|row| row.a5_fallback.is_some())
+        .map(|row| row.subject)
+        .collect::<FxHashSet<_>>();
+    let mut same_site_conflicts = FxHashSet::default();
+    for extra in a5_roles {
+        if let Some(existing) = pair_sites.iter_mut().find(|row| {
+            row.caller == extra.caller
+                && row.callee == extra.callee
+                && row.argument_index == extra.argument_index
+                && row.call_span == extra.call_span
+        }) {
+            if extra.a5_fallback.is_some() {
+                existing.a5_fallback = extra.a5_fallback;
+            }
+            match (existing.role, extra.role) {
+                (PairRole::Blocked, _) | (_, PairRole::Clear) => {}
+                (PairRole::Primary, PairRole::RawView) | (PairRole::RawView, PairRole::Primary) => {
+                    same_site_conflicts.insert(existing.subject);
+                    *existing = extra.clone();
+                }
+                (PairRole::Clear, _) | (_, PairRole::Blocked) => *existing = extra.clone(),
+                (PairRole::Primary, PairRole::Primary) | (PairRole::RawView, PairRole::RawView) => {
+                }
+            }
+        } else {
+            pair_sites.push(extra.clone());
+        }
+    }
+    // R833-1 (USER): the callee's side of the pair rule, before the raw views
+    // are blocked, so the held peer carries its own reason.
+    // Only a conversion node: a peer the ladder does not convert here (an
+    // optional formal at the Option stage, a byte view) is held, if at all,
+    // by its own stage, and a pair row for it reaches only the class terminal,
+    // after the seams are planned (the r815_6 control: binn_object_get's
+    // `key` held there left its inner call unbridged, E0308).
+    let peer_row = |member: &PairSiteDecision, peer: usize| {
+        let subject = param_key
+            .get(&(member.callee, peer))
+            .copied()
+            .filter(|subject| converts.contains(subject))?;
+        // The call's own argument fact; without it (the review's MED 3(c)) the
+        // peer is still held, its row placed at the call itself.
+        let fact = facts
+            .call_args
+            .get(&member.callee)
+            .into_iter()
+            .flatten()
+            .filter(|site| site.caller == member.caller && site.span == member.call_span)
+            .flat_map(|site| {
+                site.args
+                    .iter()
+                    .filter(move |argument| argument.index == peer)
+                    .map(move |argument| (site, argument))
+            })
+            .next();
+        Some(PairSiteDecision {
+            caller: member.caller,
+            callee: member.callee,
+            argument_index: peer,
+            span: fact.map_or(member.call_span, |(_, argument)| argument.span),
+            call_span: member.call_span,
+            subject,
+            source_node: fact.and_then(|(site, argument)| {
+                argument.shape.place_root().map(|root| (site.caller, root))
+            }),
+            target: fact.and_then(|(_, argument)| argument.target.clone()),
+            source_shape: fact.map_or("argument-fact-absent", |(_, argument)| argument.shape.key()),
+            role: PairRole::Blocked,
+            tier: PairTier::Blocked,
+            verdict: member.verdict,
+            reason: "pair-not-shown-disjoint".to_owned(),
+            peer_receipts: member.peer_receipts.clone(),
+            unproven_peers: vec![member.argument_index],
+            a5_fallback: None,
+        })
+    };
+    for subject in peers_of_unproven_raw_views(&mut pair_sites, peer_row) {
+        block(&mut node_block, subject, BlockReason::PairNotShownDisjoint);
+    }
+    for row in &pair_sites {
+        if matches!(row.role, PairRole::RawView | PairRole::Blocked) {
+            block(
+                &mut node_block,
+                row.subject,
+                BlockReason::DuplicatePlaceRoot,
+            );
+        }
+    }
+
+    // A parameter kind is crate-global. If one call site selects it as a raw
+    // view while another selects it as the safe primary, there is no coherent
+    // per-site presentation in this wave. Fail the affected caller/callee
+    // surface closed rather than letting chronological site order choose.
+    let raw_view_subjects = pair_sites
+        .iter()
+        .filter(|row| row.role == PairRole::RawView)
+        .map(|row| row.subject)
+        .collect::<FxHashSet<_>>();
+    let mut conflicting_subjects = pair_sites
+        .iter()
+        .filter(|row| row.role == PairRole::Primary && raw_view_subjects.contains(&row.subject))
+        .map(|row| row.subject)
+        .collect::<FxHashSet<_>>();
+    conflicting_subjects.extend(same_site_conflicts);
+    let affected_surfaces = pair_sites
+        .iter()
+        .filter(|row| conflicting_subjects.contains(&row.subject))
+        .map(|row| (row.caller, row.callee))
+        .collect::<FxHashSet<_>>();
+    let a5_affected_surfaces = pair_sites
+        .iter()
+        .filter(|row| {
+            conflicting_subjects.contains(&row.subject) && a5_subjects.contains(&row.subject)
+        })
+        .map(|row| (row.caller, row.callee))
+        .collect::<FxHashSet<_>>();
+    for row in &mut pair_sites {
+        if affected_surfaces.contains(&(row.caller, row.callee)) {
+            row.role = PairRole::Blocked;
+            row.tier = PairTier::Blocked;
+            row.reason = if a5_affected_surfaces.contains(&(row.caller, row.callee)) {
+                "a5-fallback-unrenderable:pair-primary-ambiguous"
+            } else {
+                "pair-primary-ambiguous"
+            }
+            .to_owned();
+            block(
+                &mut node_block,
+                row.subject,
+                BlockReason::DuplicatePlaceRoot,
+            );
+        }
+    }
+    pair_sites.sort_by_key(|row| {
+        (
+            row.caller.local_def_index.as_u32(),
+            row.callee.local_def_index.as_u32(),
+            row.span.lo(),
+            row.span.hi(),
+            row.argument_index,
+        )
+    });
+
+    let raw_view_subjects = pair_sites
+        .iter()
+        .filter(|row| row.role == PairRole::RawView)
+        .map(|row| row.subject)
+        .collect::<FxHashSet<_>>();
+    for (callee, caller) in pending_unions {
+        if !raw_view_subjects.contains(&callee) && !raw_view_subjects.contains(&caller) {
+            dsu.union(index[&callee], index[&caller]);
+        }
+    }
+
+    // ---- 3. components, then ONE blocked member blocks the class ----
+    let mut class_id: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut classes: Vec<Class> = Vec::new();
+    let mut class_of: FxHashMap<NodeKey, usize> = FxHashMap::default();
+    for (i, key) in order.iter().enumerate() {
+        let root = dsu.find(i);
+        let id = *class_id.entry(root).or_insert_with(|| {
+            classes.push(Class {
+                members: Vec::new(),
+                blocked: None,
+            });
+            classes.len() - 1
+        });
+        classes[id].members.push(*key);
+        class_of.insert(*key, id);
+        if let Some(reason) = node_block.get(key)
+            && classes[id].blocked.is_none()
+        {
+            classes[id].blocked = Some(*reason);
+        }
+    }
+
+    let settled = |key: NodeKey, form: EdgeForm| {
+        if raw_view_subjects.contains(&key)
+            || (form == EdgeForm::Ref && node_block.contains_key(&key))
+        {
+            EdgeForm::Raw
+        } else {
+            form
+        }
+    };
+    let mut edges = edge_candidates
+        .into_iter()
+        .map(|edge| {
+            let source_form = settled(edge.source, edge.source_form);
+            let target_form = settled(edge.target, edge.target_form);
+            let route = match (source_form, target_form) {
+                (EdgeForm::NestedSlice, _) | (_, EdgeForm::NestedSlice) => EdgeRoute::Glue,
+                (EdgeForm::Cursor, _) | (_, EdgeForm::Cursor) => EdgeRoute::Glue,
+                (left, right) if left == right => EdgeRoute::ZeroSyntax,
+                (EdgeForm::Raw, _) => EdgeRoute::ArmC,
+                (_, EdgeForm::Raw) => EdgeRoute::ArmA,
+                _ => EdgeRoute::Glue,
+            };
+            EdgeObligation {
+                source: edge.source,
+                target: edge.target,
+                caller: edge.caller,
+                callee: edge.callee,
+                argument_index: edge.argument_index,
+                span: edge.span,
+                source_form,
+                target_form,
+                route,
+            }
+        })
+        .collect::<Vec<_>>();
+    edges.sort_by_key(|edge| {
+        (
+            edge.caller.local_def_index.as_u32(),
+            edge.callee.local_def_index.as_u32(),
+            edge.argument_index,
+            edge.span.lo(),
+            edge.span.hi(),
+        )
+    });
+    edges.dedup_by(|left, right| {
+        left.caller == right.caller
+            && left.callee == right.callee
+            && left.argument_index == right.argument_index
+            && left.span == right.span
+            && left.source == right.source
+            && left.target == right.target
+    });
+
+    CoConv {
+        class_of,
+        classes,
+        node_block,
+        edges,
+        pair_sites,
+        hypothetical_form,
+    }
+}
+
+fn escape_block_reason(
+    escape: &Escape,
+    lifetime_eligibility: &LifetimeEligibility,
+) -> Option<BlockReason> {
+    match escape.kind {
+        EscapeKind::Return if lifetime_eligibility.return_permit(escape.subject).is_some() => None,
+        EscapeKind::Return => Some(BlockReason::EscapesViaReturn),
+        EscapeKind::ForeignArg => Some(BlockReason::EscapesViaForeignArg),
+        EscapeKind::FieldStore
+            if escape.target.is_some_and(|target| {
+                lifetime_eligibility.permits_output_storage(escape.subject, target)
+            }) =>
+        {
+            None
+        }
+        // wave-6f: a store into a struct field that converts with it.
+        EscapeKind::FieldStore
+            if lifetime_eligibility.permits_field_store(escape.subject, escape.span) =>
+        {
+            None
+        }
+        EscapeKind::FieldStore => Some(BlockReason::EscapesViaFieldStore),
+        EscapeKind::StaticStore => Some(BlockReason::EscapesViaStaticStore),
+    }
+}
+
+/// R833-1 (USER) — the callee's side of the pair rule. At a call inside the
+/// program, a member that stays raw (it takes the raw view, or it is blocked)
+/// and is not shown disjoint holds every peer its proof does not clear, and so
+/// does each peer it holds, to a fixpoint (the independent review's MED 3):
+/// - the primaries at that call whose own verdict is not clear;
+/// - a position the member's proof names as unproven, whatever that
+///   position's own row says (its row is read, not merely found);
+/// - a named position with no row at the call: `peer_row` gives it a blocked
+///   row (only for a conversion node), so the class terminal holds it, and
+///   its own unproven partners (as the rows at the call record them) follow.
+///
+/// The held subjects are returned (`pair-not-shown-disjoint`). Read-read
+/// pairs never form a pair here, and a certified pair's verdict is clear.
+pub(crate) fn peers_of_unproven_raw_views(
+    rows: &mut Vec<PairSiteDecision>,
+    peer_row: impl Fn(&PairSiteDecision, usize) -> Option<PairSiteDecision>,
+) -> Vec<NodeKey> {
+    type Call = (LocalDefId, LocalDefId, Span);
+    let call_of = |row: &PairSiteDecision| -> Call { (row.caller, row.callee, row.call_span) };
+    // Every unproven pair the rows record, both ways, by call.
+    let mut partners = FxHashMap::<(Call, usize), Vec<usize>>::default();
+    for row in rows.iter() {
+        for &peer in &row.unproven_peers {
+            for (from, to) in [(row.argument_index, peer), (peer, row.argument_index)] {
+                let list = partners.entry((call_of(row), from)).or_default();
+                if !list.contains(&to) {
+                    list.push(to);
+                }
+            }
+        }
+    }
+    let mut held = Vec::new();
+    let hold = |row: &mut PairSiteDecision, held: &mut Vec<NodeKey>| {
+        row.role = PairRole::Blocked;
+        row.tier = PairTier::Blocked;
+        row.reason = "pair-not-shown-disjoint".to_owned();
+        if !held.contains(&row.subject) {
+            held.push(row.subject);
+        }
+    };
+    let mut work = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            matches!(row.role, PairRole::RawView | PairRole::Blocked)
+                && row.verdict != A5SiteProofVerdict::Clear
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut seen = work.iter().copied().collect::<FxHashSet<_>>();
+    while let Some(member) = work.pop() {
+        let call = call_of(&rows[member]);
+        let named = partners
+            .get(&(call, rows[member].argument_index))
+            .cloned()
+            .unwrap_or_default();
+        // The primaries at the call not shown disjoint, and every row the
+        // member's proof names.
+        for index in 0..rows.len() {
+            let row = &rows[index];
+            let at_call = call_of(row) == call && index != member;
+            let unproven_primary =
+                row.role == PairRole::Primary && row.verdict != A5SiteProofVerdict::Clear;
+            let named_here = named.contains(&row.argument_index)
+                && matches!(row.role, PairRole::Primary | PairRole::Clear);
+            if at_call && (unproven_primary || named_here) {
+                hold(&mut rows[index], &mut held);
+                if seen.insert(index) {
+                    work.push(index);
+                }
+            }
+        }
+        // A named position with no row at the call.
+        for peer in named {
+            if rows
+                .iter()
+                .any(|row| call_of(row) == call && row.argument_index == peer)
+            {
+                continue;
+            }
+            let Some(mut row) = peer_row(&rows[member], peer) else {
+                continue;
+            };
+            row.unproven_peers = partners.get(&(call, peer)).cloned().unwrap_or_default();
+            hold(&mut row, &mut held);
+            rows.push(row);
+            let index = rows.len() - 1;
+            seen.insert(index);
+            work.push(index);
+        }
+    }
+    held
+}
+
+/// R808-5 / R810-2 — the proven-overlap formal pairs: `(callee, inner, outer)`
+/// where, at some call, the inner argument provably lies inside the outer
+/// argument's referent or is the same pointer (R819-1 item 4), carried to a
+/// callee that receives both bare. With the callee of each key.
+pub(crate) fn proven_overlaps(
+    facts: &EmitabilityFacts,
+    subjects: &[Subject],
+) -> (
+    std::collections::BTreeSet<(u32, usize, usize)>,
+    FxHashMap<u32, LocalDefId>,
+) {
+    let param_index: FxHashMap<NodeKey, usize> = subjects
+        .iter()
+        .filter_map(|subject| match subject.kind {
+            SubjectKind::Param { hir_index } => Some(((subject.fn_did, subject.hir_id), hir_index)),
+            SubjectKind::Local => None,
+        })
+        .collect();
+    // A bare local, or (R866-1, fan-out 083) a reborrow `&mut *x` of one: the
+    // same pointer as `x` (brotli's `SafeReadDistance(&mut *s, &mut *br)`
+    // with `br = &mut (*s).br`).
+    let bare = |argument: &super::emitability::Arg| match argument.shape {
+        ArgShape::BareLocal(binding) | ArgShape::CastOfLocal { binding, .. } => Some(binding),
+        _ => argument.reborrow_of,
+    };
+    // (callee, inner position, outer position): the inner formal lies inside
+    // the outer formal's referent at some call.
+    let mut proven_overlap = std::collections::BTreeSet::<(u32, usize, usize)>::new();
+    let mut proven_callees = FxHashMap::<u32, LocalDefId>::default();
+    loop {
+        let mut grew = false;
+        for (callee, sites) in &facts.call_args {
+            for site in sites {
+                for outer in &site.args {
+                    let Some(outer_root) = bare(outer) else { continue };
+                    for inner in &site.args {
+                        if inner.index == outer.index {
+                            continue;
+                        }
+                        let carried = bare(inner).is_some_and(|inner_root| {
+                            match (
+                                param_index.get(&(site.caller, inner_root)),
+                                param_index.get(&(site.caller, outer_root)),
+                            ) {
+                                (Some(&i), Some(&o)) => proven_overlap.contains(&(
+                                    site.caller.local_def_index.as_u32(),
+                                    i,
+                                    o,
+                                )),
+                                _ => false,
+                            }
+                        });
+                        // R819-1 item 4: the same pointer at both positions
+                        // (`zmod(a, a, d)`) overlaps by identity.
+                        let same_pointer = bare(inner) == Some(outer_root);
+                        if inner.inside_of.contains(&outer_root) || carried || same_pointer {
+                            let key = (callee.local_def_index.as_u32(), inner.index, outer.index);
+                            proven_callees.insert(key.0, *callee);
+                            grew |= proven_overlap.insert(key);
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    (proven_overlap, proven_callees)
+}
+
+#[cfg(test)]
+fn escape_block_reason_for_test(
+    kind: EscapeKind,
+    subject: NodeKey,
+    lifetime_eligibility: &LifetimeEligibility,
+) -> Option<BlockReason> {
+    escape_block_reason(
+        &Escape {
+            subject,
+            kind,
+            span: rustc_span::DUMMY_SP,
+            target: None,
+        },
+        lifetime_eligibility,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// The escape census — MEASUREMENT ONLY, and the boundary is the point
+// ---------------------------------------------------------------------------
+
+/// Where a subject's value can leave the borrow the reference form would give
+/// it, **without the compiler objecting**.
+///
+/// # Why this is measured and not gated
+///
+/// `&mut T → *mut T` is an implicit coercion at a call argument, a `static mut`
+/// store, a field store **and** a return position — all four compile at exit 0
+/// (§5a, `probe_coerce.rs`, pinned toolchain). So none of them presents as a
+/// revert; they produce no counter movement at all.
+///
+/// The *call-argument* case is the one S3.6-1 creates, because lifting the gate
+/// is what puts converting bindings in front of unconverted parameters. It is
+/// gated at decision time, in [`build`], as [`BlockReason::FlowsIntoRawParam`]
+/// and [`BlockReason::FlowsIntoPinnedCallee`].
+///
+/// The other three are **pre-existing and orthogonal**: a parameter of an
+/// uncalled function escapes exactly as readily, so the already-emitting 562
+/// carry the same shape today. S3.6-1 multiplies the population but does not
+/// introduce the class. Gating them here would silently widen this slice's
+/// scope into a standing M1 hazard; omitting them would hide the multiplication.
+/// The handoff's instruction is to do neither, so they are counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EscapeKind {
+    /// `G = p` where `G` is a `static mut`.
+    StaticStore,
+    /// `(*t).f = p`, `t[i] = p` — a store through a place projection.
+    FieldStore,
+    /// `return p`, or `p` in tail position.
+    Return,
+    /// An argument to a callee that is **not a local `fn`** — an `extern` block
+    /// entry or anything else `call_args` cannot see, so the class test above
+    /// structurally cannot reach it.
+    ForeignArg,
+}
+
+impl EscapeKind {
+    #[cfg(test)]
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            EscapeKind::StaticStore => "static-store",
+            EscapeKind::FieldStore => "field-store",
+            EscapeKind::Return => "return",
+            EscapeKind::ForeignArg => "foreign-arg",
+        }
+    }
+}
+
+/// One escaping use of one subject.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Escape {
+    pub subject: NodeKey,
+    pub kind: EscapeKind,
+    pub span: Span,
+    pub target: Option<NodeKey>,
+}
+
+/// Count the escape shapes, per subject, over every subject-bearing function.
+///
+/// **No silent caps**: a use is classified or it is not an escape; nothing is
+/// skipped for being awkward. What the pass does NOT model is stated rather
+/// than hidden — a value that reaches a store through an intermediate binding
+/// (`let q = p; G = q;`) is attributed to `q`, not to `p`, because this is a
+/// syntactic use classifier and not a flow analysis. That under-counts, in the
+/// direction that makes the hazard look smaller, which is why the figure is
+/// reported as a **lower bound** wherever it is quoted.
+pub(crate) fn escapes(
+    tcx: TyCtxt<'_>,
+    functions: &[LocalDefId],
+    subjects: &[Subject],
+) -> Vec<Escape> {
+    let owned: FxHashSet<NodeKey> = subjects.iter().map(|s| (s.fn_did, s.hir_id)).collect();
+    let mut fns: Vec<LocalDefId> = subjects.iter().map(|s| s.fn_did).collect();
+    fns.sort_unstable_by_key(|d| d.local_def_index.as_u32());
+    fns.dedup();
+
+    struct V<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        fn_did: LocalDefId,
+        owned: &'a FxHashSet<NodeKey>,
+        /// The **same list** `emitability::collect` was handed, so "a callee
+        /// the class machinery can see" means one thing in both places.
+        locals: &'a [LocalDefId],
+        /// The body's tail expression, if it has one: `p` in tail position is a
+        /// return without the keyword, and treating only `Ret` would miss it.
+        tail: Option<HirId>,
+        out: &'a mut Vec<Escape>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Path(QPath::Resolved(_, path)) = &expr.kind
+                && let Res::Local(hir_id) = path.res
+                && self.owned.contains(&(self.fn_did, hir_id))
+                && let Some(kind) = self.classify(expr)
+            {
+                let target = (kind == EscapeKind::FieldStore)
+                    .then(|| self.field_store_target(expr))
+                    .flatten();
+                self.out.push(Escape {
+                    subject: (self.fn_did, hir_id),
+                    kind,
+                    span: expr.span,
+                    target,
+                });
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+
+    impl V<'_, '_> {
+        fn field_store_target(&self, use_expr: &Expr<'_>) -> Option<NodeKey> {
+            let rustc_hir::Node::Expr(parent) = self.tcx.parent_hir_node(use_expr.hir_id) else {
+                return None;
+            };
+            let ExprKind::Assign(lhs, rhs, _) = &parent.kind else {
+                return None;
+            };
+            if rhs.hir_id != use_expr.hir_id {
+                return None;
+            }
+            let ExprKind::Unary(rustc_hir::UnOp::Deref, base) = &lhs.kind else {
+                return None;
+            };
+            let ExprKind::Path(QPath::Resolved(_, path)) = &base.kind else {
+                return None;
+            };
+            let Res::Local(binding) = path.res else {
+                return None;
+            };
+            Some((self.fn_did, binding))
+        }
+
+        /// Is this callee one the class machinery can actually see?
+        ///
+        /// **Membership in the program's function list, not `DefId` locality.**
+        /// A `fn` declared in an `extern "C" { … }` block has a `DefKind::Fn`
+        /// and a perfectly LOCAL `DefId`, so an `as_local()` test calls
+        /// `memcpy` a local function and reports zero foreign escapes. Measured
+        /// — the witness for this arm failed on exactly that, which is why the
+        /// predicate now consults the same list `emitability::collect` filters
+        /// its call arm by rather than a second test that looks equivalent.
+        fn is_visible_callee(&self, callee: &Expr<'_>) -> bool {
+            let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind else {
+                return false;
+            };
+            matches!(
+                path.res,
+                Res::Def(rustc_hir::def::DefKind::Fn, did)
+                    if did.as_local().is_some_and(|d| self.locals.contains(&d))
+            )
+        }
+
+        fn classify(&self, use_expr: &Expr<'_>) -> Option<EscapeKind> {
+            if self.tail == Some(use_expr.hir_id) {
+                return Some(EscapeKind::Return);
+            }
+            let rustc_hir::Node::Expr(parent) = self.tcx.parent_hir_node(use_expr.hir_id) else {
+                return None;
+            };
+            match &parent.kind {
+                ExprKind::Ret(Some(value)) if value.hir_id == use_expr.hir_id => {
+                    Some(EscapeKind::Return)
+                }
+                ExprKind::Assign(lhs, rhs, _) if rhs.hir_id == use_expr.hir_id => {
+                    match &lhs.kind {
+                        ExprKind::Path(QPath::Resolved(_, p))
+                            if matches!(
+                                p.res,
+                                Res::Def(rustc_hir::def::DefKind::Static { .. }, _)
+                            ) =>
+                        {
+                            Some(EscapeKind::StaticStore)
+                        }
+                        ExprKind::Field(..)
+                        | ExprKind::Index(..)
+                        | ExprKind::Unary(rustc_hir::UnOp::Deref, _) => {
+                            Some(EscapeKind::FieldStore)
+                        }
+                        // A store into another LOCAL is not an escape: the
+                        // target is itself a subject or a raw local in the same
+                        // body, and either way nothing leaves the function.
+                        _ => None,
+                    }
+                }
+                // A FOREIGN callee. The local-fn case is `build`'s, and routing
+                // it here as well would double-count the one flow that IS gated.
+                ExprKind::Call(callee, args)
+                    if args.iter().any(|a| a.hir_id == use_expr.hir_id)
+                        && !self.is_visible_callee(callee) =>
+                {
+                    Some(EscapeKind::ForeignArg)
+                }
+                _ => None,
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for fn_did in fns {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let tail = match &body.value.kind {
+            ExprKind::Block(block, _) => block.expr.map(|e| e.hir_id),
+            _ => Some(body.value.hir_id),
+        };
+        let mut v = V {
+            tcx,
+            fn_did,
+            owned: &owned,
+            locals: functions,
+            tail,
+            out: &mut out,
+        };
+        v.visit_body(body);
+    }
+    out
+}
+
+#[cfg(test)]
+mod e2_return_permit_tests {
+    use rustc_hir::{CRATE_HIR_ID, def_id::CRATE_DEF_ID};
+
+    use super::*;
+    use crate::bo_rewriter::decision::lifetime::LifetimeEligibility;
+
+    #[test]
+    fn e2_return_permit_skips_only_the_named_return_escape() {
+        let subject = (CRATE_DEF_ID, CRATE_HIR_ID);
+        let permitted = LifetimeEligibility::with_return_permit_for_test(subject);
+        let empty = LifetimeEligibility::default();
+
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::Return, subject, &permitted),
+            None
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::Return, subject, &empty),
+            Some(BlockReason::EscapesViaReturn)
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::ForeignArg, subject, &permitted),
+            Some(BlockReason::EscapesViaForeignArg)
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::FieldStore, subject, &permitted),
+            Some(BlockReason::EscapesViaFieldStore)
+        );
+        assert_eq!(
+            escape_block_reason_for_test(EscapeKind::StaticStore, subject, &permitted),
+            Some(BlockReason::EscapesViaStaticStore)
+        );
+    }
+}
+
+#[cfg(test)]
+mod pair_plan_tests {
+    use super::{super::a5_site_proof::A5SiteProofVerdict, *};
+
+    fn resolve_pair_roles_for_test(
+        entries: &[(usize, usize, A5SiteProofVerdict, bool)],
+    ) -> Vec<&'static str> {
+        resolve_pair_roles(entries)
+            .into_values()
+            .map(PairRole::key)
+            .collect()
+    }
+
+    #[test]
+    fn pair_w1_clear_component_keeps_every_position_safe() {
+        assert_eq!(
+            resolve_pair_roles_for_test(&[
+                (0, 1, A5SiteProofVerdict::Clear, false),
+                (1, 0, A5SiteProofVerdict::Clear, false),
+            ]),
+            ["clear", "clear"]
+        );
+    }
+
+    #[test]
+    fn pair_w2_overlap_chooses_one_primary_and_one_raw_view() {
+        assert_eq!(
+            resolve_pair_roles_for_test(&[
+                (0, 1, A5SiteProofVerdict::Overlapping, false),
+                (1, 0, A5SiteProofVerdict::Overlapping, false),
+            ]),
+            ["primary", "raw-view"]
+        );
+    }
+
+    #[test]
+    fn pair_w3_three_way_component_has_one_canonical_primary() {
+        assert_eq!(
+            resolve_pair_roles_for_test(&[
+                (2, 0, A5SiteProofVerdict::Overlapping, false),
+                (0, 2, A5SiteProofVerdict::Overlapping, false),
+                (1, 2, A5SiteProofVerdict::Overlapping, false),
+            ]),
+            ["primary", "raw-view", "raw-view"]
+        );
+    }
+
+    #[test]
+    fn pair_n1_unknown_falls_to_primary_raw_view_never_clear() {
+        assert_eq!(
+            resolve_pair_roles_for_test(&[
+                (0, 1, A5SiteProofVerdict::Undeterminable, false),
+                (1, 0, A5SiteProofVerdict::Undeterminable, false),
+            ]),
+            ["primary", "raw-view"]
+        );
+    }
+
+    /// Both directions of each overlap edge, with each endpoint's own retention.
+    fn star_entries(
+        edges: &[(usize, usize)],
+        retaining: &[usize],
+    ) -> Vec<(usize, usize, A5SiteProofVerdict, bool)> {
+        edges
+            .iter()
+            .flat_map(|&(left, right)| {
+                [
+                    (
+                        left,
+                        right,
+                        A5SiteProofVerdict::Overlapping,
+                        retaining.contains(&left),
+                    ),
+                    (
+                        right,
+                        left,
+                        A5SiteProofVerdict::Overlapping,
+                        retaining.contains(&right),
+                    ),
+                ]
+            })
+            .collect()
+    }
+
+    /// **R573-4 witness — the forced cover.** brotli's `EncodeData` →
+    /// `InitOrStitchToPreviousBlock(m, hasher, data, _, params)` (class 2337): `data` (2, a
+    /// `*const u8`) overlaps `m` (0), `hasher` (1) and `params` (4), which are pairwise clear;
+    /// `hasher` and `params` retain. No single primary leaves every raw view non-retaining, so the
+    /// single-primary rule blocked the call. `data` alone covers every edge and retains nothing:
+    /// it is the raw view, and the other three keep their safe forms, marked as the rule's.
+    #[test]
+    fn r573_4_a_star_with_two_retaining_leaves_takes_its_centre_as_the_raw_view() {
+        let (roles, rule) =
+            resolve_pair_roles_with_rule(&star_entries(&[(2, 0), (2, 1), (2, 4)], &[1, 4]));
+        assert_eq!(
+            roles
+                .into_iter()
+                .map(|(index, role)| (index, role.key()))
+                .collect::<Vec<_>>(),
+            [
+                (0, "primary"),
+                (1, "primary"),
+                (2, "raw-view"),
+                (4, "primary")
+            ]
+        );
+        assert_eq!(rule.into_iter().collect::<Vec<_>>(), [0, 1, 2, 4]);
+    }
+
+    /// **R573-4 control — a forced set that does not cover every edge stays blocked.** The same
+    /// star plus an overlap between the two retaining leaves: neither may be the raw side of
+    /// that edge, so no admissible assignment exists.
+    #[test]
+    fn r573_4_an_edge_between_two_retaining_vertices_stays_blocked() {
+        let (roles, rule) =
+            resolve_pair_roles_with_rule(&star_entries(&[(2, 0), (2, 1), (2, 4), (1, 4)], &[1, 4]));
+        assert!(
+            roles.values().all(|role| *role == PairRole::Blocked),
+            "{roles:?}"
+        );
+        assert!(rule.is_empty(), "{rule:?}");
+    }
+
+    /// **R573-4 control — a component with a single primary is untouched.** The rule runs only
+    /// where the single-primary rule found none: one retaining vertex keeps its canonical
+    /// primary, and nothing is marked as the rule's.
+    #[test]
+    fn r573_4_a_component_with_a_single_primary_is_untouched() {
+        let (roles, rule) =
+            resolve_pair_roles_with_rule(&star_entries(&[(2, 0), (2, 1), (2, 4)], &[1]));
+        assert_eq!(
+            roles
+                .into_iter()
+                .map(|(index, role)| (index, role.key()))
+                .collect::<Vec<_>>(),
+            [
+                (0, "raw-view"),
+                (1, "primary"),
+                (2, "raw-view"),
+                (4, "raw-view")
+            ]
+        );
+        assert!(rule.is_empty(), "{rule:?}");
+    }
+
+    #[test]
+    fn pair_positive_retention_selects_the_retaining_position_as_primary() {
+        assert_eq!(
+            resolve_pair_roles_for_test(&[
+                (0, 1, A5SiteProofVerdict::Overlapping, false),
+                (1, 0, A5SiteProofVerdict::Overlapping, true),
+            ]),
+            ["raw-view", "primary"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod a5_cast_role_tests {
+    use rustc_hir::{ItemLocalId, OwnerId, def_id::DefIndex};
+    use rustc_middle::mir::Local;
+    use rustc_span::{BytePos, edition::Edition};
+
+    use super::{
+        super::{
+            DeclShape,
+            emitability::{Arg, CallSite},
+            raw_boundary::RawMutability,
+        },
+        *,
+    };
+    use crate::analyses::borrow_ownership::guarded_repair::MirLocationKey;
+
+    // Construct the same owned Subject/DecisionTable/call-facts inputs used by
+    // the production builder. No compiler, analysis, or model run is needed.
+    fn fixture(
+        check: impl FnOnce(&EmitabilityFacts, &[Subject], &DecisionTable, PairSiteDecision),
+    ) {
+        rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
+            let caller = LocalDefId {
+                local_def_index: DefIndex::from_u32(1),
+            };
+            let callee = LocalDefId {
+                local_def_index: DefIndex::from_u32(2),
+            };
+            let argument_span = Span::with_root_ctxt(BytePos(110), BytePos(130));
+            let call_span = Span::with_root_ctxt(BytePos(100), BytePos(140));
+            let inner = Span::with_root_ctxt(BytePos(110), BytePos(113));
+            let subject = |owner, label: &str| Subject {
+                fn_did: owner,
+                local: Local::from_u32(1),
+                hir_id: HirId {
+                    owner: OwnerId { def_id: owner },
+                    local_id: ItemLocalId::from_u32(1),
+                },
+                param_name: Some(label.rsplit("::").next().unwrap().to_owned()),
+                kind: SubjectKind::Param { hir_index: 0 },
+                ptr_depth: 1,
+                label: label.to_owned(),
+                ty_span: Some(argument_span),
+                binding_span: argument_span,
+                pointee_span: Some(inner),
+                decl_shape: DeclShape::RawPtr,
+                mutable: false,
+                freed_at: None,
+                len_recovered: false,
+                null_init: false,
+                mut_binding: false,
+                ctor: None,
+            };
+            let subjects = vec![
+                subject(caller, "caller::src"),
+                subject(callee, "target::src"),
+            ];
+            let source = (caller, subjects[0].hir_id);
+            let target_node = (callee, subjects[1].hir_id);
+            let target = RawTargetType {
+                rendered: "*const i32".into(),
+                pointee: "i32".into(),
+                mutability: RawMutability::Const,
+                depth2: None,
+            };
+            let mut facts = EmitabilityFacts::default();
+            facts.call_args.insert(
+                callee,
+                vec![CallSite {
+                    caller,
+                    span: call_span,
+                    args: vec![Arg {
+                        index: 0,
+                        span: argument_span,
+                        shape: ArgShape::CastOfLocal {
+                            binding: source.1,
+                            inner,
+                        },
+                        source_type: "*const i32".into(),
+                        target: Some(target.clone()),
+                        direct_storage: None,
+                        adapter_operand_span: inner,
+                        adapter_operand_mutability: Some(RawMutability::Const),
+                        initialized_array_elements: None,
+                        array_start_blind: None,
+                        array_extent: None,
+                        place_identity: None,
+                        address_root_local: false,
+                        address_root_raw_pointer: false,
+                        element_of: None,
+                        element_address: false,
+                        deref_pointer: None,
+                        inside_of: Vec::new(),
+                        loaded_from_memory: false,
+                        address_once_here: false,
+                        array_decay: None,
+                        reborrow_of: None,
+                        identity_cast: None,
+                    }],
+                }],
+            );
+            let table = DecisionTable {
+                counted_void: Default::default(),
+                entries: subjects
+                    .iter()
+                    .cloned()
+                    .map(|subject| (subject, Decision::Ref { mutable: false }))
+                    .collect(),
+                ..DecisionTable::default()
+            };
+            let role = PairSiteDecision {
+                caller,
+                callee,
+                argument_index: 0,
+                span: argument_span,
+                call_span,
+                subject: target_node,
+                source_node: Some(source),
+                target: Some(target),
+                source_shape: "cast-of-local",
+                role: PairRole::RawView,
+                tier: PairTier::T2,
+                verdict: A5SiteProofVerdict::Undeterminable,
+                reason: "a5-fallback-raw-view-role".into(),
+                peer_receipts: "fixture".into(),
+                unproven_peers: Vec::new(),
+                a5_fallback: Some(A5ProofSiteKey {
+                    caller,
+                    location: MirLocationKey::new(0, 0),
+                    callee: callee.to_def_id(),
+                    argument_index: 0,
+                    slot_depth: 0,
+                }),
+            };
+            check(&facts, &subjects, &table, role);
+        });
+    }
+
+    fn build_case(
+        facts: &EmitabilityFacts,
+        subjects: &[Subject],
+        table: &DecisionTable,
+        roles: &[PairSiteDecision],
+    ) -> CoConv {
+        build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_roles(
+            facts,
+            subjects,
+            table,
+            &[],
+            OverlapRule::BlindOnly,
+            &[],
+            &LifetimeEligibility::default(),
+            &RawBoundaryDispositionIndex::default(),
+            None,
+            &RetentionSummaries::default(),
+            roles,
+        )
+    }
+
+    #[test]
+    fn a5_cast_role_keeps_the_exact_licensed_caller() {
+        fixture(|facts, subjects, table, role| {
+            let source = role.source_node.unwrap();
+            let result = build_case(facts, subjects, table, &[role]);
+            assert_eq!(
+                result.node_block(source),
+                None,
+                "an exact A5 raw endpoint has no cast-of-converting-local obligation"
+            );
+            assert!(result.admits(source));
+        });
+    }
+
+    #[test]
+    fn a5_cast_role_target_uses_the_raw_role_gate() {
+        fixture(|facts, subjects, table, role| {
+            let target = role.subject;
+            let result = build_case(facts, subjects, table, &[role]);
+            assert!(result.is_pair_raw_view(target));
+            assert_eq!(
+                result.node_block(target),
+                Some(BlockReason::DuplicatePlaceRoot),
+                "the selected raw parameter does not require cast stripping"
+            );
+        });
+    }
+
+    #[test]
+    fn a5_cast_role_does_not_open_an_unlicensed_cast() {
+        fixture(|facts, subjects, table, role| {
+            let source = role.source_node.unwrap();
+            let target = role.subject;
+            let result = build_case(facts, subjects, table, &[]);
+            assert_eq!(
+                result.node_block(source),
+                Some(BlockReason::CastOfConvertingLocal)
+            );
+            assert_eq!(
+                result.node_block(target),
+                Some(BlockReason::ArgCastFormUnbuilt)
+            );
+        });
+    }
+
+    #[test]
+    fn a5_cast_role_requires_the_exact_call_and_typed_origin() {
+        fixture(|facts, subjects, table, role| {
+            let source = role.source_node.unwrap();
+            let target = role.subject;
+            let mut other_call = role.clone();
+            other_call.call_span = Span::with_root_ctxt(BytePos(200), BytePos(240));
+            let mut untyped = role;
+            untyped.a5_fallback = None;
+            for role in [other_call, untyped] {
+                let result = build_case(facts, subjects, table, &[role]);
+                assert_eq!(
+                    result.node_block(source),
+                    Some(BlockReason::CastOfConvertingLocal)
+                );
+                assert_eq!(
+                    result.node_block(target),
+                    Some(BlockReason::ArgCastFormUnbuilt)
+                );
+            }
+        });
+    }
+}

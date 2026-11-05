@@ -1,0 +1,1549 @@
+//! Source-retirement review, separate from ordinary loan invalidation matrices.
+//! All object identities are abstractions; no static site proves a dynamic epoch.
+
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_middle::mir::Location;
+use rustc_mir_dataflow::points::PointIndex;
+use rustc_span::def_id::LocalDefId;
+
+use super::{
+    crate_slots::CrateSlots,
+    export::PlaceKey,
+    protected_entry::{self, EntryAnalysis, EntryCoverageError, EntryKey, EntryMoment},
+    slot_key,
+    slots::{SlotId, SlotOwner},
+    solver::SlotRef,
+    source_events::{self, Coverage, SourceEventKey, SourceEvents, SourcePhase, SourceRole},
+};
+use crate::{
+    analyses::{
+        borrow::{BorrowInferenceResults, Loan, ProvenanceOwner, StructFieldSlot},
+        borrow_ownership::borrow_fork::LoanLocation,
+    },
+    utils::rustc::RustProgram,
+};
+
+pub(crate) mod call_reach;
+pub(crate) mod discharge;
+mod field_cells;
+pub(crate) mod field_objects;
+pub(crate) mod inner_loan;
+pub(crate) mod local_outcome;
+#[cfg(test)]
+mod local_outcome_tests;
+mod objects;
+mod return_origin;
+mod routes;
+#[cfg(test)]
+mod tests_return_origin;
+
+use objects::{ObjectFacts, ObjectRoot, ObjectSet};
+use routes::{FrameEvent, RoutedEvents};
+pub(crate) use routes::{RouteProblem, RouteReason, RouteStep};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OverlapReason {
+    SameAbstractRoot,
+    PossibleInputAlias,
+    UnknownObjects,
+    UnresolvedInvocation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LoanIdentity {
+    /// Diagnostic index only; reservation/place/owners retain the actual witness.
+    pub(crate) index: usize,
+    pub(crate) reservation: Location,
+    pub(crate) borrowed: PlaceKey,
+    pub(crate) owners: Vec<ProvenanceOwner>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetirementConflict {
+    pub(crate) function: LocalDefId,
+    pub(crate) target: SlotRef,
+    pub(crate) target_key: String,
+    pub(crate) source: SourceEventKey,
+    pub(crate) phase: SourcePhase,
+    pub(crate) location: Location,
+    pub(crate) route: Vec<RouteStep>,
+    pub(crate) loan: Option<LoanIdentity>,
+    pub(crate) entry: Option<EntryKey>,
+    pub(crate) overlap: OverlapReason,
+}
+
+/// A conflict the overlap analysis raised and a discharge
+/// removed; its receipt is counted per program.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetirementDischarge {
+    pub(crate) function: LocalDefId,
+    pub(crate) target: SlotRef,
+    pub(crate) target_key: String,
+    pub(crate) source: SourceEventKey,
+    pub(crate) phase: SourcePhase,
+    pub(crate) location: Location,
+    pub(crate) route: Vec<RouteStep>,
+    /// The route's call sites by name, inner to outer, for the receipt.
+    pub(crate) route_names: Vec<String>,
+    pub(crate) rule: discharge::Rule,
+}
+
+impl RetirementDischarge {
+    pub(crate) fn receipt(&self) -> String {
+        let event = format!(
+            "{}:bb{}[{}]:{:?}",
+            self.source.function, self.source.block, self.source.statement, self.source.role
+        );
+        let route = self.route_names.join(" ");
+        // A discharge only the zero-size `realloc` premise admits names that premise.
+        let premise = |premise: bool| {
+            if premise {
+                ", premise=realloc-nonzero@R684-1"
+            } else {
+                ""
+            }
+        };
+        match &self.rule {
+            discharge::Rule::PostFreeUse { local, premise: p } => format!(
+                "retirement-disjoint:post-free-use(event={event}, route=[{route}], target={}, use=_{local}{})",
+                self.target_key,
+                premise(*p)
+            ),
+            // Every effective-type discharge rests on TypedReleaseDiscipline;
+            // one the sharpened test alone admits says so.
+            discharge::Rule::EffectiveType {
+                freed,
+                referent,
+                sole,
+            } => format!(
+                "retirement-disjoint:effective-type(P={freed}, T={referent}, event={event}, route=[{route}], target={}, premise=typed-release@R604-1{})",
+                self.target_key,
+                if *sole { ", containment=sole-type" } else { "" }
+            ),
+            // The released block was allocated inside the route.
+            discharge::Rule::FreshInRoute { allocation } => format!(
+                "retirement-disjoint:fresh-in-route(allocation={allocation}, event={event}, route=[{route}], target={})",
+                self.target_key
+            ),
+            // The referent is used after the release inside the route.
+            discharge::Rule::PostReleaseUseRoute {
+                frame,
+                local,
+                premise: p,
+            } => format!(
+                "retirement-disjoint:post-release-use-route(frame={frame}, use=_{local}, event={event}, route=[{route}], target={}{})",
+                self.target_key,
+                premise(*p)
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UnresolvedReason {
+    Route(RouteProblem),
+    MissingEntryFacts,
+    DifferentEntryFacts,
+    Entry(EntryCoverageError),
+    MissingOwner {
+        loan: usize,
+        owner: Option<ProvenanceOwner>,
+    },
+    MissingSlotKey(SlotRef),
+    MissingContext,
+    DuplicateContext,
+    UnexpectedContext,
+    MissingSourceEvent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RetirementUnresolved {
+    pub(crate) source: Option<SourceEventKey>,
+    pub(crate) function: Option<LocalDefId>,
+    pub(crate) location: Option<Location>,
+    pub(crate) phase: Option<SourcePhase>,
+    pub(crate) route: Vec<RouteStep>,
+    pub(crate) reason: UnresolvedReason,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoverageDisposition {
+    Unreachable,
+    Null,
+    InactiveStorage,
+    UnaddressedStorage,
+    IrrelevantNoSafeHolder,
+    /// All currently represented obligations were examined. A conflict or
+    /// unresolved row still prevents acceptance; this is not a soundness proof.
+    Checked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContextCoverage {
+    pub(crate) source: SourceEventKey,
+    pub(crate) function: LocalDefId,
+    pub(crate) location: Location,
+    pub(crate) phase: SourcePhase,
+    pub(crate) route: Vec<RouteStep>,
+    pub(crate) disposition: CoverageDisposition,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetirementReview {
+    pub(crate) conflicts: Vec<RetirementConflict>,
+    /// Conflicts a discharge removed, with their receipts.
+    pub(crate) discharged: Vec<RetirementDischarge>,
+    pub(crate) demotions: Vec<local_outcome::Demotion>,
+    pub(crate) unresolved: Vec<RetirementUnresolved>,
+    pub(crate) coverage: Vec<ContextCoverage>,
+    /// Actual ordinary error points, kept separate from the loan inventory.
+    pub(crate) ordinary_error_points: usize,
+    pub(crate) terminal: BTreeMap<SourceEventKey, EventDisposition>,
+    /// Exact caller evidence used only by the existing heap-only/known-stack
+    /// disjointness rule, never by generic Input/Stack comparisons.
+    pub(crate) known_stack_entries: Vec<super::licensing::stack_entry::KnownStackEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EventDisposition {
+    Irrelevant,
+    CheckedWithoutConflict,
+    Conflict,
+    Unresolved,
+}
+
+impl RetirementReview {
+    pub(crate) fn targets(&self) -> Vec<SlotRef> {
+        self.conflicts
+            .iter()
+            .map(|row| (row.target_key.clone(), row.target))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect()
+    }
+}
+
+fn residual(event: &FrameEvent, reason: UnresolvedReason) -> RetirementUnresolved {
+    RetirementUnresolved {
+        source: Some(event.source.key.clone()),
+        function: Some(event.frame),
+        location: Some(event.location),
+        phase: Some(event.phase),
+        route: event.route.clone(),
+        reason,
+    }
+}
+
+fn overlap(
+    left: &ObjectSet,
+    right: &ObjectSet,
+    frame: LocalDefId,
+    heap_only: bool,
+) -> Option<OverlapReason> {
+    if (!left.unknown && left.roots.is_empty()) || (!right.unknown && right.roots.is_empty()) {
+        return None;
+    }
+    // Under P0, free/realloc cannot retire a known stack object. A set with an
+    // unknown alternative is not a known-stack-only set.
+    if heap_only
+        && ((!left.unknown
+            && left
+                .roots
+                .iter()
+                .all(|root| matches!(root, ObjectRoot::Stack { .. })))
+            || (!right.unknown
+                && right
+                    .roots
+                    .iter()
+                    .all(|root| matches!(root, ObjectRoot::Stack { .. }))))
+    {
+        return None;
+    }
+    if left.unknown || right.unknown {
+        return Some(OverlapReason::UnknownObjects);
+    }
+    let mut reason = None;
+    for a in &left.roots {
+        for b in &right.roots {
+            if heap_only
+                && (matches!(a, ObjectRoot::Stack { .. }) || matches!(b, ObjectRoot::Stack { .. }))
+            {
+                continue;
+            }
+            if a == b {
+                return Some(OverlapReason::SameAbstractRoot);
+            }
+            let pair = match (*a, *b) {
+                (ObjectRoot::Stack { .. }, ObjectRoot::Stack { .. }) => None,
+                (
+                    ObjectRoot::Fresh { frame: born, .. },
+                    ObjectRoot::Input { .. } | ObjectRoot::Stack { .. },
+                )
+                | (
+                    ObjectRoot::Input { .. } | ObjectRoot::Stack { .. },
+                    ObjectRoot::Fresh { frame: born, .. },
+                ) if born == frame => None,
+                (ObjectRoot::Fresh { frame: a, .. }, ObjectRoot::Fresh { frame: b, .. })
+                    if a == frame && b == frame =>
+                {
+                    None
+                }
+                // Concrete Stack roots here are created in this invocation or a
+                // routed callee. A valid incoming reference precedes that storage;
+                // an incoming pointer is never concretized to an ancestor's Stack
+                // label by ObjectFacts. This is a frame relation, not name inequality.
+                (ObjectRoot::Input { .. }, ObjectRoot::Stack { .. })
+                | (ObjectRoot::Stack { .. }, ObjectRoot::Input { .. }) => None,
+                (ObjectRoot::Input { .. }, ObjectRoot::Input { .. }) => {
+                    Some(OverlapReason::PossibleInputAlias)
+                }
+                _ => Some(OverlapReason::UnresolvedInvocation),
+            };
+            // Choose the same conservative explanation independent of hash order.
+            if pair == Some(OverlapReason::PossibleInputAlias) {
+                reason = pair;
+            } else if reason.is_none() {
+                reason = pair;
+            }
+        }
+    }
+    reason
+}
+
+struct Context {
+    source: Arc<SourceEvents>,
+    entries: Arc<EntryAnalysis>,
+    objects: ObjectFacts,
+    routed: RoutedEvents,
+    functions: Vec<LocalDefId>,
+    keys: FxHashMap<SlotRef, String>,
+    locals: FxHashMap<(LocalDefId, ProvenanceOwner), SlotRef>,
+    fields: FxHashMap<StructFieldSlot, SlotRef>,
+    refs: FxHashSet<SlotRef>,
+    known_stack_entries: Vec<super::licensing::stack_entry::KnownStackEntry>,
+    function_names: BTreeMap<String, LocalDefId>,
+    safe_holders: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
+    /// Relay main/388 review-set (R1394-1): `safe_holders`' slots, for an O(1) membership test in
+    /// `demote`'s chain filter; built once when `safe_holders` is complete, never changed after.
+    safe_holder_set: FxHashSet<SlotRef>,
+    copy_graph: FxHashMap<SlotRef, Vec<SlotRef>>,
+    directed_copies: local_outcome::DirectedCopies,
+    exact_kinds: bool,
+    unrepresented_inner: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
+    /// The BO-owned loans for those of them that have one.
+    inner_loans: inner_loan::InnerLoans,
+    entry_consistent: bool,
+    latest: FxHashMap<LocalDefId, RetirementReview>,
+    discharges: discharge::Discharges,
+}
+
+thread_local! {
+    static CURRENT: RefCell<Option<Context>> = const { RefCell::new(None) };
+    static MODEL: RefCell<Option<FxHashMap<SlotRef, super::SlotKind>>> = const { RefCell::new(None) };
+}
+pub(crate) struct ModelScope(Option<FxHashMap<SlotRef, super::SlotKind>>);
+impl Drop for ModelScope {
+    fn drop(&mut self) {
+        MODEL.with(|model| model.replace(self.0.take()));
+    }
+}
+pub(crate) fn model_scope(model: &FxHashMap<SlotRef, super::SlotKind>) -> ModelScope {
+    ModelScope(MODEL.with(|current| current.replace(Some(model.clone()))))
+}
+
+pub(crate) struct RetirementScope {
+    previous: Option<Context>,
+    source_scope: Option<source_events::InventoryScope>,
+    entry_scope: Option<protected_entry::EntryScope>,
+    active: bool,
+}
+
+impl Drop for RetirementScope {
+    fn drop(&mut self) {
+        if self.active {
+            CURRENT.with(|current| {
+                current.replace(self.previous.take());
+            });
+        }
+        self.entry_scope.take();
+        self.source_scope.take();
+    }
+}
+
+pub(crate) fn begin(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    origin_flows: &crate::analyses::borrow_ownership::origin_flow::OriginFlowResults,
+    is_ref: impl Fn(SlotRef) -> bool,
+) -> RetirementScope {
+    let source = source_events::for_construction(program);
+    let source_scope = source_events::enter_inventory(&source);
+    let entry_scope = protected_entry::current()
+        .is_none()
+        .then(|| protected_entry::for_model(program, slots, &is_ref));
+    let entries = protected_entry::current().expect("validated parameter-entry scope");
+    let objects = ObjectFacts::analyze(program, slots, &source, origin_flows);
+    let routed = routes::expand(program, &source, &objects);
+    let function_names: BTreeMap<String, LocalDefId> = program
+        .functions
+        .iter()
+        .map(|&function| (program.tcx.def_path_str(function), function))
+        .collect();
+    let discharges = discharge::Discharges::analyze(program.tcx, &routed, &function_names);
+    let known_stack_entries = super::licensing::reader_replay::selected_owned_cells()
+        .map(|(facts, selected)| {
+            let mut known = super::licensing::stack_entry::collect_known_stack_entries(
+                program,
+                slots,
+                &facts,
+                &selected,
+                super::licensing::stack_entry::current_world(),
+            )
+            .unwrap_or_default();
+            if let Some(selection) = super::licensing::model_selection::current(&facts) {
+                known.extend(super::licensing::chain_entry::collect(
+                    program, slots, &facts, &selection,
+                ));
+            }
+            known
+        })
+        .unwrap_or_default();
+    let exact = MODEL.with(|current| current.borrow().clone());
+    let mut context = Context {
+        source,
+        entries,
+        objects,
+        routed,
+        functions: program.functions.clone(),
+        keys: FxHashMap::default(),
+        locals: FxHashMap::default(),
+        fields: FxHashMap::default(),
+        refs: FxHashSet::default(),
+        known_stack_entries,
+        function_names,
+        safe_holders: Vec::new(),
+        safe_holder_set: FxHashSet::default(),
+        copy_graph: local_outcome::copy_graph(program, slots),
+        directed_copies: local_outcome::directed_copies(program, slots),
+        exact_kinds: exact.is_some(),
+        unrepresented_inner: Vec::new(),
+        inner_loans: inner_loan::analyze(program, slots, &is_ref),
+        entry_consistent: true,
+        latest: FxHashMap::default(),
+        discharges,
+    };
+    let mut expected_entries = FxHashSet::default();
+    for (&function, universe) in &slots.fn_local_slots {
+        let argument_count = program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(function)
+            .borrow()
+            .arg_count;
+        for index in 0..universe.len() {
+            let id = SlotId::from_usize(index);
+            let slot = universe.slot(id);
+            let SlotOwner::Local(local) = slot.owner else { continue };
+            let reference = SlotRef::Local(function, id);
+            context.keys.insert(
+                reference,
+                slot_key::local_key(program.tcx, function, local.as_usize(), slot.depth),
+            );
+            if slot.depth == 0 {
+                context
+                    .locals
+                    .insert((function, ProvenanceOwner::Local(local)), reference);
+            }
+            // Only Ref carriers hold loans; Owning is handled by the ledger.
+            let safe = is_ref(reference);
+            if safe {
+                context
+                    .safe_holders
+                    .push((reference, Some((function, local)), slot.depth));
+            }
+            if is_ref(reference) {
+                context.refs.insert(reference);
+                if local.as_usize() > 0 && local.as_usize() <= argument_count {
+                    expected_entries.insert(reference);
+                } else if slot.depth > 0 {
+                    context.unrepresented_inner.push((
+                        reference,
+                        Some((function, local)),
+                        slot.depth,
+                    ));
+                }
+            }
+        }
+    }
+    context.entry_consistent = expected_entries
+        == context
+            .entries
+            .entries
+            .iter()
+            .map(|entry| entry.key.slot)
+            .collect();
+    for index in 0..slots.field_slots.len() {
+        let id = SlotId::from_usize(index);
+        let slot = slots.field_slots.slot(id);
+        let SlotOwner::Field(field) = slot.owner else { continue };
+        let reference = SlotRef::Field(id);
+        context.keys.insert(
+            reference,
+            slot_key::field_key(program.tcx, field.struct_did, field.field_index, slot.depth),
+        );
+        if slot.depth == 0 {
+            context.fields.insert(
+                StructFieldSlot {
+                    struct_did: field.struct_did,
+                    field_index: field.field_index,
+                },
+                reference,
+            );
+        }
+        // Only Ref carriers hold loans; Owning is handled by the ledger.
+        let safe = is_ref(reference);
+        if safe {
+            context.safe_holders.push((reference, None, slot.depth));
+        }
+        if is_ref(reference) {
+            context.refs.insert(reference);
+            if slot.depth > 0 {
+                context
+                    .unrepresented_inner
+                    .push((reference, None, slot.depth));
+            }
+        }
+    }
+    context.safe_holder_set = context
+        .safe_holders
+        .iter()
+        .map(|&(slot, _, _)| slot)
+        .collect();
+    RetirementScope {
+        previous: CURRENT.with(|current| current.replace(Some(context))),
+        source_scope: Some(source_scope),
+        entry_scope,
+        active: true,
+    }
+}
+
+impl Context {
+    fn owner(&self, function: LocalDefId, owner: ProvenanceOwner) -> Option<SlotRef> {
+        match owner {
+            ProvenanceOwner::Local(_) => self.locals.get(&(function, owner)).copied(),
+            ProvenanceOwner::Field(field) => self.fields.get(&field).copied(),
+        }
+    }
+
+    /// A would-be conflict of a heap release the overlap
+    /// analysis could not place, offered to the two discharges first. Returns
+    /// whether it was discharged (and receipted).
+    fn try_discharge(
+        &self,
+        review: &mut RetirementReview,
+        event: &FrameEvent,
+        slot: SlotRef,
+        heap_only: bool,
+        reason: OverlapReason,
+        target: discharge::Target<'_>,
+    ) -> bool {
+        if !heap_only || reason == OverlapReason::SameAbstractRoot {
+            return false;
+        }
+        let rule = self.discharges.discharge(event, &target);
+        let Some(rule) = rule else {
+            return false;
+        };
+        self.discharged(review, event, slot, rule);
+        true
+    }
+
+    fn discharged(
+        &self,
+        review: &mut RetirementReview,
+        event: &FrameEvent,
+        target: SlotRef,
+        rule: discharge::Rule,
+    ) {
+        let Some(target_key) = self.keys.get(&target) else {
+            review
+                .unresolved
+                .push(residual(event, UnresolvedReason::MissingSlotKey(target)));
+            return;
+        };
+        let name = |function: LocalDefId| {
+            self.function_names
+                .iter()
+                .find(|(_, f)| **f == function)
+                .map_or_else(|| format!("{function:?}"), |(n, _)| n.clone())
+        };
+        let route_names = event
+            .route
+            .iter()
+            .map(|step| {
+                format!(
+                    "{}:bb{}[{}]",
+                    name(step.caller),
+                    step.location.block.as_u32(),
+                    step.location.statement_index
+                )
+            })
+            .collect();
+        review.discharged.push(RetirementDischarge {
+            function: event.frame,
+            target,
+            target_key: target_key.clone(),
+            source: event.source.key.clone(),
+            phase: event.phase,
+            location: event.location,
+            route: event.route.clone(),
+            route_names,
+            rule,
+        });
+    }
+
+    fn conflict(
+        &self,
+        review: &mut RetirementReview,
+        event: &FrameEvent,
+        target: SlotRef,
+        loan: Option<LoanIdentity>,
+        entry: Option<EntryKey>,
+        overlap: OverlapReason,
+    ) {
+        let Some(target_key) = self.keys.get(&target) else {
+            review
+                .unresolved
+                .push(residual(event, UnresolvedReason::MissingSlotKey(target)));
+            return;
+        };
+        review.conflicts.push(RetirementConflict {
+            function: event.frame,
+            target,
+            target_key: target_key.clone(),
+            source: event.source.key.clone(),
+            phase: event.phase,
+            location: event.location,
+            route: event.route.clone(),
+            loan,
+            entry,
+            overlap,
+        });
+    }
+
+    fn review_function(
+        &self,
+        function: LocalDefId,
+        facts: &BorrowInferenceResults<'_>,
+        entry_facts: Option<&EntryAnalysis>,
+        owners_at: impl Fn(Loan, PointIndex) -> Vec<ProvenanceOwner>,
+    ) -> RetirementReview {
+        let mut review = RetirementReview::default();
+        review.ordinary_error_points = facts
+            .errors
+            .rows()
+            .filter(|&point| {
+                facts
+                    .errors
+                    .row(point)
+                    .is_some_and(|loans| !loans.is_empty())
+            })
+            .count();
+        for event in self.routed.frames.get(&function).into_iter().flatten() {
+            let skip = if event.unreachable {
+                Some(CoverageDisposition::Unreachable)
+            } else {
+                match event.source.coverage {
+                    Coverage::IrrelevantNull => Some(CoverageDisposition::Null),
+                    Coverage::IrrelevantInactiveStorage => {
+                        Some(CoverageDisposition::InactiveStorage)
+                    }
+                    // The inventory assigns PointerStorage's irrelevant tag
+                    // only when this cell is unaddressed. Addressed pointer
+                    // cells carry UnresolvedStorage and must still be checked.
+                    Coverage::IrrelevantPointerStorage | Coverage::IrrelevantUnaddressedStorage => {
+                        Some(CoverageDisposition::UnaddressedStorage)
+                    }
+                    _ if !event.objects.unknown && event.objects.roots.is_empty() => {
+                        Some(CoverageDisposition::Null)
+                    }
+                    _ => None,
+                }
+            };
+            let heap_only = matches!(
+                event.source.key.role,
+                SourceRole::Free | SourceRole::ReallocOld
+            );
+            let holders = self.overlapping_holders(function, event, heap_only);
+            let skip = skip.or_else(|| {
+                (self.exact_kinds && !heap_only && holders.is_empty())
+                    .then_some(CoverageDisposition::IrrelevantNoSafeHolder)
+            });
+            review.coverage.push(ContextCoverage {
+                source: event.source.key.clone(),
+                function,
+                location: event.location,
+                phase: event.phase,
+                route: event.route.clone(),
+                disposition: skip.unwrap_or(CoverageDisposition::Checked),
+            });
+            if skip.is_some() {
+                continue;
+            }
+            // No new Ref materialization in this frame means no retirement
+            // obligation here; caller protectors are checked in their routed
+            // contexts. Unknown lifecycle identity alone is not a Ref conflict.
+            if holders.is_empty() {
+                continue;
+            }
+            let heap_only = matches!(
+                event.source.key.role,
+                SourceRole::Free | SourceRole::ReallocOld
+            );
+            // Native loan owners carry only the outer provenance: `Context::owner`
+            // resolves through maps populated at depth 0 alone and
+            // `ProvenanceOwner` carries no depth, so a live native loan can never
+            // name an inner holder. The missing loan is supplied as a BO-owned
+            // obligation and this is where it is consumed, in a three-way
+            // disposition:
+            //   * dead    -- the loan is provably not demanded here: nothing;
+            //   * live    -- a conflict naming THIS holder, not a demotion of its
+            //                whole copy closure;
+            //   * missing -- no obligation, or the value escaped the frame: the
+            //                demotion this site has always done, unchanged.
+            // Field instance flow is still unrepresented and still has no
+            // obligation, so a field-owned holder takes the third arm.
+            for &(slot, owner, depth) in &self.unrepresented_inner {
+                let target = if let Some((owner_function, local)) = owner {
+                    if owner_function != function {
+                        continue;
+                    }
+                    self.objects.pointer_at(
+                        function,
+                        event.location,
+                        &PlaceKey::from_place(rustc_middle::mir::Place::from(local)),
+                        depth,
+                    )
+                } else {
+                    ObjectSet::default()
+                };
+                let Some(reason) = overlap(&target, &event.objects, function, heap_only) else {
+                    continue;
+                };
+                if let Some((_, local)) = owner
+                    && self.try_discharge(
+                        &mut review,
+                        event,
+                        slot,
+                        heap_only,
+                        reason,
+                        discharge::Target::Inner { local, depth },
+                    )
+                {
+                    continue;
+                }
+                let disposition = match owner {
+                    Some((_, local)) => self.inner_loans.disposition_at(
+                        function,
+                        local,
+                        depth,
+                        event.location,
+                        event.phase == SourcePhase::Unwind,
+                    ),
+                    None => {
+                        inner_loan::Disposition::Unrepresented(inner_loan::Missing::NoObligation)
+                    }
+                };
+                match disposition {
+                    inner_loan::Disposition::Dead => {}
+                    // No `LoanIdentity` is attached: a BO-owned obligation has no
+                    // legacy loan index, and fabricating one is exactly what the
+                    // entry obligation's `MissingLegacyLoan` warns against. The
+                    // conflict's own target key carries `@d1` or deeper, which is
+                    // what identifies it as an inner holder.
+                    inner_loan::Disposition::Live => {
+                        self.conflict(&mut review, event, slot, None, None, reason)
+                    }
+                    inner_loan::Disposition::Unrepresented(missing) => self.demote(
+                        &mut review,
+                        event,
+                        slot,
+                        match missing {
+                            inner_loan::Missing::NoObligation => {
+                                local_outcome::Reason::InnerLoanMissing { depth }
+                            }
+                            inner_loan::Missing::Escaped => {
+                                local_outcome::Reason::InnerLoanEscaped { depth }
+                            }
+                        },
+                    ),
+                }
+            }
+            let active_entries: Vec<_> = self
+                .entries
+                .entries
+                .iter()
+                .filter(|entry| entry.key.function == function)
+                .collect();
+            if !active_entries.is_empty() {
+                match entry_facts {
+                    None => review
+                        .unresolved
+                        .push(residual(event, UnresolvedReason::MissingEntryFacts)),
+                    Some(provided)
+                        if !std::ptr::eq(provided, self.entries.as_ref())
+                            && provided != self.entries.as_ref() =>
+                    {
+                        review
+                            .unresolved
+                            .push(residual(event, UnresolvedReason::DifferentEntryFacts))
+                    }
+                    _ => {}
+                }
+            }
+            for entry in active_entries {
+                let mut target = ObjectSet {
+                    roots: FxHashSet::from_iter([ObjectRoot::Input {
+                        function,
+                        parameter: entry.key.parameter,
+                        depth: entry.key.depth,
+                    }]),
+                    unknown: false,
+                };
+                if heap_only
+                    && event.source.key.role == SourceRole::Free
+                    && event.phase == SourcePhase::Call
+                    && event.route.is_empty()
+                    && entry.key.depth == 0
+                {
+                    for proof in &self.known_stack_entries {
+                        if self.keys.get(&entry.key.slot) != Some(&proof.parameter_slot)
+                            || proof.parameter != entry.key.parameter.as_u32()
+                            || proof.free_point.function.as_ref()
+                                != Some(&event.source.key.function)
+                            || proof.free_point.block != Some(event.source.key.block)
+                            || proof.free_point.statement != Some(event.source.key.statement)
+                        {
+                            continue;
+                        }
+                        let roots: Option<FxHashSet<_>> = proof
+                            .callers
+                            .iter()
+                            .map(|caller| {
+                                self.function_names
+                                    .get(&caller.call.caller)
+                                    .map(|&function| ObjectRoot::Stack {
+                                        function,
+                                        local: rustc_middle::mir::Local::from_u32(
+                                            caller.cell.local,
+                                        ),
+                                    })
+                            })
+                            .collect();
+                        if let Some(roots) = roots
+                            && !roots.is_empty()
+                        {
+                            target = ObjectSet {
+                                roots,
+                                unknown: false,
+                            };
+                            review.known_stack_entries.push(proof.clone());
+                        }
+                    }
+                }
+                let Some(reason) = overlap(&target, &event.objects, function, heap_only) else {
+                    continue;
+                };
+                match self.entries.repair_target_for_invalidation(
+                    entry.key,
+                    event.location,
+                    event.phase,
+                    EntryMoment::AtEvent,
+                ) {
+                    Ok(Some(slot)) if self.refs.contains(&slot) => {
+                        if !self.try_discharge(
+                            &mut review,
+                            event,
+                            slot,
+                            heap_only,
+                            reason,
+                            discharge::Target::Entry {
+                                parameter: entry.key.parameter,
+                                depth: entry.key.depth,
+                            },
+                        ) {
+                            self.conflict(&mut review, event, slot, None, Some(entry.key), reason)
+                        }
+                    }
+                    Ok(_) => review
+                        .unresolved
+                        .push(residual(event, UnresolvedReason::DifferentEntryFacts)),
+                    Err(error) => review
+                        .unresolved
+                        .push(residual(event, UnresolvedReason::Entry(error))),
+                }
+            }
+            let point = facts.location_map.point_from_location(event.location);
+            for loan in facts
+                .loan_liveness
+                .row(point)
+                .into_iter()
+                .flat_map(|live| live.iter())
+            {
+                let data = &facts.borrow_set.loans[loan];
+                let borrowed = PlaceKey::from_place(data.borrowed);
+                // Resolve the value at reservation, never through a later rebinding.
+                let target = self
+                    .objects
+                    .storage_at(function, data.location(), &borrowed);
+                let Some(reason) = overlap(&target, &event.objects, function, heap_only) else {
+                    continue;
+                };
+                let owners = owners_at(loan, point);
+                if owners.is_empty() {
+                    review.unresolved.push(residual(
+                        event,
+                        UnresolvedReason::MissingOwner {
+                            loan: loan.index(),
+                            owner: None,
+                        },
+                    ));
+                    continue;
+                }
+                let mut candidates = BTreeMap::new();
+                for &owner in &owners {
+                    match self.owner(function, owner) {
+                        None => review.unresolved.push(residual(
+                            event,
+                            UnresolvedReason::MissingOwner {
+                                loan: loan.index(),
+                                owner: Some(owner),
+                            },
+                        )),
+                        Some(slot) if self.refs.contains(&slot) => {
+                            if let Some(key) = self.keys.get(&slot) {
+                                candidates.insert(key.clone(), slot);
+                            } else {
+                                review
+                                    .unresolved
+                                    .push(residual(event, UnresolvedReason::MissingSlotKey(slot)));
+                            }
+                        }
+                        Some(_) => {}
+                    }
+                }
+                if let Some((_, slot)) = candidates.into_iter().next() {
+                    if self.try_discharge(
+                        &mut review,
+                        event,
+                        slot,
+                        heap_only,
+                        reason,
+                        discharge::Target::Loan {
+                            borrowed: &borrowed,
+                        },
+                    ) {
+                        continue;
+                    }
+                    self.conflict(
+                        &mut review,
+                        event,
+                        slot,
+                        Some(LoanIdentity {
+                            index: loan.index(),
+                            reservation: data.location(),
+                            borrowed,
+                            owners,
+                        }),
+                        None,
+                        reason,
+                    );
+                }
+            }
+        }
+        review
+    }
+}
+
+pub(crate) fn record_function(
+    function: LocalDefId,
+    facts: &BorrowInferenceResults<'_>,
+    entry_facts: Option<&EntryAnalysis>,
+    owners_at: impl Fn(Loan, PointIndex) -> Vec<ProvenanceOwner>,
+) {
+    CURRENT.with(|current| {
+        if let Some(context) = current.borrow_mut().as_mut() {
+            let review = context.review_function(function, facts, entry_facts, owners_at);
+            // Raw-loan replay may revisit a function: only its latest facts count.
+            context.latest.insert(function, review);
+        }
+    });
+}
+
+/// Snapshot before record_function borrows the scope. The native extraction
+/// adapter uses it to preserve the existing A′ live-requirer priority.
+pub(crate) fn owner_ref_status(function: LocalDefId) -> FxHashMap<ProvenanceOwner, bool> {
+    CURRENT.with(|current| {
+        let current = current.borrow();
+        let Some(context) = current.as_ref() else { return FxHashMap::default() };
+        context
+            .locals
+            .iter()
+            .filter_map(|((owner, place), slot)| {
+                (*owner == function).then_some((*place, context.refs.contains(slot)))
+            })
+            .chain(
+                context.fields.iter().map(|(field, slot)| {
+                    (ProvenanceOwner::Field(*field), context.refs.contains(slot))
+                }),
+            )
+            .collect()
+    })
+}
+
+type ContextKey = (
+    SourceEventKey,
+    u32,
+    u32,
+    usize,
+    SourcePhase,
+    Vec<(u32, u32, u32, usize)>,
+);
+fn context_key(
+    source: &SourceEventKey,
+    function: LocalDefId,
+    location: Location,
+    phase: SourcePhase,
+    route: &[RouteStep],
+) -> ContextKey {
+    (
+        source.clone(),
+        function.local_def_index.as_u32(),
+        location.block.as_u32(),
+        location.statement_index,
+        phase,
+        route
+            .iter()
+            .map(|step| {
+                (
+                    step.caller.local_def_index.as_u32(),
+                    step.callee.local_def_index.as_u32(),
+                    step.location.block.as_u32(),
+                    step.location.statement_index,
+                )
+            })
+            .collect(),
+    )
+}
+
+impl RetirementScope {
+    pub(crate) fn finish(mut self) -> RetirementReview {
+        let mut context = CURRENT
+            .with(|current| current.replace(self.previous.take()))
+            .expect("active retirement scope");
+        self.active = false;
+        // Relay main/388 finish-set (R1403-1): the review loop's end and `finish`'s start (log
+        // only). The row counts are the per-function rows `finish` is about to merge.
+        let started = crate::phase_log::on().then(|| {
+            let rows = |count: fn(&RetirementReview) -> usize| -> usize {
+                context.latest.values().map(count).sum()
+            };
+            crate::phase_log::mark(
+                "retirement:finish",
+                "start",
+                &format!(
+                    "sources={} unresolved={} conflicts={} demotions={} coverage={} functions={}",
+                    context.source.retirements.len(),
+                    rows(|latest| latest.unresolved.len()),
+                    rows(|latest| latest.conflicts.len()),
+                    rows(|latest| latest.demotions.len()),
+                    rows(|latest| latest.coverage.len()),
+                    context.latest.len()
+                ),
+            );
+            std::time::Instant::now()
+        });
+        let mut review = RetirementReview::default();
+        if !context.entry_consistent {
+            review.unresolved.push(RetirementUnresolved {
+                source: None,
+                function: None,
+                location: None,
+                phase: None,
+                route: Vec::new(),
+                reason: UnresolvedReason::DifferentEntryFacts,
+            });
+        }
+        for problem in &context.routed.problems {
+            review.unresolved.push(RetirementUnresolved {
+                source: problem.source.as_ref().map(|row| row.key.clone()),
+                function: None,
+                location: None,
+                phase: None,
+                route: Vec::new(),
+                reason: UnresolvedReason::Route(problem.clone()),
+            });
+        }
+        let expected: BTreeSet<_> = context
+            .routed
+            .frames
+            .values()
+            .flatten()
+            .map(|event| {
+                context_key(
+                    &event.source.key,
+                    event.frame,
+                    event.location,
+                    event.phase,
+                    &event.route,
+                )
+            })
+            .collect();
+        let mut seen = BTreeSet::new();
+        let mut sources = BTreeSet::new();
+        for function in &context.functions {
+            let Some(mut latest) = context.latest.remove(function) else { continue };
+            for row in &latest.coverage {
+                let key = context_key(
+                    &row.source,
+                    row.function,
+                    row.location,
+                    row.phase,
+                    &row.route,
+                );
+                let reason = if !expected.contains(&key) {
+                    Some(UnresolvedReason::UnexpectedContext)
+                } else if !seen.insert(key) {
+                    Some(UnresolvedReason::DuplicateContext)
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    review.unresolved.push(RetirementUnresolved {
+                        source: Some(row.source.clone()),
+                        function: Some(row.function),
+                        location: Some(row.location),
+                        phase: Some(row.phase),
+                        route: row.route.clone(),
+                        reason,
+                    });
+                }
+                sources.insert(row.source.clone());
+            }
+            review.ordinary_error_points += latest.ordinary_error_points;
+            review.conflicts.append(&mut latest.conflicts);
+            review.discharged.append(&mut latest.discharged);
+            review.demotions.append(&mut latest.demotions);
+            review.unresolved.append(&mut latest.unresolved);
+            review.coverage.append(&mut latest.coverage);
+            review
+                .known_stack_entries
+                .append(&mut latest.known_stack_entries);
+        }
+        for &function in context.latest.keys() {
+            review.unresolved.push(RetirementUnresolved {
+                source: None,
+                function: Some(function),
+                location: None,
+                phase: None,
+                route: Vec::new(),
+                reason: UnresolvedReason::UnexpectedContext,
+            });
+        }
+        for event in context.routed.frames.values().flatten() {
+            if !seen.contains(&context_key(
+                &event.source.key,
+                event.frame,
+                event.location,
+                event.phase,
+                &event.route,
+            )) {
+                review
+                    .unresolved
+                    .push(residual(event, UnresolvedReason::MissingContext));
+            }
+        }
+        for source in context.source.retirements.keys() {
+            if !sources.contains(source) {
+                review.unresolved.push(RetirementUnresolved {
+                    source: Some(source.clone()),
+                    function: None,
+                    location: None,
+                    phase: None,
+                    route: Vec::new(),
+                    reason: UnresolvedReason::MissingSourceEvent,
+                });
+            }
+        }
+        let terminal = terminal_dispositions(&review, context.source.retirements.keys());
+        review.terminal.extend(terminal);
+        if let Some(started) = started {
+            crate::phase_log::mark(
+                "retirement:finish",
+                "end",
+                &format!(
+                    "wall={:.1}s unresolved={} terminal={}",
+                    started.elapsed().as_secs_f64(),
+                    review.unresolved.len(),
+                    review.terminal.len()
+                ),
+            );
+        }
+        review
+    }
+}
+
+/// Relay main/388 finish-set (R1403-1): each retirement source's terminal disposition, read from
+/// membership sets built once over the review's rows instead of four scans of the rows per source
+/// (run 285: >= 14.48 M demotion rows). The order of the tests is the scan's, and each set holds
+/// exactly the sources its scan's `any` would find, so every source's disposition is the scan's.
+fn terminal_dispositions<'a>(
+    review: &RetirementReview,
+    sources: impl Iterator<Item = &'a SourceEventKey>,
+) -> BTreeMap<SourceEventKey, EventDisposition> {
+    // `is_none_or`: a row without a source makes every source unresolved.
+    let unresolved_without_source = review.unresolved.iter().any(|row| row.source.is_none());
+    let unresolved: BTreeSet<&SourceEventKey> = review
+        .unresolved
+        .iter()
+        .filter_map(|row| row.source.as_ref())
+        .collect();
+    let conflicted: BTreeSet<&SourceEventKey> = review
+        .conflicts
+        .iter()
+        .map(|row| &row.source)
+        .chain(review.demotions.iter().map(|row| &row.source))
+        .collect();
+    let checked: BTreeSet<&SourceEventKey> = review
+        .coverage
+        .iter()
+        .filter(|row| row.disposition == CoverageDisposition::Checked)
+        .map(|row| &row.source)
+        .collect();
+    sources
+        .map(|source| {
+            let disposition = if unresolved_without_source || unresolved.contains(source) {
+                EventDisposition::Unresolved
+            } else if conflicted.contains(source) {
+                EventDisposition::Conflict
+            } else if checked.contains(source) {
+                EventDisposition::CheckedWithoutConflict
+            } else {
+                EventDisposition::Irrelevant
+            };
+            (source.clone(), disposition)
+        })
+        .collect()
+}
+
+/// The scan [`terminal_dispositions`] replaced, kept as the witness's oracle.
+#[cfg(test)]
+fn terminal_dispositions_by_scan<'a>(
+    review: &RetirementReview,
+    sources: impl Iterator<Item = &'a SourceEventKey>,
+) -> BTreeMap<SourceEventKey, EventDisposition> {
+    let mut terminal = BTreeMap::new();
+    for source in sources {
+        let disposition = if review
+            .unresolved
+            .iter()
+            .any(|row| row.source.as_ref().is_none_or(|key| key == source))
+        {
+            EventDisposition::Unresolved
+        } else if review.conflicts.iter().any(|row| &row.source == source)
+            || review.demotions.iter().any(|row| &row.source == source)
+        {
+            EventDisposition::Conflict
+        } else if review
+            .coverage
+            .iter()
+            .any(|row| &row.source == source && row.disposition == CoverageDisposition::Checked)
+        {
+            EventDisposition::CheckedWithoutConflict
+        } else {
+            EventDisposition::Irrelevant
+        };
+        terminal.insert(source.clone(), disposition);
+    }
+    terminal
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rustc_hash::FxHashMap;
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::mir::Local;
+
+    use crate::{
+        analyses::borrow_ownership::{
+            SlotKind, borrow_verify, crate_slots::CrateSlots, export, slots::SlotId,
+            solver::SlotRef, source_events,
+        },
+        utils::rustc::RustProgram,
+    };
+
+    /// Build an explicit candidate; no ownership solver is constructed. All
+    /// nonselected slots, including wrapper parameters and aliases, stay Raw.
+    pub(super) fn accepts(code: &str, selected: &[(&str, u32, u8)]) -> bool {
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let mut functions = Vec::new();
+            let mut structs = Vec::new();
+            for owner in tcx.hir_crate(()).owners.iter() {
+                let Some(owner) = owner.as_owner() else { continue };
+                let OwnerNode::Item(item) = owner.node() else { continue };
+                match item.kind {
+                    ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+                    ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+                    _ => {}
+                }
+            }
+            let program = RustProgram {
+                tcx,
+                functions,
+                structs,
+            };
+            let slots = CrateSlots::build(&program);
+            let mut model = FxHashMap::default();
+            for index in 0..slots.field_slots.len() {
+                model.insert(SlotRef::Field(SlotId::from_usize(index)), SlotKind::Raw);
+            }
+            for (&function, universe) in &slots.fn_local_slots {
+                for index in 0..universe.len() {
+                    model.insert(
+                        SlotRef::Local(function, SlotId::from_usize(index)),
+                        SlotKind::Raw,
+                    );
+                }
+            }
+            assert_eq!(
+                model.len(),
+                slots.field_slots.len()
+                    + slots
+                        .fn_local_slots
+                        .values()
+                        .map(|universe| universe.len())
+                        .sum::<usize>()
+            );
+            for &(name, parameter, depth) in selected {
+                let functions: Vec<_> = program
+                    .functions
+                    .iter()
+                    .copied()
+                    .filter(|function| tcx.item_name(function.to_def_id()).as_str() == name)
+                    .collect();
+                assert_eq!(functions.len(), 1, "exact selected function {name}");
+                let function = functions[0];
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                // Body locals are selectable too, because an inner-loan
+                // holder IS a body local -- parameters are `protected_entry`'s and
+                // never carry an obligation. The guard still catches a typo'd
+                // index, which is what it was for.
+                assert!(
+                    parameter > 0 && (parameter as usize) < body.local_decls.len(),
+                    "selection must name an actual source local"
+                );
+                let slot = slots.fn_local_slots[&function]
+                    .slot_for_local_depth(Local::from_u32(parameter), depth)
+                    .expect("registered local depth");
+                assert_eq!(
+                    model.insert(SlotRef::Local(function, slot), SlotKind::Ref),
+                    Some(SlotKind::Raw),
+                    "selection must replace exactly one registered Raw slot"
+                );
+            }
+            assert_eq!(
+                model
+                    .values()
+                    .filter(|kind| **kind == SlotKind::Ref)
+                    .count(),
+                selected.len()
+            );
+            let inventory = Arc::new(source_events::collect(&program));
+            assert!(!export::capturing(), "model_accepts is an unarmed probe");
+            source_events::with_inventory(&inventory, || {
+                borrow_verify::model_accepts(&program, &slots, &model, false)
+            })
+        })
+        .unwrap_or_else(|error| error.raise())
+    }
+
+    #[test]
+    fn e5_p_imm_direct_copied_void_alias_retirement_rejects_shared_entry() {
+        const CODE: &str = r#"
+unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
+pub unsafe fn direct(p: *const u8) -> u8 {
+    let value = *p;
+    let alias = p as *mut u8;
+    let copied = alias;
+    free(copied as *mut core::ffi::c_void);
+    value
+}
+"#;
+        assert!(
+            !accepts(CODE, &[("direct", 1, 0)]),
+            "the shared incoming reference remains protected after its last read and through whole-object free"
+        );
+    }
+
+    #[test]
+    fn e5_p_imm_two_hop_raw_wrappers_route_retirement_to_shared_caller_entry() {
+        const CODE: &str = r#"
+unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
+unsafe fn release_once(raw: *mut u8) {
+    free(raw as *mut core::ffi::c_void);
+}
+unsafe fn release_twice(raw: *mut u8) {
+    release_once(raw);
+}
+pub unsafe fn caller(p: *const u8) -> u8 {
+    let value = *p;
+    release_twice(p as *mut u8);
+    value
+}
+"#;
+        assert!(
+            !accepts(CODE, &[("caller", 1, 0)]),
+            "Raw wrapper parameters cannot hide the caller's live incoming reference from the body free"
+        );
+    }
+
+    #[test]
+    fn e5_p_object_interior_base_overlap_rejects_but_fresh_allocation_is_disjoint() {
+        const DISJOINT: &str = r#"
+unsafe extern "C" {
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+pub unsafe fn unrelated(entry: *const u8) -> u8 {
+    let value = *entry;
+    let fresh = malloc(8);
+    free(fresh);
+    value
+}
+"#;
+        const INTERIOR: &str = r#"
+#[repr(C)]
+pub struct Pair { first: u8, second: u8 }
+unsafe extern "C" { fn free(p: *mut core::ffi::c_void); }
+pub unsafe fn interior(view: *const u8, base: *mut Pair) -> u8 {
+    let value = *view;
+    free(base as *mut core::ffi::c_void);
+    value
+}
+pub unsafe fn call_interior(base: *mut Pair) -> u8 {
+    let view = &raw const (*base).second;
+    interior(view, base)
+}
+"#;
+        let disjoint_accepted = accepts(DISJOINT, &[("unrelated", 1, 0)]);
+        let interior_accepted = accepts(INTERIOR, &[("interior", 1, 0)]);
+        assert!(
+            disjoint_accepted,
+            "freeing a fresh allocation cannot invalidate the unrelated live incoming object"
+        );
+        assert!(
+            !interior_accepted,
+            "distinct parameter names and a c_void free do not prove an interior view disjoint from its allocation"
+        );
+    }
+
+    #[test]
+    fn e5_p_ordinary_shared_reads_and_nonretiring_local_free_remain_accepted() {
+        const READS: &str = r#"
+pub unsafe fn reads(p: *const u8, q: *const u8) -> u16 {
+    (*p as u16) + (*q as u16)
+}
+"#;
+        const LOCAL_NAME: &str = r#"
+unsafe fn free(raw: *mut core::ffi::c_void) { let _ = raw; }
+pub unsafe fn same_name(p: *const u8) -> u8 {
+    let value = *p;
+    free(p as *mut core::ffi::c_void);
+    value
+}
+"#;
+        assert!(
+            accepts(READS, &[("reads", 1, 0), ("reads", 2, 0)]),
+            "ordinary shared/shared reads remain compatible"
+        );
+        assert!(
+            accepts(LOCAL_NAME, &[("same_name", 1, 0)]),
+            "a nonretiring local body named free is not the ForeignC retirement primitive"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests_rounds;
+
+#[cfg(test)]
+mod tests_edges;
+
+#[cfg(test)]
+mod tests_recursion;
+
+#[cfg(test)]
+mod tests_routes_edges;
+
+#[cfg(test)]
+mod tests_routes_inherent;
+
+#[cfg(test)]
+mod tests_call_reach;
+
+#[cfg(test)]
+mod tests_field_objects;
+
+#[cfg(test)]
+mod tests_inner_loans;
+
+#[cfg(test)]
+mod tests_loans;
+
+#[cfg(test)]
+mod tests_coverage;
+
+#[cfg(test)]
+mod tests_indirect;
+
+#[cfg(test)]
+mod tests_consumer_receipts;
+
+#[cfg(test)]
+mod tests_analysis_receipts;
+
+#[cfg(test)]
+mod tests_call_targets;
+
+#[cfg(test)]
+mod tests_library_drop;
+
+#[cfg(test)]
+mod tests_owner_guards;
+
+#[cfg(test)]
+mod tests_review_set;
+
+#[cfg(test)]
+mod tests_finish_set;
+
+#[cfg(test)]
+mod tests_object_scope;
+
+#[cfg(test)]
+mod tests_out_params;
+
+#[cfg(test)]
+mod tests_directed_closure;
+
+#[cfg(test)]
+mod tests_release_summaries;

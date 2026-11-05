@@ -1,0 +1,2218 @@
+//! Forward parameter fixtures derived from rs-crown urlparser::strff.
+
+/// Under R829-1 / R861-1 (relay 297, main 188) the pass-on target was held:
+/// `strdup::input` beside `strcpy`'s written, unproven `dup` (arg0). **R924-1
+/// (1) (USER; wave-5d 148, the 58 re-cut):** at that foreign call `dup` is a
+/// block `malloc` returned in `strdup` and `input` storage that existed at its
+/// entry, so the pair is certified disjoint and the pre-R829-1 forms return.
+#[test]
+fn wave6s_strff_forward_parameter_pass_on() {
+    let source = emit(STRFF);
+    println!("EMITTED {source}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("ptr: &[i8]"),
+        "forward parameter must deliver: {source}"
+    );
+    // The rendering is the arm that fires: the indexed forward parameter when
+    // the pass-on target stays a raw position, the S3.2′-2b reslice
+    // (`ptr = &ptr[1..]`) when it is a slice.
+    assert!(
+        source.contains("let mut __crat_wave6s_pos_") || source.contains("ptr = &ptr[1..];"),
+        "forward parameter renders by one of its two arms: {source}"
+    );
+}
+
+fn emit(input: &str) -> String {
+    emit_reverting(input, None)
+}
+
+fn emit_reverting(input: &str, revert: Option<&str>) -> String {
+    let output = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("capture original AST");
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::OverlapMode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native corpus-mode decisions");
+        println!("SLICE RECEIPTS {:#?}", table.slice_use_receipts);
+        for (subject, decision) in &table.entries {
+            println!("DECISION {} {decision:?}", subject.label);
+        }
+        let emission =
+            super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
+                .expect("native emission plan");
+        let mut held = emission.plan.held_classes();
+        if let Some(name) = revert {
+            let owner = tcx
+                .hir_body_owners()
+                .find(|owner| tcx.def_path_str(owner.to_def_id()) == name)
+                .expect("the reverted fixture function exists");
+            held.insert(super::bridge_receipt::SignatureClassId::of(owner));
+        }
+        let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+            &held,
+            &Default::default(),
+            &table,
+        )
+        .expect("planned held classes");
+        super::ast_transform::ast_emitted_files_from(
+            tcx,
+            &capture,
+            &reverts,
+            emission.plan.root_file.as_ref(),
+            &table,
+            Some(&emission.plan.terminal_call_plans),
+        )
+        .expect("native AST emission")
+        .0
+        .into_values()
+        .next()
+        .expect("one source file")
+    })
+    .expect("input type-checks");
+    println!(
+        "WAVE6S_RUNTIME {}",
+        serde_json::json!({"input": input, "output": output})
+    );
+    output
+}
+
+#[test]
+fn wave6s_brotli_forward_word_and_byte_walk() {
+    let source = emit(BROTLI);
+    println!("EMITTED {source}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("s2: &[u8]"),
+        "forward byte parameter must deliver: {source}"
+    );
+    assert!(
+        source.contains("let mut __crat_wave6s_pos_"),
+        "forward byte parameter needs its index: {source}"
+    );
+    // The computed sub-view argument of the word loop (report 004): `s1` is a
+    // sole-blocker row in all six corpus copies.
+    assert!(source.contains("s1: &[u8]"), "{source}");
+    let joined = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Composed with wave-6b's width-reader hook the reader takes `&[u8]` and
+    // the argument is the checked prefix of the suffix view (no raw pointer);
+    // alone, the suffix view is bridged raw into the raw reader.
+    assert!(
+        joined.contains(
+            "BrotliUnalignedRead64((&(s1)[(matched) as usize..]).as_ptr().cast::<core::ffi::c_void>())"
+        ) || joined.contains("BrotliUnalignedRead64(&((&(s1)[(matched) as usize..]))[..8])"),
+        "the word read takes the suffix view: {source}"
+    );
+}
+
+const STRFF: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe extern "C" {
+    fn strlen(p: *const i8) -> usize;
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn strcpy(out: *mut i8, input: *const i8) -> *mut i8;
+ }
+ unsafe extern "C" fn strdup(input: *const i8) -> *mut i8 {
+    let n = strlen(input) + 1;
+    let dup = malloc(n) as *mut i8;
+    if !dup.is_null() { strcpy(dup, input); }
+    return dup;
+ }
+ pub unsafe fn strff(mut ptr: *mut i8, n: i32) -> *mut i8 {
+  let mut y = 0; let mut i = 0;
+  while i < n { let fresh11 = *ptr; ptr = ptr.offset(1); y = fresh11 as i32; i += 1; }
+  strdup(ptr)
+ }
+ "#;
+
+const BROTLI: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe fn BrotliUnalignedRead64(p: *const core::ffi::c_void) -> u64 {
+   *(p as *const u64)
+ }
+pub unsafe fn FindMatchLengthWithLimit(mut s1:
+                    *const u8, mut s2: *const u8, mut limit: u64)
+                -> u64 {
+                let mut matched = 0 as i32 as u64;
+                let mut limit2 =
+                    (limit >>
+                                3 as
+                                    i32).wrapping_add(1 as i32 as
+                            u64);
+                loop {
+                    limit2 = limit2.wrapping_sub(1);
+                    if !((limit2 != 0) as i32 as i64 != 0) {
+                        break;
+                    }
+                    if (BrotliUnalignedRead64(s2 as *const core::ffi::c_void) ==
+                                            BrotliUnalignedRead64(s1.offset(matched as isize) as
+                                                    *const core::ffi::c_void)) as i32 as i64 != 0 {
+                        s2 = s2.offset(8 as i32 as isize);
+                        matched =
+                            (matched as
+                                                u64).wrapping_add(8 as i32 as
+                                            u64) as u64 as u64;
+                    } else {
+                        let mut x =
+                            BrotliUnalignedRead64(s2 as *const core::ffi::c_void) ^
+                                BrotliUnalignedRead64(s1.offset(matched as isize) as
+                                        *const core::ffi::c_void);
+                        let mut matching_bits =
+                            (x as u64).trailing_zeros() as i32 as u64;
+                        matched =
+                            (matched as
+                                                u64).wrapping_add(matching_bits >>
+                                            3 as i32) as u64 as u64;
+                        return matched;
+                    }
+                }
+                limit =
+                    (limit &
+                                7 as i32 as
+                                    u64).wrapping_add(1 as i32 as
+                            u64);
+                loop {
+                    limit = limit.wrapping_sub(1);
+                    if !(limit != 0) { break; }
+                    if (*s1.offset(matched as isize) as i32 ==
+                                            *s2 as i32) as i32 as i64 != 0 {
+                        s2 = s2.offset(1);
+                        matched = matched.wrapping_add(1);
+                    } else { return matched }
+                }
+                return matched;
+            }
+
+"#;
+
+#[test]
+fn wave6s_strff_revert_withdraws_index_and_tail_view() {
+    let source = emit_reverting(STRFF, Some("strff"));
+    assert!(super::verify::type_checks_str(&source));
+    assert!(source.contains("ptr: *mut i8"), "{source}");
+    assert!(!source.contains("__crat_wave6s_pos_"), "{source}");
+}
+
+#[test]
+fn wave6s_strff_mixed_return_preserves_shared_permission_hold() {
+    let input = STRFF.replace(
+        "return dup;",
+        "if n == 5 { return input as *mut i8; } return dup;",
+    );
+    let source = emit(&input);
+    assert!(super::verify::type_checks_str(&source));
+    assert!(source.contains("ptr: *mut i8"), "{source}");
+    assert!(!source.contains("__crat_wave6s_pos_"), "{source}");
+}
+
+#[test]
+fn wave6s_backward_parameter_keeps_its_separate_hold() {
+    let source = emit(&STRFF.replace("ptr.offset(1)", "ptr.offset(-1)"));
+    assert!(super::verify::type_checks_str(&source));
+    assert!(!source.contains("__crat_wave6s_pos_"), "{source}");
+}
+
+/// **The claim: the loop's PREFIX COUNT is never read as the NUL tail's
+/// extent.** `strff` walks `n` bytes forward and hands the REST to `strdup`,
+/// so `n` bounds what was consumed, not what remains — a length taken from it
+/// would be fabricated evidence wearing a proof's clothes.
+///
+/// **R217-2(a) — where the extent comes from instead is frame-dependent, and
+/// the assertion below is not.** At the batch-18 frame the thin incoming
+/// source stays raw and the construction takes the named fallback
+/// (`p: *mut i8` … `crate::FALLBACK_SLICE_EXTENT`). Under wave-4's extent-lift
+/// waiver (`8a83e007f`, USER R481-1 / R482-3) the incoming source is LIFTED —
+/// `drive(p: &[i8])`, `strdup(input: &[i8])` — so this fixture constructs
+/// nothing at all and the fabrication, where it is still owed, moves to
+/// `drive`'s own callers. Both spellings are accepted; a length read off `n`
+/// is accepted in neither.
+///
+/// **R829-1 / R861-1 (relay 297, main 188)** held the chain raw end to end;
+/// **R924-1 (1) (USER; wave-5d 148, the 58 re-cut)** certifies `strcpy(dup,
+/// input)` (a fresh block beside entry storage), so the pre-R829-1 spellings
+/// are the ones asserted again.
+#[test]
+#[ignore = "known red at the master merge (main 303): standing since S5, to be taken up after the merge"]
+fn wave6s_strff_incoming_preserves_tail_extent() {
+    let input =
+        format!("{STRFF}\npub unsafe fn drive(p: *mut i8, n: i32) -> *mut i8 {{ strff(p, n) }}");
+    let source = emit(&input);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("ptr: &[i8]"), "{source}");
+    let compact = source.split_whitespace().collect::<String>();
+    assert!(
+        !compact.contains("from_raw_parts(p,(n)asusize)")
+            && !compact.contains("from_raw_parts(p,nasusize)"),
+        "the prefix count is never the tail's extent: {source}"
+    );
+    let raw_incoming = source.contains("p: *mut i8");
+    if raw_incoming {
+        assert!(
+            source.contains("FALLBACK_SLICE_EXTENT"),
+            "a raw incoming source constructs with the named fallback: {source}"
+        );
+    } else {
+        assert!(
+            source.contains("p: &[i8]"),
+            "the incoming source is either raw or lifted, nothing else: {source}"
+        );
+        assert!(
+            !compact.contains("from_raw_parts("),
+            "a lifted chain constructs nothing here: {source}"
+        );
+    }
+}
+
+/// urlparser `url_get_port` → `strff`, reduced with the real caller: the argument
+/// `hostname` is an analysis-Raw local (allocated by a local callee, freed
+/// here) and the caller already delivers `url`. Report 002's census recorded
+/// this owner withdrawn at `restore-family-interface-path:[38, 58, 57, 55, 43]`
+/// from `url_get_port`'s `unwitnessed-family-refusal:blocked-subject:kind-raw`.
+const STRFF_WITH_URL_GET_PORT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe extern "C" {
+    fn strlen(p: *const i8) -> usize;
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+    fn strcpy(out: *mut i8, input: *const i8) -> *mut i8;
+ }
+ unsafe extern "C" fn strdup(input: *const i8) -> *mut i8 {
+    let n = strlen(input) + 1;
+    let dup = malloc(n) as *mut i8;
+    if !dup.is_null() { strcpy(dup, input); }
+    return dup;
+ }
+ unsafe fn strff(mut ptr: *mut i8, n: i32) -> *mut i8 {
+  let mut y = 0; let mut i = 0;
+  while i < n { let fresh11 = *ptr; ptr = ptr.offset(1); y = fresh11 as i32; i += 1; }
+  strdup(ptr)
+ }
+ unsafe fn url_get_hostname() -> *mut i8 { malloc(64) as *mut i8 }
+ pub unsafe fn url_get_port(url: *mut i8, n: i32) -> *mut i8 {
+    let hostname = url_get_hostname();
+    let first = *url;
+    let tmp_hostname = strff(hostname, n);
+    free(hostname as *mut core::ffi::c_void);
+    tmp_hostname
+ }
+ "#;
+
+fn emit_with_family_receipts(input: &str) -> (String, String) {
+    let receipts = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = receipts.clone();
+    let output = ::utils::compilation::run_compiler_on_str(input, move |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("capture original AST");
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::OverlapMode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native corpus-mode decisions");
+        for (subject, decision) in &table.entries {
+            println!(
+                "DECISION {} arms={:?} {decision:?}",
+                subject.label,
+                table.arm_requirements.get(&(subject.fn_did, subject.hir_id))
+            );
+        }
+        for edit in &table.seams.edits {
+            println!("SEAM owner={:?} src={:?} repl={} zero={} shape={} found={:?} expected={:?} spec={:?} outbound={}", edit.owner_class, edit.source_node, edit.replacement, edit.zero_syntax, edit.source_shape, edit.found, edit.expected, edit.spec, edit.raw_outbound.is_some());
+        }
+        for block in &table.seams.blocked {
+            println!("SEAM-BLOCK {block:?}");
+        }
+        *sink.lock().unwrap() = format!(
+            "{:#?}",
+            ctx.raw_boundary_artifacts.additive_family_receipts
+        );
+        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
+            .expect("native emission plan");
+        for edits in emission.plan.by_file.values() {
+            for edit in edits {
+                println!(
+                    "EDIT {}..{} {:?} owner={:?} kind={:?}",
+                    edit.lo,
+                    edit.hi,
+                    edit.replacement,
+                    edit.owner_path,
+                    edit.bridge.as_ref().map(|b| b.bridge_kind.clone())
+                );
+            }
+        }
+        for (id, class) in &emission.plan.class_finalization.classes {
+            println!(
+                "CLASS {} ready={} holds={:?}",
+                tcx.def_path_str(id.local_def_id().to_def_id()),
+                class.is_ready(),
+                class.hold_reasons()
+            );
+        }
+        let held = emission.plan.held_classes();
+        let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+            &held,
+            &Default::default(),
+            &table,
+        )
+        .expect("planned held classes");
+        super::ast_transform::ast_emitted_files_from(
+            tcx,
+            &capture,
+            &reverts,
+            emission.plan.root_file.as_ref(),
+            &table,
+            Some(&emission.plan.terminal_call_plans),
+        )
+        .expect("native AST emission")
+        .0
+        .into_values()
+        .next()
+        .expect("one source file")
+    })
+    .expect("input type-checks");
+    let receipts = receipts.lock().unwrap().clone();
+    println!(
+        "WAVE6S_RUNTIME {}",
+        serde_json::json!({"input": input, "output": output})
+    );
+    (output, receipts)
+}
+
+/// **Caller-bearing witness (report 004; R401-4 lands the fix).**
+/// The callee-only fixture delivers `ptr: &[i8]`; adding the real caller
+/// must not withdraw it. Today the caller's class is charged the C arm for
+/// its raw argument `hostname` while the adapter site is owned by the callee
+/// class, so the caller holds (`blocked-subject:kind-raw`,
+/// `missing-required-arm:c`), its previously applied `url` is "lost", and the
+/// restoration walk withdraws `strff` through the interface graph.
+///
+/// **R829-1 / R861-1 (relay 297, main 188)** held `strff::ptr` on its callee's
+/// side; **R924-1 (1) (USER; wave-5d 148, the 58 re-cut)** certifies the
+/// `strcpy(dup, input)` pair, so the forward parameter delivers again. The
+/// caller still withdraws nothing: `url` delivers and no interface
+/// restoration receipt is written.
+#[test]
+fn wave6s_strff_survives_its_raw_local_caller() {
+    let (source, receipts) = emit_with_family_receipts(STRFF_WITH_URL_GET_PORT);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("ptr: &[i8]"),
+        "the forward parameter delivers and its caller withdraws nothing: {receipts}\n{source}"
+    );
+    assert!(source.contains("url: &i8"), "{source}");
+    assert!(
+        !receipts.contains("restore-family-interface-path"),
+        "interface restoration withdrew a caller-side family: {receipts}"
+    );
+}
+
+/// brotli `StoreRangeH2` → `StoreH2` → `HashBytesH2`: the caller passes a thin
+/// raw `data` (held `local-callee-access-extent`), the callee now delivers.
+const STOREH2_WITH_STORE_RANGE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ #[repr(C)] pub struct H2 { pub buckets_: [u32; 65536] }
+ static kHashMul64: u64 = 0x1E35A7BD1E35A7BD;
+ unsafe fn BrotliUnalignedRead64(p: *const core::ffi::c_void) -> u64 { *(p as *const u64) }
+ unsafe fn HashBytesH2(mut data: *const u8) -> u32 {
+    let h = (BrotliUnalignedRead64(data as *const core::ffi::c_void) << (64 - 8 * 5)).wrapping_mul(kHashMul64);
+    return (h >> (64 - 16)) as u32;
+ }
+ pub unsafe fn StoreH2(mut self_0: *mut H2, mut data: *const u8, mask: usize, ix: usize) {
+    let key = HashBytesH2(&*data.offset((ix & mask) as isize));
+    (*self_0).buckets_[key as usize] = ix as u32;
+ }
+ pub unsafe fn StoreRangeH2(mut self_0: *mut H2, mut data: *const u8, mask: usize, ix_start: usize, ix_end: usize) {
+    let mut i = ix_start;
+    while i < ix_end { StoreH2(self_0, data, mask, i); i = i.wrapping_add(1); }
+ }
+ // A live caller (R898-1: an uncalled function's pairs are disjoint by
+ // vacuity). wave-5d 149g (the 58 re-cut): it hands two separate objects; the
+ // opaque twin (`STOREH2_OPAQUE_DRIVER`) hands two unknown pointers.
+ extern "C" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }
+ #[no_mangle]
+ pub unsafe extern "C" fn __crat_test_live() { let mut h: H2 = core::mem::zeroed(); let buf = [0u8; 64]; StoreRangeH2(&mut h, buf.as_ptr(), 0, 0, 0); }
+"#;
+
+/// **Second caller-bearing witness (report 004; R401-4) — the `unrestored` form before the fix.**
+/// `StoreRangeH2` (caller) and `StoreH2` (callee) depend on each other in the
+/// class graph (`interface-call-zero-syntax` one way, the raw→slice adapter
+/// the other); when the caller's class holds for the mis-charged C arm, both
+/// `self_0` deliveries are "lost", the restoration walk finds each owner held
+/// only through the other and requests nothing, and the pipeline fails with
+/// `additive-family-preservation-invariant:unrestored:[(9, 1), (10, 1)]` —
+/// wave-5d's binn `binn_get_bool` MAX-3 shape.
+///
+/// **R829-1 / R861-1 (relay 297, main 188).** The caller's `data` is now held
+/// raw: it is handed to `StoreH2`'s raw `data` (the `pair-raw-view` role)
+/// beside `self_0` (arg0), which `StoreH2` writes and which is not shown
+/// disjoint (`held:pair-not-shown-disjoint`). So the caller is neither lifted
+/// nor adapted with the fallback; the call still crosses through the A5 raw
+/// local, now bound to the raw `data`. Both `self_0` deliveries — this
+/// witness's own subject — are unchanged.
+#[test]
+fn wave6s_storeh2_survives_its_thin_raw_caller() {
+    let (source, receipts) = emit_with_family_receipts(STOREH2_WITH_STORE_RANGE);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("data: &[u8]"), "{source}");
+    assert!(source.contains("self_0: &mut H2"), "{source}");
+    // **The claim: `mask` is a BIT MASK and is never read as an extent.**
+    // Under the arm-C charge probe (report 004) the adjacency arm licensed
+    // the FOLLOWING argument as the length; wave-4 R408-1 licenses a sibling
+    // only on a count position of the callee's own contract, so no length is
+    // taken from `mask` on any frame.
+    let compact = source.split_whitespace().collect::<String>();
+    assert!(!compact.contains("(mask)asusize"), "{source}");
+    // **R217-2(a) — which END of the call carries the adaptation is
+    // frame-dependent.** At the batch-18 frame the caller's thin raw `data`
+    // is adapted INTO the callee with the named fallback extent. Under
+    // wave-4's extent-lift waiver (`8a83e007f`, USER R481-1 / R482-3) the
+    // CALLER is lifted instead (`StoreRangeH2(data: &[u8])`), the callee's
+    // `data` settles `pair-raw-view`, and the call crosses back through A5's
+    // T2 raw bridge (`let __crat_a5_raw_…: *const u8 = data.as_ptr();`).
+    // Both spellings keep this witness's own subject — the two `self_0`
+    // deliveries the preservation invariant is about — and both type-check.
+    // R829-1 (relay 297, main 188) held StoreRangeH2::data beside `self_0` at
+    // StoreH2. wave-5d 149g (the 58 re-cut): the fixture's one caller now
+    // hands two separate objects, and R931-1's caller-side certificate shows
+    // StoreRangeH2's own pair disjoint at every call, so the data chain is a
+    // slice end to end and the call is zero syntax. The witness's own
+    // subject, both `self_0` deliveries, is unchanged.
+    assert!(
+        compact.contains("fnStoreH2(mutself_0:&mutH2,mutdata:&[u8],"),
+        "{source}"
+    );
+    assert!(
+        compact.contains("fnStoreRangeH2(mutself_0:&mutH2,mutdata:&[u8],"),
+        "{source}"
+    );
+    assert!(compact.contains("StoreH2(self_0,data,mask,i);"), "{source}");
+    assert!(
+        !compact.contains("from_raw_parts(data,crate::FALLBACK_SLICE_EXTENT)"),
+        "{source}"
+    );
+}
+
+/// wave-5d 149h (the round-2 review's MED): the opaque twin of the driver. Two
+/// unknown pointers may name one object, so `StoreRangeH2`'s pair is held at
+/// the driver's call (R833-1 / R864-1) and neither of its formals delivers;
+/// what is asserted is that nothing is delivered beside the unproven pair.
+#[test]
+fn wave6s_storeh2_opaque_driver_keeps_the_pair_raw() {
+    let input = STOREH2_WITH_STORE_RANGE.replace(
+        "let mut h: H2 = core::mem::zeroed(); let buf = [0u8; 64]; StoreRangeH2(&mut h, buf.as_ptr(), 0, 0, 0);",
+        "StoreRangeH2(__crat_test_opaque() as *mut H2, __crat_test_opaque() as *const u8, 0, 0, 0);",
+    );
+    assert_ne!(input, STOREH2_WITH_STORE_RANGE);
+    let (source, _) = emit_with_family_receipts(&input);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let compact = source.split_whitespace().collect::<String>();
+    assert!(
+        compact.contains("fnStoreRangeH2(mutself_0:*mutH2,mutdata:*constu8,"),
+        "{source}"
+    );
+}
+
+/// Negative controls: the arithmetic consumed by anything other than the
+/// call-argument spine is not a view and keeps the collector's verdict.
+#[test]
+fn wave6s_computed_view_refuses_non_argument_consumers() {
+    // A copy of the arithmetic.
+    let copied = STOREH2.replace(
+        "let key = HashBytesH2(&*data.offset((ix & mask) as isize));",
+        "let q = data.offset((ix & mask) as isize); let key = HashBytesH2(q);",
+    );
+    let source = emit(&copied);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    // **Re-premised by wave-4's W4-LIFT (R475-2), disclosed in wave-4 report
+    // 038.** The callee is lifted to the slice form by its own callee's exact
+    // licensed width, and `StoreH2`'s parameter follows it, so the old
+    // `data: *const u8` no longer states this control's claim. The claim
+    // itself is unchanged and is asserted directly: the arithmetic copied into
+    // a local is NOT a view, so it does not reach the argument as
+    // `&(data)[..]` — it goes through the local, and the bridge at the call is
+    // the §77 fallback with its receipt.
+    assert!(!source.contains("HashBytesH2((&(data)["), "{source}");
+    assert!(
+        source.contains("let q = (&(data)[(ix & mask)..]).as_ptr();"),
+        "{source}"
+    );
+    // A borrowed element bound to a local, not passed on.
+    let bound = STOREH2.replace(
+        "let key = HashBytesH2(&*data.offset((ix & mask) as isize));",
+        "let r = &*data.offset((ix & mask) as isize); let key = HashBytesH2(r);",
+    );
+    let source = emit(&bound);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(!source.contains("HashBytesH2((&(data)["), "{source}");
+}
+
+/// A signed delta is the bidirectional family's (R394-2): no view.
+#[test]
+fn wave6s_computed_view_refuses_signed_delta() {
+    let signed = STOREH2
+        .replace(
+            "mask: usize, ix: usize",
+            "mask: usize, ix: usize, back: i32",
+        )
+        .replace(
+            "&*data.offset((ix & mask) as isize)",
+            "&*data.offset(back as isize)",
+        );
+    let source = emit(&signed);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("data: *const u8"), "{source}");
+}
+
+const STOREH2: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ #[repr(C)] pub struct H2 { pub buckets_: [u32; 65536] }
+ static kHashMul64: u64 = 0x1E35A7BD1E35A7BD;
+ unsafe fn BrotliUnalignedRead64(p: *const core::ffi::c_void) -> u64 { *(p as *const u64) }
+ unsafe fn HashBytesH2(mut data: *const u8) -> u32 {
+    let h = (BrotliUnalignedRead64(data as *const core::ffi::c_void) << (64 - 8 * 5)).wrapping_mul(kHashMul64);
+    return (h >> (64 - 16)) as u32;
+ }
+ pub unsafe fn StoreH2(mut self_0: *mut H2, mut data: *const u8, mask: usize, ix: usize) {
+    let key = HashBytesH2(&*data.offset((ix & mask) as isize));
+    (*self_0).buckets_[key as usize] = ix as u32;
+ }
+"#;
+
+#[test]
+fn wave6s_storeh2_computed_subview_argument() {
+    let source = emit(STOREH2);
+    println!("EMITTED {source}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("data: &[u8]"), "{source}");
+    // **Re-premised by wave-4's W4-LIFT (R475-2), disclosed in wave-4 report
+    // 038.** `HashBytesH2` hands its own parameter to `BrotliUnalignedRead64`,
+    // whose region contract carries an exact eight-byte width, so that callee
+    // is no longer raw: it takes the slice form and the suffix view is passed
+    // WHOLE, with no `as_ptr()` downgrade in between. The view itself is
+    // unchanged — this is the same computed sub-view, one raw bridge shorter.
+    assert!(
+        source.contains("HashBytesH2((&(data)[(ix & mask)..]))"),
+        "the suffix view is passed whole to a lifted callee: {source}"
+    );
+    assert!(
+        !source.contains(".as_ptr())"),
+        "and the raw downgrade is gone: {source}"
+    );
+}
+
+/// brotli `ClearHistogramsLiteral` → `HistogramClearLiteral`: the arithmetic
+/// itself is the argument, no borrow.
+const CLEAR_HISTOGRAMS: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" { fn memset(s: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void; }
+ #[repr(C)] pub struct HistogramLiteral { pub data_: [u32; 256], pub total_count_: usize, pub bit_cost_: f64 }
+ unsafe fn HistogramClearLiteral(mut self_0: *mut HistogramLiteral) {
+    memset(((*self_0).data_).as_mut_ptr() as *mut core::ffi::c_void, 0, core::mem::size_of::<[u32; 256]>());
+    (*self_0).total_count_ = 0;
+    (*self_0).bit_cost_ = f64::INFINITY;
+ }
+ pub unsafe fn ClearHistogramsLiteral(mut array: *mut HistogramLiteral, mut length: usize) {
+    let mut i: usize = 0;
+    while i < length { HistogramClearLiteral(array.offset(i as isize)); i = i.wrapping_add(1); }
+ }
+"#;
+
+#[test]
+fn wave6s_clear_histograms_direct_offset_argument() {
+    let (source, receipts) = emit_with_family_receipts(CLEAR_HISTOGRAMS);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("array: &mut [HistogramLiteral]"),
+        "{source}"
+    );
+}
+
+/// brotli `BrotliCreateHuffmanTree` → `InitHuffmanTree`: a mutable computed
+/// sub-view argument.
+const CREATE_HUFFMAN_TREE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ #[repr(C)] #[derive(Clone, Copy)] pub struct HuffmanTree { pub total_count_: u32, pub index_left_: i16, pub index_right_or_value_: i16 }
+ unsafe fn InitHuffmanTree(mut self_0: *mut HuffmanTree, mut count: u32, mut left: i16, mut right: i16) {
+    (*self_0).total_count_ = count;
+    (*self_0).index_left_ = left;
+    (*self_0).index_right_or_value_ = right;
+ }
+ pub unsafe fn BrotliCreateHuffmanTree(mut data: *const u32, length: usize, mut tree: *mut HuffmanTree) {
+    let mut n: usize = 0;
+    let mut i: usize = 0;
+    while i < length {
+        let count = *data.offset(i as isize);
+        if count != 0 {
+            let fresh1 = n;
+            n = n.wrapping_add(1);
+            InitHuffmanTree(&mut *tree.offset(fresh1 as isize), count, -1, -1);
+        }
+        i = i.wrapping_add(1);
+    }
+ }
+"#;
+
+#[test]
+fn wave6s_create_huffman_tree_mutable_subview_argument() {
+    let (source, receipts) = emit_with_family_receipts(CREATE_HUFFMAN_TREE);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("tree: &mut [HuffmanTree]"), "{source}");
+}
+
+/// The E-ADAPT-W4 shape with a forward delta: the base now delivers and the
+/// scalar-reference callee receives the checked element of the suffix.
+#[test]
+fn wave6s_forward_computed_view_delivers_the_scalar_reference_base() {
+    let source = emit(
+        "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+         pub unsafe fn scalar(p: *const i32) -> i32 { *p }\n\
+         pub unsafe fn caller(base: *const i32) -> i32 { scalar(base.offset(1)) }\n",
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("base: &[i32]"), "{source}");
+    assert!(source.contains("scalar(&(&(base)[1..])[0])"), "{source}");
+}
+
+/// brotli `ComputeDistanceCost`: a computed sub-view bound to a local
+/// (`let cmd: *const Command = &*cmds.offset(i) as *const Command`) that a
+/// local callee and field reads consume.
+const COMPUTE_DISTANCE_COST: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ #[repr(C)] #[derive(Clone, Copy)] pub struct Command { pub insert_len_: u32, pub copy_len_: u32, pub dist_extra_: u32, pub cmd_prefix_: u16, pub dist_prefix_: u16 }
+ unsafe fn CommandCopyLen(mut self_0: *const Command) -> u32 { return (*self_0).copy_len_ & 0x1ffffff; }
+ pub unsafe fn ComputeDistanceCost(mut cmds: *const Command, mut num_commands: usize) -> i32 {
+    let mut i: usize = 0;
+    let mut total: u32 = 0;
+    while i < num_commands {
+        let mut cmd: *const Command = &*cmds.offset(i as isize) as *const Command;
+        if CommandCopyLen(cmd) != 0 && (*cmd).cmd_prefix_ as i32 >= 128 {
+            total = total.wrapping_add((*cmd).dist_prefix_ as u32);
+        }
+        i = i.wrapping_add(1);
+    }
+    return total as i32;
+ }
+"#;
+
+#[test]
+fn wave6s_compute_distance_cost_computed_view_bound_to_local() {
+    let (source, receipts) = emit_with_family_receipts(COMPUTE_DISTANCE_COST);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("cmds: &[Command]"), "{source}");
+    assert!(
+        source.contains("let mut cmd: &Command = &(cmds)[i];"),
+        "the bound view composes with the destination's identity-cast peel: {source}"
+    );
+    assert!(source.contains("self_0: &Command"), "{source}");
+}
+
+/// heman `kmVec4TransformArray`: derived pointers bound to locals and passed
+/// on (`let in_0 = pV.offset(i * vStride); … kmVec4Transform(out, in_0, pM)`).
+const KM_VEC4_TRANSFORM_ARRAY: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ #[repr(C)] #[derive(Clone, Copy)] pub struct kmVec4 { pub x: f32, pub y: f32, pub z: f32, pub w: f32 }
+ #[repr(C)] #[derive(Clone, Copy)] pub struct kmMat4 { pub mat: [f32; 16] }
+ unsafe fn kmVec4Transform(mut pOut: *mut kmVec4, mut pV: *const kmVec4, mut pM: *const kmMat4) {
+    (*pOut).x = (*pV).x * (*pM).mat[0] + (*pV).y * (*pM).mat[4] + (*pV).z * (*pM).mat[8] + (*pV).w * (*pM).mat[12];
+    (*pOut).y = (*pV).x * (*pM).mat[1] + (*pV).y * (*pM).mat[5] + (*pV).z * (*pM).mat[9] + (*pV).w * (*pM).mat[13];
+    (*pOut).z = (*pV).x * (*pM).mat[2] + (*pV).y * (*pM).mat[6] + (*pV).z * (*pM).mat[10] + (*pV).w * (*pM).mat[14];
+    (*pOut).w = (*pV).x * (*pM).mat[3] + (*pV).y * (*pM).mat[7] + (*pV).z * (*pM).mat[11] + (*pV).w * (*pM).mat[15];
+ }
+ pub unsafe fn kmVec4TransformArray(mut pOut: *mut kmVec4, mut outStride: u32, mut pV: *const kmVec4, mut vStride: u32, mut pM: *const kmMat4, mut count: u32) {
+    let mut i = 0u32;
+    while i < count {
+        let mut in_0 = pV.offset(i.wrapping_mul(vStride) as isize);
+        let mut out = pOut.offset(i.wrapping_mul(outStride) as isize);
+        kmVec4Transform(out, in_0, pM);
+        i = i.wrapping_add(1);
+    }
+ }
+"#;
+
+/// **Third caller-side witness (report 005; R401-4) — same-function form.** The
+/// derived local `out` (degraded `copy-source-coupled`) is the raw source of
+/// the converted `kmVec4Transform::pOut: &mut kmVec4`, so the arm-C charge
+/// lands on it and holds its own class (`blocked-subject:copy-source-coupled`)
+/// although `pV` / `pOut` both plan their suffix raw views.
+#[test]
+fn wave6s_km_vec4_transform_array_derived_pointers_bound_to_locals() {
+    let (source, receipts) = emit_with_family_receipts(KM_VEC4_TRANSFORM_ARRAY);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("pV: &[kmVec4]"), "{source}");
+    assert!(source.contains("pOut: &mut [kmVec4]"), "{source}");
+    assert!(
+        source.contains("let mut in_0 = (&(pV)[(i.wrapping_mul(vStride)) as usize..]).as_ptr();"),
+        "{source}"
+    );
+}
+
+/// brotli `EvaluateNode` → `ComputeDistanceShortcut`: a MUTABLE slice base
+/// passed as-is into a parameter that settles as a SHARED slice — the
+/// `&mut [T] → &[T]` coercion is zero syntax; wave-5c's same-slice carrier
+/// (W-C1) completes it through its coercion arm (report 006).
+const EVALUATE_NODE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ #[repr(C)] #[derive(Clone, Copy)] pub struct U { pub cost: f32, pub shortcut: u32 }
+ #[repr(C)] #[derive(Clone, Copy)] pub struct ZopfliNode { pub length: u32, pub distance: u32, pub dcode_insert_length: u32, pub u: U }
+ unsafe fn ZopfliNodeCopyLength(mut self_0: *const ZopfliNode) -> u32 { return (*self_0).length & 0x1ffffff; }
+ unsafe fn ComputeDistanceShortcut(block_start: usize, pos: usize, gap: usize, mut nodes: *const ZopfliNode) -> u32 {
+    let clen = ZopfliNodeCopyLength(&*nodes.offset(pos as isize)) as usize;
+    if pos == 0 { return 0; }
+    if pos.wrapping_sub(clen) == block_start { return 0; }
+    return (*nodes.offset(pos.wrapping_sub(clen) as isize)).u.shortcut;
+ }
+ pub unsafe fn EvaluateNode(block_start: usize, pos: usize, gap: usize, mut nodes: *mut ZopfliNode) {
+    let mut node_cost = (*nodes.offset(pos as isize)).u.cost;
+    (*nodes.offset(pos as isize)).u.shortcut = ComputeDistanceShortcut(block_start, pos, gap, nodes);
+    if node_cost <= 1.0 { (*nodes.offset(pos as isize)).u.cost = 0.0; }
+ }
+"#;
+
+#[test]
+fn wave6s_evaluate_node_bare_pass_on_into_same_form_parameter() {
+    let (source, receipts) = emit_with_family_receipts(EVALUATE_NODE);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut nodes: &mut [ZopfliNode]"), "{source}");
+    assert!(source.contains("mut nodes: &[ZopfliNode]"), "{source}");
+    let joined = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        joined.contains("ComputeDistanceShortcut(block_start, pos, gap, nodes)"),
+        "the same-form pass-on stays zero-syntax: {source}"
+    );
+    assert!(joined.contains("nodes[pos].u.shortcut ="), "{source}");
+}
+
+/// brotli `FindBlocksLiteral::cost`: a delivered slice base cast to `*mut
+/// c_void` at a foreign counted callee (`memset`).
+const FIND_BLOCKS_COST: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" { fn memset(s: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void; }
+ pub unsafe fn FindBlocks(mut cost: *mut f64, num_histograms: usize, mut insert: *const f64) -> usize {
+    let mut best: usize = 0;
+    memset(cost as *mut core::ffi::c_void, 0, core::mem::size_of::<f64>().wrapping_mul(num_histograms));
+    let mut k: usize = 0;
+    let mut min_cost = 1e99f64;
+    while k < num_histograms {
+        *cost.offset(k as isize) += *insert.offset(k as isize);
+        if *cost.offset(k as isize) < min_cost { min_cost = *cost.offset(k as isize); best = k; }
+        k = k.wrapping_add(1);
+    }
+    best
+ }
+"#;
+
+/// Relay 004 §1's first ask: the cast-argument bridge. It already exists —
+/// this pins it (`VoidFromSliceMut`, T2 at the foreign counted callee).
+#[test]
+fn wave6s_cast_argument_bridge_already_exists() {
+    let (source, receipts) = emit_with_family_receipts(FIND_BLOCKS_COST);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("cost: &mut [f64]"), "{source}");
+    assert!(
+        source.contains("memset(cost.as_mut_ptr().cast::<core::ffi::c_void>(), 0,"),
+        "{source}"
+    );
+}
+
+/// tulipindicators `smoke::get_array` (corpus regression of the partial
+/// census, report 006): the Option value composition snapshots the seam's
+/// text, so the computed-view rendering must be on the seam set before it —
+/// `strtok((&mut (line)[1..]).as_mut_ptr(), …)` composed into `.as_ref()`.
+#[test]
+fn wave6s_computed_view_composes_into_option_value() {
+    let src = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, static_mut_refs)]
+ unsafe extern "C" {
+    fn strtok(s: *mut i8, delim: *const i8) -> *mut i8;
+    fn atof(s: *const i8) -> f64;
+ }
+ static mut BUF: [i8; 64] = [0; 64];
+ unsafe fn next_line() -> *mut i8 { BUF.as_mut_ptr() }
+ pub unsafe fn get_array(mut s: *mut f64) -> i32 {
+    let mut line: *mut i8 = next_line();
+    if *line.offset(0 as i32 as isize) as i32 != '{' as i32 { return 0; }
+    let mut num: *mut i8 = strtok(line.offset(1 as i32 as isize), b",}\r\n\0" as *const u8 as *const i8);
+    if num.is_null() { return 0; }
+    let mut inp: *mut f64 = s;
+    loop {
+        *inp = atof(num);
+        inp = inp.offset(1);
+        num = strtok(0 as *mut i8, b",}\r\n\0" as *const u8 as *const i8);
+        if num.is_null() { break; }
+    }
+    return 1;
+ }
+"#;
+    let (source, receipts) = emit_with_family_receipts(src);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("line: &mut [i8]"), "{source}");
+    let joined = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        joined.contains("strtok((&mut (line)[(1 as i32) as usize..]).as_mut_ptr(),"),
+        "{source}"
+    );
+}
+
+/// **Sum of forward deltas (report 007 §5a).** lodepng
+/// `lodepng_chunk_generate_crc`: `chunk.offset((8 as isize) + (length as
+/// isize))` — the delta is a `+` of a non-negative literal and an unsigned
+/// value under casts. Conditional on a UB-free input each summand is
+/// non-negative and a sum leaving the object would already be the input's
+/// UB, so the sum is forward and the argument is the suffix view.
+#[test]
+fn wave6s_generate_crc_sum_of_forward_deltas() {
+    let (source, receipts) = emit_with_family_receipts(GENERATE_CRC_LENGTH_GIVEN);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("fnlodepng_chunk_generate_crc(mutchunk:&mut[libc::c_uchar]"),
+        "{source}"
+    );
+    assert!(
+        flat.contains("lodepng_set32bitInt((&mut(chunk)[((8aslibc::c_intasisize)+(lengthasisize))asusize..]),CRC)"),
+        "{source}"
+    );
+}
+
+/// A `+` with a signed summand keeps the cursor verdict (R394-2).
+#[test]
+fn wave6s_sum_with_signed_summand_keeps_the_cursor_verdict() {
+    let signed = GENERATE_CRC_LENGTH_GIVEN.replace(
+        "(8 as libc::c_int as isize) + (length as isize)",
+        "(8 as libc::c_int as isize) + (length as libc::c_int as isize)",
+    );
+    assert_ne!(signed, GENERATE_CRC_LENGTH_GIVEN);
+    let rows = super::emit_tests::decisions_of(&signed);
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(n, p, _)| n == "chunk" && *p)
+        .map(|(_, _, r)| r.clone())
+        .expect("generate_crc::chunk");
+    assert_eq!(reason, "slice-cursor-use", "{rows:?}");
+}
+
+/// The faithful lodepng shape (`lodepng_chunk_generate_crc::chunk`,
+/// `slice-cursor-use` at `60f52cff`): with the sum forward and the bare
+/// `from_raw_parts` seam of a slice callee taking the suffix view, the
+/// subject delivers, its `lodepng_chunk_length(chunk)` pass-on through the
+/// existing thin-element carrier.
+#[test]
+fn wave6s_generate_crc_faithful_delivers() {
+    let (source, receipts) = emit_with_family_receipts(GENERATE_CRC);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("fnlodepng_chunk_generate_crc(mutchunk:&mut[libc::c_uchar])"),
+        "{source}"
+    );
+    // RESTATED (main 170, the gate of 55): `lodepng_chunk_length::chunk` was
+    // thin and handed `chunk.first().unwrap()`, then reached
+    // `lodepng_read32bitInt`'s four-byte read as a one-element view. Handed
+    // bare to that array formal it takes the fat twin (R758-1 (2), R763-1 (a)),
+    // and the pass-on is the slice itself.
+    assert!(
+        flat.contains("fnlodepng_chunk_length(mutchunk:&[libc::c_uchar])")
+            && flat.contains("lodepng_chunk_length(chunk)"),
+        "{source}"
+    );
+    assert_eq!(receipts.trim(), "[]", "no family withdrawal: {receipts}");
+}
+
+const GENERATE_CRC: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ mod libc { pub type c_uchar = u8; pub type c_uint = u32; pub type c_int = i32; pub type c_ulong = u64; }
+ pub type size_t = libc::c_ulong;
+ static lodepng_crc32_table: [libc::c_uint; 256] = [0; 256];
+ unsafe extern "C" fn lodepng_read32bitInt(mut buffer: *const libc::c_uchar) -> libc::c_uint {
+    return (*buffer.offset(0 as libc::c_int as isize) as libc::c_uint) << 24 as libc::c_uint
+        | (*buffer.offset(1 as libc::c_int as isize) as libc::c_uint) << 16 as libc::c_uint
+        | (*buffer.offset(2 as libc::c_int as isize) as libc::c_uint) << 8 as libc::c_uint
+        | *buffer.offset(3 as libc::c_int as isize) as libc::c_uint;
+ }
+ unsafe extern "C" fn lodepng_set32bitInt(mut buffer: *mut libc::c_uchar, mut value: libc::c_uint) {
+    *buffer.offset(0 as libc::c_int as isize) = (value >> 24 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(1 as libc::c_int as isize) = (value >> 16 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(2 as libc::c_int as isize) = (value >> 8 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(3 as libc::c_int as isize) = (value & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+ }
+ pub unsafe extern "C" fn lodepng_chunk_length(mut chunk: *const libc::c_uchar) -> libc::c_uint {
+    return lodepng_read32bitInt(chunk);
+ }
+ pub unsafe extern "C" fn lodepng_crc32(mut data: *const libc::c_uchar, mut length: size_t) -> libc::c_uint {
+    let mut r = 0xffffffff as libc::c_uint;
+    let mut i: size_t = 0;
+    i = 0 as libc::c_int as size_t;
+    while i < length {
+        r = lodepng_crc32_table[((r ^ *data.offset(i as isize) as libc::c_uint) & 0xff as libc::c_uint) as usize] ^ r >> 8 as libc::c_uint;
+        i = i.wrapping_add(1);
+    }
+    return r ^ 0xffffffff as libc::c_uint;
+ }
+ pub unsafe extern "C" fn lodepng_chunk_generate_crc(mut chunk: *mut libc::c_uchar) {
+    let mut length = lodepng_chunk_length(chunk);
+    let mut CRC = lodepng_crc32(&mut *chunk.offset(4 as libc::c_int as isize), length.wrapping_add(4 as libc::c_int as libc::c_uint) as size_t);
+    lodepng_set32bitInt(chunk.offset((8 as libc::c_int as isize) + (length as isize)), CRC);
+ }
+"#;
+
+const GENERATE_CRC_LENGTH_GIVEN: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ mod libc { pub type c_uchar = u8; pub type c_uint = u32; pub type c_int = i32; pub type c_ulong = u64; }
+ pub type size_t = libc::c_ulong;
+ static lodepng_crc32_table: [libc::c_uint; 256] = [0; 256];
+ unsafe extern "C" fn lodepng_read32bitInt(mut buffer: *const libc::c_uchar) -> libc::c_uint {
+    return (*buffer.offset(0 as libc::c_int as isize) as libc::c_uint) << 24 as libc::c_uint
+        | (*buffer.offset(1 as libc::c_int as isize) as libc::c_uint) << 16 as libc::c_uint
+        | (*buffer.offset(2 as libc::c_int as isize) as libc::c_uint) << 8 as libc::c_uint
+        | *buffer.offset(3 as libc::c_int as isize) as libc::c_uint;
+ }
+ unsafe extern "C" fn lodepng_set32bitInt(mut buffer: *mut libc::c_uchar, mut value: libc::c_uint) {
+    *buffer.offset(0 as libc::c_int as isize) = (value >> 24 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(1 as libc::c_int as isize) = (value >> 16 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(2 as libc::c_int as isize) = (value >> 8 as libc::c_int & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+    *buffer.offset(3 as libc::c_int as isize) = (value & 0xff as libc::c_int as libc::c_uint) as libc::c_uchar;
+ }
+ pub unsafe extern "C" fn lodepng_chunk_length(mut chunk: *const libc::c_uchar) -> libc::c_uint {
+    return lodepng_read32bitInt(chunk);
+ }
+ pub unsafe extern "C" fn lodepng_crc32(mut data: *const libc::c_uchar, mut length: size_t) -> libc::c_uint {
+    let mut r = 0xffffffff as libc::c_uint;
+    let mut i: size_t = 0;
+    i = 0 as libc::c_int as size_t;
+    while i < length {
+        r = lodepng_crc32_table[((r ^ *data.offset(i as isize) as libc::c_uint) & 0xff as libc::c_uint) as usize] ^ r >> 8 as libc::c_uint;
+        i = i.wrapping_add(1);
+    }
+    return r ^ 0xffffffff as libc::c_uint;
+ }
+ pub unsafe extern "C" fn lodepng_chunk_generate_crc(mut chunk: *mut libc::c_uchar, mut length: libc::c_uint) {
+    let mut CRC = lodepng_crc32(&mut *chunk.offset(4 as libc::c_int as isize), length.wrapping_add(4 as libc::c_int as libc::c_uint) as size_t);
+    lodepng_set32bitInt(chunk.offset((8 as libc::c_int as isize) + (length as isize)), CRC);
+ }
+"#;
+
+/// **Borrow-deref-double-cast view at a foreign position (relay 008 §3,
+/// routed from wave-6s2).** brotli `MakeUncompressedStream`:
+/// `memcpy(&mut *output.offset(result) as *mut u8 as *mut c_void, …)`. The
+/// spine already walks the casts; what was missing is the foreign call fact's
+/// ROOT — `AddrOfCast` carried none, so the site was never a raw-boundary
+/// argument of `output` and the collector's cursor verdict took it
+/// (`slice-cursor-use` at `60f52cff`). Rooted, the site is the subject's own
+/// C-arm seam and the view renders `(&mut (output)[result..]).as_mut_ptr()`.
+#[test]
+fn wave6s_borrow_deref_double_cast_view_at_a_foreign_position() {
+    let (source, receipts) = emit_with_family_receipts(MEMSET_DOUBLE_CAST);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("fnfill(mutoutput:&mut[uint8_t]"), "{source}");
+    assert!(
+        flat.contains(
+            "memset((&mut(output)[(result)asusize..]).as_mut_ptr().cast::<core::ffi::c_void>(),"
+        ),
+        "{source}"
+    );
+    assert_eq!(receipts.trim(), "[]", "no family withdrawal: {receipts}");
+}
+
+/// The faithful brotli shape: `output` (the `memcpy` destination, a T2
+/// open-boundary void bridge) is admitted by the root; `input` (the source,
+/// a SHARED view at a pointer-returning foreign callee) holds under the
+/// returned-child permission rule `write-through-shared-view` — wave-6r's
+/// family. Alone (this lane's tree) the hold withdraws the function's
+/// SliceUse stage and both stay raw; composed with wave-6r's libc
+/// negative-write contract at `memcpy`'s source (relay 009 §2, batch 8)
+/// both deliver, `input` through the suffix view. Either outcome is the
+/// rule that owns it (R217-2(a)); this lane's own claim is the rooted view.
+#[test]
+fn wave6s_make_uncompressed_stream_source_is_wave6r_s_rule() {
+    let (source, receipts) = emit_with_family_receipts(MAKE_UNCOMPRESSED_STREAM);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    let delivered = flat.contains("mutinput:&[uint8_t]")
+        && flat.contains("mutoutput:&mut[uint8_t]")
+        && flat.contains("memcpy((&mut(output)[(result)asusize..]).as_mut_ptr().cast::<core::ffi::c_void>(),(&(input)[(offset)asusize..]).as_ptr().cast::<core::ffi::c_void>(),");
+    let held = receipts.contains("write-through-shared-view") || receipts.contains("memcpy:arg=1");
+    assert!(delivered || held, "{source}\n{receipts}");
+}
+
+const MEMSET_DOUBLE_CAST: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ mod libc { pub type c_void = core::ffi::c_void; pub type c_int = i32; pub type c_ulong = u64; }
+ pub type uint8_t = u8;
+ pub type size_t = libc::c_ulong;
+ unsafe extern "C" { fn memset(d: *mut libc::c_void, c: libc::c_int, n: libc::c_ulong) -> *mut libc::c_void; }
+ unsafe extern "C" fn fill(mut output: *mut uint8_t, mut result: size_t, mut n: size_t) {
+    *output.offset(0 as libc::c_int as isize) = 1 as libc::c_int as uint8_t;
+    memset(&mut *output.offset(result as isize) as *mut uint8_t as *mut libc::c_void, 0 as libc::c_int, n);
+ }
+"#;
+
+const MAKE_UNCOMPRESSED_STREAM: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case, non_upper_case_globals)]
+ mod libc { pub type c_void = core::ffi::c_void; pub type c_int = i32; pub type c_ulong = u64; pub type c_uint = u32; }
+ pub type uint8_t = u8;
+ pub type size_t = libc::c_ulong;
+ unsafe extern "C" { fn memcpy(d: *mut libc::c_void, s: *const libc::c_void, n: libc::c_ulong) -> *mut libc::c_void; }
+ unsafe extern "C" fn MakeUncompressedStream(mut input: *const uint8_t, mut input_size: size_t, mut output: *mut uint8_t) -> size_t {
+    let mut size = input_size;
+    let mut result = 0 as libc::c_int as size_t;
+    let mut offset = 0 as libc::c_int as size_t;
+    if input_size == 0 as libc::c_int as libc::c_ulong {
+        *output.offset(0 as libc::c_int as isize) = 6 as libc::c_int as uint8_t;
+        return 1 as libc::c_int as size_t;
+    }
+    let fresh95 = result;
+    result = result.wrapping_add(1);
+    *output.offset(fresh95 as isize) = 0x21 as libc::c_int as uint8_t;
+    while size > 0 as libc::c_int as libc::c_ulong {
+        let mut chunk_size = if size > (1 as libc::c_int as size_t) << 24 { (1 as libc::c_int as size_t) << 24 } else { size };
+        let fresh96 = result;
+        result = result.wrapping_add(1);
+        *output.offset(fresh96 as isize) = (chunk_size >> 8 as libc::c_int) as uint8_t;
+        memcpy(&mut *output.offset(result as isize) as *mut uint8_t as *mut libc::c_void,
+            &*input.offset(offset as isize) as *const uint8_t as *const libc::c_void, chunk_size as libc::c_ulong);
+        result = (result as libc::c_ulong).wrapping_add(chunk_size as libc::c_ulong) as size_t as size_t;
+        offset = (offset as libc::c_ulong).wrapping_add(chunk_size as libc::c_ulong) as size_t as size_t;
+        size = (size as libc::c_ulong).wrapping_sub(chunk_size as libc::c_ulong) as size_t as size_t;
+    }
+    let fresh97 = result;
+    result = result.wrapping_add(1);
+    *output.offset(fresh97 as isize) = 3 as libc::c_int as uint8_t;
+    return result;
+ }
+"#;
+
+/// **Relay 013 — the slice-use receipt drift that aborted batch 8's census
+/// (lodepng class 563, brotli class 1276).** A slice-use candidate retired by
+/// R220 keeps its candidate form beside the restored source form
+/// (`source_form=raw`, `candidate_form=opt-slice-mut`, adapter
+/// `prior-family-rendering:<stage>`), licensed at reconciliation by its
+/// terminal partner (`Reclassified`, `additive-family-fallback:…`). When the
+/// whole program then degrades (`RewriteOutcome::degraded`: lodepng's and
+/// brotli's revert loops exhausted on wave-6v's missing raw twins), every
+/// terminal is rewritten to `Dropped` / `ProgramDegradedUnmodifiedInput` — the
+/// license vanishes while the row still carries both forms, and the census
+/// worker aborts on `slice-use specialized/common drift … :plan`. The retired
+/// identity is the row's, not the partner's state: a degraded partner
+/// licenses it too.
+#[test]
+fn wave6s_retired_slice_use_row_survives_program_degradation() {
+    use super::mechanical_receipt::{MechanicalStage, MechanicalState, MechanicalTerminalReason};
+    let input = "#![allow(dead_code, unused_unsafe)]\n\
+        pub unsafe fn target(p: *const i32) -> i32 {\n\
+            let q: *const i32 = p; *p.offset(1) + *q\n\
+        }\n";
+    let table = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        super::decide_table(tcx).expect("retired-candidate table")
+    })
+    .expect("fixture compiles");
+    let retired = table
+        .slice_use_receipts
+        .iter()
+        .find(|plan| plan.obligation.intended_terminal_state == MechanicalState::Reclassified)
+        .expect("an R220-retired slice-use candidate");
+    assert_ne!(retired.source_form, retired.candidate_form, "{retired:?}");
+    let (mut events, mut rows) = retired.materialize(false, false);
+    super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
+        .expect("the retired partner licenses the row");
+    // `RewriteOutcome::degraded` (bo_rewriter/mod.rs): every terminal event
+    // and row drops with the program.
+    for event in &mut events {
+        if event.stage == MechanicalStage::Terminal {
+            event.state = MechanicalState::Dropped;
+            event.terminal_reason = Some(MechanicalTerminalReason::ProgramDegradedUnmodifiedInput);
+        }
+    }
+    for row in &mut rows {
+        row.terminal_class_state = MechanicalState::Dropped;
+        if row.terminal.stage == MechanicalStage::Terminal {
+            row.terminal.state = MechanicalState::Dropped;
+            row.terminal.reason = Some(MechanicalTerminalReason::ProgramDegradedUnmodifiedInput);
+        }
+    }
+    super::mechanical_receipt::reconcile_slice_use_rows(&rows, &events)
+        .expect("a degraded partner still licenses the retired row");
+}
+
+/// The lodepng shape verbatim (`addChunk_IHDR` with `lodepng_chunk_init`,
+/// `ucvector_resize`/`reserve`, `lodepng_memcpy`, `lodepng_set32bitInt`,
+/// `lodepng_chunk_generate_crc`; `benchmarks/rs-crown-derived/lodepng`):
+/// `data = chunk.offset(8)` then `lodepng_set32bitInt(data.offset(0), w)` —
+/// the census's `class=563:subject=local:563:9:…:callee=def-id:0:329:arg=0`
+/// is this reduction's `subject=local:9 … arg=0` (the HIR item-local id 114
+/// coincides). The program degrades in the reduction as in the corpus, and
+/// the census's reconciliation must then hold rather than abort the worker.
+#[test]
+fn wave6s_lodepng_addchunk_ihdr_reduction_reconciles_after_degradation() {
+    let input = include_str!("testdata/wave6s-drift/lodepng-addchunk-ihdr.rs");
+    let outcome = super::rewrite_core_injected(
+        ::utils::compilation::str_to_input(input),
+        None,
+        super::MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        true,
+        true,
+        Some((
+            super::OverlapMode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    );
+    let artifacts = match &outcome {
+        super::RewriteOutcome::Emitted {
+            raw_boundary_artifacts,
+            ..
+        }
+        | super::RewriteOutcome::Degraded {
+            raw_boundary_artifacts,
+            ..
+        } => raw_boundary_artifacts,
+    };
+    // **Restated for both frames (R217-2(a), under R465-5).** What this test
+    // is about is the invariant after it: a retired row of a DEGRADED program
+    // still reconciles. Which retirement produced the row is frame-dependent
+    // and was never the point:
+    //
+    // * **before R465-5** — `addChunk_IHDR::data`'s carrier was built from the
+    //   base's raw form, the Option presentation at that class was dropped
+    //   `option-evidence-held`, and the slice-use family fell back behind it,
+    //   so the row carried a `prior-family-rendering:` adapter and a candidate
+    //   form that differed from its source.
+    // * **after R465-5** — the carrier takes the base's decided form, the
+    //   class is not dropped, and the same two sites (`hir:…:96`, `…:114`)
+    //   carry `source_form == candidate_form == "opt-slice-mut"` with the
+    //   program's own degradation as the only retirement.
+    let retired_after_degradation = artifacts.slice_use_rows.iter().any(|row| {
+        row.terminal.reason
+            == Some(
+                super::mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+            )
+            && (
+                // the pre-R465-5 rendering
+                (row.adapter.starts_with("prior-family-rendering:")
+                    && row.source_form != row.candidate_form)
+                // the R465-5 rendering: the option-presented base on both sides
+                || (row.source_form == "opt-slice-mut" && row.candidate_form == "opt-slice-mut")
+            )
+    });
+    assert!(
+        retired_after_degradation,
+        "the reduction must carry a retired row of a degraded program: {:?}",
+        artifacts.slice_use_rows
+    );
+    super::mechanical_receipt::reconcile_slice_use_rows(
+        &artifacts.slice_use_rows,
+        &artifacts.mechanical_events,
+    )
+    .expect("slice-use receipt reconciliation");
+}
+
+/// **Relay 013 §3 — tulipindicators `ti_trima::inputs` → `ti_sma::inputs`.**
+/// The bare pass-on of a depth-2 parameter's OUTER slot (`inputs: &[*const
+/// f64]`, same form on both sides, raw element on both sides) had no carrier
+/// (`slice-use-existing-c-interface-carrier-unmapped:candidates=0`): the
+/// same-slice carrier (wave-5c W-C1) looked for the source and the parameter
+/// at `ptr_depth == 1` only, the site dropped `slice-use-evidence-held`, and
+/// the exclusion re-derivation withdrew `ti_sma`'s family with it (its
+/// cursor `input` among the losses — slicecursor 015). The carrier now reads
+/// the plan's own slot depth and requires every deeper slot to agree. Verbatim
+/// `ti_sma` / `ti_trima` (+ their `_start`) from `benchmarks/rs-crown-derived/
+/// tulipindicators`.
+#[test]
+fn wave6s_ti_trima_outer_slot_pass_on_delivers_and_returns_ti_sma_s_cursor() {
+    let input = include_str!("testdata/wave6s-drift/tulip-trima-sma.rs");
+    let (source, receipts) = emit_with_family_receipts(input);
+    println!("EMITTED {source}");
+    println!("FAMILY RECEIPTS {receipts}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("fnti_trima(mutsize:std::os::raw::c_int,mutinputs:&[*conststd::os::raw::c_double],mutoptions:&[std::os::raw::c_double],"),
+        "{source}"
+    );
+    assert!(
+        flat.contains("fnti_sma(mutsize:std::os::raw::c_int,mutinputs:&[*conststd::os::raw::c_double],mutoptions:&[std::os::raw::c_double],"),
+        "{source}"
+    );
+    assert!(
+        flat.contains("returnti_sma(size,inputs,options,outputs)"),
+        "{source}"
+    );
+    assert_eq!(receipts.trim(), "[]", "no family withdrawal: {receipts}");
+}
+
+// ---------------------------------------------------------------------------
+// W6S-7 — the Option-slice destination of a forward computed view
+//
+// `let mut p = 0 as *mut T; … p = &mut *src.offset(e) as *mut T;` is this
+// lane's computed view landing in a null-initialized destination, whose form
+// is `Option<&[T]>`. Two pieces:
+//
+//   (i)  the destination's own use walk admits the assignment — the right-hand
+//        side is the view's to render, not the destination's. The structural
+//        walk is wave-6s2's (W6S2-5); the DELTA authority is this lane's
+//        width-aware `forward_delta`, which admits the C2Rust double-cast
+//        literal (`2 as i32 as isize`) their narrower rule refuses.
+//   (ii) the `Decision::Opt { slice: true }` destination renders the same
+//        suffix the `Decision::Slice` destination already renders; the
+//        `Some(..)` belongs to the Option family's value planner.
+//
+// Measured state after (i) and (ii): the wall MOVES from this family to the
+// Option family. The destination's reason becomes `null-init`, the Option
+// family's candidate for it is `raw -> opt-slice-shared`, and the stage is
+// withdrawn by ONE named hold — wave-6o's R410-7 STOP 1(b)
+// `option-slice-value:one-element-carrier`, which refuses the one-element
+// `from_ref` carrier "until the base delivers a real view". This lane now
+// delivers that view; what the hold still does not see is the composition —
+// `construction::collect_composable_edits` at the value planner's view span
+// returns empty for this edit. That last link is wave-6o's (report 021 STOP 1).
+// ---------------------------------------------------------------------------
+
+/// **W6S-7 (i)+(ii) — the destination leaves this family.** Before the arm it
+/// was this family's `slice-use-unsupported`; after it, the assignment is
+/// admitted and the row belongs to the Option family.
+///
+/// **R217-2(a) — what the Option family then does with it is frame-dependent,
+/// and this witness asserts only the part that is not.** At `046482b8e` the
+/// row stopped at ONE named hold — candidate `raw -> opt-slice-shared`,
+/// withdrawn on `option-presentation:
+/// EvidenceMissing("option-slice-value:one-element-carrier")` (wave-6o's
+/// R410-7 STOP 1(b), which holds "until the base delivers a real view"). On
+/// the composed frame (`batch-14-dry17d`, with wave-6o's option 1) the hold is
+/// discharged by exactly this lane's view and the row DELIVERS:
+///
+/// ```text
+/// let mut p: Option<&[f32]> = None;
+/// p = Some(&src[2..]);
+/// return p.unwrap()[(0 as i32) as usize] + p.unwrap()[(1 as i32) as usize];
+/// ```
+///
+/// The shared property is the arm's own claim: the destination is never left
+/// with this family's refusal, and whichever frame it is read on, the outcome
+/// is one of those two — the named hold, or the optional suffix view.
+#[test]
+fn wave6s_forward_view_into_a_null_initialized_destination_moves_to_the_option_family() {
+    const INPUT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut src: *mut f32, mut n: i32) -> f32 {
+    let mut p: *mut f32 = 0 as *mut f32;
+    p = &mut *src.offset(2 as i32 as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize) + *p.offset(1 as i32 as isize);
+ }
+"#;
+    let rows = super::emit_tests::decisions_of(INPUT);
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "p" && !is_param)
+        .map(|(_, _, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(reason, "slice-use-unsupported", "{rows:?}");
+    if reason == "<emitted>" {
+        // The composed frame: the hold is discharged and the view is placed.
+        let source = emit(INPUT);
+        assert!(super::verify::type_checks_str(&source), "{source}");
+        let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(flat.contains("letmutp:Option<&[f32]>=None"), "{source}");
+        assert!(flat.contains("p=Some(&src[2..])"), "{source}");
+        return;
+    }
+    assert_eq!(reason, "null-init", "{rows:?}");
+    let (_, receipts) = emit_with_family_receipts(INPUT);
+    assert!(
+        receipts.contains("opt-slice-shared"),
+        "the Option family must carry this destination as an optional slice candidate: {receipts}"
+    );
+    assert!(
+        receipts.contains("option-presentation") && receipts.contains("option-evidence-held"),
+        "and its withdrawal must be the named presentation hold: {receipts}"
+    );
+}
+
+/// **The bare copy is unchanged.** The same destination whose value is the
+/// root itself still delivers `Option<&[f32]>` — the admission is additive.
+#[test]
+fn wave6s_bare_copy_into_a_null_initialized_destination_still_delivers() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut src: *mut f32, mut n: i32) -> f32 {
+    let mut p: *mut f32 = 0 as *mut f32;
+    p = src;
+    return *p.offset(0 as i32 as isize) + *p.offset(1 as i32 as isize);
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("letmutp:Option<&[f32]>=None"), "{source}");
+}
+
+/// **FAULT — a BACKWARD delta is never this arm's.** The sign authority is one
+/// and the same; a view that can move the root backwards belongs to the
+/// bidirectional family, and the destination keeps the cursor rendering.
+///
+/// The emission of this shape does NOT type-check at this frame
+/// (`E0596: cannot borrow data in a *const pointer as mutable`, from the
+/// cursor's `&mut *src.offset_by(..).addr()` inside the optional value) —
+/// measured identical with and without this arm, so it is pinned as
+/// pre-existing and reported rather than asserted away (report 021 STOP 2).
+#[test]
+fn wave6s_option_slice_destination_refuses_a_backward_view() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut src: *mut f32, mut n: i32) -> f32 {
+    let mut p: *mut f32 = 0 as *mut f32;
+    p = &mut *src.offset(-(2 as i32) as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize) + *p.offset(1 as i32 as isize);
+ }
+"#,
+    );
+    // R608-1 (slicecursor 077): `src` never moves and is read at `-2`, below
+    // the pointer its caller hands over, so it is no longer a parameter
+    // cursor (that window would panic on the first read). It keeps its raw
+    // form; the view below is still never a backward `Some(&src[..])`.
+    assert!(source.contains("mut src: *mut f32"), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!flat.contains("Some(&(src)["), "{source}");
+    assert!(!flat.contains("Some(&mut(src)["), "{source}");
+}
+
+/// **FAULT — a different pointee keeps the wall.** The view's element type is
+/// the destination's; a cast that changes it is a reinterpretation, which is
+/// the void-region family's evidence to supply, not this arm's.
+#[test]
+fn wave6s_option_slice_destination_refuses_a_retyped_view() {
+    let rows = super::emit_tests::decisions_of(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut src: *mut u32, mut n: i32) -> u8 {
+    let mut p: *mut u8 = 0 as *mut u8;
+    p = src.offset(2 as i32 as isize) as *mut u8;
+    return *p.offset(0 as i32 as isize);
+ }
+"#,
+    );
+    let p = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "p" && !is_param)
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(p.2, "<emitted>", "{rows:?}");
+}
+
+/// **The heman corpus row, after W6S-11.** `kmQuaternionRotationMatrix`'s
+/// `pMatrix` takes its view off the function's own `[f32; 16]`
+/// (`&mut *m4x4.as_mut_ptr().offset(0) as *mut c_float`). Report 021 pinned it
+/// as NOT admitted — an array local carries no subject, so there was no view.
+/// W6S-11 gives it one, and the row leaves this family: its reason is now the
+/// Option family's `null-init` (R217-2(a); the name is kept so the movement is
+/// traceable to the pin it replaces).
+#[test]
+fn wave6s_array_local_root_is_not_yet_a_view_root() {
+    let input = include_str!("testdata/wave6s-drift/heman-quaternion-rotation-matrix.rs");
+    let rows = super::emit_tests::decisions_of(input);
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "pMatrix" && !is_param)
+        .map(|(_, _, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_eq!(reason, "null-init", "{rows:?}");
+}
+
+/// **The doubled view (R475-3), as a REPRODUCTION rather than a guess.**
+///
+/// brotli emits `(histograms[(i) as usize].data_).as_ptr().as_ptr()` for the input
+/// `&*((*histograms.offset(i)).data_).as_ptr().offset(0)` — `data_` is a fixed array, so
+/// the FIRST `as_ptr()` is c2rust's own decay and is correct; a second one lands on the
+/// `*const u32` it produced. This is the smallest shape that carries all three features:
+/// a delivered slice parameter, indexed; a fixed-array field on the element; and the
+/// W-C6 `&*….as_ptr().offset(0)` idiom over that field.
+#[test]
+fn r475_3_the_doubled_view_reproduced() {
+    let source = emit(DOUBLED_VIEW);
+    println!("EMITTED {source}");
+    // The defect is not one spelling: brotli renders `.as_ptr().as_ptr()` and this
+    // fixture `.as_ptr().as_mut_ptr().cast::<u32>().cast_const()`. The PROPERTY is a
+    // raw-producing view applied to a receiver that already produced a raw pointer --
+    // the W-C6 operand `(place).as_ptr()` is `*const u32` before anything is appended.
+    for doubled in [
+        ".as_ptr().as_ptr()",
+        ".as_ptr().as_mut_ptr()",
+        ".as_mut_ptr().as_ptr()",
+        ".as_mut_ptr().as_mut_ptr()",
+    ] {
+        assert!(
+            !source.contains(doubled),
+            "a view was emitted over a receiver that had already produced one \
+             ({doubled}):\n{source}"
+        );
+    }
+}
+
+const DOUBLED_VIEW: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ #[derive(Copy, Clone)]
+ #[repr(C)]
+ pub struct Histogram { pub data_: [u32; 4], pub total_: usize }
+ unsafe extern "C" {
+    // FOREIGN: the position can never be delivered, so `expected` stays Raw and the
+    // bridge must go slice -> raw. That is brotli's direction; a local callee converts
+    // and the bridge goes the other way, which is why the first fixture missed.
+    fn consume(counts: *const u32, n: usize) -> u32;
+ }
+ pub unsafe fn drive(mut histograms: *mut Histogram, n: usize) -> u32 {
+    let mut total: u32 = 0;
+    let mut i: usize = 0;
+    while i < n {
+        total = total.wrapping_add(consume(
+            &*((*histograms.offset(i as isize)).data_).as_ptr().offset(0 as isize),
+            4,
+        ));
+        i = i.wrapping_add(1);
+    }
+    return total;
+ }
+"#;
+
+/// **`offset_from` (R475-3)** — brotli's `EmitUncompressedMetaBlock` delivers
+/// `end: &uint8_t` and keeps `end.offset_from(begin)` verbatim in the body, which is
+/// `E0599`: `offset_from` is a raw-pointer method. Every other arithmetic use in the
+/// corpus is `offset`/`add`, which the use-rewrite carries; `offset_from` reads a PAIR of
+/// pointers and is the one shape it does not.
+#[test]
+fn r475_3_offset_from_on_delivered_references() {
+    let source = emit(OFFSET_FROM);
+    println!("EMITTED {source}");
+    // The R130 bridge at a use: a delivered reference reaches `offset_from` through
+    // `core::ptr::from_ref`. The defect is a use left BARE on a delivered receiver, not
+    // the presence of `offset_from` -- the bridged form contains it too.
+    // R739-1 (slicecursor 092, main 145): a subject only ever measured (an address observation) is held raw (`held:address-observation-only`): `end` is only measured, so it is held raw and its
+    // `offset_from` stays the raw method call; `begin` is delivered (a `sink`
+    // argument too) and is never the receiver.
+    assert!(source.contains("end: *const u8"), "{source}");
+    assert!(source.contains("begin: &u8"), "{source}");
+    assert!(source.contains("end.offset_from(begin)"), "{source}");
+    assert!(
+        !source.contains("begin.offset_from("),
+        "a delivered reference kept a bare raw-pointer `offset_from` use:\n{source}"
+    );
+}
+
+const OFFSET_FROM: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe extern "C" {
+    fn sink(p: *const u8, n: usize);
+ }
+ pub unsafe fn span_len(mut begin: *const u8, mut end: *const u8) -> usize {
+    let len = end.offset_from(begin) as usize;
+    sink(begin, len);
+    return len;
+ }
+"#;
+
+// ---------------------------------------------------------------------------
+// W6S-8 — a delivered slice at a FOREIGN raw-pointer formal (R479-5)
+//
+// libtree's `print_line(… color_bold: *mut c_char …)` uses its formal only at
+// `fputs(color_bold, stdout)`. The boundary planner already owns SOME of those
+// operands (`raw_use` short-circuits on a collected foreign-call-argument
+// fact), but the ones it has not collected reach the use walk, which had no
+// arm for a call argument at all — so the subject degraded
+// `slice-use-unsupported` at the very site the bridge exists for. Measured on
+// the real crate (wave-5d2's 75-second harness): `print_line::color_bold#3`
+// and `color_regular#4`, `family=slice`, refused at `lib.rs:1210:23` /
+// `1205:23` / `1213:44` while their OTHER `fputs` operand was admitted.
+//
+// The rule: a foreign callee's raw-pointer formal takes the slice's own
+// pointer — `s.as_ptr()` for `*const T`, `s.as_mut_ptr()` for `*mut T`
+// (addendum 130's bridge). **No extent is fabricated**: a raw pointer needs
+// none, and the subject keeps its slice form. Refused, each with a control:
+// a `*mut T` formal under a SHARED subject (that would be `&T -> &mut T`),
+// a formal whose pointee is not the subject's element (a reinterpretation,
+// the void-region family's evidence to supply), a formal that is itself a
+// pointer (depth-2, the nested family's), and anything in the variadic tail
+// (no declared formal to read). A LOCAL callee is untouched.
+// ---------------------------------------------------------------------------
+
+/// **W6S-8 (a) — libtree's shape.** The formal is used only at `fputs`, twice,
+/// and the second use sits inside a block the boundary planner did not
+/// collect. Both take the slice's pointer and the subject delivers.
+#[test]
+fn wave6s_foreign_formal_takes_the_slices_pointer() {
+    let source = emit(FOREIGN_FPUTS_SHAPE);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("color_bold:&[libc::c_char]")
+            || flat.contains("color_bold:&mut[libc::c_char]"),
+        "{source}"
+    );
+    assert!(
+        !flat.contains("fputs(color_bold,") && !flat.contains("fputs(color_regular,"),
+        "no RAW operand survives at the foreign call: {source}"
+    );
+    assert!(
+        flat.contains("as_ptr()") || flat.contains("as_mut_ptr()"),
+        "{source}"
+    );
+    let rows = super::emit_tests::decisions_of(FOREIGN_FPUTS_SHAPE);
+    for name in ["color_bold", "color_regular"] {
+        let reason = rows
+            .iter()
+            .rev()
+            .find(|(row, is_param, _)| row == name && *is_param)
+            .map(|(_, _, reason)| reason.clone())
+            .unwrap_or_else(|| panic!("{name}: {rows:?}"));
+        assert_eq!(reason, "<emitted>", "{rows:?}");
+    }
+}
+
+const FOREIGN_FPUTS_SHAPE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_char = i8; pub type c_int = i32; pub type FILE = core::ffi::c_void; }
+ unsafe extern "C" { static mut stdout: *mut libc::FILE; fn fputs(s: *const libc::c_char, f: *mut libc::FILE) -> libc::c_int; }
+ pub unsafe extern "C" fn print_line(mut color_bold: *mut libc::c_char,
+     mut color_regular: *mut libc::c_char, mut on: libc::c_int) {
+    if on != 0 {
+        fputs(color_regular, stdout);
+        fputs(color_bold, stdout);
+    } else {
+        if on == 0 { fputs(color_bold, stdout); }
+    }
+ }
+"#;
+
+/// **W6S-8 (b) — a `*mut T` formal the callee writes.** The mutable subject
+/// hands over `as_mut_ptr()`; the extent is not fabricated, the callee's own
+/// count argument is the C program's.
+#[test]
+fn wave6s_mutable_foreign_formal_takes_the_mutable_pointer() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; pub type size_t = usize; }
+ unsafe extern "C" { fn fill(buf: *mut u8, n: libc::size_t) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut buffer: *mut u8, mut n: libc::size_t) -> libc::c_int {
+    *buffer.offset(0 as isize) = 0u8;
+    return fill(buffer, n);
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("buffer:&mut[u8]"), "{source}");
+    assert!(flat.contains("fill(buffer.as_mut_ptr(),n)"), "{source}");
+}
+
+/// **FAULT — a SHARED subject at a `*mut T` formal is refused.** Handing a
+/// `&[T]` to a formal the callee may write is exactly the `&T -> &mut T` the
+/// soundness line forbids; the subject keeps the use wall.
+#[test]
+fn wave6s_shared_subject_refuses_a_mutable_foreign_formal() {
+    let rows = super::emit_tests::decisions_of(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; pub type size_t = usize; }
+ unsafe extern "C" { fn fill(buf: *mut u8, n: libc::size_t) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut buffer: *const u8, mut n: libc::size_t) -> libc::c_int {
+    let mut acc = *buffer.offset(0 as isize) as libc::c_int;
+    return fill(buffer as *mut u8, n) + acc;
+ }
+"#,
+    );
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "buffer" && *is_param)
+        .map(|(_, _, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(reason, "<emitted>", "{rows:?}");
+}
+
+/// **FAULT — a formal that is itself a pointer is refused.** `*mut *mut T` is
+/// the nested family's depth-2 position, not a slice's own pointer.
+#[test]
+fn wave6s_pointer_to_pointer_foreign_formal_is_refused() {
+    let rows = super::emit_tests::decisions_of(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; }
+ unsafe extern "C" { fn take(pp: *mut *mut u8) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut slots: *mut *mut u8) -> libc::c_int {
+    let mut first = *slots.offset(0 as isize);
+    return take(slots) + (first as libc::c_int);
+ }
+"#,
+    );
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "slots" && *is_param)
+        .map(|(_, _, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(reason, "<emitted>", "{rows:?}");
+}
+
+/// **FAULT — a pointee-changing formal is refused.** `*const c_void` at a
+/// `u32` subject is a reinterpretation, which is the void-region family's
+/// evidence to supply and never this arm's.
+#[test]
+fn wave6s_retyped_foreign_formal_is_refused() {
+    let rows = super::emit_tests::decisions_of(RETYPED_FOREIGN_FORMAL);
+    let _ = &rows;
+    // The boundary planner delivers this row on its own evidence, and its
+    // rendering CARRIES THE CAST (`words.as_ptr().cast::<c_void>()`). What
+    // this control pins is that THIS arm never does it: a formal whose pointee
+    // is not the subject's element never receives the bare pointer, because a
+    // reinterpretation is the void-region family's evidence to supply.
+    let source = emit(RETYPED_FOREIGN_FORMAL);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!flat.contains("sink(words.as_ptr(),"), "{source}");
+    assert!(!flat.contains("sink(words.as_mut_ptr(),"), "{source}");
+}
+
+const RETYPED_FOREIGN_FORMAL: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; pub type c_void = core::ffi::c_void; pub type size_t = usize; }
+ unsafe extern "C" { fn sink(p: *const libc::c_void, n: libc::size_t) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut words: *const u32, mut n: libc::size_t) -> libc::c_int {
+    let mut acc = *words.offset(0 as isize) as libc::c_int;
+    return sink(words as *const libc::c_void, n) + acc;
+ }
+"#;
+
+/// **CONTROL — a LOCAL callee is untouched.** The existing c-raw-slice path
+/// owns a local callee's argument; this arm reads the callee's body to tell
+/// the two apart, exactly as R410-9(b) does.
+#[test]
+fn wave6s_local_callee_argument_keeps_its_own_path() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; }
+ unsafe extern "C" fn sum(mut p: *const u8, mut n: libc::c_int) -> libc::c_int {
+    return *p.offset(0 as isize) as libc::c_int + n;
+ }
+ pub unsafe extern "C" fn run(mut data: *const u8, mut n: libc::c_int) -> libc::c_int {
+    let mut acc = *data.offset(1 as isize) as libc::c_int;
+    return sum(data, n) + acc;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("sum(data,n)") || flat.contains("sum(&(data)"),
+        "{source}"
+    );
+    assert!(
+        !flat.contains("sum(data.as_ptr()"),
+        "a local callee is not bridged here: {source}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W6S-9 — the UNCOLLECTED call position, MEASURED AND NOT BUILT (report 059)
+//
+// The premise of 058 STOPs 2 and 3 was that these positions lack an ARM. They
+// do not. Both renderings already exist and both fire in a reduction — the
+// two controls below — so what distinguishes the corpus rows is not the
+// rendering but the boundary planner's collected fact set: where the planner
+// did not collect a position, it had REFUSED it, and admitting it in the use
+// walk overrides the refusal rather than supplying anything.
+//
+// Measured: a blanket admission of a bare local-callee argument turns three
+// hold controls red — `emit_tests::slu_w1_positive_retention_stays_held`,
+// `ordinary_argument_permission_tests::
+// ordinary_argument_shared_subject_holds_with_its_typed_reason` and
+// `slice_passon_tests::wave6s2_pin_pass_on_into_a_positively_retaining_callee_stays_held`
+// — i.e. it passes a subject to a callee that STORES it (`KEEP = p`, positive
+// retention, addendum 130's one genuinely new UB channel) and promotes a
+// shared subject with a writable descendant. The arm was reverted; the
+// controls below stay as the record of what a reduction does.
+// ---------------------------------------------------------------------------
+
+/// **CONTROL — a thin `ref` formal already takes the ELEMENT in a reduction**
+/// (058 STOP 3; the corpus row is bzip2
+/// `blocksort::mainQSort3::block#2` at `mainSimpleSort(ptr, block, …)`, whose
+/// refusal this fixture does NOT reproduce).
+#[test]
+fn wave6s_bare_argument_at_a_thin_callee_takes_the_element() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" fn sink(mut p: *mut u8, mut n: i32) -> i32 { return *p as i32 + n; }
+ pub unsafe extern "C" fn drive(mut block: *mut u8, mut n: i32) -> i32 {
+    let mut a = *block.offset(1 as i32 as isize) as i32;
+    return sink(block, n) + a;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("block:&[u8]") || flat.contains("block:&mut[u8]"),
+        "{source}"
+    );
+    assert!(
+        flat.contains("sink(&block[0],n)")
+            || flat.contains("sink(&mutblock[0],n)")
+            || flat.contains("sink(block.first().unwrap(),n)")
+            || flat.contains("sink(block.first_mut().unwrap(),n)"),
+        "the thin formal takes the element: {source}"
+    );
+}
+
+/// **CONTROL — a `slice` formal already takes the slice whole in a
+/// reduction.** The callee delivers; the argument is the delivered subject,
+/// with no adapter of its own and no extent invented. The 18 corpus rows of
+/// this shape are refused by the planner, not by the absence of this.
+#[test]
+fn wave6s_bare_argument_at_a_slice_callee_passes_the_slice() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" fn sum(mut p: *const u8, mut n: i32) -> i32 {
+    let mut acc = 0;
+    let mut i = 0;
+    while i < n { acc += *p.offset(i as isize) as i32; i += 1; }
+    return acc;
+ }
+ pub unsafe extern "C" fn drive(mut data: *const u8, mut n: i32) -> i32 {
+    let mut a = *data.offset(1 as i32 as isize) as i32;
+    return sum(data, n) + a;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("data:&[u8]"), "{source}");
+    assert!(
+        flat.contains("sum(data,n)"),
+        "the slice passes whole: {source}"
+    );
+    assert!(
+        !flat.contains("as_ptr()"),
+        "no raw bridge is needed: {source}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W6S-11 — the ARRAY-LOCAL view root (058 §2(d), 061 STOP 3)
+//
+// heman `kmQuaternionRotationMatrix` writes
+//
+//     let mut pMatrix = 0 as *mut c_float;          // null-initialised
+//     let mut m4x4: [c_float; 16] = [0.; 16];
+//     pMatrix = &mut *m4x4.as_mut_ptr().offset(0) as *mut c_float;
+//     … *pMatrix.offset(k) …
+//
+// The same shape with the view in the DECLARATION already delivers (the
+// construction family types it). By ASSIGNMENT it does not: W6S-7's walk
+// requires the view's root to be a pointer BINDING, and an array local is
+// not one — it carries no subject to hang the view on. It needs none: the
+// array's own name is the view (`&mut m4x4[e..]`), the extent is the array's,
+// and nothing is fabricated.
+// ---------------------------------------------------------------------------
+
+/// **W6S-11 — an array local is a view root, and the wall moves off this
+/// family.** The use walk admits the assignment and the row becomes the
+/// Option family's `null-init`; what it does with the value is §3 of report
+/// 062's STOP — for a BINDING root the composition works (lodepng
+/// `addChunk_IHDR::data` delivered at batch 13/14 that way), for an ARRAY root
+/// `collect_composable_edits` cannot see this arm's edit, because it reads
+/// only edits attached to OTHER delivered subjects and an array local is not
+/// one.
+#[test]
+fn wave6s_array_local_is_a_view_root() {
+    let rows = super::emit_tests::decisions_of(ARRAY_ROOT_SHAPE);
+    let reason = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "p" && !is_param)
+        .map(|(_, _, reason)| reason.clone())
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(reason, "slice-use-unsupported", "{rows:?}");
+    let source = emit(ARRAY_ROOT_SHAPE);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    if reason == "<emitted>" {
+        let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            flat.contains("p=Some(&mutm4x4[(0asi32)asusize..])")
+                || flat.contains("p=Some(&m4x4[(0asi32)asusize..])"),
+            "the array's own name is the view: {source}"
+        );
+    } else {
+        assert_eq!(reason, "null-init", "{rows:?}");
+    }
+}
+
+const ARRAY_ROOT_SHAPE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    m4x4[0 as usize] = 1.0f32;
+    let mut p = 0 as *mut f32;
+    p = &mut *m4x4.as_mut_ptr().offset(0 as i32 as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize) + *p.offset(5 as i32 as isize);
+ }
+"#;
+
+/// **CONTROL — the declaration form is untouched.** The same view in the
+/// local's initialiser is the construction family's and already delivers; this
+/// arm must not change it.
+#[test]
+fn wave6s_array_root_in_a_declaration_is_unchanged() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    m4x4[0 as usize] = 1.0f32;
+    let mut p: *mut f32 = &mut *m4x4.as_mut_ptr().offset(2 as i32 as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize) + *p.offset(5 as i32 as isize);
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("p:&[f32]") || flat.contains("p:&mut[f32]"),
+        "{source}"
+    );
+}
+
+/// **FAULT — a BACKWARD delta off an array root is refused.** The sign
+/// authority is one; a view that can move backwards is the bidirectional
+/// family's.
+#[test]
+fn wave6s_array_root_refuses_a_backward_view() {
+    let rows = super::emit_tests::decisions_of(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    m4x4[0 as usize] = 1.0f32;
+    let mut p = 0 as *mut f32;
+    p = &mut *m4x4.as_mut_ptr().offset(-(1 as i32) as isize) as *mut f32;
+    return *p.offset(0 as i32 as isize);
+ }
+"#,
+    );
+    let p = rows
+        .iter()
+        .rev()
+        .find(|(name, is_param, _)| name == "p" && !is_param)
+        .unwrap_or_else(|| panic!("{rows:?}"));
+    assert_ne!(p.2, "<emitted>", "{rows:?}");
+}
+
+/// **FAULT — a retyped view off an array root is never THIS arm's.** `[u32; 4]`
+/// read as `*mut u8` is a reinterpretation; another family may deliver the row
+/// on its own evidence, but the array's name is never handed over as a view of
+/// the wrong element type.
+#[test]
+fn wave6s_array_root_refuses_a_retyped_view() {
+    let source = emit(RETYPED_ARRAY_ROOT);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(!flat.contains("p=Some(&words["), "{source}");
+    assert!(!flat.contains("p=Some(&mutwords["), "{source}");
+    assert!(!flat.contains("p=&words["), "{source}");
+    assert!(!flat.contains("p=&mutwords["), "{source}");
+    let rows = super::emit_tests::decisions_of(RETYPED_ARRAY_ROOT);
+    let _ = &rows;
+}
+
+const RETYPED_ARRAY_ROOT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe extern "C" fn diag(mut n: i32) -> u8 {
+    let mut words: [u32; 4] = [0; 4];
+    words[0 as usize] = 1;
+    let mut p = 0 as *mut u8;
+    p = words.as_mut_ptr() as *mut u8;
+    return *p.offset(1 as i32 as isize);
+ }
+"#;
+
+// ---------------------------------------------------------------------------
+// W6S-12 — a `*mut` formal read through every use takes the SHARED slice
+// (R490-4)
+//
+// libtree's `print_line(color_bold: *mut c_char)` is written `*mut` by C and
+// read at every use (`fputs(color_bold, stdout)`, a `*const` formal). The
+// decided form followed the declaration, so the caller-side seam asked for a
+// MUTABLE view of a value whose origin is a `b"…"` literal and was refused
+// `shared-to-mut` — the row's whole remaining block.
+//
+// The permission the program needs is the one its uses take: a subject whose
+// only rewritten uses are W6S-8 bridges at foreign `*const T` formals is read
+// through every one of them, so its slice form is the shared one. Narrowing
+// only — `&mut` → `&` never widens a permission — and exact: at least one
+// such bridge, and no other rewrite.
+// ---------------------------------------------------------------------------
+
+/// **CONTROL — in a REDUCTION the narrowing must not fire, and does not.**
+/// libtree's shape reduced: here the boundary planner COLLECTS both `fputs`
+/// positions, so they are its bridges (`as_mut_ptr().cast::<i8>().cast_const()`)
+/// and not W6S-8's — `foreign_const_bridges` stays 0 and the mutable form
+/// stands. The narrowing is keyed on this lane's own bridges precisely so it
+/// cannot reach a position another planner owns.
+///
+/// The real-crate witness is `plan::class_split::tests::
+/// wave6s_libtree_foreign_formals_leave_the_use_wall`, where the positions
+/// are NOT collected, W6S-8 renders them, and `color_bold` delivers
+/// (`placed = 1`) as a shared slice.
+#[test]
+fn wave6s_mut_formal_read_at_every_use_takes_the_shared_slice() {
+    let source = emit(LITERAL_AT_A_MUT_FORMAL);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("color_bold:&mut[libc::c_char]"), "{source}");
+    assert!(
+        !flat.contains("fputs(color_bold.as_ptr(),stdout)"),
+        "{source}"
+    );
+}
+
+const LITERAL_AT_A_MUT_FORMAL: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_char = i8; pub type c_int = i32; pub type FILE = core::ffi::c_void; }
+ unsafe extern "C" { static mut stdout: *mut libc::FILE; fn fputs(s: *const libc::c_char, f: *mut libc::FILE) -> libc::c_int; }
+ unsafe extern "C" fn print_line(mut color_bold: *mut libc::c_char, mut on: libc::c_int) {
+    if on != 0 { fputs(color_bold, stdout); }
+    fputs(color_bold, stdout);
+ }
+ pub unsafe extern "C" fn recurse(mut excluded: libc::c_int) {
+    let mut bold_color = (if excluded != 0 { b"\x1B[0;35m\0" as *const u8 as *const libc::c_char } else { b"\x1B[1;36m\0" as *const u8 as *const libc::c_char }) as *mut libc::c_char;
+    print_line(bold_color, excluded);
+ }
+"#;
+
+/// **FAULT — a `*mut` foreign formal keeps the mutable form.** The callee may
+/// write through it, so the permission stands.
+#[test]
+fn wave6s_mut_foreign_formal_keeps_the_mutable_slice() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_int = i32; pub type size_t = usize; }
+ unsafe extern "C" { fn fill(buf: *mut u8, n: libc::size_t) -> libc::c_int; }
+ pub unsafe extern "C" fn run(mut buffer: *mut u8, mut n: libc::size_t) -> libc::c_int {
+    let mut seen = *buffer.offset(1 as i32 as isize) as libc::c_int;
+    return fill(buffer, n) + seen;
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        flat.contains("buffer:&mut[u8]"),
+        "the mutable formal keeps it: {source}"
+    );
+}
+
+/// **FAULT — any other rewritten use keeps the mutable form.** A deref WRITE
+/// beside the foreign read is a write, and the narrowing's conjunct is
+/// "no other rewrite" precisely so this case keeps `&mut`.
+#[test]
+fn wave6s_a_write_beside_the_foreign_read_keeps_the_mutable_slice() {
+    let source = emit(
+        r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub mod libc { pub type c_char = i8; pub type c_int = i32; pub type FILE = core::ffi::c_void; }
+ unsafe extern "C" { static mut stdout: *mut libc::FILE; fn fputs(s: *const libc::c_char, f: *mut libc::FILE) -> libc::c_int; }
+ pub unsafe extern "C" fn touch(mut text: *mut libc::c_char, mut on: libc::c_int) {
+    *text.offset(0 as i32 as isize) = 65 as libc::c_char;
+    fputs(text, stdout);
+ }
+"#,
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let flat: String = source.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(flat.contains("text:&mut[libc::c_char]"), "{source}");
+}
+
+/// **R533-4 (wave-4 061 C7) — the exact arm lifts with the SUBJECT's
+/// mutability.** A mutable caller held at `BrotliUnalignedRead32` (a width
+/// READ, whose region is `mutable: false`) that also hands itself to a local
+/// callee writing through it. Lifted at `subject.mutable && region.mutable` it
+/// was `&[u8]` beside a `&mut u8` formal, and the whole program came back
+/// `Degraded` (wave-6s 071 C2). Carried here without the pass-on line (R554-2).
+const W4_READ_THEN_WRITE: &str = r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type uint32_t = u32;
+unsafe extern "C" fn BrotliUnalignedRead32(mut p: *const core::ffi::c_void) -> uint32_t {
+    return *(p as *const uint32_t);
+}
+unsafe extern "C" fn Clear(mut dst: *mut uint8_t) {
+    *dst = 0;
+}
+unsafe extern "C" fn HashAndClear(mut data: *mut uint8_t) -> uint32_t {
+    let h = BrotliUnalignedRead32(data as *const core::ffi::c_void);
+    Clear(data);
+    return h;
+}
+"#;
+
+#[test]
+fn w4_arm_a_mutable_caller_is_never_lifted_shared() {
+    let entries = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(W4_READ_THEN_WRITE),
+        |tcx| {
+            let (table, _ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::OverlapMode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )?;
+            Ok::<_, String>(
+                table
+                    .entries
+                    .iter()
+                    .map(|(s, d)| (s.label.clone(), format!("{d:?}")))
+                    .collect::<Vec<_>>(),
+            )
+        },
+    )
+    .expect("fixture compiles")
+    .expect("table");
+    let data = entries
+        .iter()
+        .find(|(l, _)| l == "HashAndClear::data")
+        .map(|(_, d)| d.clone())
+        .unwrap_or_else(|| panic!("{entries:#?}"));
+    assert!(
+        !data.starts_with("Slice { mutable: false"),
+        "a mutable caller is never lifted to a SHARED slice: {data}"
+    );
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(W4_READ_THEN_WRITE)
+    else {
+        panic!("the fixture must emit (it came back Degraded before R533-4)")
+    };
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// **W6S-14 (R554-3, wave-6s 075 N1) — a computed view whose index holds
+/// ANOTHER subject's rewrite.** brotli `BuildBlockHistograms*::histograms#5`:
+/// `HistogramAdd*(&mut *histograms.offset(*block_ids.offset(i) as isize), …)`
+/// with `block_ids` itself a delivered slice. The view's index is the delta's
+/// source text; it must be rendered with `block_ids`' own edit spliced in, or
+/// the element borrow is refused and its bare-offset twin is emitted ill-typed
+/// (`method not found in &[u8]`).
+fn nested_index_fixture(call: &str) -> String {
+    format!(
+        r#"
+#![allow(dead_code, unused_mut, unused_assignments, non_snake_case, non_camel_case_types, unused_unsafe)]
+pub type uint8_t = u8;
+pub type size_t = usize;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct HistogramLiteral {{ pub total_count_: size_t }}
+unsafe extern "C" fn HistogramAddLiteral(mut self_0: *mut HistogramLiteral, mut val: size_t) {{
+    (*self_0).total_count_ = ((*self_0).total_count_).wrapping_add(val);
+}}
+unsafe extern "C" fn BuildBlockHistogramsLiteral(length: size_t, mut block_ids: *const uint8_t,
+        mut histograms: *mut HistogramLiteral) {{
+    let mut i: size_t = 0;
+    while i < length {{
+        {call}
+        i = i.wrapping_add(1);
+    }}
+}}
+"#
+    )
+}
+
+fn delivered_and_emitted(input: &str) -> (String, String) {
+    let decision = ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let (table, _ctx) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::OverlapMode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )?;
+            Ok::<_, String>(
+                table
+                    .entries
+                    .iter()
+                    .find(|(s, _)| s.label == "BuildBlockHistogramsLiteral::histograms")
+                    .map(|(_, d)| format!("{d:?}"))
+                    .unwrap_or_default(),
+            )
+        },
+    )
+    .expect("fixture compiles")
+    .expect("table");
+    let super::RewriteOutcome::Emitted { source, .. } = super::rewrite_m1(input) else {
+        panic!("the fixture must emit")
+    };
+    (decision, source)
+}
+
+#[test]
+fn w6s14_the_element_borrow_renders_its_index_from_the_inner_rewrite() {
+    let (decision, source) = delivered_and_emitted(&nested_index_fixture(
+        "HistogramAddLiteral(&mut *histograms.offset(*block_ids.offset(i as isize) as isize), i);",
+    ));
+    assert!(decision.starts_with("Slice { mutable: true"), "{decision}");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("HistogramAddLiteral(&mut (histograms)[(block_ids[i]) as usize], i)"),
+        "the index carries block_ids' own rewrite: {source}"
+    );
+}
+
+#[test]
+fn w6s14_the_bare_offset_view_renders_its_index_from_the_inner_rewrite() {
+    let (decision, source) = delivered_and_emitted(&nested_index_fixture(
+        "HistogramAddLiteral(histograms.offset(*block_ids.offset(i as isize) as isize), i);",
+    ));
+    assert!(decision.starts_with("Slice { mutable: true"), "{decision}");
+    assert!(
+        super::verify::type_checks_str(&source),
+        "the bare-offset twin must be well typed: {source}"
+    );
+    assert!(!source.contains("block_ids.offset"), "{source}");
+}

@@ -1,0 +1,198 @@
+//! Mutability hard facts for the BO borrow replay.
+//!
+//! Feeds the Foster mutability qualifier into the production borrow verifier's existing
+//! per-local `is_mutable` closure (today forced `true` in every BO seam). When a pointer's
+//! outermost provenance is immutable, `borrow::invalidates` skips its loan
+//! (`invalidates.rs:73` — *loan of immutable provenance does not invalidate*), so two shared
+//! reads of one base stop invalidating each other and both survive `Ref`. That is the entire
+//! depth-0 Ref recovery mechanism.
+//!
+//! This adds NOTHING to the z3 kind solver — no new variable, no kind clause. Mutability is consumed entirely outside the solve, as a static
+//! per-`(LocalDefId, Local)` boolean. The `&T`/`&mut T` distinction is a *readout* fact, not
+//! a solver kind (the domain has only `Raw`/`Ref`/`Owning`).
+//!
+//! Soundness posture (the coherence equate-closure is NOT the acceptance-level guard):
+//! Foster is *precise per-pointer* — it marks a pointer `Imm` iff that pointer is never written
+//! THROUGH, which is NOT the same as its referent cell being immutable. A read-only view whose
+//! cell is written through a *sibling* pointer is therefore `Imm`, and its loan IS skipped by
+//! `invalidates.rs:73`. On its own, that makes the immutable-skip **UNSOUND at the acceptance
+//! level** for interprocedurally-aliased writes:
+//!   1. MISSING map data defaults to `Mut` (`is_mutable` below) — the sole unsound *data*
+//!      direction (a wrongly-`&T`), so absent facts never wrongly relax a conflict.
+//!   2. The coherence equate-closure unifies only **DIRECT** copy clusters, so it demotes the
+//!      direct case but does NOT cover call-return / parameter / cast / offset / field aliases.
+//!      A call-return alias (`let x=id(p); let z=x; let q=x; *b=5;`, `b=p`) leaves x/z/q a
+//!      shared `&T` aliasing the written cell — a fact-uniquely-unsound `Ref` at acceptance.
+//!      Production's own `borrow::mutable_references_no_guarantee` ships the same shared `&T`
+//!      here (production parity: BO is not stricter than what ships to the rewriter).
+//! So the equate-closure is **NOT** an acceptance-level guard (and the unsoundness is not
+//! contingent on future flow-sensitivity). The fix is **write-aware invalidation** (writes
+//! invalidate all overlapping loans regardless of Foster mutability), in the forked borrow
+//! engine.
+
+use rustc_hash::FxHashMap;
+use rustc_index::IndexVec;
+use rustc_middle::mir::Local;
+use rustc_span::def_id::LocalDefId;
+
+use crate::{
+    analyses::{
+        borrow_ownership::mutability::{MutabilityResult, mutability_analysis},
+        mir_variable_grouping::SourceVarGroups,
+    },
+    utils::rustc::RustProgram,
+};
+
+/// A per-local mutability oracle for the production borrow replay's
+/// `is_mutable(LocalDefId, Local)` closure. Implemented by `bool` (uniform — the
+/// forced-mutable control / mode `Off`, so all-mutable callers pass `true`
+/// unchanged) and by `&MutFacts` (fact-driven). The `borrow_verify` seams are generic over
+/// this, so the seam signatures — not their 40+ existing call sites — carry the change.
+pub(crate) trait MutProvider {
+    fn is_mutable(&self, fn_did: LocalDefId, local: Local) -> bool;
+}
+
+impl MutProvider for bool {
+    fn is_mutable(&self, _fn_did: LocalDefId, _local: Local) -> bool {
+        *self
+    }
+}
+
+/// The verification round's provider -- the caller's facts AND the
+/// round's model-conditional facts (`MutFacts::from_program_gated`). The gated
+/// facts drop guards and read only the outermost level, so they are a subset of
+/// the ungated ones; the AND keeps a forced-mutable caller (`bool`) meaningful.
+#[derive(Clone, Copy)]
+pub(crate) struct RoundMut<'a, M> {
+    pub(crate) base: M,
+    pub(crate) round: &'a MutFacts,
+}
+
+impl<M: MutProvider> MutProvider for RoundMut<'_, M> {
+    fn is_mutable(&self, fn_did: LocalDefId, local: Local) -> bool {
+        self.base.is_mutable(fn_did, local) && self.round.is_mutable(fn_did, local)
+    }
+}
+
+impl MutProvider for &MutFacts {
+    fn is_mutable(&self, fn_did: LocalDefId, local: Local) -> bool {
+        MutFacts::is_mutable(self, fn_did, local)
+    }
+}
+
+/// Per-`(LocalDefId, Local)` outermost-provenance mutability, built to be BYTE-IDENTICAL to
+/// production's `mutables` input (`mutability_analysis` +
+/// `SourceVarGroups::postprocess_mut_res`: per-local `any(is_mutable)` across pointer depths,
+/// then source-var-group OR). BO thereby adopts production's exact mutability handling rather
+/// than a novel scheme.
+pub(crate) struct MutFacts {
+    /// Empty when `all_mut` — the map is not consulted in that mode.
+    mutables: FxHashMap<LocalDefId, IndexVec<Local, bool>>,
+    /// `true` ⇒ every pointer is treated mutable (forced-mutable control / mode `Off`).
+    all_mut: bool,
+}
+
+impl MutFacts {
+    #[cfg(test)]
+    /// Forced-mutable: every pointer mutable. The mode-`Off` sweep control and the
+    /// non-vacuity control prong of the mutability fixtures (reproduces the all-mutable behavior
+    /// exactly).
+    pub(crate) fn all_mut() -> MutFacts {
+        MutFacts {
+            mutables: FxHashMap::default(),
+            all_mut: true,
+        }
+    }
+
+    /// The production-parity fact map for the whole program. Env-free (deterministic) — mode
+    /// gating is applied by the caller. Runs the same two analyses the production rewriter
+    /// runs (`mutability_analysis`, `SourceVarGroups`), so the cost is already paid upstream.
+    pub(crate) fn from_program(program: &RustProgram) -> MutFacts {
+        let result = mutability_analysis(program);
+        let mutables = SourceVarGroups::new(program).postprocess_mut_res(program, &result);
+        MutFacts {
+            mutables,
+            all_mut: false,
+        }
+    }
+
+    /// The same facts with Foster's load guard (`lhs ⇒ p` for
+    /// `lhs = copy (*p)…`) kept only where `keep_load` says so, and each local's bit
+    /// taken from its OUTERMOST level (the cells its loans borrow). The verification
+    /// replay keeps it where the LOADED level is not Raw in the round's model: a Raw
+    /// inner level makes the writes through it raw-pointer writes, so the table it
+    /// came from is only read and its reborrow is shared.
+    pub(crate) fn from_program_gated<'tcx>(
+        program: &RustProgram<'tcx>,
+        keep_load: &dyn Fn(LocalDefId, &rustc_middle::mir::Place<'tcx>) -> bool,
+    ) -> MutFacts {
+        let result = crate::analyses::borrow_ownership::mutability::mutability_analysis_gated(
+            program,
+            Some(keep_load),
+        );
+        let groups = SourceVarGroups::new(program);
+        let mutables = postprocess_mut_res_outermost(&groups, program, &result);
+        MutFacts {
+            mutables,
+            all_mut: false,
+        }
+    }
+
+    /// Per-local outermost-provenance mutability. Missing data (unseen `did` / out-of-range
+    /// `Local`) ⇒ `Mut` (the sole sound default). Inherent so the bo_c1 readout can query it
+    /// directly (the `&T`/`&mut` split); the `MutProvider` impl delegates here.
+    pub(crate) fn is_mutable(&self, fn_did: LocalDefId, local: Local) -> bool {
+        if self.all_mut {
+            return true;
+        }
+        self.mutables
+            .get(&fn_did)
+            .and_then(|per_local| per_local.get(local))
+            .copied()
+            .unwrap_or(true)
+    }
+
+    /// Whether `(fn_did, local)` would fall back to the `Mut` default because the map has no
+    /// fact for it (unseen `did` / out-of-range `Local`). Feeds the `mut_default_fires`
+    /// reporting column (requirement #1: the missing-data default is the sole unsound
+    /// direction, so it is counted). Always `false` under `all_mut` (nothing defaults there).
+    pub(crate) fn is_defaulted(&self, fn_did: LocalDefId, local: Local) -> bool {
+        !self.all_mut
+            && self
+                .mutables
+                .get(&fn_did)
+                .and_then(|per_local| per_local.get(local))
+                .is_none()
+    }
+}
+
+/// era-5c R545-1: `SourceVarGroups::postprocess_mut_res` with each local's bit taken from its
+/// OUTERMOST level only (the cells it points at), not `any` depth. Used only by the
+/// model-conditional verification facts, where a written Ref element still reaches the outer
+/// level through Foster's (kept) load guard. (Moved here from this crate's copy of the legacy
+/// `mir_variable_grouping`, the master-merge cleanup's legacy-copy stage.)
+fn postprocess_mut_res_outermost(
+    groups: &SourceVarGroups,
+    program: &RustProgram,
+    mutability_result: &MutabilityResult,
+) -> FxHashMap<LocalDefId, IndexVec<Local, bool>> {
+    program
+        .functions
+        .iter()
+        .map(|&f| {
+            let mut muts = mutability_result
+                .function_body_facts(f)
+                .map(|muts| muts.first().is_some_and(|m| m.is_mutable()))
+                .collect::<IndexVec<_, _>>();
+            if let Some(groups) = groups.inner.get(&f) {
+                for locals in groups.values() {
+                    let is_mutable = locals.iter().any(|local| muts[*local]);
+                    for local in locals {
+                        muts[*local] = is_mutable;
+                    }
+                }
+            }
+            (f, muts)
+        })
+        .collect::<FxHashMap<_, _>>()
+}

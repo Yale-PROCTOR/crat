@@ -1,0 +1,876 @@
+//! Bounded whole-body transport, followed by a conservative full-object scan.
+//! Unioning all definitions deliberately refuses ambiguous generations. It is
+//! not a reaching-definition or loan-liveness replacement. Evidence is valid
+//! only for the recorded one-base/index-only component and MIR body snapshot.
+
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+use rustc_hir::def_id::LocalDefId;
+use rustc_middle::{
+    mir::{
+        self, Body, Local, Location, Operand, Place, Rvalue, StatementKind, TerminatorKind,
+        visit::{PlaceContext, Visitor},
+    },
+    ty::{self, Ty, TyCtxt},
+};
+
+use super::{
+    Admission, Candidate, Finding, ModelKind, Need, Outcome, Predicate, Shape, Site, Status,
+    Unsupported,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Root {
+    Array(Local),
+    Slice(Local),
+    Parameter(Local),
+    Table(Local),
+    Projection(Local),
+    Opaque(Local),
+}
+
+#[derive(Clone, Default)]
+struct Node {
+    roots: BTreeSet<Root>,
+    parents: BTreeSet<Local>,
+    copies: BTreeSet<Local>,
+    nullable: bool,
+    layout_changed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Method {
+    Pointer,
+    Slice,
+    Null,
+    Observe,
+    Wrapping,
+    Unsupported,
+}
+
+fn element(ty: Ty<'_>) -> Option<Ty<'_>> {
+    let pointee = match ty.kind() {
+        ty::RawPtr(pointee, _) | ty::Ref(_, pointee, _) => *pointee,
+        _ => return None,
+    };
+    Some(match pointee.kind() {
+        ty::Array(t, _) | ty::Slice(t) => *t,
+        _ => pointee,
+    })
+}
+
+fn method<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    func: &Operand<'tcx>,
+    receiver: Option<&Operand<'tcx>>,
+) -> Method {
+    let ty::FnDef(did, _) = *func.ty(&body.local_decls, tcx).kind() else {
+        return Method::Unsupported;
+    };
+    let krate = tcx.crate_name(did.krate);
+    if did.is_local() || !matches!(krate.as_str(), "core" | "std") {
+        return Method::Unsupported;
+    }
+    let name = tcx.item_name(did);
+    if matches!(name.as_str(), "null" | "null_mut") {
+        return Method::Null;
+    }
+    let Some(receiver) = receiver else { return Method::Unsupported };
+    let receiver_ty = receiver.ty(&body.local_decls, tcx);
+    match (name.as_str(), receiver_ty.kind()) {
+        (
+            "wrapping_add"
+            | "wrapping_sub"
+            | "wrapping_offset"
+            | "wrapping_byte_add"
+            | "wrapping_byte_sub"
+            | "wrapping_byte_offset",
+            ty::RawPtr(..),
+        ) => Method::Wrapping,
+        ("add" | "sub" | "offset", ty::RawPtr(..)) => Method::Pointer,
+        ("as_ptr" | "as_mut_ptr", ty::Ref(_, t, _))
+            if matches!(t.kind(), ty::Array(..) | ty::Slice(..)) =>
+        {
+            Method::Slice
+        }
+        ("is_null", ty::RawPtr(..)) => Method::Observe,
+        _ => Method::Unsupported,
+    }
+}
+
+fn reject(finding: &mut Finding, outcome: Outcome, site: Location) {
+    // Findings accumulate: a later missing fact must not erase an unsupported
+    // storage/layout operation already observed elsewhere in the component.
+    let rank = |outcome| match outcome {
+        Outcome::Proven => 0,
+        Outcome::Missing(_) => 1,
+        Outcome::Unsupported(_) => 2,
+    };
+    if rank(outcome) > rank(finding.outcome) {
+        finding.outcome = outcome;
+        finding.site = Some(at(site));
+    }
+}
+
+fn at(location: Location) -> Site {
+    Site {
+        block: location.block.index(),
+        statement: location.statement_index,
+    }
+}
+
+#[derive(Default)]
+struct Places<'tcx> {
+    rows: Vec<(Place<'tcx>, PlaceContext, Location)>,
+}
+impl<'tcx> Visitor<'tcx> for Places<'tcx> {
+    fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+        self.rows.push((*place, context, location));
+        self.super_place(place, context, location);
+    }
+}
+
+/// Graph reachability has at most one visit per MIR block. Same-block backwards
+/// reachability requires a real CFG cycle, never statement-index wraparound.
+fn reaches(body: &Body<'_>, from: Location, to: Location) -> bool {
+    if from.block == to.block && from.statement_index < to.statement_index {
+        return true;
+    }
+    let mut queue = VecDeque::from_iter(body.basic_blocks[from.block].terminator().successors());
+    let mut seen = BTreeSet::new();
+    while let Some(block) = queue.pop_front() {
+        if block == to.block {
+            return true;
+        }
+        if seen.insert(block) {
+            queue.extend(body.basic_blocks[block].terminator().successors());
+        }
+    }
+    false
+}
+
+fn dominates(body: &Body<'_>, definition: Location, use_site: Location) -> bool {
+    if definition.block == use_site.block {
+        return definition.statement_index <= use_site.statement_index;
+    }
+    let mut queue = VecDeque::from([mir::START_BLOCK]);
+    let mut seen = BTreeSet::new();
+    while let Some(block) = queue.pop_front() {
+        if block == definition.block {
+            continue;
+        }
+        if block == use_site.block {
+            return false;
+        }
+        if seen.insert(block) {
+            queue.extend(body.basic_blocks[block].terminator().successors());
+        }
+    }
+    true
+}
+
+fn zero(operand: &Operand<'_>) -> bool {
+    matches!(operand, Operand::Constant(value) if value.const_.try_to_scalar()
+        .and_then(|scalar| scalar.try_to_scalar_int().ok())
+        .is_some_and(|int| int.to_bits(int.size()) == 0))
+}
+
+fn operand_source(node: &mut Node, operand: &Operand<'_>, destination: Local, body: &Body<'_>) {
+    match operand.place() {
+        Some(place) if place.projection.is_empty() => {
+            node.parents.insert(place.local);
+        }
+        Some(place) => {
+            let table = place.projection.len() == 1
+                && place.is_indirect()
+                && matches!(body.local_decls[place.local].ty.kind(), ty::RawPtr(t, _) if matches!(t.kind(), ty::RawPtr(..)));
+            node.roots.insert(if table {
+                Root::Table(destination)
+            } else {
+                Root::Projection(destination)
+            });
+        }
+        None => {
+            node.roots.insert(Root::Opaque(destination));
+        }
+    }
+}
+
+pub(super) fn inspect<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    body: &Body<'tcx>,
+    candidate: Candidate,
+    kinds: &BTreeMap<Local, ModelKind>,
+) -> Admission {
+    let mut nodes = vec![Node::default(); body.local_decls.len()];
+    let mut null_tests = Vec::new();
+    let mut lends = BTreeMap::<Local, Vec<Location>>::new();
+    let mut definitions = BTreeMap::<Local, Vec<(Location, bool)>>::new();
+    for local in body.args_iter() {
+        let root = match body.local_decls[local].ty.kind() {
+            ty::RawPtr(..) => Root::Parameter(local),
+            ty::Ref(_, t, _) if matches!(t.kind(), ty::Array(..) | ty::Slice(..)) => {
+                Root::Slice(local)
+            }
+            _ => continue,
+        };
+        nodes[local.index()].roots.insert(root);
+    }
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            let location = Location {
+                block,
+                statement_index,
+            };
+            let StatementKind::Assign(assignment) = &statement.kind else { continue };
+            let (destination, value) = &**assignment;
+            let Some(dest) = destination.as_local() else { continue };
+            definitions.entry(dest).or_default().push((
+                location,
+                matches!(value, Rvalue::Aggregate(..) | Rvalue::Repeat(..)),
+            ));
+            if element(body.local_decls[dest].ty).is_none() {
+                continue;
+            }
+            let node = &mut nodes[dest.index()];
+            match value {
+                Rvalue::Use(operand) | Rvalue::Cast(_, operand, _)
+                    if matches!(body.local_decls[dest].ty.kind(), ty::RawPtr(..))
+                        && zero(operand) =>
+                {
+                    node.nullable = true;
+                }
+                Rvalue::Use(operand) => {
+                    if let Some(place) = operand.place()
+                        && place.projection.is_empty()
+                    {
+                        node.copies.insert(place.local);
+                    }
+                    operand_source(node, operand, dest, body);
+                }
+                Rvalue::Cast(_, operand, target)
+                    if element(operand.ty(&body.local_decls, tcx)).is_some() =>
+                {
+                    node.layout_changed |=
+                        element(operand.ty(&body.local_decls, tcx)) != element(*target);
+                    if let Some(place) = operand.place()
+                        && place.projection.is_empty()
+                    {
+                        node.copies.insert(place.local);
+                    }
+                    operand_source(node, operand, dest, body);
+                }
+                Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                    if place.projection.is_empty()
+                        && matches!(body.local_decls[place.local].ty.kind(), ty::Array(..))
+                    {
+                        node.roots.insert(Root::Array(place.local));
+                        lends.entry(place.local).or_default().push(location);
+                    } else if place.is_indirect()
+                        && matches!(body.local_decls[place.local].ty.kind(), ty::Ref(..))
+                    {
+                        node.parents.insert(place.local);
+                    } else {
+                        node.roots.insert(Root::Opaque(dest));
+                    }
+                }
+                _ => {
+                    node.roots.insert(Root::Opaque(dest));
+                }
+            }
+        }
+        if let TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &data.terminator().kind
+        {
+            let operation = method(tcx, body, func, args.first().map(|a| &a.node));
+            if operation == Method::Observe
+                && let Some(receiver) = args.first().and_then(|arg| arg.node.place())
+                && receiver.projection.is_empty()
+            {
+                nodes[receiver.local.index()].nullable = true;
+                null_tests.push(receiver.local);
+            }
+            let Some(dest) = destination.as_local() else { continue };
+            if element(body.local_decls[dest].ty).is_none() {
+                continue;
+            }
+            let node = &mut nodes[dest.index()];
+            match operation {
+                Method::Null => node.nullable = true,
+                Method::Pointer | Method::Slice => operand_source(node, &args[0].node, dest, body),
+                _ => {
+                    node.roots.insert(Root::Opaque(dest));
+                }
+            }
+        }
+    }
+    // A native is_null receiver is commonly a copy temporary. Attribute the
+    // observation backwards through copies/casts, not through displacement or
+    // memory-load edges; literal-null values still flow forwards below.
+    let mut observed = BTreeSet::new();
+    while let Some(local) = null_tests.pop() {
+        if observed.insert(local) {
+            nodes[local.index()].nullable = true;
+            null_tests.extend(nodes[local.index()].copies.iter().copied());
+        }
+    }
+    // Finite monotone transport: each root/flag enters each local at most once.
+    // Worklist propagation cannot manufacture a root for an unseeded cycle.
+    let mut children = vec![Vec::new(); nodes.len()];
+    for (child, node) in nodes.iter().enumerate() {
+        for parent in &node.parents {
+            children[parent.index()].push(child);
+        }
+    }
+    let mut queue = VecDeque::from_iter(0..nodes.len());
+    while let Some(parent) = queue.pop_front() {
+        for &child in &children[parent] {
+            let prior = (
+                nodes[child].roots.len(),
+                nodes[child].nullable,
+                nodes[child].layout_changed,
+            );
+            let roots = nodes[parent].roots.clone();
+            nodes[child].roots.extend(roots);
+            nodes[child].nullable |= nodes[parent].nullable;
+            nodes[child].layout_changed |= nodes[parent].layout_changed;
+            if prior
+                != (
+                    nodes[child].roots.len(),
+                    nodes[child].nullable,
+                    nodes[child].layout_changed,
+                )
+            {
+                queue.push_back(child);
+            }
+        }
+    }
+    let node = &nodes[candidate.local.index()];
+    let shape = if node.roots.len() > 1 {
+        Shape::MultipleRoots
+    } else {
+        match node.roots.first() {
+            Some(Root::Array(_)) => Shape::LocalArray,
+            Some(Root::Slice(_)) => Shape::BorrowedSlice,
+            Some(Root::Parameter(_)) => Shape::RawParameter,
+            Some(Root::Table(_)) => Shape::PointerTableLoad,
+            Some(Root::Projection(_)) => Shape::ProjectionLoad,
+            _ if node.roots.is_empty() && node.nullable => Shape::NullOnly,
+            _ => Shape::Opaque,
+        }
+    };
+    let component: Vec<_> = body
+        .local_decls
+        .indices()
+        .filter(|local| !nodes[local.index()].roots.is_disjoint(&node.roots))
+        .collect();
+    let mut report = Admission {
+        owner,
+        local: candidate.local,
+        shape,
+        status: Status::NeedsFact,
+        nullable: node.nullable,
+        component: component.clone(),
+        base_elements: None,
+        findings: [
+            (Predicate::RetainedBase, Need::BaseOrigin),
+            (Predicate::GenerationWindow, Need::Generation),
+            (Predicate::RawEntryPrefix, Need::Prefix),
+            (Predicate::FullRegionSchedule, Need::Schedule),
+        ]
+        .map(|(predicate, need)| Finding {
+            predicate,
+            outcome: Outcome::Missing(need),
+            root: None,
+            site: None,
+        }),
+    };
+    if shape == Shape::BorrowedSlice {
+        report.findings[1].outcome = Outcome::Missing(Need::WindowCoverage);
+    }
+    if candidate.slot_depth != 0
+        || !matches!(body.local_decls[candidate.local].ty.kind(), ty::RawPtr(..))
+    {
+        report.findings[0].outcome = Outcome::Unsupported(Unsupported::PointerDepth);
+    } else if candidate.model_kind != ModelKind::Ref
+        || component.iter().any(|local| {
+            matches!(body.local_decls[*local].ty.kind(), ty::RawPtr(..))
+                && kinds.get(local) != Some(&ModelKind::Ref)
+        })
+    {
+        report.findings[0].outcome = Outcome::Missing(Need::RefAdmission);
+    } else if shape == Shape::RawParameter {
+        let entry = node
+            .roots
+            .iter()
+            .find_map(|root| match root {
+                Root::Parameter(local) => Some(*local),
+                _ => None,
+            })
+            .unwrap_or(candidate.local);
+        derive_parameter(tcx, body, candidate.local, entry, &component, &mut report);
+    } else if shape == Shape::LocalArray {
+        let Root::Array(root) = *node.roots.first().unwrap() else { unreachable!() };
+        derive_array(
+            tcx,
+            body,
+            root,
+            &component,
+            &nodes,
+            &lends,
+            &definitions,
+            &mut report,
+        );
+    }
+    report.status = if report
+        .findings
+        .iter()
+        .any(|f| matches!(f.outcome, Outcome::Unsupported(_)))
+    {
+        Status::OutOfScope
+    } else if report.findings.iter().all(|f| f.outcome == Outcome::Proven) {
+        Status::DecisionOnly
+    } else {
+        Status::NeedsFact
+    };
+    report
+}
+
+/// **The base derivation for a parameter root.** Unlike a local array, whose
+/// origin is a lend site inside the body, a raw parameter arrives already
+/// pointing somewhere: its base origin IS the entry position, and the region it
+/// can address begins there. So the retained base is PROVEN at entry — named by
+/// root and site rather than left at the seeded "nothing was derived" — unless
+/// the body observably needs a position BELOW entry, which this shape cannot
+/// supply. Only literal evidence counts: `p.offset(-1)` and `p.sub(1)` are
+/// backward, a variable delta proves nothing and leaves the base proven, and
+/// the three interprocedural predicates (generation, prefix, schedule) stay
+/// exactly as seeded because nothing here derives them.
+fn derive_parameter<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    root: Local,
+    entry_root: Local,
+    component: &[Local],
+    report: &mut Admission,
+) {
+    fn constant(operand: &Operand<'_>) -> Option<i128> {
+        let Operand::Constant(value) = operand else { return None };
+        let int = value.const_.try_to_scalar()?.try_to_scalar_int().ok()?;
+        Some(int.to_int(int.size()))
+    }
+    let entry = Location {
+        block: mir::START_BLOCK,
+        statement_index: 0,
+    };
+    report.findings[0].root = Some(root);
+    report.findings[0].site = Some(at(entry));
+    report.findings[0].outcome = Outcome::Proven;
+    // A backward move is only outside the window when nothing moves the position
+    // forward first: `p.offset(4)` then `p.offset(-1)` stays inside, and a walk
+    // whose ends are computed forward (`ip_end.offset(-2)` beside `ip.offset(1)`)
+    // is the ordinary bounded loop. The window is unrepresentable only for a
+    // subject that walks below entry and never above it.
+    let mut backward: Option<Location> = None;
+    let mut forward = false;
+    // R828-7 (relay 114): the backward steps taken only after the moving
+    // position was tested against the root's entry value; see
+    // [`guarded_backward_step`]. `!=` needs every other move non-negative.
+    let mut guarded: Vec<(Location, bool)> = Vec::new();
+    let mut unsigned_moves = true;
+    let entry_fixed = holds_entry_value(body, entry_root);
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        let TerminatorKind::Call { func, args, .. } = &data.terminator().kind else {
+            continue;
+        };
+        if method(tcx, body, func, args.first().map(|arg| &arg.node)) != Method::Pointer {
+            continue;
+        }
+        let Some(receiver) = args.first().and_then(|arg| arg.node.place()) else {
+            continue;
+        };
+        if !component.contains(&receiver.local) {
+            continue;
+        }
+        let ty::FnDef(did, _) = *func.ty(&body.local_decls, tcx).kind() else {
+            continue;
+        };
+        let Some(delta) = args.get(1).and_then(|arg| constant(&arg.node)) else {
+            let forward_method = matches!(tcx.item_name(did).as_str(), "offset" | "add");
+            if !(forward_method
+                && args
+                    .get(1)
+                    .is_some_and(|arg| unsigned_delta(tcx, body, block, &arg.node)))
+            {
+                unsigned_moves = false;
+            }
+            continue;
+        };
+        let moves_back = if tcx.item_name(did).as_str() == "sub" {
+            delta > 0
+        } else {
+            delta < 0
+        };
+        let site = Location {
+            block,
+            statement_index: data.statements.len(),
+        };
+        if moves_back && delta.abs() == 1 && entry_fixed {
+            match guarded_backward_step(body, entry_root, block, receiver.local) {
+                Some(strict) => guarded.push((site, strict)),
+                None => {
+                    backward.get_or_insert(site);
+                }
+            }
+        } else if moves_back {
+            backward.get_or_insert(site);
+        } else {
+            forward = true;
+        }
+    }
+    // A step guarded by `pos > root` stays at or above entry on its own; one
+    // guarded by `pos != root` does only while the position never starts below
+    // entry, so every other move must be non-negative.
+    for (site, strict) in guarded {
+        if !strict && !unsigned_moves {
+            backward.get_or_insert(site);
+        }
+    }
+    if let Some(site) = backward.filter(|_| !forward) {
+        reject(
+            &mut report.findings[0],
+            Outcome::Missing(Need::EntryWindow),
+            site,
+        );
+    }
+}
+
+/// **R828-7 (relay 114) — a backward step under a test against the root.**
+/// The one-step move `p.offset(-1)` in the block a `switchInt` enters when
+/// `p != root` (or `p > root`, `root < p`) holds, with nothing re-assigning the
+/// moved position in that block before the step: `while p != a { p--; .. }`.
+/// `Some(true)` for an ordering guard (the step stays at or above entry on its
+/// own), `Some(false)` for `!=` (it does while the position never starts
+/// below entry), `None` when the step is not so guarded.
+fn guarded_backward_step(
+    body: &Body<'_>,
+    root: Local,
+    block: mir::BasicBlock,
+    receiver: Local,
+) -> Option<bool> {
+    let step = &body.basic_blocks[block];
+    let moved = copied_from(step, receiver);
+    if step.statements.iter().any(|statement| {
+        matches!(&statement.kind, StatementKind::Assign(assign)
+            if assign.0.local == moved && assign.0.projection.is_empty())
+    }) {
+        return None;
+    }
+    let predecessors = &body.basic_blocks.predecessors()[block];
+    let [test] = predecessors.as_slice() else {
+        return None;
+    };
+    let data = &body.basic_blocks[*test];
+    let TerminatorKind::SwitchInt { discr, targets } = &data.terminator().kind else {
+        return None;
+    };
+    let flag = discr
+        .place()
+        .filter(|place| place.projection.is_empty())?
+        .local;
+    let mut values = targets.iter();
+    if !matches!(values.next(), Some((0, _)))
+        || values.next().is_some()
+        || targets.otherwise() != block
+    {
+        return None;
+    }
+    let (op, lhs, rhs) = match &last_assignment(data, flag)?.1 {
+        Rvalue::BinaryOp(op, operands) => (*op, &operands.0, &operands.1),
+        _ => return None,
+    };
+    let side = |operand: &Operand<'_>| {
+        operand
+            .place()
+            .filter(|place| place.projection.is_empty())
+            .map(|place| copied_from(data, place.local))
+    };
+    let (lhs, rhs) = (side(lhs)?, side(rhs)?);
+    match op {
+        mir::BinOp::Ne if (lhs, rhs) == (moved, root) || (lhs, rhs) == (root, moved) => Some(false),
+        mir::BinOp::Gt if (lhs, rhs) == (moved, root) => Some(true),
+        mir::BinOp::Lt if (lhs, rhs) == (root, moved) => Some(true),
+        _ => None,
+    }
+}
+
+/// The local a block's temporary was copied (or moved) from, if the block
+/// assigns it so; the local itself otherwise.
+fn copied_from(data: &mir::BasicBlockData<'_>, local: Local) -> Local {
+    match last_assignment(data, local).map(|assign| &assign.1) {
+        Some(Rvalue::Use(Operand::Copy(place) | Operand::Move(place)))
+            if place.projection.is_empty() =>
+        {
+            place.local
+        }
+        _ => local,
+    }
+}
+
+/// The block's last assignment to the whole of `local`, if any.
+fn last_assignment<'a, 'tcx>(
+    data: &'a mir::BasicBlockData<'tcx>,
+    local: Local,
+) -> Option<&'a (Place<'tcx>, Rvalue<'tcx>)> {
+    data.statements
+        .iter()
+        .rev()
+        .find_map(|statement| match &statement.kind {
+            StatementKind::Assign(assign) if assign.0.local == local => {
+                assign.0.projection.is_empty().then_some(&**assign)
+            }
+            _ => None,
+        })
+}
+
+/// The parameter still holds its entry value everywhere: the body never
+/// assigns it and never borrows it (`a = q`, `&mut a`).
+fn holds_entry_value(body: &Body<'_>, entry: Local) -> bool {
+    body.basic_blocks.iter().all(|data| {
+        data.statements
+            .iter()
+            .all(|statement| match &statement.kind {
+                StatementKind::Assign(assign) => {
+                    assign.0.local != entry
+                        && !matches!(&assign.1, Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place)
+                        if place.local == entry)
+                }
+                _ => true,
+            })
+            && !matches!(&data.terminator().kind,
+            TerminatorKind::Call { destination, .. } if destination.local == entry)
+    })
+}
+
+/// A variable delta that cannot be negative: the block casts it from an
+/// unsigned integer (`n as isize`, `IntToInt`).
+fn unsigned_delta<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    block: mir::BasicBlock,
+    operand: &Operand<'tcx>,
+) -> bool {
+    let Some(place) = operand.place().filter(|place| place.projection.is_empty()) else {
+        return false;
+    };
+    matches!(last_assignment(&body.basic_blocks[block], place.local).map(|assign| &assign.1),
+        Some(Rvalue::Cast(mir::CastKind::IntToInt, source, _))
+            if matches!(source.ty(&body.local_decls, tcx).kind(), ty::Uint(_)))
+}
+
+fn derive_array<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    body: &Body<'tcx>,
+    root: Local,
+    component: &[Local],
+    nodes: &[Node],
+    lends: &BTreeMap<Local, Vec<Location>>,
+    definitions: &BTreeMap<Local, Vec<(Location, bool)>>,
+    report: &mut Admission,
+) {
+    let origins = &lends[&root];
+    let origin = origins[0];
+    for finding in &mut report.findings {
+        finding.root = Some(root);
+        finding.site = Some(at(origin));
+        finding.outcome = Outcome::Proven;
+    }
+    let ty::Array(elem, len) = *body.local_decls[root].ty.kind() else { unreachable!() };
+    report.base_elements = len.try_to_target_usize(tcx);
+    let typing_env = ty::TypingEnv::post_analysis(tcx, body.source.def_id());
+    let layout_ok = tcx
+        .layout_of(typing_env.as_query_input(elem))
+        .is_ok_and(|layout| layout.size.bytes() != 0)
+        && !matches!(elem.kind(), ty::RawPtr(..) | ty::Ref(..) | ty::Adt(..))
+        && !component
+            .iter()
+            .any(|local| nodes[local.index()].layout_changed);
+    if !layout_ok {
+        report.findings[0].outcome = Outcome::Unsupported(Unsupported::Layout);
+    }
+    let initializations = definitions.get(&root).map(Vec::as_slice).unwrap_or(&[]);
+    let mut places = Places::default();
+    places.visit_body(body);
+    let uses: Vec<_> = places
+        .rows
+        .iter()
+        .filter(|(place, context, _)| {
+            component.contains(&place.local) && !matches!(context, PlaceContext::NonUse(_))
+        })
+        .map(|(_, _, site)| *site)
+        .collect();
+    match initializations {
+        [(initialization, true)]
+            if origins
+                .iter()
+                .chain(&uses)
+                .all(|site| dominates(body, *initialization, *site)) =>
+        {
+            // The proposed base is formed immediately after initialization,
+            // before the statement at this boundary. Unlike origins[0], this
+            // boundary dominates both branches of an if/else extraction.
+            report.findings[3].site = Some(at(Location {
+                block: initialization.block,
+                statement_index: initialization.statement_index + 1,
+            }));
+            if reaches(body, *initialization, *initialization) {
+                report.findings[1].outcome = Outcome::Missing(Need::Generation);
+            }
+        }
+        [] => reject(
+            &mut report.findings[0],
+            Outcome::Missing(Need::Initialization),
+            origin,
+        ),
+        _ => report.findings[1].outcome = Outcome::Missing(Need::Generation),
+    }
+    if component
+        .iter()
+        .any(|local| nodes[local.index()].roots != BTreeSet::from([Root::Array(root)]))
+    {
+        report.findings[1].outcome = Outcome::Missing(Need::Generation);
+    }
+    for (place, context, site) in &places.rows {
+        if place.local == root
+            && !matches!(context, PlaceContext::NonUse(_))
+            && !origins.contains(site)
+            && !initializations.iter().any(|(init, _)| init == site)
+        {
+            reject(
+                &mut report.findings[3],
+                Outcome::Missing(Need::Schedule),
+                *site,
+            );
+        }
+    }
+    for (block, data) in body.basic_blocks.iter_enumerated() {
+        for (statement_index, statement) in data.statements.iter().enumerate() {
+            let site = Location {
+                block,
+                statement_index,
+            };
+            if matches!(statement.kind, StatementKind::StorageDead(local) if local == root)
+                && uses.iter().any(|use_site| reaches(body, site, *use_site))
+            {
+                report.findings[1].outcome = Outcome::Missing(Need::Generation);
+                report.findings[1].site = Some(at(site));
+            }
+            if let StatementKind::Assign(assignment) = &statement.kind {
+                let (destination, value) = &**assignment;
+                if let Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) = value
+                    && component.contains(&place.local)
+                {
+                    let outcome = if place.projection.is_empty() {
+                        Outcome::Unsupported(Unsupported::EscapedStorage)
+                    } else {
+                        Outcome::Missing(Need::Schedule)
+                    };
+                    reject(&mut report.findings[3], outcome, site);
+                }
+                if matches!(value, Rvalue::Cast(_, operand, _) if operand.place().is_some_and(|p| component.contains(&p.local)) && element(destination.ty(&body.local_decls, tcx).ty).is_none())
+                {
+                    reject(
+                        &mut report.findings[3],
+                        Outcome::Unsupported(Unsupported::Operation),
+                        site,
+                    );
+                }
+                let mut operands = Places::default();
+                operands.visit_rvalue(value, site);
+                let uses_component = operands
+                    .rows
+                    .iter()
+                    .any(|(place, _, _)| component.contains(&place.local));
+                let supported = match value {
+                    Rvalue::Use(operand) => operand.place().is_some_and(|place| {
+                        place.is_indirect()
+                            || (destination.as_local().is_some()
+                                && element(destination.ty(&body.local_decls, tcx).ty).is_some())
+                    }),
+                    Rvalue::Cast(_, _, target) => element(*target).is_some(),
+                    Rvalue::BinaryOp(op, _) => matches!(
+                        op,
+                        mir::BinOp::Eq
+                            | mir::BinOp::Ne
+                            | mir::BinOp::Lt
+                            | mir::BinOp::Le
+                            | mir::BinOp::Gt
+                            | mir::BinOp::Ge
+                    ),
+                    Rvalue::Len(_) => true,
+                    // Aggregates, Repeat, raw address formation, references to
+                    // storage, and every unhandled transport fail closed at
+                    // the source use, before a later hidden escape is lost.
+                    _ => false,
+                };
+                if uses_component && !supported {
+                    reject(
+                        &mut report.findings[3],
+                        Outcome::Missing(Need::Schedule),
+                        site,
+                    );
+                }
+            }
+        }
+        let site = Location {
+            block,
+            statement_index: data.statements.len(),
+        };
+        match &data.terminator().kind {
+            TerminatorKind::Call { func, args, .. }
+                if args.iter().any(|arg| {
+                    arg.node
+                        .place()
+                        .is_some_and(|p| component.contains(&p.local))
+                }) =>
+            {
+                match method(tcx, body, func, args.first().map(|a| &a.node)) {
+                    Method::Wrapping => reject(
+                        &mut report.findings[3],
+                        Outcome::Unsupported(Unsupported::Operation),
+                        site,
+                    ),
+                    Method::Unsupported => reject(
+                        &mut report.findings[3],
+                        Outcome::Missing(Need::Schedule),
+                        site,
+                    ),
+                    _ => {}
+                }
+            }
+            TerminatorKind::Return if component.contains(&mir::RETURN_PLACE) => {
+                reject(
+                    &mut report.findings[3],
+                    Outcome::Missing(Need::Schedule),
+                    site,
+                );
+            }
+            TerminatorKind::InlineAsm { .. }
+            | TerminatorKind::TailCall { .. }
+            | TerminatorKind::Yield { .. } => {
+                reject(
+                    &mut report.findings[3],
+                    Outcome::Unsupported(Unsupported::Operation),
+                    site,
+                );
+            }
+            _ => {}
+        }
+    }
+}

@@ -1,0 +1,1032 @@
+//! Sealed alternatives for reverting one callee parameter to its input form.
+//! Selection consumes only class/atom custody; proof and syntax work stays here.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use rustc_hash::FxHashMap;
+use rustc_hir::{
+    Expr, ExprKind, HirId, QPath,
+    def::Res,
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
+use rustc_middle::ty::{TyCtxt, TyKind};
+use rustc_span::Span;
+
+use super::{
+    Decision, DecisionTable, SubjectKind,
+    emitability::{Arg, ArgShape, EmitabilityFacts},
+    raw_boundary::{self, RawBoundaryDisposition, RawBoundaryDispositionIndex},
+    seam::{self, Form, GlueSpec, SeamFamily, SeamInputRendering, SeamPlan},
+};
+use crate::bo_rewriter::bridge_receipt::{
+    BridgeCalleeId, BridgeExtentKind, BridgeRetentionTier, BridgeSitePlan, SignatureClassId,
+};
+
+pub(crate) type Key = (SignatureClassId, u32, u32);
+pub(crate) type InputPlans = BTreeMap<Key, CalleeParameterInput>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SeamAlternative {
+    pub(crate) rendering: SeamInputRendering,
+    pub(crate) arg_span: Span,
+    pub(crate) bridge: Option<BridgeSitePlan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CalleeParameterInput {
+    pub(crate) caller: LocalDefId,
+    pub(crate) node: (LocalDefId, HirId),
+    pub(crate) input_form: Form,
+    pub(crate) source_node: Option<(LocalDefId, HirId)>,
+    pub(crate) target_atom_ids: Vec<String>,
+    pub(crate) source_atom_ids: Vec<String>,
+    pub(crate) current_source: Result<SeamAlternative, &'static str>,
+    pub(crate) input_source: Result<SeamAlternative, &'static str>,
+    /// Metadata for the existing source-input AST carrier while the callee
+    /// parameter keeps its decided interface. No new rendering is derived.
+    pub(crate) kept_target_input_source: Option<SeamAlternative>,
+    /// Direct return producers whose original interfaces are needed by the
+    /// original argument. The consumer's owned closure restores these first.
+    pub(crate) input_source_required_classes: BTreeSet<SignatureClassId>,
+    /// Unknown restoration shapes must refuse the target's safe-interface
+    /// planning before finalization, not become an AST-time guess.
+    pub(crate) preflight_hold: Option<&'static str>,
+}
+
+impl CalleeParameterInput {
+    pub(crate) fn source_is_input(
+        &self,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> bool {
+        classes.contains(&SignatureClassId::of(self.caller))
+            || self.source_atom_ids.iter().any(|atom| atoms.contains(atom))
+    }
+
+    pub(crate) fn select<'a>(
+        &'a self,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> Option<Result<&'a SeamAlternative, &'static str>> {
+        let target_input = classes.contains(&SignatureClassId::of(self.node.0))
+            || self.target_atom_ids.iter().any(|atom| atoms.contains(atom));
+        if !target_input {
+            return None;
+        }
+        let source_input = self.source_is_input(classes, atoms);
+        Some(if source_input {
+            if !self.input_source_required_classes.is_subset(classes) {
+                Err("callee-parameter-input-source-return-interface-live")
+            } else {
+                self.input_source.as_ref().map_err(|reason| *reason)
+            }
+        } else {
+            self.current_source.as_ref().map_err(|reason| *reason)
+        })
+    }
+
+    /// Owners needed when a selected alternative is unavailable. This is
+    /// dependency transport, not a decision/model recomputation.
+    pub(crate) fn unavailable_owners(&self) -> BTreeSet<SignatureClassId> {
+        let mut owners = self.input_source_required_classes.clone();
+        owners.insert(SignatureClassId::of(self.caller));
+        if self.preflight_hold.is_some() {
+            owners.insert(SignatureClassId::of(self.node.0));
+        }
+        owners
+    }
+}
+
+fn expressions<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    caller: LocalDefId,
+) -> FxHashMap<(u32, u32), Vec<&'tcx Expr<'tcx>>> {
+    struct V<'tcx>(FxHashMap<(u32, u32), Vec<&'tcx Expr<'tcx>>>);
+    impl<'tcx> Visitor<'tcx> for V<'tcx> {
+        fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
+            if !matches!(expression.kind, ExprKind::DropTemps(_)) {
+                self.0
+                    .entry((expression.span.lo().0, expression.span.hi().0))
+                    .or_default()
+                    .push(expression);
+            }
+            intravisit::walk_expr(self, expression);
+        }
+    }
+    let mut visitor = V(FxHashMap::default());
+    visitor.visit_body(tcx.hir_body_owned_by(caller));
+    visitor.0
+}
+
+fn stable_array_pointer(tcx: TyCtxt<'_>, expression: &Expr<'_>) -> bool {
+    let typeck = tcx.typeck(expression.hir_id.owner.def_id);
+    let mut expression = expression;
+    while let ExprKind::Cast(inner, _) = expression.kind {
+        if !typeck.expr_ty(inner).is_raw_ptr() || !typeck.expr_ty(expression).is_raw_ptr() {
+            return false;
+        }
+        expression = inner;
+    }
+    let ExprKind::MethodCall(segment, receiver, args, _) = expression.kind else { return false };
+    let ExprKind::Path(QPath::Resolved(_, path)) = receiver.kind else { return false };
+    if !matches!(path.res, Res::Local(_))
+        || !matches!(typeck.expr_ty(receiver).kind(), TyKind::Array(..))
+        || !matches!(segment.ident.name.as_str(), "as_ptr" | "as_mut_ptr")
+        || !args.is_empty()
+    {
+        return false;
+    }
+    typeck
+        .type_dependent_def_id(expression.hir_id)
+        .is_some_and(|callee| tcx.crate_name(callee.krate).as_str() == "core")
+        && typeck.expr_ty(expression).is_raw_ptr()
+}
+
+/// R593-2 (a1): the argument's root keeps its raw text (Degraded, or not a
+/// subject of the caller).
+fn root_stays_raw(root: Option<&Decision>) -> bool {
+    match root {
+        None | Some(Decision::Degraded(_)) => true,
+        Some(
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. },
+        ) => false,
+    }
+}
+
+/// R593-2 (a2): `(*root).field` with `root` a thin `ref` (`(*s).f` reads the same
+/// for `&T` and `*mut T`), the field a raw pointer that no field transaction
+/// delivers.
+fn raw_field_read_through_ref(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    expression: &Expr<'_>,
+    root: Option<&Decision>,
+) -> bool {
+    let thin_ref = match root {
+        Some(Decision::Ref { .. }) => true,
+        None
+        | Some(
+            Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Box(_)
+            | Decision::Cursor { .. }
+            | Decision::Degraded(_),
+        ) => false,
+    };
+    let ExprKind::Field(base, _) = expression.kind else { return false };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, inner) = base.kind else { return false };
+    let ExprKind::Path(QPath::Resolved(_, path)) = inner.kind else { return false };
+    if !thin_ref || !matches!(path.res, Res::Local(_)) {
+        return false;
+    }
+    let typeck = tcx.typeck(expression.hir_id.owner.def_id);
+    let Some(struct_did) = typeck
+        .expr_ty(base)
+        .ty_adt_def()
+        .and_then(|adt| adt.did().as_local())
+    else {
+        return false;
+    };
+    let Some(field) = typeck.opt_field_index(expression.hir_id) else { return false };
+    typeck.expr_ty(expression).is_raw_ptr()
+        && !table.field_transactions.applied.iter().any(|transaction| {
+            transaction.array.is_none()
+                && transaction.key.struct_did == struct_did
+                && transaction.key.field_index == field.as_usize()
+        })
+}
+
+fn return_dependencies<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expression: &'tcx Expr<'tcx>,
+    table: &DecisionTable,
+) -> BTreeSet<SignatureClassId> {
+    struct V<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
+        table: &'a DecisionTable,
+        owners: BTreeSet<SignatureClassId>,
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+        fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) {
+            let typeck = self.tcx.typeck(expression.hir_id.owner.def_id);
+            let callee = match expression.kind {
+                ExprKind::Call(callee, _) => match typeck.expr_ty(callee).kind() {
+                    TyKind::FnDef(callee, _) => callee.as_local(),
+                    _ => None,
+                },
+                ExprKind::MethodCall(..) => typeck
+                    .type_dependent_def_id(expression.hir_id)
+                    .and_then(|callee| callee.as_local()),
+                _ => None,
+            };
+            if let Some(callee) = callee
+                && self.table.return_interfaces.functions.contains_key(&callee)
+            {
+                self.owners.insert(SignatureClassId::of(callee));
+            }
+            if let ExprKind::Path(QPath::Resolved(_, path)) = expression.kind
+                && let Res::Local(binding) = path.res
+            {
+                let node = (expression.hir_id.owner.def_id, binding);
+                if let Some(receiver) = self.table.return_receivers.plans.get(&node) {
+                    self.owners.insert(SignatureClassId::of(receiver.callee));
+                }
+                if let Some((_, decision)) = self
+                    .table
+                    .entries
+                    .iter()
+                    .find(|(subject, _)| (subject.fn_did, subject.hir_id) == node)
+                {
+                    match decision {
+                        Decision::InferredRef { callee, .. } => {
+                            self.owners.insert(SignatureClassId::of(*callee));
+                        }
+                        Decision::Ref { .. }
+                        | Decision::Slice { .. }
+                        | Decision::Opt { .. }
+                        | Decision::Box(_)
+                        | Decision::NestedSlice { .. }
+                        | Decision::Cursor { .. }
+                        | Decision::Degraded(_) => {}
+                    }
+                }
+            }
+            intravisit::walk_expr(self, expression);
+        }
+    }
+    let mut visitor = V {
+        tcx,
+        table,
+        owners: BTreeSet::new(),
+    };
+    visitor.visit_expr(expression);
+    visitor.owners
+}
+
+/// **R583-4** — the receipt of a raw-rooted input at a held callee, carried
+/// in the zero-syntax receipt's `found_form` column (counted per program).
+pub(crate) const HELD_CALLEE_RAW_ROOTED: &str = "held-callee-input:raw-rooted";
+
+/// **R583-4** — `&mut <place>` whose place is rooted in a `kind-raw` FORMAL of
+/// the caller, through a deref, and projects only fields no transaction
+/// delivers (a deref of an undelivered pointer field stays raw as well). An
+/// argument whose path crosses a delivered field is not raw-rooted.
+fn raw_rooted(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    caller: LocalDefId,
+    arg: &Arg,
+    expression: Option<&Expr<'_>>,
+) -> bool {
+    let ArgShape::AddrOf {
+        base: Some(root),
+        through_deref: true,
+        ..
+    } = arg.shape
+    else {
+        return false;
+    };
+    let kind_raw_formal = table.entries.iter().any(|(subject, decision)| {
+        subject.fn_did == caller
+            && subject.hir_id == root
+            && matches!(subject.kind, SubjectKind::Param { .. })
+            && match decision {
+                Decision::Degraded(record) => {
+                    matches!(record.reason, super::DegradeReason::KindRaw)
+                }
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Cursor { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_) => false,
+            }
+    });
+    let Some(ExprKind::AddrOf(_, _, place)) = expression.map(|e| e.kind) else {
+        return false;
+    };
+    let mut place = place;
+    if !kind_raw_formal {
+        return false;
+    }
+    let typeck = tcx.typeck(caller);
+    loop {
+        match place.kind {
+            ExprKind::Field(base, _) => {
+                let Some(index) = typeck.opt_field_index(place.hir_id) else { return false };
+                let TyKind::Adt(adt, _) = typeck.expr_ty(base).kind() else { return false };
+                if adt.did().as_local().is_some_and(|struct_did| {
+                    table.field_transactions.applied.iter().any(|t| {
+                        t.key.struct_did == struct_did && t.key.field_index == index.as_usize()
+                    })
+                }) {
+                    return false;
+                }
+                place = base;
+            }
+            ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) => place = pointer,
+            ExprKind::Path(QPath::Resolved(_, path)) => {
+                return matches!(path.res, Res::Local(id) if id == root);
+            }
+            _ => return false,
+        }
+    }
+}
+
+fn zero(arg: &Arg, found: Form) -> SeamAlternative {
+    SeamAlternative {
+        rendering: SeamInputRendering::ZeroSyntax { found },
+        arg_span: arg.span,
+        bridge: None,
+    }
+}
+
+fn kept_target_source_receipt(
+    tcx: TyCtxt<'_>,
+    seams: &SeamPlan,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    arg: &Arg,
+    expected: Form,
+) -> Option<SeamAlternative> {
+    let owner = SignatureClassId::of(callee);
+    let ordinary = seams
+        .edits
+        .iter()
+        .filter(|edit| {
+            edit.owner_class == owner
+                && edit.span == arg.span
+                && edit.bridge.caller == caller
+                && edit.source_node.is_some_and(|node| node.0 == caller)
+                && edit.bridge.callee == BridgeCalleeId::Local(callee)
+                && matches!(edit.bridge.arm.as_str(), "c" | "glue")
+        })
+        .filter_map(|edit| {
+            edit.input_rendering
+                .as_ref()
+                .map(|input| (edit.arg_span, input))
+        });
+    let identities = seams
+        .revert_found_form_edits
+        .iter()
+        .filter(|edit| {
+            edit.owner_class == owner && edit.span == arg.span && edit.source_node.0 == caller
+        })
+        .map(|edit| (edit.arg_span, &edit.input));
+    let candidates = ordinary.chain(identities).collect::<Vec<_>>();
+    let [(arg_span, rendering)] = candidates.as_slice() else { return None };
+    let (found, kind, extent, retention, waiver_id, unsafe_context) = match rendering {
+        SeamInputRendering::ZeroSyntax { found } => (
+            *found,
+            "source-input:zero-syntax".to_owned(),
+            BridgeExtentKind::None,
+            BridgeRetentionTier::None,
+            None,
+            None,
+        ),
+        SeamInputRendering::Adapter {
+            found,
+            spec,
+            retention,
+            waiver_id,
+            ..
+        } => (
+            *found,
+            format!("source-input:{}", spec.template_key()),
+            seam::receipt_extent(spec),
+            *retention,
+            waiver_id.clone(),
+            seam::unsafe_context_for(tcx, caller, spec),
+        ),
+    };
+    Some(SeamAlternative {
+        rendering: (*rendering).clone(),
+        arg_span: *arg_span,
+        bridge: Some(BridgeSitePlan {
+            caller,
+            callee: BridgeCalleeId::Local(callee),
+            arm: seam::receipt_arm(expected, found).to_owned(),
+            position: format!("arg{}", arg.index),
+            bridge_kind: kind,
+            expected_form: expected.key().to_owned(),
+            found_form: found.key().to_owned(),
+            argument_kind: arg.shape.key().to_owned(),
+            extent,
+            retention,
+            waiver_id,
+            unsafe_context,
+        }),
+    })
+}
+
+fn current_alternative(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    raw: &RawBoundaryDispositionIndex,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    call_span: Span,
+    arg: &Arg,
+    expression: Option<&Expr<'_>>,
+    found: Form,
+    input_form: Form,
+) -> Result<SeamAlternative, &'static str> {
+    if matches!(found, Form::NestedSlice { .. }) {
+        return Err("callee-parameter-input-nested-source-unbuilt");
+    }
+    if matches!(found, Form::Cursor { .. }) {
+        return Err("callee-parameter-input-cursor-source-unbuilt");
+    }
+    if input_form != Form::Raw {
+        return Err("callee-parameter-input-native-target-unbuilt");
+    }
+    let root_decision = arg.shape.place_root().and_then(|root| {
+        table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.fn_did == caller && subject.hir_id == root)
+            .map(|(_, decision)| decision)
+    });
+    // wave-5d relay 205: a computed suffix view of a delivered slice base this
+    // callee's class rendered (`slice_forms`). Looked up first: the raw
+    // expression's stability gate and the raw zero-syntax shortcut below read
+    // the argument's text as a raw pointer, which over a delivered base it is
+    // not (the stand-in review's LOW-3 / LOW-4).
+    let view = table
+        .seams
+        .computed_view_inputs
+        .iter()
+        .find(|view| {
+            view.caller == caller && view.argument_span == arg.span && view.param_index == arg.index
+        })
+        .filter(|_| match root_decision {
+            Some(Decision::Slice { .. }) => true,
+            Some(
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::Cursor { .. }
+                | Decision::Degraded(_),
+            )
+            | None => false,
+        });
+    if view.is_some_and(|view| !view.sealable) {
+        return Err("callee-parameter-input-computed-view-unsealable");
+    }
+    // R593-2 (main 120): a raw expression's found form is `Raw` by shape, which
+    // holds only while its text still reads a raw pointer. (a1) Over a root that
+    // stays raw (Degraded, or not a subject) it renders unchanged: the
+    // zero-syntax branch below. (a2) A field read through a thin converted `ref`
+    // whose field no transaction delivers reads the same raw pointer. Anything
+    // else keeps the stability gate.
+    if matches!(arg.shape, ArgShape::RawExpr { .. })
+        && view.is_none()
+        && !root_stays_raw(root_decision)
+        && !expression.is_some_and(|expression| {
+            stable_array_pointer(tcx, expression)
+                || raw_field_read_through_ref(tcx, table, expression, root_decision)
+        })
+    {
+        return Err("callee-parameter-input-raw-expression-not-proven-stable");
+    }
+    if matches!(arg.shape, ArgShape::Other | ArgShape::Cast { .. }) {
+        return Err("callee-parameter-input-source-shape-unbuilt");
+    }
+    // R551-5 joint (a): a `Box` owner is NOT refused. `form_of(Box)` is
+    // `Raw`, so it must also skip the zero-syntax shortcut below — a Box
+    // owner's text is never a raw pointer — and supply its raw view, tiered
+    // by the raw boundary's own disposition of this site.
+    // The owner's view is the OWNER's: only the owner passed bare takes it.
+    // An element address (`&mut *owner.offset(i)`) roots at the owner but is
+    // a reference to one element, and keeps the refusal (R555-1).
+    let bare = matches!(arg.shape, ArgShape::BareLocal(_));
+    let owner = match root_decision {
+        Some(
+            Decision::NestedSlice { .. } | Decision::Cursor { .. } | Decision::InferredRef { .. },
+        ) => {
+            return Err("callee-parameter-input-owned-or-inferred-source-unbuilt");
+        }
+        Some(owner @ Decision::Box(_)) if bare => Some(owner),
+        Some(Decision::Box(_)) => {
+            return Err("callee-parameter-input-owned-or-inferred-source-unbuilt");
+        }
+        Some(
+            Decision::Ref { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Degraded(_),
+        )
+        | None => None,
+    };
+    if owner.is_none() && found == Form::Raw && view.is_none() {
+        return Ok(zero(arg, found));
+    }
+    let matches = raw
+        .inventoried_sites()
+        .filter(|(key, _, site)| {
+            site.callee_local == Some(callee)
+                && key.caller == tcx.def_path_str(caller.to_def_id())
+                && key.argument_index == arg.index
+                && site.call_span == call_span
+                && site.span == arg.span
+        })
+        .collect::<Vec<_>>();
+    let [(key, disposition, site)] = matches.as_slice() else {
+        return Err("callee-parameter-input-raw-boundary-evidence-unavailable");
+    };
+    // R473-2: a site rooted at the address of a VALUE LOCAL carries its
+    // disposition on the side channel — the admission unlocks THIS input and
+    // nothing else, so the site's public disposition stays refused.
+    //
+    // The rendering is ZERO SYNTAX, and that is the whole point: `&mut x`
+    // already coerces to `*mut T` and already IS `&mut T`, so the original
+    // argument text is correct at either formal. The bridge templates cannot
+    // render this source — they reborrow (`&mut *x`), which is ill-typed over
+    // a value place; wave-6o's pin caught exactly that.
+    if matches!(
+        disposition,
+        RawBoundaryDisposition::Blocked { .. } | RawBoundaryDisposition::OwnedByOtherArm { .. }
+    ) && matches!(
+        raw.address_root_disposition(key),
+        Some(RawBoundaryDisposition::T1 { .. } | RawBoundaryDisposition::T2 { .. })
+    ) {
+        return Ok(zero(arg, found));
+    }
+    // R575-5: this alternative exists only for a HELD callee, whose emitted
+    // formal is its raw input form. There R481-2's tier-2 retention waiver
+    // applies although the kept disposition (the formal decided safe)
+    // declines, so the raw boundary publishes the held-world answer beside
+    // R473-2's. The same zero syntax, receipted: the waiver spent is counted
+    // per site.
+    if matches!(disposition, RawBoundaryDisposition::Blocked { .. })
+        && let Some(RawBoundaryDisposition::T2 { waiver_id, .. }) =
+            raw.held_address_root_disposition(key)
+    {
+        return Ok(SeamAlternative {
+            rendering: SeamInputRendering::ZeroSyntax { found },
+            arg_span: arg.span,
+            bridge: Some(BridgeSitePlan {
+                caller,
+                callee: BridgeCalleeId::Local(callee),
+                arm: "c".into(),
+                position: format!("arg{}", arg.index),
+                bridge_kind: "interface-call-zero-syntax".into(),
+                expected_form: input_form.key().into(),
+                found_form: found.key().into(),
+                argument_kind: arg.shape.key().into(),
+                extent: BridgeExtentKind::None,
+                retention: BridgeRetentionTier::T2,
+                waiver_id: Some((*waiver_id).to_owned()),
+                unsafe_context: None,
+            }),
+        });
+    }
+    // **R583-4 — the raw-rooted arm.** An address rooted in a `kind-raw`
+    // formal through undelivered fields (`&mut (*s).hasher_` at
+    // `EncodeData → HasherReset`) is raw on both sides: the caller's root keeps
+    // its declared raw type, and the held callee's formal is its raw input
+    // form. No safe subject stands on either side, so there is no bridge to
+    // render and no retention to read (§130's channel — Rust noalias against a
+    // retained alias — is absent). Admitted as written; the receipt is the
+    // zero-syntax row, its `found_form` naming the arm.
+    // The refusal it replaces is the site's `Blocked` (a raw root's is
+    // `raw-boundary-subject-not-safe`).
+    if matches!(disposition, RawBoundaryDisposition::Blocked { .. })
+        && raw_rooted(tcx, table, caller, arg, expression)
+    {
+        return Ok(SeamAlternative {
+            rendering: SeamInputRendering::ZeroSyntax { found },
+            arg_span: arg.span,
+            bridge: Some(BridgeSitePlan {
+                caller,
+                callee: BridgeCalleeId::Local(callee),
+                arm: "c".into(),
+                position: format!("arg{}", arg.index),
+                bridge_kind: "interface-call-zero-syntax".into(),
+                expected_form: input_form.key().into(),
+                found_form: HELD_CALLEE_RAW_ROOTED.into(),
+                argument_kind: arg.shape.key().into(),
+                extent: BridgeExtentKind::None,
+                retention: BridgeRetentionTier::None,
+                waiver_id: None,
+                unsafe_context: None,
+            }),
+        });
+    }
+    let (retention, waiver_id) = match disposition {
+        RawBoundaryDisposition::T1 { .. } => (BridgeRetentionTier::T1, None),
+        RawBoundaryDisposition::T2 { waiver_id, .. } => {
+            (BridgeRetentionTier::T2, Some((*waiver_id).to_owned()))
+        }
+        RawBoundaryDisposition::Blocked { .. } | RawBoundaryDisposition::OwnedByOtherArm { .. } => {
+            return Err("callee-parameter-input-raw-boundary-held");
+        }
+    };
+    // **wave-5d relay 205 (main 219 §4).** A computed suffix view of a
+    // delivered slice base (`&mut *bits.offset(64)`, `bits: &mut [u16]`) was
+    // planned as the callee class's safe view. The callee withdrawn, the
+    // formal is raw again and the argument's text still reads the base as a
+    // pointer (`bits.offset(..)`: E0599 on the slice). The same suffix is
+    // sealed for the raw formal, as `slice_forms`' raw arm seals it for a raw
+    // callee: `(&mut (bits)[64..]).as_mut_ptr()`.
+    if let Some(view) = view {
+        let target_mutable = matches!(site.target.mutability, raw_boundary::RawMutability::Mut);
+        if target_mutable && !view.mutable {
+            return Err("callee-parameter-input-computed-view-immutable");
+        }
+        let source = Decision::Slice {
+            mutable: view.mutable,
+            uses: Vec::new(),
+        };
+        let template = raw_boundary::template_for(
+            &source,
+            &site.target,
+            None,
+            raw.negative_write_evidence(key).is_some(),
+        )
+        .map_err(|_| "callee-parameter-input-raw-view-unavailable")?;
+        // The stand-in review's HIGH-1: the returned-child permission and
+        // template, as the generic path below and the terminal sealing of
+        // `slice_forms`' raw arm ask them (`computed_view_template`).
+        let child = raw
+            .returned_child_evidence(key)
+            .filter(|child| !(child.raw_field_parent && arg.shape.key() == "raw-expr"));
+        let actual_view = match arg.shape.key() {
+            "addr-of" | "addr-of-cast" => Form::Ref { mutable: false },
+            "addr-of-mut" | "addr-of-mut-cast" => Form::Ref { mutable: true },
+            _ => found,
+        };
+        let (template, writable) = computed_view_template(
+            view.mutable,
+            actual_view,
+            &site.target,
+            template,
+            child.map(|child| child.child.as_ref().ok().map(|child| &child.access)),
+        )?;
+        let mut spec = GlueSpec::raw_boundary_target(template, &site.target, false, false);
+        let mut forward = view.forward.clone();
+        forward.mutable = forward.mutable || target_mutable || writable;
+        spec.forward_slice = Some(forward);
+        let found = seam::form_of(&source);
+        let unsafe_fn = tcx
+            .fn_sig(caller.to_def_id())
+            .skip_binder()
+            .skip_binder()
+            .safety
+            .is_unsafe();
+        let replacement = spec
+            .render_in_context(&view.name, unsafe_fn)
+            .ok_or("callee-parameter-input-raw-view-unrenderable")?;
+        let bridge = BridgeSitePlan {
+            caller,
+            callee: BridgeCalleeId::Local(callee),
+            arm: "c".into(),
+            position: format!("arg{}", arg.index),
+            bridge_kind: template.key().into(),
+            expected_form: input_form.key().into(),
+            found_form: found.key().into(),
+            argument_kind: super::slice_forms::COMPUTED_SUFFIX_VIEW.into(),
+            extent: BridgeExtentKind::None,
+            retention,
+            waiver_id: waiver_id.clone(),
+            unsafe_context: seam::unsafe_context_for(tcx, caller, &spec),
+        };
+        return Ok(SeamAlternative {
+            rendering: SeamInputRendering::Adapter {
+                replacement,
+                spec,
+                family: SeamFamily::Safe,
+                found,
+                len_arm: None,
+                retention,
+                waiver_id,
+            },
+            arg_span: view.argument_span,
+            bridge: Some(bridge),
+        });
+    }
+    if let Some(owner) = owner {
+        // The owner's view through the template every raw-boundary Box site
+        // renders (`x.as_mut_ptr()`, `core::ptr::from_mut(x.as_mut())`, the
+        // R130 optional form), the slice/value choice read from the site.
+        let template = raw_boundary::template_for(
+            owner,
+            &site.target,
+            None,
+            raw.negative_write_evidence(key).is_some(),
+        )
+        .map_err(|_| "callee-parameter-input-raw-view-unavailable")?;
+        let spec = GlueSpec::raw_boundary_target(template, &site.target, site.box_slice, true);
+        return adapter(
+            tcx, caller, callee, arg, site, template, spec, found, input_form, retention, waiver_id,
+        );
+    }
+    let found = crate::bo_rewriter::wave6r_shared_root::input_found(
+        table,
+        caller,
+        arg,
+        &site.target,
+        found,
+    );
+    let source = seam::decision_for_safe_form(found)
+        .ok_or("callee-parameter-input-source-form-unavailable")?;
+    let child = raw.returned_child_evidence(key);
+    seam::terminal_returned_child_permission(child, arg.shape.key(), found)
+        .map_err(|_| "callee-parameter-input-returned-child-permission")?;
+    let mut template = raw_boundary::template_for(
+        &source,
+        &site.target,
+        None,
+        raw.negative_write_evidence(key).is_some(),
+    )
+    .map_err(|_| "callee-parameter-input-raw-view-unavailable")?;
+    if let Some(child) =
+        child.filter(|child| !(child.raw_field_parent && arg.shape.key() == "raw-expr"))
+    {
+        let selected = raw_boundary::returned_child_template(
+            &source,
+            &site.target,
+            child.child.as_ref().ok().map(|child| &child.access),
+            template,
+        )
+        .map_err(|_| "callee-parameter-input-returned-child-template")?;
+        if selected.mutable_binding_required
+            && !arg
+                .shape
+                .place_root()
+                .is_some_and(|root| table.option_mut_bindings.contains(&(caller, root)))
+        {
+            return Err("callee-parameter-input-mutable-binding-unplanned");
+        }
+        template = selected.template;
+    }
+    let spec = GlueSpec::raw_boundary_target(template, &site.target, false, true);
+    adapter(
+        tcx, caller, callee, arg, site, template, spec, found, input_form, retention, waiver_id,
+    )
+}
+
+/// **wave-5d relay 206 (the stand-in review's HIGH-1, made testable).** The
+/// template a withdrawn callee's sealed computed view takes under the site's
+/// returned child: `child` is `None` when no child descends from the argument,
+/// `Some(access)` otherwise. A `*const` formal whose child the caller writes
+/// through takes the WRITABLE view (`{view}.as_mut_ptr().cast_const()`), never
+/// `.as_ptr()` — a shared-derived pointer is Frozen under Tree Borrows, and the
+/// caller's write would be UB on a UB-free input. Returns the template and
+/// whether it is the writable one.
+pub(crate) fn computed_view_template(
+    view_mutable: bool,
+    actual_view: Form,
+    target: &raw_boundary::RawTargetType,
+    base: raw_boundary::BridgeTemplate,
+    child: Option<Option<&super::returned_child::ChildAccess>>,
+) -> Result<(raw_boundary::BridgeTemplate, bool), &'static str> {
+    let Some(access) = child else {
+        return Ok((base, false));
+    };
+    // The argument's own view must permit what the caller does with the
+    // child (`&*p.offset(e)` written through is refused), as
+    // `seam::terminal_returned_child_permission` asks it.
+    if let Some(actual) = seam::decision_for_safe_form(actual_view) {
+        raw_boundary::returned_child_permission(&actual, access)
+            .map_err(|_| "callee-parameter-input-returned-child-permission")?;
+    }
+    let source = Decision::Slice {
+        mutable: view_mutable,
+        uses: Vec::new(),
+    };
+    let selected = raw_boundary::returned_child_template(&source, target, access, base)
+        .map_err(|_| "callee-parameter-input-returned-child-template")?;
+    if selected.mutable_binding_required {
+        return Err("callee-parameter-input-mutable-binding-unplanned");
+    }
+    let writable = selected.template != base;
+    if writable && !view_mutable {
+        return Err("callee-parameter-input-computed-view-immutable");
+    }
+    Ok((selected.template, writable))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adapter(
+    tcx: TyCtxt<'_>,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    arg: &Arg,
+    site: &raw_boundary::RawBoundaryRenderSite,
+    template: raw_boundary::BridgeTemplate,
+    spec: GlueSpec,
+    found: Form,
+    input_form: Form,
+    retention: BridgeRetentionTier,
+    waiver_id: Option<String>,
+) -> Result<SeamAlternative, &'static str> {
+    let arg_span = site
+        .direct_storage_span
+        .unwrap_or(site.adapter_operand_span);
+    let text = tcx
+        .sess
+        .source_map()
+        .span_to_snippet(arg_span)
+        .map_err(|_| "callee-parameter-input-operand-unplaceable")?;
+    let text = crate::bo_rewriter::wave6r_shared_root::input_text(text, arg, found);
+    let unsafe_fn = tcx
+        .fn_sig(caller.to_def_id())
+        .skip_binder()
+        .skip_binder()
+        .safety
+        .is_unsafe();
+    let replacement = spec
+        .render_in_context(&text, unsafe_fn)
+        .ok_or("callee-parameter-input-raw-view-unrenderable")?;
+    let bridge = BridgeSitePlan {
+        caller,
+        callee: BridgeCalleeId::Local(callee),
+        arm: "c".into(),
+        position: format!("arg{}", arg.index),
+        bridge_kind: template.key().into(),
+        expected_form: input_form.key().into(),
+        found_form: found.key().into(),
+        argument_kind: arg.shape.key().into(),
+        extent: BridgeExtentKind::None,
+        retention,
+        waiver_id: waiver_id.clone(),
+        unsafe_context: seam::unsafe_context_for(tcx, caller, &spec),
+    };
+    Ok(SeamAlternative {
+        rendering: SeamInputRendering::Adapter {
+            replacement,
+            spec,
+            family: SeamFamily::Safe,
+            found,
+            len_arm: None,
+            retention,
+            waiver_id,
+        },
+        arg_span,
+        bridge: Some(bridge),
+    })
+}
+
+pub(crate) fn plan(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    facts: &EmitabilityFacts,
+    seams: &SeamPlan,
+    raw: &RawBoundaryDispositionIndex,
+) -> InputPlans {
+    let decisions = table
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<FxHashMap<_, _>>();
+    let mut expression_maps = FxHashMap::default();
+    let mut result = InputPlans::new();
+    for (&callee, calls) in &facts.call_args {
+        for call in calls {
+            let expressions = expression_maps
+                .entry(call.caller)
+                .or_insert_with(|| expressions(tcx, call.caller));
+            for arg in &call.args {
+                let owner = SignatureClassId::of(callee);
+                // PAIR/A5 whole-call carriers own their own input alternatives.
+                // This carrier governs ordinary argument adapters and their
+                // explicit identity receipts only.
+                let ordinary = seams.edits.iter().any(|edit| {
+                    edit.owner_class == owner
+                        && edit.span == arg.span
+                        && edit.param_index == arg.index
+                        && edit.bridge.caller == call.caller
+                        && edit.bridge.callee == BridgeCalleeId::Local(callee)
+                        && matches!(edit.bridge.arm.as_str(), "c" | "glue")
+                        && edit.bridge.position == format!("arg{}", arg.index)
+                }) || seams.zero_bridges.iter().any(|site| {
+                    site.owner_class == owner
+                        && site.caller == call.caller
+                        && site.span == Some(arg.span)
+                        && matches!(site.arm, "c" | "glue")
+                        && site.bridge_kind == "interface-call-zero-syntax"
+                });
+                if !ordinary {
+                    continue;
+                }
+                let Some((parameter, choice)) = table.entries.iter().find(|(subject, _)| subject.fn_did == callee
+                    && matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == arg.index)) else { continue };
+                let expected = match choice {
+                    Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Slice { .. }
+                    | Decision::Opt { .. } => seam::form_of(choice),
+                    Decision::Box(_)
+                    | Decision::NestedSlice { .. }
+                    | Decision::Cursor { .. }
+                    | Decision::Degraded(_) => continue,
+                };
+                let input_form = *table
+                    .input_interfaces
+                    .parameter_forms
+                    .get(&(callee, arg.index))
+                    .expect("settled callee parameter has its original input interface");
+                if input_form == expected {
+                    continue;
+                }
+                let node = (parameter.fn_did, parameter.hir_id);
+                let source_node = arg.shape.place_root().map(|root| (call.caller, root));
+                let expression_candidates = expressions.get(&(arg.span.lo().0, arg.span.hi().0));
+                let expression = expression_candidates.and_then(|found| match found.as_slice() {
+                    [expression] => Some(*expression),
+                    _ => None,
+                });
+                let input_subject = source_node
+                    .and_then(|node| table.input_interfaces.subject_forms.get(&node))
+                    .copied()
+                    .unwrap_or(Form::Raw);
+                let input_found = seam::a5_argument_expression_form(arg.shape.key(), input_subject)
+                    .unwrap_or(Form::Raw);
+                let found = seam::argument_form(call.caller, &arg.shape, &decisions);
+                let required = expression_candidates
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|expression| return_dependencies(tcx, expression, table))
+                    .collect();
+                // The caller owns local/parameter presentation and body-use
+                // edits. Once it and every referenced changed return producer
+                // are restored, this exact original HIR argument retains its
+                // original type (including native raw-pointer coercions).
+                let input_source = if expression_candidates.is_some_and(|found| !found.is_empty()) {
+                    Ok(zero(arg, input_found))
+                } else {
+                    Err("callee-parameter-input-original-expression-unlocated")
+                };
+                let current_source = current_alternative(
+                    tcx,
+                    table,
+                    raw,
+                    call.caller,
+                    callee,
+                    call.span,
+                    arg,
+                    expression,
+                    found,
+                    input_form,
+                );
+                let atoms = |node| {
+                    seams
+                        .raw_boundary_atom_groups
+                        .get(&node)
+                        .into_iter()
+                        .flatten()
+                        .map(|atom| atom.id.clone())
+                        .collect::<Vec<_>>()
+                };
+                let key = (
+                    SignatureClassId::of(callee),
+                    arg.span.lo().0,
+                    arg.span.hi().0,
+                );
+                let entry = CalleeParameterInput {
+                    caller: call.caller,
+                    node,
+                    input_form,
+                    source_node,
+                    target_atom_ids: atoms(node),
+                    source_atom_ids: source_node.map(atoms).unwrap_or_default(),
+                    preflight_hold: input_source.as_ref().err().copied(),
+                    current_source,
+                    input_source,
+                    kept_target_input_source: kept_target_source_receipt(
+                        tcx,
+                        seams,
+                        call.caller,
+                        callee,
+                        arg,
+                        expected,
+                    ),
+                    input_source_required_classes: required,
+                };
+                if let Some(previous) = result.get_mut(&key) {
+                    previous.current_source = Err("callee-parameter-input-ambiguous-site");
+                    previous.input_source = Err("callee-parameter-input-ambiguous-site");
+                    previous.preflight_hold = Some("callee-parameter-input-ambiguous-site");
+                    previous.target_atom_ids.extend(entry.target_atom_ids);
+                    previous.source_atom_ids.extend(entry.source_atom_ids);
+                } else {
+                    result.insert(key, entry);
+                }
+            }
+        }
+    }
+    result
+}

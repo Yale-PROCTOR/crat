@@ -55,7 +55,7 @@ pub(super) fn find_alloc_funcs(
         let scc = &sccs.scc_elems[scc_id];
         for f in scc {
             let assigns = &assigns[f];
-            if is_alloc(Local::ZERO, assigns, &alloc_fns) {
+            if is_alloc(Local::ZERO, assigns, &alloc_fns, &mut FxHashSet::default()) {
                 alloc_fns.insert(*f);
             }
         }
@@ -63,15 +63,21 @@ pub(super) fn find_alloc_funcs(
     alloc_fns
 }
 
+// `seen` (R697-6): an assignment cycle such as `p0 = p1; p1 = p0` would recurse
+// without bound; a local already on the search adds no new path.
 fn is_alloc(
     local: Local,
     assigns: &FxHashMap<Local, FxHashSet<Value>>,
     alloc_fns: &FxHashSet<LocalDefId>,
+    seen: &mut FxHashSet<Local>,
 ) -> bool {
+    if !seen.insert(local) {
+        return false;
+    }
     let vs = some_or!(assigns.get(&local), return false);
     for v in vs {
         let b = match v {
-            Value::Local(l) => is_alloc(*l, assigns, alloc_fns),
+            Value::Local(l) => is_alloc(*l, assigns, alloc_fns, seen),
             Value::IntraCall(def_id) => alloc_fns.contains(def_id),
             Value::CCall => true,
         };

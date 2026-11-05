@@ -132,6 +132,18 @@ struct Args {
     points_to_file: Option<PathBuf>,
     #[arg(long, value_delimiter = ',', help = "Names of functions exposed to C")]
     c_exposed_fn: Vec<String>,
+    #[arg(
+        long,
+        help = "Write the pointer-bo pass's emission receipt to this file"
+    )]
+    bo_receipt: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "SECS",
+        value_parser = clap::value_parser!(u32).range(1..=4_294_967),
+        help = "Per-query z3 budget of the pointer-bo pass in seconds (default 600); outranks CRAT_BO_QUERY_TIMEOUT_MS"
+    )]
+    bo_query_timeout: Option<u32>,
 
     #[arg(long, help = "Enable in-place transformation of the input directory")]
     inplace: bool,
@@ -168,6 +180,9 @@ enum Pass {
     Enum,
     Io,
     Pointer,
+    #[value(name = "pointer-bo")]
+    #[serde(rename = "pointer-bo")]
+    PointerBo,
     Static,
     Simpl,
 }
@@ -202,6 +217,8 @@ struct Config {
     unexpand: unexpander::Config,
     #[serde(default)]
     pointer: pointer_replacer::Config,
+    #[serde(default, rename = "pointer-bo")]
+    pointer_bo: pointer_replacer_bo::Config,
     #[serde(default)]
     andersen: points_to::andersen::Config,
     #[serde(default)]
@@ -373,6 +390,10 @@ fn main() {
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
     config
+        .pointer_bo
+        .c_exposed_fns
+        .extend(config.c_exposed_fns.iter().cloned());
+    config
         .andersen
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
@@ -384,6 +405,9 @@ fn main() {
         .punning
         .c_exposed_fns
         .extend(config.c_exposed_fns.iter().cloned());
+
+    let bo_receipt = args.bo_receipt;
+    let bo_query_timeout = args.bo_query_timeout;
 
     let dir = if !config.passes.is_empty() {
         if config.analysis_output.is_some() {
@@ -632,6 +656,31 @@ fn main() {
                     utils::add_dependency(&dir, "bytemuck", "1.24.0");
                 }
             }
+            Pass::PointerBo => {
+                // Relay main/388 O2 (R1386-1): the flag's budget: the flag > the variable > 600 s.
+                if let Some(secs) = bo_query_timeout {
+                    let ms =
+                        pointer_replacer_bo::query_timeout_env_value(secs).unwrap_or_else(|e| {
+                            eprintln!("{e}");
+                            std::process::exit(2);
+                        });
+                    // Safety: the driver's main thread, before the analysis starts any thread; nothing
+                    // reads the environment concurrently.
+                    unsafe { std::env::set_var("CRAT_BO_QUERY_TIMEOUT_MS", ms) };
+                }
+                let receipt = pointer_replacer_bo::rewrite_bo(
+                    &file,
+                    config.pointer_bo.c_exposed_fns.iter().cloned(),
+                )
+                .unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                println!("{}", receipt.summary());
+                if let Some(path) = &bo_receipt {
+                    std::fs::write(path, receipt.render()).unwrap();
+                }
+            }
             Pass::Static => {
                 let s = run_compiler_on_path(&file, static_replacer::replace_static).unwrap();
                 std::fs::write(&file, s).unwrap();
@@ -798,5 +847,54 @@ fn max_sensitivity_in_range(s: &str) -> Result<usize, String> {
         Err("max_loop_head_states must be greater than 0".to_string())
     } else {
         Ok(m)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Relay main/388 O2 (R1386-1, R3): `--bo-query-timeout` takes whole seconds 1..=4,294,967; 0, a
+    /// non-number and a value whose milliseconds would overflow a `u32` are refused at parse time.
+    #[test]
+    fn r1386_bo_query_timeout_parses_seconds_in_range() {
+        let parse =
+            |value: &str| Args::try_parse_from(["crat", "--bo-query-timeout", value, "input"]);
+        assert_eq!(parse("600").unwrap().bo_query_timeout, Some(600));
+        assert_eq!(parse("1").unwrap().bo_query_timeout, Some(1));
+        assert_eq!(parse("4294967").unwrap().bo_query_timeout, Some(4_294_967));
+        assert!(parse("0").is_err());
+        assert!(parse("ten").is_err());
+        assert!(parse("4294968").is_err());
+        assert_eq!(
+            Args::try_parse_from(["crat", "input"])
+                .unwrap()
+                .bo_query_timeout,
+            None,
+            "unset: the variable, the file or 600 s decide"
+        );
+    }
+
+    /// S15 (the user's word in main's session 11-04: "pointer bo 로 하자"): `pointer` and `[pointer]` are
+    /// master's pass again; the borrow/ownership pass is `pointer-bo`, read from `[pointer-bo]`.
+    #[test]
+    fn s15_pointer_is_masters_pass_and_the_new_one_is_pointer_bo() {
+        let pass =
+            |name: &str| Args::try_parse_from(["crat", "--pass", name, "input"]).map(|a| a.pass);
+        assert!(matches!(pass("pointer").unwrap()[..], [Pass::Pointer]));
+        assert!(matches!(pass("pointer-bo").unwrap()[..], [Pass::PointerBo]));
+        assert!(pass("pointer-old").is_err());
+        let config: Config = toml::from_str(
+            "passes = [\"pointer\", \"pointer-bo\"]\n\
+             [pointer]\nc_exposed_fns = []\nverbose = true\n\
+             [pointer-bo]\nc_exposed_fns = [\"f\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            config.passes[..],
+            [Pass::Pointer, Pass::PointerBo]
+        ));
+        assert!(config.pointer.verbose);
+        assert!(config.pointer_bo.c_exposed_fns.contains("f"));
     }
 }

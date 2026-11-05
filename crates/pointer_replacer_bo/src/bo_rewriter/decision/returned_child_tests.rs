@@ -1,0 +1,208 @@
+//! W-C5: a shared view borrowed into a contract-less local callee that may
+//! hand a pointer back. Reduced from heman's `kmRay2IntersectTriangle` (`ray`,
+//! at `8e84dc6d`: `borrowed-into-raw-param`, the site `kmVec2Subtract arg 2`
+//! blocked `ordinary-argument-permission:write-through-shared-view`).
+
+const RAY: &str = r###"
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct kmVec2 { pub x: f32, pub y: f32 }
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct kmRay2 { pub start: kmVec2, pub dir: kmVec2 }
+pub unsafe fn kmVec2Subtract(pOut: *mut kmVec2, pV1: *const kmVec2, pV2: *const kmVec2) -> *mut kmVec2 {
+    (*pOut).x = (*pV1).x - (*pV2).x;
+    (*pOut).y = (*pV1).y - (*pV2).y;
+    return pOut;
+}
+pub unsafe fn kmVec2Length(pIn: *const kmVec2) -> f32 { ((*pIn).x * (*pIn).x + (*pIn).y * (*pIn).y).sqrt() }
+pub unsafe fn kmVec2Dot(pV1: *const kmVec2, pV2: *const kmVec2) -> f32 { (*pV1).x * (*pV2).x + (*pV1).y * (*pV2).y }
+pub unsafe fn kmRay2IntersectLineSegment(ray: *const kmRay2, p1: *const kmVec2, p2: *const kmVec2, intersection: *mut kmVec2) -> u8 {
+    let ua = ((*p2).x - (*p1).x) * ((*ray).start.y - (*p1).y) - ((*p2).y - (*p1).y) * ((*ray).start.x - (*p1).x);
+    if ua >= 0.0 && ua <= 1.0 {
+        (*intersection).x = (*ray).start.x + ua * (*ray).dir.x;
+        (*intersection).y = (*ray).start.y + ua * (*ray).dir.y;
+        return 1;
+    }
+    0
+}
+pub unsafe fn kmRay2IntersectTriangle(ray: *const kmRay2, p1: *const kmVec2, p2: *const kmVec2, p3: *const kmVec2,
+    intersection: *mut kmVec2, distance_out: *mut f32) -> u8 {
+    let mut intersect = kmVec2 { x: 0., y: 0. };
+    let mut final_intersect = kmVec2 { x: 0., y: 0. };
+    let mut distance = 10000.0f32;
+    let mut intersected = 0u8;
+    if kmRay2IntersectLineSegment(ray, p1, p2, &mut intersect) != 0 {
+        let mut tmp = kmVec2 { x: 0., y: 0. };
+        let this_distance = kmVec2Length(kmVec2Subtract(&mut tmp, &mut intersect, &(*ray).start));
+        let mut this_normal = kmVec2 { x: (*p2).y - (*p1).y, y: (*p1).x - (*p2).x };
+        if this_distance < distance && kmVec2Dot(&mut this_normal, &(*ray).dir) < 0.0f32 {
+            final_intersect.x = intersect.x;
+            final_intersect.y = intersect.y;
+            distance = this_distance;
+            intersected = 1;
+        }
+    }
+    if intersected != 0 {
+        (*intersection).x = final_intersect.x;
+        (*intersection).y = final_intersect.y;
+        if distance != 0. { *distance_out = distance; }
+    }
+    intersected
+}
+"###;
+
+fn fixture() -> String {
+    format!(
+        "#![allow(dead_code,unused_unsafe,unused_mut,unused_assignments,unused_variables,non_snake_case,non_camel_case_types)]\n{RAY}"
+    )
+}
+
+fn decisions(input: &str) -> Vec<(String, super::Decision)> {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap()
+        .0
+        .entries
+        .iter()
+        .map(|(s, d)| (s.label.clone(), d.clone()))
+        .collect()
+    })
+    .unwrap()
+}
+
+fn decision<'a>(table: &'a [(String, super::Decision)], label: &str) -> &'a super::Decision {
+    &table
+        .iter()
+        .find(|(l, _)| l == label)
+        .unwrap_or_else(|| panic!("{label}"))
+        .1
+}
+
+/// W-C5's own verdict: the ARGUMENT's pointee (`kmVec2`, what `pV2` points
+/// to) reaching a pointer could hand a child back through a load, so the
+/// pointee is not pointer-free and W-C5 admits nothing. (The final decision
+/// is no longer this control's to assert: over the batch-8 composition
+/// another lane's returned-child evidence admits the site on its own — the
+/// pointer handed back is `pOut`, argument 0 — which is sound here.)
+#[test]
+fn w5c_returned_child_pointer_bearing_pointee_is_not_pointer_free() {
+    let input = fixture()
+        .replace(
+            "pub struct kmVec2 { pub x: f32, pub y: f32 }",
+            "pub struct kmVec2 { pub x: f32, pub y: f32, pub aux: *mut f32 }",
+        )
+        .replace(
+            "kmVec2 { x: 0., y: 0. }",
+            "kmVec2 { x: 0., y: 0., aux: 0 as *mut f32 }",
+        )
+        .replace(
+            "y: (*p1).x - (*p2).x }",
+            "y: (*p1).x - (*p2).x, aux: 0 as *mut f32 }",
+        );
+    let parameters = |input: &str| {
+        ::utils::compilation::run_compiler_on_str(input, |tcx| {
+            let vec2 = tcx
+                .hir_body_owners()
+                .find(|d| tcx.item_name(d.to_def_id()).as_str() == "kmVec2Subtract")
+                .unwrap();
+            super::returned_child_descent::pointer_free_parameters(tcx, vec2).collect::<Vec<_>>()
+        })
+        .unwrap()
+    };
+    assert!(parameters(&input).is_empty());
+    assert_eq!(parameters(&fixture()), vec![0, 1, 2]);
+}
+
+/// A callee that hands the argument itself back retains it; the pointee-free
+/// scan never settles that (no T1). Composition re-pin (wave-6v2, R412-7,
+/// R217-2(a)): a Return-only local callee whose result the caller only READS
+/// through is the used-returned-alias tier — T2 under the named waiver,
+/// receipted `retention-returned-alias-used` — so the shared view delivers;
+/// a caller that writes through the returned alias keeps the refusal
+/// (`wave6r_returned_alias_kept_by_caller_keeps_hold`).
+#[test]
+fn w5c_returned_child_returned_argument_is_the_waived_tier() {
+    let input = fixture().replace(
+        "    (*pOut).y = (*pV1).y - (*pV2).y;\n    return pOut;",
+        "    (*pOut).y = (*pV1).y - (*pV2).y;\n    return pV2 as *mut kmVec2;",
+    );
+    let table = decisions(&input);
+    assert!(
+        matches!(
+            decision(&table, "kmRay2IntersectTriangle::ray"),
+            super::Decision::Ref { mutable: false }
+        ),
+        "{:?}",
+        decision(&table, "kmRay2IntersectTriangle::ray")
+    );
+    let site = ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (_, ctx) = crate::bo_rewriter::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                crate::bo_rewriter::OverlapMode::PreciseReplay,
+                Some(crate::bo_rewriter::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .unwrap();
+        ctx.raw_boundary
+            .receipts_tsv()
+            .lines()
+            .filter(|l| {
+                l.contains("kmRay2IntersectTriangle::ray#1") && l.contains("kmVec2Subtract\t2")
+            })
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    })
+    .unwrap();
+    // **The tier this site reaches has moved twice, both times upward.**
+    // Report 015 refused the view here (the callee hands the argument back);
+    // wave-6v2's R412-7 re-pinned it as the WAIVED tier (T2,
+    // `retention-returned-alias-used`, delivered under the waiver); with
+    // wave-6r's `d2720f79` the callee's retention is summarized locally and
+    // the negative-write proof is present, so the bridge is CERTIFIED (T1,
+    // `local-retention-summary;negative-write=foster-immutable`) and needs no
+    // waiver. Sound at this site because the bridge is SHARED
+    // (`ref-shared-to-raw-const`): the returned alias is consumed by
+    // `kmVec2Length` in the same expression while the `&(*ray).start` borrow
+    // is live, and `&T` aliasing `&T` is not addendum 130's channel — that
+    // one is a RETAINED alias beside a live `&mut`. A returned alias into a
+    // mutable bridge, or one that is stored, still has no certificate here.
+    assert!(
+        site.iter().any(|l| l.contains("\tT1\t")
+            && l.contains("local-retention-summary")
+            && !l.contains("retention-returned-alias-used")),
+        "{site:?}"
+    );
+}
+
+/// A callee whose retention is unknown (it passes the argument on to an
+/// opaque function, a T2-waived boundary) may hand the argument back; a
+/// pointer-free pointee does not settle that, so the view stays refused.
+#[test]
+fn w5c_returned_child_unknown_retention_stays_refused() {
+    let input = fixture()
+        .replace(
+            "pub unsafe fn kmVec2Subtract(",
+            "extern \"C\" { fn opaque(p: *const kmVec2) -> *mut kmVec2; }\npub unsafe fn kmVec2Subtract(",
+        )
+        .replace(
+            "    (*pOut).y = (*pV1).y - (*pV2).y;\n    return pOut;",
+            "    (*pOut).y = (*pV1).y - (*pV2).y;\n    return opaque(pV2);",
+        );
+    let table = decisions(&input);
+    assert!(
+        !matches!(
+            decision(&table, "kmRay2IntersectTriangle::ray"),
+            super::Decision::Ref { .. }
+        ),
+        "{:?}",
+        decision(&table, "kmRay2IntersectTriangle::ray")
+    );
+}

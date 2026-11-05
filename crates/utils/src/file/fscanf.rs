@@ -64,7 +64,21 @@ fn parse_format(s: &[u8]) -> ParseResult<'_> {
                     *negative = true;
                     state = State::ScanSet;
                 } else {
-                    err(s, start_idx);
+                    // C7.21.6.2: only a LEADING `^` negates a scanset; any
+                    // later one is an ordinary member. This arm used to
+                    // `err()` — which is `panic!`, not a recoverable error —
+                    // and aborted the whole analysis on the `%[^? | ^#]` at
+                    // `benchmarks/rs-crown/urlparser/src/test.rs:404`.
+                    //
+                    // Reachable only where the old parser panicked, so this
+                    // cannot alter an execution that previously completed. That
+                    // is asserted over the corpus rather than argued — see
+                    // `the_fix_only_changes_executions_that_previously_panicked`.
+                    let Some((Conversion::ScanSet(ScanSet { chars, .. }), _)) = &mut conversion
+                    else {
+                        unreachable!()
+                    };
+                    chars.push(*c);
                 }
             } else if *c == b']' {
                 if state == State::ScanSet {
@@ -507,4 +521,52 @@ fn test_scanf_parse() {
     assert!(!specs[0].trailing_space);
     assert!(specs[1].leading_space);
     assert!(specs[1].trailing_space);
+}
+
+// ---------------------------------------------------------------------------
+// F-1 (2026-08-06) — the scanset non-leading-`^` fix, and its gates
+// ---------------------------------------------------------------------------
+
+// The G1 differential (every corpus literal the old parser accepted parses identically after the fix: 190 of 190) is
+// recorded in 8988530d7. It read the gitignored benchmarks/rs-crown-derived, so it left the branch at the master merge (S13).
+
+/// **G2 — the urlparser regression.** Exact parse, not merely "does not panic".
+///
+/// *Mutation-tested (Rider 4):* restoring `err(s, start_idx)` in the
+/// non-leading-`^` arm fails this.
+#[test]
+fn f1_urlparser_scanset_parses_with_the_caret_as_an_ordinary_member() {
+    let specs = parse_specs(b"%[^? | ^#]");
+    assert_eq!(specs.len(), 1, "one conversion: {specs:?}");
+    let Conversion::ScanSet(set) = &specs[0].conversion else { panic!("not a scanset: {specs:?}") };
+    assert!(set.negative, "the LEADING `^` still negates: {specs:?}");
+    assert_eq!(
+        set.chars, b"? | ^#",
+        "the non-leading `^` is an ordinary member, and every other byte is \
+         preserved in order: {specs:?}"
+    );
+}
+
+/// **The two F-2 shapes, witnessed — one panics, one MISPARSES SILENTLY.**
+///
+/// Pinned because they are categorically different and the difference decides
+/// what a licence may cover. The F-1 micro-plan claimed both panicked; measured
+/// (reviewer amendment H2), `%[^]abc]` **completes**, yielding an empty negated
+/// set — so repairing it would change an execution that succeeds today, which
+/// is outside any licence scoped to panics.
+///
+/// Both remain unfixed. This test is their record, not their repair.
+#[test]
+fn the_f2_scanset_shapes_behave_as_witnessed() {
+    assert!(
+        std::panic::catch_unwind(|| parse_specs(b"%[]abc]")).is_err(),
+        "F-2a: `]` in the first position still panics — unfixed by design"
+    );
+    let quiet = std::panic::catch_unwind(|| parse_specs(b"%[^]abc]"))
+        .expect("F-2b completes rather than panicking");
+    let Conversion::ScanSet(set) = &quiet[0].conversion else { panic!("not a scanset: {quiet:?}") };
+    assert!(
+        set.negative && set.chars.is_empty(),
+        "F-2b: empty negated set — the silent misparse: {quiet:?}"
+    );
 }

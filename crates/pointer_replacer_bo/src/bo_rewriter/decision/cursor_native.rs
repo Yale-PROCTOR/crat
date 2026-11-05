@@ -1,0 +1,922 @@
+//! Native cursor decisions and compiler-bound admission receipts. The observer
+//! reports candidate-stage facts; terminal delivery remains custody-owned.
+
+use std::collections::BTreeMap;
+
+use rustc_hash::FxHashMap;
+use rustc_hir::def_id::LocalDefId;
+use rustc_middle::{mir::Local, ty::TyCtxt};
+
+use super::{Ctx, Decision, DegradeReason, Subject};
+use crate::analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef};
+
+#[path = "cursor/admission.rs"]
+mod admission;
+#[path = "cursor/delivered.rs"]
+mod delivered;
+#[path = "cursor/emission.rs"]
+mod emission;
+#[path = "cursor/foreign.rs"]
+pub(crate) mod foreign;
+#[path = "cursor/negative_index.rs"]
+mod negative_index;
+#[path = "cursor/wrapper.rs"]
+pub(crate) mod wrapper;
+#[path = "cursor/wrapper_ast.rs"]
+pub(crate) mod wrapper_ast;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorPlan {
+    pub(crate) parent_cursor: Option<rustc_hir::HirId>,
+    pub(crate) wrapper: bool,
+    pub(crate) parameter: bool,
+    pub(crate) optional: bool,
+    pub(crate) fallback: bool,
+    pub(crate) uses: Vec<super::emitability::UseEdit>,
+    pub(crate) use_hirs: Vec<rustc_hir::HirId>,
+    pub(crate) base: Local,
+    pub(crate) component: Vec<Local>,
+    pub(crate) extent: u64,
+    pub(crate) delivered_base: Option<DeliveredBase>,
+    pub(crate) bridges: Vec<CursorBridge>,
+    pub(crate) local_bridges: Vec<CursorLocalBridge>,
+    /// Outer-subject use edits composed into the constructor text; the AST
+    /// pass applies the constructor at that span and skips these.
+    pub(crate) composed_edit_spans: Vec<rustc_span::Span>,
+    /// The cursor type to declare on an untyped local (`let mut q = …`), emitted
+    /// through the explicit-declaration site.
+    pub(crate) explicit_declaration: Option<String>,
+    /// The bases this cursor is re-pointed to after initialisation (`p = q`,
+    /// `p = Some(q.offset(k))`): a parent cursor or another family's delivered
+    /// local. The cursor stands only while every one of them is admitted.
+    pub(crate) peer_bases: Vec<rustc_hir::HirId>,
+    /// Peer cursor candidates a use of this cursor was left to (the peer's
+    /// initialiser or re-point owns the edit): both are cursors of this family
+    /// or neither is emitted.
+    pub(crate) peer_cursors: Vec<rustc_hir::HirId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeliveredBase {
+    pub(crate) binding: rustc_hir::HirId,
+    pub(crate) window_binding: rustc_hir::HirId,
+    pub(crate) initializer: Option<rustc_hir::HirId>,
+    pub(crate) provider: DeliveredBaseProvider,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeliveredBaseProvider {
+    OriginalSlice,
+    Slice {
+        producer: super::construction::SliceConstructionPlan,
+    },
+    Box {
+        producer: super::box_facts::BoxPlan,
+        elements: u64,
+    },
+    /// The binding is a delivered outer table whose loaded element is the
+    /// cursor's raw base; the base is fallback-receipted, the link carries the
+    /// outer's revert dependency only.
+    TableElement,
+    /// The binding is a delivered slice PARAMETER (`p: &[T]` at the safe body);
+    /// the window is the binding's runtime length.
+    SliceParameter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorLocalBridge {
+    pub(crate) destination: rustc_hir::HirId,
+    pub(crate) initializer: rustc_hir::HirId,
+    pub(crate) access: rustc_hir::HirId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorBridge {
+    pub(crate) call_hir: rustc_hir::HirId,
+    pub(crate) callee: LocalDefId,
+    pub(crate) argument_span: rustc_span::Span,
+    pub(crate) argument_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CursorHold {
+    SourceUnavailable,
+    UseUnbuilt,
+    IndexRangeMissing,
+    WindowMissing,
+    BaseMissing,
+    BaseModelRaw,
+    LayoutUnbuilt,
+    ScheduleMissing,
+    RawBoundaryUnbuilt,
+    DeclarationUnbuilt,
+    OptionalUnbuilt,
+    RefMissing,
+    ComponentAliasUnbuilt,
+    BorrowedElementUnbuilt,
+    /// R608-1: a parameter that never moves and is read at a definitely
+    /// negative offset; its window would start at the pointer.
+    NegativeIndexBelowEntry,
+    /// R609-4 (c): the same parameter read at an index loaded through a deref,
+    /// which the sign lattice reads as `Top`; scoped by measurement.
+    LoadedIndexBelowEntry,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CursorReceipt {
+    pub(crate) owner: LocalDefId,
+    pub(crate) hir_id: rustc_hir::HirId,
+    pub(crate) local: Local,
+    pub(crate) disposition: Result<(), CursorHold>,
+}
+
+// **R452-6.** A cursor whose base is a table element (`*t.offset(k)`) is
+// planned while `t` is still a flat slice of pointers. When `t` later delivers
+// its inner level (nested's N1), the element becomes a slice VALUE and the
+// constructor becomes `new(t[k])` — no length, nothing fabricated. That base
+// is this family's, so the plan is REBUILT here through the family's own
+// producer: a post-hoc rewrite of a finalised plan costs the cursor entirely
+// (nested 007's A/B). The caller flips the table first and calls this after.
+//
+// A rebuild that holds leaves its entry untouched and is reported, so the
+// caller can withdraw the flip that made this necessary rather than emit a
+// cursor whose base text no longer types.
+thread_local! {
+    /// **R525-7 (slicecursor 071) — the stale-replan count, PER PROGRAM.**
+    ///
+    /// The `debug_assert!` beside the increment is the loud form and a release
+    /// census compiles it out; the receipt vector counts TARGETS, which after
+    /// nested's transaction are exactly the rebased rows and so are non-zero by
+    /// design; and the call site discards that vector. So the detector's exit
+    /// condition — two consecutive censuses at zero and it goes — had nothing
+    /// to read. This is the thing it reads, on the same mechanism as
+    /// `ast_transform::graft_refusals`: a per-program cell, reset by the census
+    /// worker and published as one additive column.
+    static STALE_REPLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn stale_replans() -> usize {
+    STALE_REPLANS.with(std::cell::Cell::get)
+}
+
+fn record_stale_replan() {
+    STALE_REPLANS.with(|cell| cell.set(cell.get() + 1));
+}
+
+pub(crate) fn replan_delivered_table_elements(
+    ctx: &Ctx<'_, '_>,
+    entries: &mut [(Subject, Decision)],
+) -> Vec<CursorReceipt> {
+    let targets = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, (subject, decision))| {
+            // S3.0: a `Decision` is consumed through an EXHAUSTIVE match, so a
+            // new disposition is a compile error here rather than a silent
+            // `false` that drops the row. Both arms below are spelled out for
+            // that reason and must not be collapsed to a wildcard.
+            let plan = match decision {
+                Decision::Cursor { plan, .. } => plan,
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => return false,
+            };
+            let Some(base) = plan.delivered_base.as_ref() else {
+                return false;
+            };
+            matches!(base.provider, DeliveredBaseProvider::TableElement)
+                && entries.iter().any(|(table, table_decision)| {
+                    table.fn_did == subject.fn_did
+                        && table.hir_id == base.binding
+                        && match table_decision {
+                            Decision::NestedSlice { .. } => true,
+                            Decision::Cursor { .. }
+                            | Decision::Ref { .. }
+                            | Decision::InferredRef { .. }
+                            | Decision::Slice { .. }
+                            | Decision::Opt { .. }
+                            | Decision::Box(_)
+                            | Decision::Degraded(_) => false,
+                        }
+                })
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let mut receipts = Vec::new();
+    for index in targets {
+        let subject = entries[index].0.clone();
+        // **R512-4 / slicecursor 064 §3, 068.** Since nested's transaction,
+        // `promote` asks `plan_with(.., Some(&prospective))` BEFORE it writes,
+        // so a row whose table has flipped was already built against the
+        // delivered base and this re-build is a no-op: `table_element_base`
+        // takes the `NestedSlice` arm either way and returns the same
+        // `new(t[k])` with `fallback == false`.
+        //
+        // A target still carrying a FALLBACK plan is the opposite: a plan built
+        // against the flat form whose table flipped afterwards, which is the
+        // stale-plan case this pass exists to repair and which the transaction
+        // is supposed to have made unreachable. It stays a repair rather than a
+        // deletion, because "no other producer can flip a table later" is a
+        // cross-family ordering claim and is not provable locally — but it is
+        // now loud. The auditable count is this function's own receipt vector.
+        //
+        // S3.0: the `Decision` read is exhaustive.
+        let stale = match &entries[index].1 {
+            Decision::Cursor { plan, .. } => plan.fallback,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => false,
+        };
+        if stale {
+            record_stale_replan();
+        }
+        debug_assert!(
+            !stale,
+            "cursor-replan-after-flip: {:?} kept a fabricated window after its \
+             table delivered its inner level — `promote` must ask \
+             `plan_with(.., Some(..))` before it writes",
+            subject.label
+        );
+        // `None`: this consumer re-plans AFTER a flip that already happened, so
+        // there is no prospective table to tell the planner about — the flip is
+        // in `entries`. R513-5 replaces this repair with an assert; the
+        // assembler applies that patch when composing onto a frame that has
+        // this function.
+        let rebuilt = wrapper::build(ctx, &subject, entries, None);
+        receipts.push(CursorReceipt {
+            owner: subject.fn_did,
+            hir_id: subject.hir_id,
+            local: subject.local,
+            disposition: rebuilt.as_ref().map(|_| ()).map_err(|e| *e),
+        });
+        if let Ok(plan) = rebuilt {
+            entries[index].1 = Decision::Cursor {
+                mutable: subject.mutable,
+                plan,
+            };
+        }
+    }
+    receipts
+}
+
+/// **R800-2 (relay 109).** The dispositions this family never plans a cursor
+/// over, by any path (`promote`, its boundary retry, nested's re-base through
+/// `wrapper::plan_with`): every `held:*` hold and the freed-slot veto. Each is
+/// a decision that the subject keeps its raw form because a reference form —
+/// a cursor's `&mut [T]` included — would claim what the hold denies. The match
+/// is exhaustive, so a new reason is a compile error here, not a silent `false`.
+pub(crate) fn hold_is_final(decision: &Decision) -> bool {
+    let reason = match decision {
+        Decision::Degraded(record) => &record.reason,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Cursor { .. } => return false,
+    };
+    match reason {
+        DegradeReason::AddressObservationOnly
+        | DegradeReason::IoDomainType
+        | DegradeReason::VoidPointee
+        | DegradeReason::ThinExtent
+        | DegradeReason::LocalCalleeAccessExtent { .. }
+        | DegradeReason::MaskedIndexRuntimeLength { .. }
+        | DegradeReason::RetainedAlias { .. }
+        | DegradeReason::ReleasedThroughIndirectCall { .. }
+        | DegradeReason::IntoHeldFormal { .. }
+        | DegradeReason::PairNotShownDisjoint { .. }
+        | DegradeReason::FreedSlot => true,
+        DegradeReason::RevertedAfterVerifyFailure
+        | DegradeReason::SignatureClassHeld { .. }
+        | DegradeReason::KindRaw
+        | DegradeReason::PairRawView
+        | DegradeReason::BoxFailure { .. }
+        | DegradeReason::RawPointerOperation { .. }
+        | DegradeReason::CallSiteNotAdapted
+        | DegradeReason::PtrComparison
+        | DegradeReason::PendingSiblingOverlap
+        | DegradeReason::NoSlot
+        | DegradeReason::UnsupportedDeclShape { .. }
+        | DegradeReason::ReturnNotAdapted
+        | DegradeReason::PlaceReadPointee
+        | DegradeReason::CopySourceCoupled
+        | DegradeReason::SliceUseUnsupported
+        | DegradeReason::SliceCursorUse
+        | DegradeReason::CursorBaseModelRaw
+        | DegradeReason::CursorBaseUnavailable
+        | DegradeReason::NestedUseEdits
+        | DegradeReason::SliceNegOrUnknownOffset
+        | DegradeReason::SliceLocalConstruction
+        | DegradeReason::NullInit
+        | DegradeReason::OptUseUnsupported
+        | DegradeReason::OptLocalConstruction
+        | DegradeReason::OptNeedsMutBinding
+        | DegradeReason::AliasedStorageWithdrawn { .. }
+        | DegradeReason::SilentCoercion { .. }
+        | DegradeReason::ClassBlocked { .. } => false,
+    }
+}
+
+pub(crate) fn promote(
+    ctx: &Ctx<'_, '_>,
+    entries: &mut [(Subject, Decision)],
+) -> Vec<CursorReceipt> {
+    if !matches!(
+        ctx.family_policy.stage,
+        super::super::additive::FamilyStage::Return
+            | super::super::additive::FamilyStage::Ownership
+    ) {
+        return vec![];
+    }
+    let proposals = entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (subject, decision))| {
+            // Wave-6o relay 146 (R796-1), generalized at R800-2: a hold is final;
+            // no cursor is planned over a held subject (the bzip2 probe:
+            // `BZ2_bzDecompress::strm` came back as a cursor after the stop-gap
+            // held it). `wrapper::plan_with` asks the same question, so the
+            // nested re-base and the boundary retry cannot plan one either.
+            if hold_is_final(decision) {
+                return None;
+            }
+            if !ctx.family_policy.enabled_for(
+                (subject.fn_did, subject.hir_id),
+                super::super::additive::FamilyStage::Return,
+            ) {
+                return None;
+            }
+            // wave-6b (R609-4, R422-7): a byte view is exactly one scalar's
+            // storage, so an index outside it was UB in the input whatever its
+            // sign; the view keeps its exact extent and never becomes a cursor
+            // over a fallback one.
+            if ctx
+                .void_region
+                .get(&(subject.fn_did, subject.hir_id))
+                .is_some_and(|region| region.shape == super::void_region::Shape::ByteView)
+            {
+                return None;
+            }
+            if let Some(plan) = wrapper::plan(ctx, subject, decision, entries) {
+                return Some((index, plan));
+            }
+            let proposed = match decision {
+                Decision::Degraded(record) => {
+                    if is_cursor_reason(&record.reason) {
+                        Some(
+                            delivered::plan(ctx, subject, entries)
+                                .unwrap_or_else(|| emission::plan(ctx, subject, entries)),
+                        )
+                    } else if matches!(
+                        record.reason,
+                        DegradeReason::KindRaw | DegradeReason::RawPointerOperation { .. }
+                    ) {
+                        // An original typed slice is already a reference capability.
+                        // The closed administrative rewrite does not fabricate a Ref
+                        // model verdict or license a raw base construction.
+                        delivered::plan(ctx, subject, entries)
+                    } else {
+                        None
+                    }
+                }
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_)
+                | Decision::NestedSlice { .. }
+                | Decision::Cursor { .. } => None,
+            };
+            proposed.map(|plan| (index, plan))
+        })
+        .collect::<Vec<_>>();
+    let mut receipts = Vec::new();
+    let mut committed = Vec::new();
+    for (index, proposed) in proposals {
+        let (subject, decision) = &mut entries[index];
+        receipts.push(CursorReceipt {
+            owner: subject.fn_did,
+            hir_id: subject.hir_id,
+            local: subject.local,
+            disposition: proposed.as_ref().map(|_| ()).map_err(|e| *e),
+        });
+        if proposed.is_ok() {
+            committed.push((index, receipts.len() - 1, decision.clone()));
+        }
+        if proposed == Err(CursorHold::BaseModelRaw)
+            && let Decision::Degraded(record) = decision
+        {
+            record.reason = DegradeReason::CursorBaseModelRaw;
+        }
+        if proposed == Err(CursorHold::BaseMissing)
+            && let Decision::Degraded(record) = decision
+        {
+            record.reason = DegradeReason::CursorBaseUnavailable;
+        }
+        if let Ok(plan) = proposed {
+            *decision = Decision::Cursor {
+                mutable: subject.mutable,
+                plan,
+            };
+        }
+    }
+    // A caller's whole-cursor argument admits only once its local callee's
+    // parameter is a cursor; that is decided in the same pass, so a boundary
+    // hold is re-planned against the committed entries, to a bounded fixpoint.
+    for _round in 0..4 {
+        let retry = receipts
+            .iter()
+            .enumerate()
+            .filter(|(_, receipt)| receipt.disposition == Err(CursorHold::RawBoundaryUnbuilt))
+            .filter_map(|(slot, receipt)| {
+                entries
+                    .iter()
+                    .position(|(subject, _)| {
+                        subject.fn_did == receipt.owner && subject.hir_id == receipt.hir_id
+                    })
+                    .map(|index| (slot, index))
+            })
+            .collect::<Vec<_>>();
+        let mut progressed = false;
+        for (slot, index) in retry {
+            let (subject, decision) = &entries[index];
+            let Some(Ok(plan)) = wrapper::plan(ctx, subject, decision, entries) else {
+                continue;
+            };
+            let prior = decision.clone();
+            receipts[slot].disposition = Ok(());
+            committed.push((index, slot, prior));
+            entries[index].1 = Decision::Cursor {
+                mutable: entries[index].0.mutable,
+                plan,
+            };
+            progressed = true;
+        }
+        if !progressed {
+            break;
+        }
+    }
+    // A derived cursor stands only on a parent that admitted: withdraw any
+    // committed cursor whose parent is not itself a committed cursor, to a
+    // fixpoint, so the family never emits a child over a raw parent.
+    loop {
+        let orphan = committed
+            .iter()
+            .position(|&(index, _, _)| match &entries[index].1 {
+                Decision::Cursor { plan, .. } => {
+                    plan.parent_cursor
+                        .iter()
+                        .chain(&plan.peer_bases)
+                        .chain(&plan.peer_cursors)
+                        .any(|&base| {
+                            // A base that is no subject at all (an original
+                            // safe binding) has nothing to withdraw.
+                            entries.iter().any(|(other, decision)| {
+                                other.fn_did == entries[index].0.fn_did
+                                    && other.hir_id == base
+                                    && !match decision {
+                                        Decision::Cursor { plan, .. } => plan.wrapper,
+                                        // A delivered peer another family owns
+                                        // (`data = start`): admitted as long as
+                                        // that family's decision stands.
+                                        Decision::Slice { .. }
+                                        | Decision::NestedSlice { .. }
+                                        | Decision::Opt { .. } => {
+                                            plan.peer_bases.contains(&base)
+                                                && !plan.peer_cursors.contains(&base)
+                                        }
+                                        Decision::Ref { .. }
+                                        | Decision::InferredRef { .. }
+                                        | Decision::Box(_)
+                                        | Decision::Degraded(_) => false,
+                                    }
+                            })
+                        })
+                }
+                Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => false,
+            });
+        let Some(slot) = orphan else { break };
+        let (index, receipt, prior) = committed.remove(slot);
+        entries[index].1 = prior;
+        receipts[receipt].disposition = Err(CursorHold::UseUnbuilt);
+    }
+    compose_nested_uses(ctx, entries, &committed, &mut receipts);
+    receipts
+}
+
+/// **R512-4 / nested 018 STOP 1.** One bit the cursor family does not have at
+/// plan time: *this table is about to deliver its inner level*. `promote` hands
+/// it in before it writes anything, so `entries` stays pre-flip and is a single
+/// source of truth for the whole query; the family answers with a constructed
+/// `CursorPlan` or a `CursorHold`, and the caller commits the parameter only if
+/// every row came back constructed.
+///
+/// Asked, not installed: report 061 measured what installing a decision before
+/// its dependents are known good costs — a committed cursor beside a sibling
+/// that did not deliver, and `SliceCursor.offset(..)` in the emitted text
+/// (E0599). Rolling that back means unwinding the `uses` the flip wrote and
+/// everything else that read the variant in the same pass.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProspectiveTable {
+    /// The table being flipped.
+    pub(crate) binding: rustc_hir::HirId,
+    /// The element's mutability after the flip.
+    pub(crate) inner_mutable: bool,
+}
+
+/// Explicit declaration sites for untyped cursor locals (one hook in `mod.rs`).
+pub(crate) fn explicit_declarations(
+    table: &super::DecisionTable,
+) -> Vec<super::seam::ExplicitDeclarationSite> {
+    use crate::bo_rewriter::bridge_receipt::SignatureClassId;
+    // One explicit declaration per node: a site another producer already
+    // registered for this subject is not duplicated (the AST pass refuses
+    // duplicates). The cursor's site exists only for a `Cursor` decision.
+    let declared = table
+        .seams
+        .explicit_declarations
+        .iter()
+        .filter(|site| site.category == "local")
+        .filter_map(|site| site.node)
+        .collect::<rustc_hash::FxHashSet<_>>();
+    table
+        .entries
+        .iter()
+        .filter(|(subject, _)| !declared.contains(&(subject.fn_did, subject.hir_id)))
+        .filter_map(|(subject, decision)| match decision {
+            Decision::Cursor { plan, .. } => {
+                plan.explicit_declaration.as_ref().map(|emitted_type| {
+                    super::seam::ExplicitDeclarationSite {
+                        owner_class: SignatureClassId::of(subject.fn_did),
+                        caller: subject.fn_did,
+                        node: Some((subject.fn_did, subject.hir_id)),
+                        span: Some(subject.binding_span),
+                        category: "local",
+                        emitted_type: emitted_type.clone(),
+                        replacement: None,
+                        arm: "surface",
+                    }
+                })
+            }
+            Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => None,
+        })
+        .collect()
+}
+
+fn use_edits_mut(decision: &mut Decision) -> Option<&mut Vec<super::emitability::UseEdit>> {
+    match decision {
+        Decision::Slice { uses, .. }
+        | Decision::NestedSlice { uses, .. }
+        | Decision::Opt { uses, .. } => Some(uses),
+        Decision::Cursor { plan, .. } => Some(&mut plan.uses),
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Box(_)
+        | Decision::Degraded(_) => None,
+    }
+}
+
+/// A cursor use nested inside another subject's use edit (`*f.offset(*w.offset(k)
+/// as isize)` with `w` the cursor) is composed the way the slice family composes
+/// two nested slices: the outer edit's replacement, rendered from source text,
+/// takes the cursor's rendered text in place of the inner's original text, and
+/// the inner edit is dropped. An inner whose text is not found exactly once in
+/// the outer keeps the subject's prior degraded decision.
+fn compose_nested_uses(
+    ctx: &Ctx<'_, '_>,
+    entries: &mut [(Subject, Decision)],
+    committed: &[(usize, usize, Decision)],
+    receipts: &mut [CursorReceipt],
+) {
+    let source_map = ctx.tcx.sess.source_map();
+    let contains = |outer: rustc_span::Span, inner: rustc_span::Span| {
+        let (outer, inner) = (outer.source_callsite(), inner.source_callsite());
+        outer.lo() <= inner.lo() && inner.hi() <= outer.hi() && outer != inner
+    };
+    for &(index, receipt, ref prior) in committed {
+        let owner = entries[index].0.fn_did;
+        let uses = match &entries[index].1 {
+            Decision::Cursor { plan, .. } => plan.uses.clone(),
+            Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => continue,
+        };
+        // (inner use index, outer entry index, outer edit index, new outer text)
+        let mut splices = Vec::new();
+        let mut failed = false;
+        for (k, inner) in uses.iter().enumerate() {
+            let Some((j, o)) = entries
+                .iter()
+                .enumerate()
+                .find_map(|(j, (other, decision))| {
+                    if j == index || other.fn_did != owner {
+                        return None;
+                    }
+                    let outer = match decision {
+                        Decision::Slice { uses, .. }
+                        | Decision::NestedSlice { uses, .. }
+                        | Decision::Opt { uses, .. } => uses,
+                        Decision::Cursor { plan, .. } => &plan.uses,
+                        Decision::Ref { .. }
+                        | Decision::InferredRef { .. }
+                        | Decision::Box(_)
+                        | Decision::Degraded(_) => return None,
+                    };
+                    outer
+                        .iter()
+                        .position(|edit| contains(edit.span, inner.span))
+                        .map(|o| (j, o))
+                })
+            else {
+                continue;
+            };
+            let Ok(text) = source_map.span_to_snippet(inner.span) else {
+                failed = true;
+                break;
+            };
+            let replacement = match &entries[j].1 {
+                Decision::Slice { uses, .. }
+                | Decision::NestedSlice { uses, .. }
+                | Decision::Opt { uses, .. } => uses[o].replacement.clone(),
+                Decision::Cursor { plan, .. } => plan.uses[o].replacement.clone(),
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => unreachable!("outer edit came from a use list"),
+            };
+            if replacement.matches(text.as_str()).count() != 1 {
+                failed = true;
+                break;
+            }
+            splices.push((k, j, o, replacement.replacen(&text, &inner.replacement, 1)));
+        }
+        if failed {
+            entries[index].1 = prior.clone();
+            receipts[receipt].disposition = Err(CursorHold::UseUnbuilt);
+            continue;
+        }
+        // The reverse nesting: a cursor edit (a constructor, an advance, or —
+        // R615-5 — an element or address whose index holds another subject's
+        // use, `base[length[i] + 1]`) that CONTAINS another subject's use edit
+        // takes that inner's rendered text in place of the inner's original
+        // text and records the inner span, which the AST pass then skips.
+        let mut contained = Vec::new();
+        {
+            let uses = match &entries[index].1 {
+                Decision::Cursor { plan, .. } => plan.uses.clone(),
+                Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Opt { .. }
+                | Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => Vec::new(),
+            };
+            for (k, outer) in uses.iter().enumerate() {
+                if !matches!(
+                    outer.bridge_kind,
+                    "cursor-constructor" | "cursor-advance" | "cursor-element" | "cursor-address"
+                ) {
+                    continue;
+                }
+                let mut text = outer.replacement.clone();
+                let mut spans = Vec::new();
+                for (j, (other, decision)) in entries.iter().enumerate() {
+                    if j == index || other.fn_did != owner {
+                        continue;
+                    }
+                    let inner_uses = match decision {
+                        Decision::Slice { uses, .. }
+                        | Decision::NestedSlice { uses, .. }
+                        | Decision::Opt { uses, .. } => uses,
+                        Decision::Cursor { .. }
+                        | Decision::Ref { .. }
+                        | Decision::InferredRef { .. }
+                        | Decision::Box(_)
+                        | Decision::Degraded(_) => continue,
+                    };
+                    for inner in inner_uses
+                        .iter()
+                        .filter(|inner| contains(outer.span, inner.span))
+                    {
+                        let Ok(original) = source_map.span_to_snippet(inner.span) else {
+                            failed = true;
+                            break;
+                        };
+                        if text.matches(original.as_str()).count() != 1 {
+                            failed = true;
+                            break;
+                        }
+                        text = text.replacen(&original, &inner.replacement, 1);
+                        spans.push(inner.span);
+                    }
+                }
+                if !spans.is_empty() {
+                    contained.push((k, text, spans));
+                }
+            }
+        }
+        if failed {
+            entries[index].1 = prior.clone();
+            receipts[receipt].disposition = Err(CursorHold::UseUnbuilt);
+            continue;
+        }
+        match &mut entries[index].1 {
+            Decision::Cursor { plan, .. } => {
+                for (k, text, spans) in contained {
+                    plan.uses[k].replacement = text;
+                    plan.composed_edit_spans.extend(spans);
+                }
+            }
+            Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => unreachable!("committed cursor entry"),
+        }
+        if splices.is_empty() {
+            continue;
+        }
+        for &(_, j, o, ref text) in &splices {
+            if let Some(outer) = use_edits_mut(&mut entries[j].1) {
+                outer[o].replacement = text.clone();
+            }
+        }
+        let dropped = splices.iter().map(|s| s.0).collect::<Vec<_>>();
+        match &mut entries[index].1 {
+            Decision::Cursor { plan, .. } => {
+                let mut k = 0;
+                plan.uses.retain(|_| {
+                    k += 1;
+                    !dropped.contains(&(k - 1))
+                });
+                let mut k = 0;
+                plan.use_hirs.retain(|_| {
+                    k += 1;
+                    !dropped.contains(&(k - 1))
+                });
+            }
+            Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => unreachable!("committed cursor entry"),
+        }
+    }
+}
+
+pub(crate) fn inspect_subject(
+    tcx: TyCtxt<'_>,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    subject: &Subject,
+) -> admission::Admission {
+    let body = tcx
+        .mir_drops_elaborated_and_const_checked(subject.fn_did)
+        .borrow();
+    let kinds = model_kinds(subject.fn_did, body.local_decls.indices(), slots, model);
+    admission::inspect(
+        tcx,
+        subject.fn_did,
+        &body,
+        admission::Candidate {
+            local: subject.local,
+            slot_depth: usize::from(subject.ptr_depth.saturating_sub(1)),
+            model_kind: kinds
+                .get(&subject.local)
+                .copied()
+                .unwrap_or(admission::ModelKind::Missing),
+        },
+        &kinds,
+    )
+}
+
+fn model_kinds(
+    owner: LocalDefId,
+    locals: impl Iterator<Item = Local>,
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> BTreeMap<Local, admission::ModelKind> {
+    locals
+        .map(|local| {
+            let kind = slots
+                .fn_local_slots
+                .get(&owner)
+                .and_then(|universe| universe.slot_for_local_depth(local, 0))
+                .and_then(|slot| model.get(&SlotRef::Local(owner, slot)));
+            let kind = match kind {
+                Some(SlotKind::Ref) => admission::ModelKind::Ref,
+                Some(SlotKind::Raw) => admission::ModelKind::Raw,
+                Some(SlotKind::Owning) => admission::ModelKind::Owning,
+                None => admission::ModelKind::Missing,
+            };
+            (local, kind)
+        })
+        .collect()
+}
+
+/// **R619-6 — SC-2's per-site receipt, `entry-window:top-index`.** One row per
+/// parameter cursor that never moves and reads a `Top` index: the entry window
+/// is kept, and a C-valid negative index below it would panic (the accepted
+/// behaviour waiver of R608-1; premise register SC-2). A `Neg` or loaded index
+/// is held in `wrapper::build` before any plan exists, so it never reaches this
+/// table. Rows are the final decision table's; delivery is the join with the
+/// subject outcomes.
+pub(crate) fn entry_window_receipts(
+    tcx: TyCtxt<'_>,
+    sign: &super::super::sign_facts::SignFacts,
+    entries: &[(Subject, Decision)],
+) -> String {
+    let mut out = String::from("owner_fn\tsubject_key\tparameter\treceipt\n");
+    for (subject, decision) in entries {
+        // S3.0: an exhaustive match, so a new disposition is a compile error.
+        let parameter_cursor = match decision {
+            Decision::Cursor { plan, .. } => plan.wrapper && plan.parameter,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_)
+            | Decision::Degraded(_) => false,
+        };
+        // `Top` is the taint bit read as a verdict, never a lookup miss:
+        // `Some(true)` only, so an unanalyzed local is not counted as waived.
+        if parameter_cursor
+            && sign.verdict(subject.fn_did, subject.local) == Some(true)
+            && wrapper::never_moves(tcx, subject)
+        {
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            out.push_str(&format!(
+                "{owner}\t{}\t{}\tentry-window:top-index\n",
+                subject.identity_key(&owner),
+                subject.param_name.as_deref().unwrap_or("-"),
+            ));
+        }
+    }
+    out
+}
+
+pub(super) fn is_cursor_reason(reason: &DegradeReason) -> bool {
+    matches!(
+        reason,
+        DegradeReason::SliceNegOrUnknownOffset
+            | DegradeReason::SliceCursorUse
+            | DegradeReason::SliceUseUnsupported
+    )
+}
+
+#[cfg(test)]
+#[path = "cursor/native_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "cursor/delivered_tests.rs"]
+mod delivered_tests;
+
+#[cfg(test)]
+#[path = "cursor/custody_tests.rs"]
+mod custody_tests;
+
+#[cfg(test)]
+#[path = "cursor/wrapper_tests.rs"]
+mod wrapper_tests;
+
+/// The archive belongs to one program at one source frame. A second worker for
+/// the same pair (a census bisect probe, a retry) may write into it; a row from
+/// another program or frame may not.
+#[cfg(test)]
+fn custody_matches(prior: &serde_json::Value, program: &str, frame: &str) -> bool {
+    prior.get("program").and_then(serde_json::Value::as_str) == Some(program)
+        && prior.get("frame").and_then(serde_json::Value::as_str) == Some(frame)
+}

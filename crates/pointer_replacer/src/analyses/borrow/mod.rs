@@ -38,15 +38,15 @@ macro_rules! disallow_interprocedural {
     };
 }
 
-mod errors;
-mod invalidates;
-mod killed;
+pub mod errors;
+pub mod invalidates;
+pub mod killed;
 pub mod lifetime_flow;
-mod loan_liveness;
+pub mod loan_liveness;
 mod places_conflict;
-mod provenance_liveness;
-mod requires;
-mod subset_closure;
+pub mod provenance_liveness;
+pub mod requires;
+pub mod subset_closure;
 
 rustc_index::newtype_index! {
     #[orderable]
@@ -158,10 +158,10 @@ impl std::fmt::Debug for ProvenanceData {
 /// This formulation is definitely wrong as we don't create [`Origin`]
 /// for nested pointers. But I guess it could be fine?
 pub struct ProvenanceSet {
-    local_data: IndexVec<Local, Option<Provenance>>,
+    pub local_data: IndexVec<Local, Option<Provenance>>,
     field_data: FxHashMap<StructFieldSlot, Option<Provenance>>,
-    provenance_data: IndexVec<Provenance, ProvenanceData>,
-    tree_borrow_local: RefCell<UnionFind<Local>>,
+    pub provenance_data: IndexVec<Provenance, ProvenanceData>,
+    pub tree_borrow_local: RefCell<UnionFind<Local>>,
 }
 
 impl ProvenanceSet {
@@ -172,7 +172,7 @@ impl ProvenanceSet {
         }
     }
 
-    fn owner_for_place<'tcx, D: HasLocalDecls<'tcx>>(
+    pub fn owner_for_place<'tcx, D: HasLocalDecls<'tcx>>(
         &self,
         local_decls: &D,
         place: Place<'tcx>,
@@ -191,7 +191,7 @@ impl ProvenanceSet {
             .map(|_| ProvenanceOwner::Field(field))
     }
 
-    fn disable_owner(&mut self, owner: ProvenanceOwner) -> bool {
+    pub fn disable_owner(&mut self, owner: ProvenanceOwner) -> bool {
         match owner {
             ProvenanceOwner::Local(local) => {
                 let changed = self.local_data[local].is_some();
@@ -390,9 +390,9 @@ rustc_index::newtype_index! {
 impl<C> DebugWithContext<C> for Loan {}
 
 pub struct BorrowData<'tcx> {
-    location: Location,
-    borrowed: Place<'tcx>,
-    assigned: Borrower,
+    pub location: Location,
+    pub borrowed: Place<'tcx>,
+    pub assigned: Borrower,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -409,9 +409,9 @@ impl std::fmt::Debug for BorrowData<'_> {
 }
 
 pub struct BorrowSet<'tcx> {
-    loans: IndexVec<Loan, BorrowData<'tcx>>,
-    location_map: FxHashMap<Location, Vec<Loan>>,
-    local_map: SparseBitMatrix<Local, Loan>,
+    pub loans: IndexVec<Loan, BorrowData<'tcx>>,
+    pub location_map: FxHashMap<Location, Vec<Loan>>,
+    pub local_map: SparseBitMatrix<Local, Loan>,
 }
 
 pub trait HasBorrowSet<'tcx> {

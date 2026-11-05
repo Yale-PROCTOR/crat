@@ -66,6 +66,12 @@ cargo run --bin crat -- \
 ```
 
 This will create `~/rs-transformed/sum` containing the transformed Rust code.
+A second pointer pass, `pointer-bo` (crate `pointer_replacer_bo`, a joint
+borrow/ownership analysis), replaces raw pointers with safe references, slices
+and boxes. To use it, write `pointer-bo` in place of `pointer` in the list
+above; it expects the `expand`, `extern` and `preprocess` passes before it, as
+above. Its settings are read from the `[pointer-bo]` table of the configuration
+file. The `pointer` pass (crate `pointer_replacer`) is unchanged.
 Run the following commands to run the program:
 
 ```bash

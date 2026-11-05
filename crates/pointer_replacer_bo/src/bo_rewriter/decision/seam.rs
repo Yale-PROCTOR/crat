@@ -1,0 +1,9154 @@
+//! **Type-directed seam adapters** at mismatched argument positions.
+//!
+//! S3.6-1 converts a callee's parameter and the caller's binding *jointly* where
+//! the co-conversion class links them. Where the class graph has no edge, the
+//! two ends convert independently and the argument position is left ill-typed —
+//! measured at 2,950 positions, **100 % `E0308`**, which is the whole of the
+//! 95.7 % revert load.
+//!
+//! A seam adapter is one expression of glue at that position, bridging the form
+//! the caller supplies to the form the callee now expects.
+//!
+//! # Two families, and the exposure the reborrow one carries
+//!
+//! - **Safe** — `Some(x)`, `x.unwrap()`, `slice::from_mut/from_ref`, `&mut x[0]`
+//!   and their compositions. No `unsafe`, compiler-checked end to end.
+//! - **Reborrow** — `&mut *p` / `&*p`. One expression, borrow scoped to the
+//!   call.
+//!
+//! **The reborrow family is placed exactly where the compiler stops checking
+//! aliasing** (`-1` micro-plan §5a, the inversion finding): `two_mut(&mut v,
+//! &mut v)` on a real local is `E0499`, but through a raw base it compiles with
+//! zero diagnostics. That is why the site gates — `duplicate-place-root` and P2
+//! `BlindOnly` — apply to adapter-generated arguments **exactly as to converted
+//! ones**, with no bypass. A gate that skipped glue would move the argument from
+//! the checked region into the unchecked one and book it as yield.
+//!
+//! # Slice seams are length-gated, and no length is ever fabricated
+//!
+//! `*mut T → &[T]` needs a length. `slice::from_raw_parts` with an oversized
+//! `len` is **UB at construction** by its own safety contract — not on first
+//! out-of-bounds read — so a guessed constant is unsound the moment it is built.
+//! Those positions gate under [`SeamBlock::LengthUnknown`] until a length source
+//! is proven. **65.7 % of the measured market sits behind that gate**, which is
+//! why it is a first-class outcome here rather than a `None`.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use rustc_span::Span;
+
+use super::a5_site_proof::{A5PeerProof, A5ProofSiteKey, A5SeamProofIndex, A5SiteProofVerdict};
+use crate::bo_rewriter::bridge_receipt::{
+    BridgeCalleeId, BridgeExtentKind, BridgeRetentionTier, BridgeSitePlan,
+    RAW_BOUNDARY_T2_WAIVER_ID, SignatureClassId,
+};
+
+/// The pointer-ish form a value has at an argument position.
+///
+/// `Raw` carries no mutability: the glue's mutability follows the **expected**
+/// side. `&*p` is well-formed on a `*mut T` and `&mut *p` is not obtainable from
+/// a `*const T` at all, so reading the raw side's constness would only let a
+/// caller ask for something the callee's own converted type already forbids.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Form {
+    Cursor { mutable: bool },
+    Raw,
+    Ref { mutable: bool },
+    Slice { mutable: bool },
+    NestedSlice { mutable: bool, inner_mutable: bool },
+    Opt { mutable: bool, slice: bool },
+}
+
+impl Form {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Form::Cursor { mutable: true } => "cursor-mut",
+            Form::Cursor { mutable: false } => "cursor-shared",
+            Form::NestedSlice {
+                mutable: false,
+                inner_mutable: false,
+            } => "nested-slice-shared",
+            Form::NestedSlice {
+                mutable: false,
+                inner_mutable: true,
+            } => "nested-slice-shared-mut",
+            Form::NestedSlice {
+                mutable: true,
+                inner_mutable: false,
+            } => "nested-slice-mut-shared",
+            Form::NestedSlice {
+                mutable: true,
+                inner_mutable: true,
+            } => "nested-slice-mut-mut",
+            Form::Raw => "raw",
+            Form::Ref { mutable: true } => "ref-mut",
+            Form::Ref { mutable: false } => "ref-shared",
+            Form::Slice { mutable: true } => "slice-mut",
+            Form::Slice { mutable: false } => "slice-shared",
+            Form::Opt {
+                mutable: true,
+                slice: true,
+            } => "opt-slice-mut",
+            Form::Opt {
+                mutable: false,
+                slice: true,
+            } => "opt-slice-shared",
+            Form::Opt {
+                mutable: true,
+                slice: false,
+            } => "opt-ref-mut",
+            Form::Opt {
+                mutable: false,
+                slice: false,
+            } => "opt-ref-shared",
+        }
+    }
+}
+
+/// Why a position could not be adapted. **A first-class outcome**, never a
+/// silent skip — an unadapted position is a revert, and a revert with no reason
+/// is a yield number nobody can attribute.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SeamBlock {
+    CursorBoundaryUnbuilt,
+    NestedBoundaryUnbuilt,
+    /// A slice form is expected and the argument is raw: a length is needed and
+    /// **none may be invented**. Ruling item 4.
+    LengthUnknown,
+    /// `&mut T` expected, a shared borrow supplied. Not upgradable.
+    SharedToMut,
+    /// The argument's expression is not one this slice can name — a bare cast, a
+    /// null literal, a call result, arithmetic.
+    UnnameableOperand,
+    /// An optional source cannot satisfy a required target without a positive
+    /// non-null/nonempty proof. Wave 2 has no such proof at this seam, so it
+    /// never inserts an unchecked or panicking unwrap.
+    NullabilityInsufficient,
+    /// Two positions at one call site may borrow the same place, and at least
+    /// one wants `&mut`. **The gate applies to adapter-generated arguments
+    /// exactly as to converted ones** (ruling item 3, 2026-08-11): glue may not
+    /// bypass it, because the reborrow family places its borrow precisely where
+    /// §5a measured borrowck as blind.
+    SiteOverlap,
+    /// The converted callee is known to retain this parameter. A call-scoped
+    /// raw-to-safe bridge cannot license a reference that escapes the call.
+    PositiveRetention,
+    /// A slice cannot be projected to a required thin reference without a
+    /// carried proof that the slice has at least one element.
+    NonemptyUnknown,
+    /// A raw expression cannot enter a safe return without the typed origin
+    /// permit that supplies the emitted return lifetime.
+    ReturnLifetimeAbsent,
+    ReturnInterfaceUnavailable,
+    /// A5 selected a raw-view fallback from a shared safe value to a mutable
+    /// raw parameter, but the callee has no Foster/libc negative-write proof.
+    A5NegativeWriteAbsent,
+    /// The proof-site identity is sound but the settled safe form has no
+    /// mechanical raw-view template in this wave.
+    A5RawViewUnavailable,
+    /// A counted byte view would start from a local this table decided thin
+    /// (or from a converted subject's own storage) without a fitting proof
+    /// that the count equals the named place — never widen a thin reference.
+    CountedVoidRoot,
+    /// Wave-6o (relay 122): a THIN optional reference at a callee formal that
+    /// ended raw, the formal a C string (`c_char` pointee): casting the thin
+    /// reference hands the callee one byte of provenance for the whole string.
+    /// Held, receipted; the fat twin (`Option<&[c_char]>`) is bridged instead.
+    ThinCStringToRaw,
+    /// The same at any other pointee: the raw callee's access extent is not
+    /// known to be one element.
+    ThinOptionalToRaw,
+    /// **R622-1 / R628-2 (R416-5).** A one-element `from_ref` / `from_mut`
+    /// into a formal the callee accesses past its first element.
+    OneElementIntoWider,
+}
+
+impl SeamBlock {
+    /// Wave-6o (relay 122): the blocks whose revert key is the CALLER.
+    pub(crate) fn held_at_caller(self) -> bool {
+        matches!(
+            self,
+            SeamBlock::ThinCStringToRaw | SeamBlock::ThinOptionalToRaw
+        )
+    }
+
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            SeamBlock::NestedBoundaryUnbuilt => "nested-boundary-unbuilt",
+            SeamBlock::CursorBoundaryUnbuilt => "cursor-boundary-unbuilt",
+            SeamBlock::LengthUnknown => "seam-len-unknown",
+            SeamBlock::SharedToMut => "seam-shared-to-mut",
+            SeamBlock::UnnameableOperand => "seam-unnameable-operand",
+            SeamBlock::NullabilityInsufficient => "glue-nullability-insufficient",
+            SeamBlock::SiteOverlap => "seam-site-overlap",
+            SeamBlock::PositiveRetention => "seam-positive-retention",
+            SeamBlock::NonemptyUnknown => "seam-nonempty-unknown",
+            SeamBlock::ReturnLifetimeAbsent => "return-lifetime-permit-absent",
+            SeamBlock::ReturnInterfaceUnavailable => "return-interface-unavailable",
+            SeamBlock::A5NegativeWriteAbsent => "raw-boundary-shared-to-mut:negative-write-absent",
+            SeamBlock::A5RawViewUnavailable => "a5-raw-view-template-unavailable",
+            SeamBlock::CountedVoidRoot => "counted-void:safe-root-extent-unproved",
+            SeamBlock::ThinCStringToRaw => "held:thin-cstring-to-libc",
+            SeamBlock::ThinOptionalToRaw => "held:thin-optional-to-raw-formal",
+            SeamBlock::OneElementIntoWider => "seam-one-element-into-wider-formal",
+        }
+    }
+}
+
+/// What the callee's own signature says about a companion length.
+///
+/// Measured on the SIGNATURE rather than the call site, because the C idiom
+/// this is looking for — `void f(int *buf, size_t len)` — is a property of the
+/// declaration: every caller of such a function supplies the length in the same
+/// position, so the signature answers for all of them at once.
+///
+/// **Adjacency is evidence, not proof.** `f(dst, src, n)` has an integer in the
+/// position after `src` that is the length of BOTH pointers, and `f(p, flags)`
+/// has one that is a length of nothing. This enum records what was seen; it
+/// does not certify a length, and no seam is placed from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LenEvidence {
+    /// An integer-typed parameter immediately AFTER the pointer — the dominant
+    /// C spelling.
+    Following,
+    /// An integer-typed parameter immediately BEFORE it.
+    Preceding,
+    /// An integer parameter exists somewhere in the signature, but not adjacent.
+    Elsewhere,
+    /// The signature carries no integer parameter at all. **A length cannot come
+    /// from the call site**, so such a position can only ever be served by
+    /// certified `approx-len` (U-2') or stay gated.
+    None,
+    /// Wave-4 #1b: the callee parameter's contract-extent promotion names the
+    /// exact count argument (`memcpy(dest, src, n)`: `n` for BOTH pointers),
+    /// so the companion is that argument, not the adjacent one.
+    Contract,
+    /// **R625** — no companion, but the argument points at element 0 of a
+    /// `[T; N]` of its own pointee type: the length is `N`, the array's
+    /// (`emitability::array_extent`).
+    ArrayType,
+    /// **R674-9 / R677-6** — no companion (nor array), but the callee's own
+    /// straight-line body reads or writes exactly elements `0..N` of the
+    /// parameter on every call (`element_extent::constant_access_extent`): the
+    /// length is `N`, for an element address and a raw argument alike.
+    CalleeAccess,
+    /// **wave-6l relay 071 (R697-7)** — the argument reads a struct's pointer
+    /// field whose every allocation holds `length + k` elements past it
+    /// (`field_alloc`): the length is that field's, read from the same object.
+    FieldAlloc,
+    /// **wave-6l relay 077 (R776-4)** — a C string the callee reads no further
+    /// than its NUL, with the arm and provenance that prove it terminated
+    /// (`nul_walk_arm`): the length is `strlen + 1`.
+    NulWalk,
+    /// **R707 (wave-4 build 1)** — nor an array: the callee's own accesses
+    /// bound the parameter (`callee_bound`), instantiated with this call's
+    /// arguments. `key` is the full receipt,
+    /// `len-callee-bound:<must|may>:<expr>`.
+    CalleeBound { key: &'static str },
+}
+
+impl LenEvidence {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            LenEvidence::Following => "len-following",
+            LenEvidence::Preceding => "len-preceding",
+            LenEvidence::Elsewhere => "len-elsewhere",
+            LenEvidence::None => "len-absent",
+            LenEvidence::Contract => "len-contract",
+            LenEvidence::ArrayType => "len-array-type",
+            LenEvidence::CalleeAccess => "len-callee-access",
+            LenEvidence::FieldAlloc => "len-field-alloc",
+            LenEvidence::NulWalk => "len-nul-walk",
+            LenEvidence::CalleeBound { key } => key,
+        }
+    }
+}
+
+/// **Which arm produced a placed slice seam's length** — the ruled audit tag
+/// (user ruling 2026-08-12, marker ruled 2026-08-15).
+///
+/// A two-arm type rather than a `bool` beside the evidence, so a fabricated site
+/// can never be counted inside the licensed 277 by accident. `Fabricated`
+/// carries the signature evidence that WAS available, because
+/// bound-verification's derivability question is exactly `Elsewhere` (a
+/// non-adjacent integer exists) vs `None` (none does).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LenArm {
+    /// Ruling B adjacency evidence — the length is the caller's own companion.
+    Licensed(LenEvidence),
+    /// FABRICATED. The placeholder was placed where no companion exists.
+    Fabricated(LenEvidence),
+}
+
+impl LenArm {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            // **Byte-identical to the pre-ruling column for all 277 licensed
+            // placements** — the licensed population's artifact bytes do not
+            // move, which is what makes the fabricated count a clean addition
+            // rather than a re-keying.
+            LenArm::Licensed(e) => e.key(),
+            LenArm::Fabricated(_) => "len-fabricated",
+        }
+    }
+
+    #[cfg(test)]
+    /// The signature evidence, whichever arm placed the length. The
+    /// `lengated` rows read this so the `len-elsewhere` / `len-absent` split
+    /// survives fabrication as bound-verification's derivability input.
+    pub(crate) fn evidence(self) -> LenEvidence {
+        match self {
+            LenArm::Licensed(e) | LenArm::Fabricated(e) => e,
+        }
+    }
+}
+
+/// **A slice seam's length, WITH ITS PROVENANCE** (marker ruling, 2026-08-15).
+///
+/// The provenance rides *in* the value rather than beside it, so "fabricate
+/// without tagging it" is not expressible **in the emitted text**.
+///
+/// ⚠ **That was originally claimed for the ARTIFACT too, and it was false.**
+/// `synthesize` decided the audit arm by its own `match` on the companion text,
+/// so the tag and the length were two expressions reading one variable — they
+/// agreed by coincidence, and forcing the tag one way left the emitted text
+/// untouched with the whole suite green (ADV-FAB-01). Repaired 2026-08-15: the
+/// arm is derived from this field after `glue` answers, so the claim now holds
+/// because of the code rather than in spite of it. The prefix-testing
+/// `glue_shape` classifier was retired for the same reason — a second derivation
+/// of a fact the decision already holds is a defect waiting for a mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SeamLen {
+    /// The caller's own companion argument text (ruling B adjacency).
+    Licensed(String),
+    /// The fabricated placeholder, rendered as the named const the emitter
+    /// inserts. Carries no text because there is none to carry — which is the
+    /// point.
+    Fabricated,
+    /// **R477-6 — the masked companion's `mask + 1`.** The text is derived from
+    /// a call-site argument, so it is evidence about the indexes the callee
+    /// forms; the read width at such an index and the allocation are NOT
+    /// bounded by it, so the site is ALSO counted as a fabricated extent under
+    /// §77. Both halves of the ruling in one value: the emitted length is the
+    /// derived text, the receipt says fabricated.
+    MaskDerived(String),
+    /// **R500-8 — the count picked BY POSITION.** The sibling immediately
+    /// following the pointer in the signature is admissible as the count, and
+    /// the emitted length IS that argument's text — but a positional pick is a
+    /// guess, not evidence, so the receipt counts it with the fabricated
+    /// extents under §77 exactly as the 1024 fallback is counted. The
+    /// parameter's name rides along so the receipt can name what was guessed.
+    PositionalSibling { text: String, param: String },
+    /// **wave-6l relay 063 (R645-5).** The fabricated extent where a companion
+    /// was REFUSED: an argument only ever `0` (`only-zero`), a mask offered
+    /// as a count (`mask-as-count:<arg>`),
+    /// or the masked arm's `mask + 1` of a constant mask (`no-op-mask:<arg>`,
+    /// relay 066). Rendered and counted exactly as [`Fabricated`](Self::Fabricated); the
+    /// receipt names the refusal: `fallback(extent-refused:<reason>)`.
+    Refused(String),
+    /// **wave-6l relay 067.** A companion the EXTENT PROVER licensed
+    /// (`extent_proof::prove_parameter_extent`), rendered as a licensed one;
+    /// the receipt names the proof and its premises:
+    /// `evidence(extent-proof:<premises>:<text>)`.
+    Proven { text: String, premises: String },
+    /// **wave-6l relay 077 (R776-4).** `strlen + 1` of a C string the NUL-walk
+    /// arm licensed (`nul_walk_arm`), rendered as a licensed length; the
+    /// receipt names the arm and the provenance: `evidence(nul-walk:<arm>:<provenance>)`.
+    NulWalk { text: String, receipt: String },
+}
+
+/// **wave-6l relay 077.** The binding a NUL-walk construction gives its base,
+/// which its `strlen + 1` length reads.
+pub(crate) const NUL_WALK_BASE: &str = "__crat_nul_walk_base";
+
+/// **wave-6l R825-4a.** The bindings a null-guarded field-allocated
+/// construction gives its base and its length (a `match` arm's, bound after
+/// both are evaluated).
+pub(crate) const FIELD_BASE: &str = "__crat_field_base";
+pub(crate) const FIELD_LEN: &str = "__crat_field_len";
+
+impl SeamLen {
+    /// The length's source text. **The single place both emitters read it
+    /// from**, so the span layer's string and the AST layer's parsed node come
+    /// from one derivation rather than two spellings of the same const.
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            SeamLen::Licensed(t) | SeamLen::MaskDerived(t) => t,
+            SeamLen::PositionalSibling { text, .. }
+            | SeamLen::Proven { text, .. }
+            | SeamLen::NulWalk { text, .. } => text,
+            SeamLen::Fabricated | SeamLen::Refused(_) => FABRICATED_LEN_PATH,
+        }
+    }
+
+    /// **Counted as fabricated, deliberately** — the mask bounds the indexes
+    /// and nothing else, and §77's audit is where that residue is counted.
+    pub(crate) fn is_fabricated(&self) -> bool {
+        matches!(
+            self,
+            SeamLen::Fabricated
+                | SeamLen::Refused(_)
+                | SeamLen::MaskDerived(_)
+                | SeamLen::PositionalSibling { .. }
+        )
+    }
+
+    #[cfg(test)]
+    /// What was guessed, when the length is a positional pick: the receipt
+    /// reads `fallback(sibling-by-position:<param>)`.
+    pub(crate) fn positional_param(&self) -> Option<&str> {
+        match self {
+            SeamLen::PositionalSibling { param, .. } => Some(param),
+            _ => None,
+        }
+    }
+}
+
+/// The one fallback slice extent (§39 addendum 77): N = 2^28, the census's N of record (R693-1)
+/// and the value the twenty and the TRACTOR 376 were measured at. The switch
+/// `CRAT_FALLBACK_SLICE_EXTENT` that set it per run (unset = 1,024) is fixed at that value (the
+/// master-merge cleanup S3, the user's word in main's session 11-02). This is the numeric
+/// source of truth for call-site adapters, the borrowed-slice emission path, every emitted
+/// declaration and every receipt.
+pub(crate) const FALLBACK_SLICE_EXTENT: usize = 268_435_456;
+
+/// The const's name in the emitted crate (marker ruling, 2026-08-15).
+pub(crate) const SEAM_LEN_CONST: &str = "FALLBACK_SLICE_EXTENT";
+
+/// The path a fabricated extent is spelled as at the call site.
+///
+/// Crate-qualified so a fabricated site in a non-root file resolves — the
+/// spelling the frozen legacy rewriter already used for `crate::slice_cursor::`.
+pub(crate) const FABRICATED_LEN_PATH: &str = "crate::FALLBACK_SLICE_EXTENT";
+
+/// **The const item, as emitted text — produced from a real AST item.**
+///
+/// The marker ruling says *named const via `item!`*, and this is that: the text
+/// is `pprust`'s rendering of a node the parser accepted, not a hand-written
+/// string that merely looks like Rust. A typo in a string blob would reach the
+/// emitted crate and fail at the callers' `verify`, attributed to them; a typo
+/// here fails at `parse_item`, attributed to itself.
+///
+/// The parsed node is **printed and discarded**, never inserted into a krate, so
+/// the fresh-`ParseSess` span-aliasing hazard cannot follow it — the node's spans
+/// never leave this function.
+///
+/// One producer, two consumers: the span layer splices this string and the AST
+/// layer appends it, so the two emitters cannot disagree about the const's text.
+pub(crate) fn fabricated_len_item() -> String {
+    let extent = FALLBACK_SLICE_EXTENT;
+    let item = ::utils::item!("const {SEAM_LEN_CONST}: usize = {extent};");
+    rustc_ast_pretty::pprust::item_to_string(&item)
+}
+
+/// Which family a placed adapter came from. Reported in the artifacts' seam
+/// column so the reborrow population — the one carrying the aliasing exposure —
+/// stays countable on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SeamFamily {
+    Safe,
+    Reborrow,
+}
+
+/// One placed adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SeamInputRendering {
+    ZeroSyntax {
+        found: Form,
+    },
+    Adapter {
+        replacement: String,
+        spec: GlueSpec,
+        family: SeamFamily,
+        found: Form,
+        len_arm: Option<LenArm>,
+        retention: BridgeRetentionTier,
+        waiver_id: Option<String>,
+    },
+}
+
+/// A decided-form zero-syntax call position whose raw/input-form twin becomes
+/// active only if its source subject is reverted by verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RevertFoundFormEdit {
+    pub span: Span,
+    pub arg_span: Span,
+    pub owner_class: SignatureClassId,
+    pub source_node: (LocalDefId, HirId),
+    pub input: SeamInputRendering,
+}
+
+/// Frozen input and evidence needed to seal an outbound operand after class
+/// finalization. Text is carried from the exact original AST spans.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawOutboundEndpoint {
+    pub(crate) return_independent: Option<super::slice_return_evidence::ReturnIndependence>,
+    pub(crate) returned_child: Option<super::raw_boundary::ReturnedChildSiteEvidence>,
+    pub(crate) mutable_binding_required: bool,
+    pub(crate) target: super::raw_boundary::RawTargetType,
+    pub(crate) original_expression: String,
+    pub(crate) operand_expression: String,
+    pub(crate) ownership: Option<super::raw_boundary_contracts::OwnershipContract>,
+    pub(crate) negative_write: bool,
+    pub(crate) box_slice: bool,
+    pub(crate) enclosing_unsafe_fn: bool,
+    /// Can the callee hand a pointer back, by return or by output storage?
+    /// The terminal emission needs this to decide a shared source's fate when
+    /// no contract row supplies returned-child evidence.
+    pub(crate) callee_may_yield_pointer: bool,
+    /// K18'/OAP-CHILD-ACCESS: what the caller does with a pointer a
+    /// contract-less callee may hand back. `None` keeps the child unknown.
+    pub(crate) child_access: Option<super::returned_child::ChildAccess>,
+}
+
+/// Recheck only frozen returned-child evidence against the terminal view.
+/// A source form change cannot reuse an earlier shared-write permission bit.
+pub(crate) fn terminal_returned_child_permission(
+    evidence: Option<&super::raw_boundary::ReturnedChildSiteEvidence>,
+    source_shape: &str,
+    terminal_source: Form,
+) -> Result<(), super::raw_boundary::ReturnedChildPermissionFailure> {
+    let Some(evidence) = evidence else { return Ok(()) };
+    if evidence.raw_field_parent && source_shape == "raw-expr" {
+        return Ok(());
+    }
+    let actual_view = match source_shape {
+        "addr-of" | "addr-of-cast" => Form::Ref { mutable: false },
+        "addr-of-mut" | "addr-of-mut-cast" => Form::Ref { mutable: true },
+        _ => terminal_source,
+    };
+    let Some(source) = decision_for_safe_form(actual_view) else { return Ok(()) };
+    super::raw_boundary::returned_child_permission(
+        &source,
+        evidence.child.as_ref().ok().map(|child| &child.access),
+    )
+}
+
+/// One placed adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SeamEdit {
+    pub(crate) raw_outbound: Option<RawOutboundEndpoint>,
+    pub(crate) zero_syntax: bool,
+    /// The **argument expression's** span, in the CALLER's file.
+    pub span: Span,
+    /// Whole call expression used only for class attribution.
+    pub call_span: Span,
+    pub replacement: String,
+    /// Direct identity of the converted signature class. This is the sole
+    /// ownership key used by verification; `owner_fn` is display-only.
+    pub owner_class: SignatureClassId,
+    pub bridge: BridgeSitePlan,
+    /// The callee subject whose conversion justifies this edit — the revert key.
+    /// The edit lands in the caller's file and is owned by the callee, which is
+    /// the divergence `plan`'s `owner_fn` doc was written for.
+    pub owner_fn: String,
+    /// Digest of the callee's finalized E2 signature plan. `None` means this
+    /// seam is unrelated to E2; it may never be reconstructed downstream.
+    pub lifetime_plan_digest: Option<String>,
+    /// The caller side of `CallAdapterKey`.
+    pub caller_fn: String,
+    /// The callee's zero-based parameter position.
+    pub param_index: usize,
+    /// The HIR argument classifier's carried answer. This is receipt-only; no
+    /// consumer re-infers the source shape from replacement text.
+    pub source_shape: &'static str,
+    pub family: SeamFamily,
+    /// **Which adjacency arm licensed this slice seam's length** (ruling B,
+    /// 2026-08-11). `None` for every non-slice seam, which needs no length.
+    ///
+    /// Carried NOW rather than added when the bound-verification follow-up runs:
+    /// that check certifies or corrects each selection, and it can only be
+    /// surgical if it can tell a `following` selection from a `preceding` one
+    /// without re-deriving the choice.
+    /// **Fabricated placements ride the same field, tagged** (2026-08-15), so
+    /// the licensed 277 and the fabricated 93 are one vocabulary in two arms —
+    /// never one blended count.
+    pub len_arm: Option<LenArm>,
+    /// **The adapter, DESCRIBED** — option A's carried interface (2026-08-13).
+    ///
+    /// [`Self::replacement`] is `spec.render(<the argument's source text>)`, so
+    /// the two are redundant *by construction* and the span layer keeps reading
+    /// the string. The AST layer reads this instead, because it cannot rebuild a
+    /// wrapper from a rendered string without re-parsing the argument it was
+    /// told to keep as a subtree.
+    pub spec: GlueSpec,
+    /// **The span whose TEXT the replacement was built from** — which is NOT
+    /// always [`Self::span`].
+    ///
+    /// `span` is the whole argument and is what the span layer overwrites. For
+    /// the two cast shapes (`AddrOfCast`, `CastOfLocal`) the decision layer
+    /// builds the replacement from the cast's OPERAND (`ArgShape`'s `inner`),
+    /// so the surviving subtree is nested one level inside the replaced node.
+    ///
+    /// Carried rather than re-derived: an AST layer that peeled casts by
+    /// pattern would be guessing at exactly the point where the span layer
+    /// already knows, and a `Paren` between the cast and its operand would make
+    /// the guess silently wrong.
+    pub arg_span: Span,
+    /// Candidate facts retained for the common receipt schema.
+    pub expected: Form,
+    pub found: Form,
+    /// Compiler identity of the argument's place root, when one exists.
+    pub source_node: Option<(LocalDefId, HirId)>,
+    /// Rendering selected if verification reverts that source subject.
+    pub input_rendering: Option<SeamInputRendering>,
+    pub root_identity: String,
+    pub blind: bool,
+    /// The attested site proof that discharged the conservative overlap gate.
+    /// `None` means this position never needed that gate.
+    pub overlap: Option<A5PositionProof>,
+    /// Raw-boundary subject/site dependency group. Empty for every older seam
+    /// family; populated once by the decision layer and never inferred from
+    /// replacement text.
+    pub atom_ids: Vec<String>,
+}
+
+/// One placed initializer/assignment adapter. It deliberately carries the
+/// same `GlueSpec`/family pair as [`SeamEdit`]; only ownership and context
+/// differ.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BodyEdit {
+    pub span: Span,
+    pub replacement: String,
+    pub owner_class: SignatureClassId,
+    pub bridge: BridgeSitePlan,
+    pub owner_fn: String,
+    pub destination: String,
+    pub context: super::emitability::BodyAdapterContext,
+    pub source_shape: &'static str,
+    pub family: SeamFamily,
+    pub spec: GlueSpec,
+    pub arg_span: Span,
+    pub expected: Form,
+    pub found: Form,
+    pub root_identity: String,
+    pub blind: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PeerConflict {
+    pub left: usize,
+    pub right: usize,
+    pub same_root: bool,
+    pub left_blind: bool,
+    pub right_blind: bool,
+    pub proof: A5PeerProof,
+}
+
+/// One position-level aggregation of all peer proofs consulted by the seam.
+/// Carried into both placed and blocked receipts; a clear no-op candidate also
+/// remains in `SeamPlan::overlap_proofs` so it cannot vanish from the control.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5PositionProof {
+    pub shared_permission: Option<super::overlapping_pairs::consumer::Permission>,
+    pub proof_site_key: Option<A5ProofSiteKey>,
+    pub caller: LocalDefId,
+    pub callee: LocalDefId,
+    pub index: usize,
+    pub span: Span,
+    pub expected_form: Form,
+    pub found_form: Form,
+    pub argument_shape: &'static str,
+    pub candidate_template: String,
+    pub verdict: A5SiteProofVerdict,
+    pub reason: String,
+    pub locations: String,
+    pub peer_receipts: String,
+    /// R833-1: the argument positions whose proof against `index` is not clear.
+    pub unproven_peers: Vec<usize>,
+    pub world: &'static str,
+    pub guard: &'static str,
+    pub fallback: A5ProofSiteFallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum A5ProofSiteFallback {
+    Clear,
+    Primary,
+    T2RawView {
+        template: String,
+        negative_write: Option<super::raw_boundary::NegativeWriteEvidence>,
+    },
+    Held {
+        reason: String,
+    },
+}
+
+impl A5ProofSiteFallback {
+    pub(crate) fn key(&self) -> &'static str {
+        match self {
+            Self::Clear => "a5-site-proof-clear",
+            Self::Primary => "a5-site-proof-pair-primary",
+            Self::T2RawView { .. } => "a5-site-proof-t2-fallback",
+            Self::Held { .. } => "a5-site-proof-reclassified",
+        }
+    }
+}
+
+impl A5PositionProof {
+    fn from_conflicts(
+        caller: LocalDefId,
+        callee: LocalDefId,
+        index: usize,
+        span: Span,
+        expected_form: Form,
+        found_form: Form,
+        argument_shape: &'static str,
+        candidate_template: String,
+        conflicts: &[PeerConflict],
+        proofs: &A5SeamProofIndex,
+    ) -> Self {
+        debug_assert!(!conflicts.is_empty());
+        let verdict = if conflicts
+            .iter()
+            .any(|conflict| conflict.proof.verdict == A5SiteProofVerdict::Overlapping)
+        {
+            A5SiteProofVerdict::Overlapping
+        } else if conflicts
+            .iter()
+            .any(|conflict| conflict.proof.verdict == A5SiteProofVerdict::Undeterminable)
+        {
+            A5SiteProofVerdict::Undeterminable
+        } else {
+            A5SiteProofVerdict::Clear
+        };
+        let reason = match verdict {
+            A5SiteProofVerdict::Clear => "all-peers-clear".to_owned(),
+            A5SiteProofVerdict::Overlapping => "at-least-one-peer-overlapping".to_owned(),
+            A5SiteProofVerdict::Undeterminable => conflicts
+                .iter()
+                .filter(|conflict| conflict.proof.verdict == A5SiteProofVerdict::Undeterminable)
+                .map(|conflict| conflict.proof.reason)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(";"),
+        };
+        let locations = conflicts
+            .iter()
+            .map(|conflict| conflict.proof.location_key())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(";");
+        let peer_receipts = conflicts
+            .iter()
+            .map(|conflict| conflict.proof.receipt(conflict.left, conflict.right))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(";");
+        let unproven_peers = conflicts
+            .iter()
+            .filter(|conflict| conflict.proof.verdict != A5SiteProofVerdict::Clear)
+            .map(|conflict| {
+                if conflict.left == index {
+                    conflict.right
+                } else {
+                    conflict.left
+                }
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut proof_site_key = None;
+        let mut ambiguous_site_key = false;
+        for key in conflicts
+            .iter()
+            .filter_map(|conflict| conflict.proof.site_key(index))
+        {
+            match proof_site_key {
+                None => proof_site_key = Some(key),
+                Some(existing) if existing == key => {}
+                Some(_) => ambiguous_site_key = true,
+            }
+        }
+        if ambiguous_site_key {
+            proof_site_key = None;
+        }
+        Self {
+            proof_site_key,
+            shared_permission: None,
+            caller,
+            callee,
+            index,
+            span,
+            expected_form,
+            found_form,
+            argument_shape,
+            candidate_template,
+            verdict,
+            reason,
+            locations,
+            peer_receipts,
+            unproven_peers,
+            world: proofs.world(),
+            guard: proofs.guard(),
+            fallback: if verdict == A5SiteProofVerdict::Clear {
+                A5ProofSiteFallback::Clear
+            } else {
+                A5ProofSiteFallback::Held {
+                    reason: "a5-proof-site-fallback-unplanned".to_owned(),
+                }
+            },
+        }
+    }
+
+    fn clears_site_overlap(&self) -> bool {
+        self.verdict == A5SiteProofVerdict::Clear
+    }
+}
+
+impl PeerConflict {
+    pub(crate) fn key(&self) -> String {
+        format!(
+            "{}/{}[same_root={},left_blind={},right_blind={}]",
+            self.left,
+            self.right,
+            u8::from(self.same_root),
+            u8::from(self.left_blind),
+            u8::from(self.right_blind)
+        )
+    }
+}
+
+/// A call position rejected after candidate construction. Strings are carried
+/// here so the receipt never re-derives a form from emitted text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockedSeam {
+    pub caller: LocalDefId,
+    pub callee: LocalDefId,
+    pub index: usize,
+    pub span: Span,
+    pub block: SeamBlock,
+    pub expected: Option<Form>,
+    pub found: Option<Form>,
+    pub source_shape: &'static str,
+    pub candidate_template: String,
+    pub null_arm: String,
+    pub extent_arm: String,
+    pub root_identity: String,
+    pub blind: bool,
+    pub peers: Vec<PeerConflict>,
+    pub overlap: Option<A5PositionProof>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BodyBlock {
+    SideEffectingRhs,
+    UnnameableRhs,
+    NullRequiredRef,
+    SharedToMut,
+    RenderRefused,
+}
+
+impl BodyBlock {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::SideEffectingRhs => "body-side-effecting-rhs",
+            Self::UnnameableRhs => "body-unnameable-rhs",
+            Self::NullRequiredRef => "body-null-required-ref",
+            Self::SharedToMut => "body-shared-to-mut",
+            Self::RenderRefused => "body-render-refused",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockedBody {
+    pub owner_class: SignatureClassId,
+    pub owner_fn: String,
+    pub destination: String,
+    pub span: Span,
+    pub context: super::emitability::BodyAdapterContext,
+    pub block: BodyBlock,
+    pub expected: Form,
+    pub found: Option<Form>,
+    pub source_shape: &'static str,
+    pub candidate_template: Option<&'static str>,
+    pub root_identity: String,
+    pub blind: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BlockedRawBoundary {
+    pub owner_class: SignatureClassId,
+    pub bridge: BridgeSitePlan,
+    pub span: Span,
+    pub reason: String,
+}
+
+/// Final explicit type for a source or generated declaration whose surrounding
+/// inference context changes with its signature class. The type is selected in
+/// the decision phase and consumed verbatim by both receipt and AST emission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExplicitDeclarationSite {
+    pub owner_class: SignatureClassId,
+    pub caller: LocalDefId,
+    pub node: Option<(LocalDefId, HirId)>,
+    pub span: Option<Span>,
+    pub category: &'static str,
+    pub emitted_type: String,
+    pub replacement: Option<String>,
+    pub arm: &'static str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ZeroBridgeSite {
+    pub owner_class: SignatureClassId,
+    pub caller: LocalDefId,
+    pub span: Option<Span>,
+    pub arm: &'static str,
+    pub position: String,
+    pub bridge_kind: &'static str,
+    pub expected_form: &'static str,
+    pub found_form: &'static str,
+    pub argument_kind: &'static str,
+    pub retention: BridgeRetentionTier,
+    pub waiver_id: Option<String>,
+    pub unsafe_context: Option<super::super::mechanical_receipt::UnsafeContextPresentation>,
+}
+
+/// Adapter collections sealed against finalized interfaces. Supplying this
+/// carrier makes every collection authoritative, including an empty one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TerminalCallPlans {
+    pub(crate) native_return_sites: Vec<super::emitability::ReturnSiteFact>,
+    pub(crate) outbound_expressions: super::outbound_expression::OutboundExpressionPlans,
+    pub(crate) raw_receivers: super::raw_receiver::RawReceiverPlans,
+    /// wave-6l: native results consumed at deref / cast / assignment positions.
+    pub(crate) native_result_expressions:
+        super::native_result_expression::NativeResultExpressionPlans,
+    pub(crate) receiver_inputs: super::receiver_input::ReceiverInputMap,
+    pub(crate) callee_parameter_inputs: super::callee_parameter_input::InputPlans,
+    pub(crate) surface_arguments: Vec<super::surface_argument::SurfaceArgumentPlan>,
+    pub(crate) return_origin_dependencies: super::lifetime::ReturnOriginAtomDependencies,
+    pub(crate) a5_raw_calls: Vec<A5RawViewCall>,
+    pub(crate) pair_raw_calls: Vec<PairRawViewCall>,
+    pub(crate) seam_edits: Vec<SeamEdit>,
+    pub(crate) revert_found_form_edits: Vec<RevertFoundFormEdit>,
+    /// **R815-7 item 2 (wave-6a 150, F1).** `(callee, caller)` for every
+    /// argument a caller's native Box plan renders itself (the seam's
+    /// `native-box-lend` zero-syntax sites). A native lend leaves no input twin
+    /// at that argument, so the callee follows the caller's reversion. An
+    /// ordinary interface site keeps its input alternative and is not here.
+    pub(crate) native_lend_dependencies: Vec<(SignatureClassId, SignatureClassId)>,
+}
+
+impl TerminalCallPlans {
+    pub(crate) fn effective_reverted_classes(
+        &self,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> BTreeSet<SignatureClassId> {
+        self.input_reversion_closure(classes, atoms).0
+    }
+
+    pub(crate) fn input_reversion_closure(
+        &self,
+        classes: &BTreeSet<SignatureClassId>,
+        atoms: &BTreeSet<String>,
+    ) -> (
+        BTreeSet<SignatureClassId>,
+        BTreeMap<SignatureClassId, BTreeSet<String>>,
+    ) {
+        let mut effective = self
+            .return_origin_dependencies
+            .effective_reverted_classes(classes, atoms);
+        let mut reasons = BTreeMap::<SignatureClassId, BTreeSet<String>>::new();
+        loop {
+            // R815-7 item 2: a reverted caller takes the callees of its
+            // native lends with it, to a fixpoint.
+            loop {
+                let followers = self
+                    .native_lend_dependencies
+                    .iter()
+                    .filter(|(callee, caller)| {
+                        effective.contains(caller) && !effective.contains(callee)
+                    })
+                    .map(|(callee, caller)| (*callee, *caller))
+                    .collect::<Vec<_>>();
+                if followers.is_empty() {
+                    break;
+                }
+                for (callee, caller) in followers {
+                    effective.insert(callee);
+                    reasons.entry(callee).or_default().insert(format!(
+                        "native-lend-caller-reverted:caller={}",
+                        caller.order_key()
+                    ));
+                }
+            }
+            let mut owners = BTreeSet::new();
+            for (&key, input) in &self.callee_parameter_inputs {
+                let Some(Err(reason)) = input.select(&effective, atoms) else { continue };
+                for owner in input.unavailable_owners() {
+                    if effective.contains(&owner) {
+                        continue;
+                    }
+                    owners.insert(owner);
+                    reasons.entry(owner).or_default().insert(format!(
+                        "callee-parameter-input-unavailable:class={}:arg={}..{}:{reason}",
+                        key.0.order_key(),
+                        key.1,
+                        key.2,
+                    ));
+                }
+            }
+            for unavailable in self.receiver_inputs.unavailable.values() {
+                if unavailable.selection.active(&effective, atoms) {
+                    let owner = unavailable.selection.callee;
+                    owners.insert(owner);
+                    reasons.entry(owner).or_default().insert(format!(
+                        "return-receiver-input-unavailable:caller={}:hir={}:{:?}",
+                        unavailable.selection.node.0.local_def_index.as_u32(),
+                        unavailable.selection.node.1.local_id.as_u32(),
+                        unavailable.reason,
+                    ));
+                }
+            }
+            if owners.is_empty() {
+                return (effective, reasons);
+            }
+            let affected = self.return_origin_dependencies.dependents_of(&owners);
+            for owner in affected
+                .difference(&owners)
+                .filter(|owner| !effective.contains(*owner))
+            {
+                reasons
+                    .entry(*owner)
+                    .or_default()
+                    .insert("input-interface-dependency-reverted".to_owned());
+            }
+            effective.extend(affected);
+        }
+    }
+
+    pub(crate) fn candidates(seams: &SeamPlan) -> Self {
+        Self {
+            native_return_sites: seams.native_return_sites.clone(),
+            outbound_expressions: seams.outbound_expressions.clone(),
+            raw_receivers: seams.raw_receivers.clone(),
+            native_result_expressions: seams.native_result_expressions.clone(),
+            receiver_inputs: seams.receiver_inputs.clone(),
+            surface_arguments: seams.surface_arguments.clone(),
+            callee_parameter_inputs: seams.callee_parameter_inputs.clone(),
+            return_origin_dependencies: Default::default(),
+            a5_raw_calls: seams.a5_raw_calls.clone(),
+            pair_raw_calls: seams.pair_raw_calls.clone(),
+            seam_edits: seams.edits.clone(),
+            revert_found_form_edits: seams.revert_found_form_edits.clone(),
+            native_lend_dependencies: {
+                let mut edges = seams
+                    .zero_bridges
+                    .iter()
+                    .filter(|site| site.found_form == "native-box-lend")
+                    .map(|site| (site.owner_class, SignatureClassId::of(site.caller)))
+                    .filter(|(callee, caller)| callee != caller)
+                    .collect::<Vec<_>>();
+                edges.sort();
+                edges.dedup();
+                edges
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PairRawViewTemp {
+    pub argument_index: usize,
+    pub raw_expression: String,
+    pub target_type: String,
+    pub source_node: Option<(LocalDefId, HirId)>,
+    pub argument_expression: String,
+    pub argument_shape: &'static str,
+    pub target: super::raw_boundary::RawTargetType,
+    pub input_rendering: Option<PairRawViewRendering>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PairRawViewRendering {
+    pub raw_expression: String,
+    pub target_type: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PairRawViewCall {
+    pub owner_class: SignatureClassId,
+    pub caller: LocalDefId,
+    pub callee: LocalDefId,
+    pub call_span: Span,
+    pub views: Vec<PairRawViewTemp>,
+    pub reasons: Vec<String>,
+    pub atom_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5RawViewTemp {
+    pub argument_index: usize,
+    /// The plan-time argument subtree, retained so terminal re-planning never
+    /// reconstructs an expression from a receipt string.
+    pub argument_expression: String,
+    /// The same HIR shape key that selected `found_form` at plan time. Terminal
+    /// validation must replay this derivation over the placed subject form.
+    pub argument_shape: &'static str,
+    pub raw_expression: String,
+    pub target_type: String,
+    pub target: super::raw_boundary::RawTargetType,
+    pub adapted_expression: String,
+    pub extent_expression: Option<String>,
+    pub template: String,
+    pub proof_site_key: A5ProofSiteKey,
+    pub unsafe_context: Option<super::super::mechanical_receipt::UnsafeContextPresentation>,
+    pub negative_write: Option<super::raw_boundary::NegativeWriteEvidence>,
+    pub expected_form: Form,
+    pub found_form: Form,
+    pub source_node: Option<(LocalDefId, HirId)>,
+    pub enclosing_unsafe_fn: bool,
+    pub input_rendering: Option<A5RawViewRendering>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5RawViewRendering {
+    pub raw_expression: String,
+    pub target_type: String,
+    pub adapted_expression: String,
+    pub extent_expression: Option<String>,
+    pub template: String,
+    pub unsafe_context: Option<super::super::mechanical_receipt::UnsafeContextPresentation>,
+    pub negative_write: Option<super::raw_boundary::NegativeWriteEvidence>,
+    pub expected_form: Form,
+    pub found_form: Form,
+}
+
+impl A5RawViewRendering {
+    pub(crate) fn from_view(view: &A5RawViewTemp) -> Self {
+        Self {
+            raw_expression: view.raw_expression.clone(),
+            target_type: view.target_type.clone(),
+            adapted_expression: view.adapted_expression.clone(),
+            extent_expression: view.extent_expression.clone(),
+            template: view.template.clone(),
+            unsafe_context: view.unsafe_context,
+            negative_write: view.negative_write,
+            expected_form: view.expected_form,
+            found_form: view.found_form,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5RawViewCall {
+    pub owner_class: SignatureClassId,
+    pub caller: LocalDefId,
+    pub callee: LocalDefId,
+    pub call_span: Span,
+    pub views: Vec<A5RawViewTemp>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct InterfaceInventoryKey {
+    pub(crate) caller: SignatureClassId,
+    pub(crate) callee: SignatureClassId,
+    pub(crate) block: u32,
+    pub(crate) argument_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct InterfaceInventorySite {
+    pub(crate) key: InterfaceInventoryKey,
+    pub(crate) call_span: Span,
+    pub(crate) argument_span: Span,
+    pub(crate) source_shape: &'static str,
+    pub(crate) non_subject: bool,
+    pub(crate) disposition: &'static str,
+}
+
+/// **The authorization rule for fabrication, as a pure function** (R8).
+///
+/// One place decides *licensed vs fabricated*, and it decides it from the only
+/// input that may decide it: whether the call site supplied a companion length.
+/// Lifted out of `glue`'s two arms rather than written twice, because two copies
+/// of an authorization rule is one copy too many — and because a rule inside a
+/// match arm is a rule only a corpus sweep can exercise.
+///
+/// **This is the whole of "fabricate exactly when authorized":** a `Some` input
+/// can only produce `Licensed`, a `None` input can only produce `Fabricated`,
+/// and neither can produce the other.
+fn with_length(spec: GlueSpec, len: Option<&str>) -> GlueSpec {
+    match len {
+        Some(text) => spec.with_len(text),
+        None => spec.with_fabricated_len(),
+    }
+}
+
+/// **R477-6 — the masked companion's length, as a pure function.** `mask + 1`
+/// covers every index `expr & mask` the accessing callee forms. `wrapping_add`
+/// because a mask of `usize::MAX` is representable and a debug overflow there
+/// would be a panic this rule did not intend; the extent is then `0`, an empty
+/// slice rather than a wrong one.
+pub(crate) fn masked_len_text(text: String, masked: bool) -> String {
+    if masked {
+        format!("({text}).wrapping_add(1)")
+    } else {
+        text
+    }
+}
+
+/// `&mut ` or `&`.
+fn amp(mutable: bool) -> &'static str {
+    if mutable { "&mut " } else { "&" }
+}
+
+/// Unwrap an optional **without consuming it**.
+///
+/// `Option<&T>` is `Copy`, so a plain `.unwrap()` leaves the binding usable.
+/// **`Option<&mut T>` is not**, and `.unwrap()` MOVES it — a caller that passes
+/// the same optional to two calls would compile before the rewrite and fail
+/// `E0382` after, which is a rewrite that breaks a working program.
+///
+/// `.as_mut().unwrap()` yields `&mut &mut T`, which deref-coerces to `&mut T` at
+/// the argument position and borrows rather than moves.
+///
+/// **Compile-verified on the pinned toolchain, twice-in-one-body**, because the
+/// single-use spelling passes and the defect only appears on the second use.
+/// The moving form was written first and caught by compiling, not by review.
+fn unwrap_expr(text: &str, mutable: bool) -> String {
+    if mutable {
+        format!("{text}.as_mut().unwrap()")
+    } else {
+        format!("{text}.unwrap()")
+    }
+}
+
+/// **THE GLUE SPEC — the reification ruled at the arm-3 boundary (2026-08-13).**
+///
+/// Glue used to be manufactured as TEXT here and consumed as text downstream.
+/// The AST application layer cannot build a node from a rendered string without
+/// re-parsing the argument it was told to keep as a subtree — the round-trip
+/// arm 1 declined — so the shape the decision layer already knew is now
+/// CARRIED rather than re-derived.
+///
+/// **Reification only.** No decision, gate, family or position-walk change: the
+/// spec is computed at exactly the sites that already computed the string, and
+/// [`GlueSpec::render`] reproduces that string byte-for-byte. That equality is
+/// GATED, not asserted — see `render_is_byte_identical_to_the_frozen_glue_text`.
+///
+/// The dependency arrow runs application→decision: this type lives here, and
+/// the AST layer consumes it. The import denylist is untouched.
+///
+/// Every arm of [`glue`] is one point in a small algebra —
+/// `[Some(] core([unwrap(] text [)]) [)]` — which is why five cores suffice for
+/// all fourteen emitting arms.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GlueCore {
+    /// `X` — the argument unchanged (the payload already fits).
+    Bare,
+    /// `&mut *X` / `&*X`
+    Reborrow,
+    /// `unsafe { X.as_mut() }` / `unsafe { X.as_ref() }` for a nullable raw
+    /// pointer crossing into an optional safe parameter.
+    RawOption,
+    /// `X.first().unwrap()` / `X.first_mut().unwrap()` under a carried
+    /// nonempty contract.
+    First,
+    /// `&mut X[0]` / `&X[0]`
+    Index0,
+    /// `&mut X[OFFSET..]` / `&X[OFFSET..]`, preserving a native return origin.
+    Suffix { offset: u64 },
+    /// `core::slice::from_raw_parts{_mut}(X, (LEN) as usize)`
+    FromRawParts,
+    /// `core::slice::from_mut(X)` / `core::slice::from_ref(X)`
+    FromRefMut,
+}
+
+/// How an optional TARGET treats null at the call boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NullArm {
+    /// Not a raw-to-optional boundary. `optional=true` still means a known-safe
+    /// reference/slice is wrapped in `Some`.
+    None,
+    /// The source expression is a raw pointer. Evaluate it once, test
+    /// `is_null`, and construct the payload only on the non-null branch.
+    Checked,
+    /// The raw pointer's `as_ref`/`as_mut` API performs the null-to-Option
+    /// mapping directly and evaluates the receiver once.
+    PointerApi,
+    /// The source expression is syntactically a null literal.
+    LiteralNone,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawBoundaryGlue {
+    pub template: super::raw_boundary::BridgeTemplate,
+    pub target_mutability: super::raw_boundary::RawMutability,
+    pub box_slice: bool,
+    pub force_explicit: bool,
+    pub cast_pointee: Option<String>,
+}
+
+/// One adapter, described rather than rendered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GlueSpec {
+    pub(crate) counted_byte: Option<super::counted_void::CountedByte>,
+    /// wave-6b: the argument is a void buffer bridged as one typed region.
+    pub(crate) void_region: Option<super::void_region::Bridge>,
+    pub(crate) forward_slice: Option<super::slice_forms::ForwardView>,
+    pub shared_address: Option<super::overlapping_pairs::consumer::SharedAddress>,
+    /// wave-6p (R407-5): an `&mut place` argument at a SHARED formal is emitted
+    /// as `&(place)` / `Some(&(place))` — a strictly weaker borrow.
+    pub shared_weakening: Option<super::shared_weakening::SharedWeakening>,
+    pub core: GlueCore,
+    /// The EXPECTED side's mutability — selects `&`/`&mut` and
+    /// `from_ref`/`from_mut`.
+    pub mutable: bool,
+    /// The unwrap that precedes the core when the FOUND side is optional.
+    /// `Some(true)` is `.as_mut().unwrap()`, `Some(false)` is `.unwrap()` —
+    /// the distinction `unwrap_expr` exists for, carried rather than inferred.
+    pub unwrap: Option<bool>,
+    /// The length, `FromRawParts` only, **with its provenance**.
+    ///
+    /// The held fabricated-length slice landed HERE, exactly as this doc
+    /// predicted, rather than at a string substitution. `None` still means
+    /// refused — but after the 2026-08-12 ruling `glue` no longer produces it
+    /// for the two length-needing arms, which fabricate instead. What `None`
+    /// now guards is the layer BELOW the gate: a builder handed a length-less
+    /// `FromRawParts` still places nothing.
+    pub len: Option<SeamLen>,
+    /// Wrap the result in `Some(...)`.
+    pub optional: bool,
+    /// The §29 boundary behavior. Separate from `optional`: a safe reference
+    /// uses ordinary `Some`, while a raw expression must be checked.
+    pub null_arm: NullArm,
+    /// Raw-boundary wave-1's explicit safe-to-raw form. Kept inside the seam
+    /// algebra so span and AST consumers share one carried template.
+    pub raw_boundary: Option<RawBoundaryGlue>,
+    pub nonempty_evidence: bool,
+    /// Exact source type for the one-evaluation local introduced by a checked
+    /// nullable bridge. `None` means this spec introduces no local.
+    pub checked_binding_type: Option<String>,
+    /// **R583-8 wall 1 (wave-6a)**: an OPTIONAL `Box` owner at an optional
+    /// reference formal — `X.as_deref_mut()` (`Some(true)`) / `X.as_deref()`
+    /// — the owner's own view, `None` for `None`: the panic-free spelling the
+    /// R422-5 owner-view glue lacked.
+    pub(crate) option_view: Option<bool>,
+    /// **wave-6l R825-4a (R517-10).** A `FromRawParts` whose base may still
+    /// hold its field's null initializer: the construction evaluates the base
+    /// and the length once and a null base is the empty slice (the
+    /// declaration planner's rendering), never a slice of the length on a
+    /// null pointer.
+    pub(crate) null_base_empty: bool,
+    /// **R1128-1 / relay 334**: the operand is KNOWN to be a raw pointer (a subject whose final decision is
+    /// `Degraded`, or an array decay `….as_mut_ptr()` / `.as_ptr()`), so a non-null reborrow of it may take
+    /// the `CRAT_BRIDGE_SPELLING` method form. False by default: a reference or `Box` operand (a converted
+    /// formal, a copy source, an owner view, a delivered field) keeps `&*` / `&mut *`.
+    pub(crate) raw_operand: bool,
+}
+
+impl GlueSpec {
+    pub(crate) fn requires_unsafe(&self) -> bool {
+        if let Some(raw) = &self.raw_boundary {
+            return matches!(
+                raw.template,
+                super::raw_boundary::BridgeTemplate::CursorSharedToRawConst
+                    | super::raw_boundary::BridgeTemplate::CursorMutToRawMut
+                    | super::raw_boundary::BridgeTemplate::CursorMutToRawConst
+            );
+        }
+        self.raw_boundary.is_none()
+            && matches!(
+                self.core,
+                GlueCore::Reborrow | GlueCore::RawOption | GlueCore::FromRawParts
+            )
+    }
+
+    pub(crate) fn core(core: GlueCore, mutable: bool) -> Self {
+        Self {
+            counted_byte: None,
+            void_region: None,
+            forward_slice: None,
+            shared_address: None,
+            shared_weakening: None,
+            core,
+            mutable,
+            unwrap: None,
+            len: None,
+            optional: false,
+            null_arm: NullArm::None,
+            raw_boundary: None,
+            nonempty_evidence: false,
+            checked_binding_type: None,
+            option_view: None,
+            null_base_empty: false,
+
+            raw_operand: false,
+        }
+    }
+
+    pub(crate) fn with_unwrap(mut self, found_mutable: bool) -> Self {
+        self.unwrap = Some(found_mutable);
+        self
+    }
+
+    pub(crate) fn with_len(mut self, len: &str) -> Self {
+        self.len = Some(SeamLen::Licensed(len.to_owned()));
+        self
+    }
+
+    /// **The fabricated extent** (user ruling 2026-08-12; marker 2026-08-15).
+    ///
+    /// Deliberately a *separate* constructor from [`Self::with_len`] rather than
+    /// a flag on it: the two produce different emitted text and different
+    /// artifact rows, and a caller must name which one it means.
+    pub(crate) fn with_fabricated_len(mut self) -> Self {
+        self.len = Some(SeamLen::Fabricated);
+        self
+    }
+
+    pub(crate) fn wrapped(mut self) -> Self {
+        self.optional = true;
+        self
+    }
+
+    pub(crate) fn checked(mut self) -> Self {
+        self.optional = true;
+        self.null_arm = NullArm::Checked;
+        self
+    }
+
+    pub(crate) fn pointer_option(mut self) -> Self {
+        self.optional = true;
+        self.null_arm = NullArm::PointerApi;
+        self
+    }
+
+    pub(crate) fn with_nonempty_evidence(mut self) -> Self {
+        self.nonempty_evidence = true;
+        self
+    }
+
+    pub(crate) fn with_checked_binding_type(mut self, ty: String) -> Self {
+        self.checked_binding_type = Some(ty);
+        self
+    }
+
+    pub(crate) fn literal_none(mutable: bool) -> Self {
+        Self {
+            counted_byte: None,
+            void_region: None,
+            forward_slice: None,
+            shared_address: None,
+            shared_weakening: None,
+            core: GlueCore::Bare,
+            mutable,
+            unwrap: None,
+            len: None,
+            optional: true,
+            null_arm: NullArm::LiteralNone,
+            raw_boundary: None,
+            nonempty_evidence: false,
+            checked_binding_type: None,
+            option_view: None,
+            null_base_empty: false,
+
+            raw_operand: false,
+        }
+    }
+
+    pub(crate) fn raw_boundary(
+        template: super::raw_boundary::BridgeTemplate,
+        target_mutability: super::raw_boundary::RawMutability,
+        box_slice: bool,
+        force_explicit: bool,
+    ) -> Self {
+        Self {
+            counted_byte: None,
+            void_region: None,
+            forward_slice: None,
+            shared_address: None,
+            shared_weakening: None,
+            core: GlueCore::Bare,
+            mutable: target_mutability == super::raw_boundary::RawMutability::Mut,
+            unwrap: None,
+            len: None,
+            optional: false,
+            null_arm: NullArm::None,
+            raw_boundary: Some(RawBoundaryGlue {
+                template,
+                target_mutability,
+                box_slice,
+                force_explicit,
+                cast_pointee: None,
+            }),
+            nonempty_evidence: false,
+            checked_binding_type: None,
+            option_view: None,
+            null_base_empty: false,
+
+            raw_operand: false,
+        }
+    }
+
+    pub(crate) fn raw_boundary_target(
+        template: super::raw_boundary::BridgeTemplate,
+        target: &super::raw_boundary::RawTargetType,
+        box_slice: bool,
+        force_explicit: bool,
+    ) -> Self {
+        let mut spec = Self::raw_boundary(template, target.mutability, box_slice, force_explicit);
+        spec.raw_boundary
+            .as_mut()
+            .expect("constructed")
+            .cast_pointee = target
+            .depth2
+            .as_ref()
+            .map(|depth2| depth2.inner_pointee.clone())
+            .or_else(|| {
+                (target.is_void_pointee()
+                    || matches!(
+                        template,
+                        super::raw_boundary::BridgeTemplate::CursorSharedToRawConst
+                            | super::raw_boundary::BridgeTemplate::CursorMutToRawMut
+                            | super::raw_boundary::BridgeTemplate::CursorMutToRawConst
+                            | super::raw_boundary::BridgeTemplate::OptRefMutToRawMut
+                            | super::raw_boundary::BridgeTemplate::RefMutToWritableRawConst
+                            | super::raw_boundary::BridgeTemplate::SliceMutToWritableRawConst
+                            | super::raw_boundary::BridgeTemplate::OptRefMutToWritableRawConst
+                            | super::raw_boundary::BridgeTemplate::OptSliceMutToWritableRawConst
+                            | super::raw_boundary::BridgeTemplate::TypedRawTemporary
+                            | super::raw_boundary::BridgeTemplate::OptRefToRawConst
+                            | super::raw_boundary::BridgeTemplate::OptRefToRawMut
+                            | super::raw_boundary::BridgeTemplate::OptSliceToRaw
+                            | super::raw_boundary::BridgeTemplate::OptSliceToRawMut
+                    ))
+                .then(|| target.pointee.clone())
+            });
+        spec
+    }
+
+    pub(crate) fn null_arm_key(&self) -> &'static str {
+        if self.unwrap.is_some() {
+            return "callee-required";
+        }
+        match self.null_arm {
+            NullArm::Checked => "checked-is-null",
+            NullArm::PointerApi => "raw-pointer-option",
+            NullArm::LiteralNone => "literal-none",
+            NullArm::None if self.optional => "known-some",
+            NullArm::None => "-",
+        }
+    }
+
+    pub(crate) fn extent_arm_key(&self) -> &'static str {
+        match self.len.as_ref() {
+            Some(SeamLen::Licensed(_)) => "evidence-backed",
+            Some(SeamLen::Proven { .. }) => "evidence-backed:extent-proof",
+            // The whole receipt (`nul-walk:<arm>:<provenance>`, the contract
+            // function and position included, R780-3), interned: the set of
+            // receipts is finite, and the row is audited by it.
+            Some(SeamLen::NulWalk { receipt, .. }) => {
+                static INTERNED: std::sync::OnceLock<
+                    std::sync::Mutex<rustc_hash::FxHashSet<&'static str>>,
+                > = std::sync::OnceLock::new();
+                let key = format!("evidence-backed:{receipt}");
+                let mut interned = INTERNED
+                    .get_or_init(Default::default)
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match interned.get(key.as_str()) {
+                    Some(found) => found,
+                    None => {
+                        let leaked: &'static str = Box::leak(key.into_boxed_str());
+                        interned.insert(leaked);
+                        leaked
+                    }
+                }
+            }
+            Some(SeamLen::MaskDerived(_)) => "mask-plus-one@addendum-77",
+            Some(SeamLen::PositionalSibling { .. }) => "fallback-sibling-by-position@addendum-77",
+            Some(SeamLen::Fabricated) | Some(SeamLen::Refused(_)) => "fallback-1024",
+            None => "-",
+        }
+    }
+
+    pub(crate) fn template_key(&self) -> &'static str {
+        if self.shared_address.is_some() {
+            return "shared-pair-address";
+        }
+        if let Some(weakening) = &self.shared_weakening {
+            return weakening.key();
+        }
+        if let Some(raw) = self.raw_boundary.as_ref() {
+            return raw.template.key();
+        }
+        // The owner view is a `Bare` core with neither a wrapper nor an unwrap:
+        // left to the core match it would read `scalar-reference` (main 116 §2).
+        if let Some(mutable) = self.option_view {
+            return if mutable {
+                "owner-option-view-mut"
+            } else {
+                "owner-option-view"
+            };
+        }
+        if self.null_arm == NullArm::PointerApi {
+            return match self.core {
+                GlueCore::RawOption if self.mutable => "c-raw-option-mut",
+                GlueCore::RawOption => "c-raw-option-shared",
+                GlueCore::FromRawParts => "c-raw-option-slice",
+                GlueCore::Bare
+                | GlueCore::Reborrow
+                | GlueCore::First
+                | GlueCore::Index0
+                | GlueCore::Suffix { .. }
+                | GlueCore::FromRefMut => "optional",
+            };
+        }
+        if self.null_arm == NullArm::Checked && matches!(self.core, GlueCore::FromRawParts) {
+            return "c-raw-option-slice";
+        }
+        if self.unwrap.is_some() {
+            return "nullable-required-unwrap";
+        }
+        if !self.optional {
+            match self.core {
+                GlueCore::Reborrow if self.mutable => return "c-raw-reborrow-mut",
+                GlueCore::Reborrow => return "c-raw-reborrow-shared",
+                GlueCore::FromRawParts if self.mutable => return "c-raw-slice-mut",
+                GlueCore::FromRawParts => return "c-raw-slice-shared",
+                GlueCore::Bare | GlueCore::RawOption | GlueCore::Index0 | GlueCore::FromRefMut => {}
+                GlueCore::First | GlueCore::Suffix { .. } => {}
+            }
+        }
+        if self.optional {
+            "optional"
+        } else {
+            match self.core {
+                GlueCore::FromRawParts => "slice",
+                GlueCore::FromRefMut if self.mutable => "thin-to-slice-mut",
+                GlueCore::FromRefMut => "thin-to-slice-shared",
+                GlueCore::First if self.mutable => "slice-to-thin-mut",
+                GlueCore::First => "slice-to-thin-shared",
+                GlueCore::Suffix { .. } if self.mutable => "slice-suffix-mut",
+                GlueCore::Suffix { .. } => "slice-suffix-shared",
+                GlueCore::Reborrow | GlueCore::RawOption | GlueCore::Index0 | GlueCore::Bare => {
+                    "scalar-reference"
+                }
+            }
+        }
+    }
+
+    /// **The census's `glue_shape`, CARRIED rather than inferred** — condition 5
+    /// of the option-A ruling.
+    ///
+    /// `seam_tsv` used to recover the shape by testing PREFIXES of the rendered
+    /// replacement. Same column, same ten-word vocabulary, strictly better
+    /// provenance — but it IS a schema semantics change, because the prefix test
+    /// reads a string the argument's own text contributes to and this reads the
+    /// decision.
+    ///
+    /// **Two inherited quirks are reproduced deliberately, not repaired here.**
+    /// The classifier tested `.contains(".unwrap()")` BEFORE the `Some(` tests,
+    /// so an unwrap under a wrapper reported `unwrap`/`as_mut_unwrap` rather
+    /// than the wrapper's shape; and `Some(&X[0])` fell through the
+    /// `Some(&mut *`/`Some(&*` test to `some_wrap`. Both are kept so this
+    /// function is provably zero-delta wherever the classifier was right, and
+    /// the places it was NOT right are the measured movement rather than a
+    /// change of vocabulary mixed in with it.
+    pub(crate) fn shape_key(&self) -> &'static str {
+        if self.raw_boundary.is_some() {
+            return "raw-boundary";
+        }
+        // Before the core match, which would read the owner view's `Bare`
+        // core with no wrapper as `index` (main 116 §2). This column's own
+        // vocabulary is underscored (R588-5).
+        if let Some(mutable) = self.option_view {
+            return if mutable {
+                "owner_option_view_mut"
+            } else {
+                "owner_option_view"
+            };
+        }
+        match self.null_arm {
+            NullArm::LiteralNone => return "none",
+            NullArm::Checked => {
+                return match self.core {
+                    GlueCore::FromRawParts => "checked_from_raw_parts",
+                    GlueCore::RawOption => "checked_optional",
+                    GlueCore::Reborrow => "checked_reborrow",
+                    _ => "checked_optional",
+                };
+            }
+            NullArm::PointerApi => return "raw_option",
+            NullArm::None => {}
+        }
+        if let Some(found_mutable) = self.unwrap {
+            return if found_mutable {
+                "as_mut_unwrap"
+            } else {
+                "unwrap"
+            };
+        }
+        match (self.optional, &self.core) {
+            (true, GlueCore::FromRawParts) => "some_from_raw_parts",
+            (true, GlueCore::Reborrow) => "some_reborrow",
+            (true, GlueCore::RawOption) => "checked_optional",
+            (true, GlueCore::First) => "some_wrap",
+            (true, GlueCore::FromRefMut) => "some_from_ref_mut",
+            (true, GlueCore::Suffix { .. }) => "some_suffix",
+            // `Some(&X[0])` matches neither `Some(&mut *` nor `Some(&*`.
+            (true, GlueCore::Bare | GlueCore::Index0) => "some_wrap",
+            (false, GlueCore::FromRawParts) => "from_raw_parts",
+            (false, GlueCore::Reborrow) => "reborrow",
+            (false, GlueCore::RawOption) => "checked_optional",
+            (false, GlueCore::First) => "first",
+            (false, GlueCore::FromRefMut) => "from_ref_mut",
+            (false, GlueCore::Suffix { .. }) => "suffix",
+            // `index` is the classifier's FALLBACK arm, and the two cores that
+            // land in it are **not** in the same position — a distinction this
+            // comment previously got wrong, in the direction this track calls
+            // its founding failure class.
+            //
+            // - `Index0` here is REACHABLE and REAL: `glue`'s `(Ref, Slice)`
+            //   arm builds exactly `core(Index0, w)` with no unwrap and no
+            //   wrapper, rendering `&w X[0]`, which the retired classifier fell
+            //   through to `index`. It is corpus-ZERO on the frozen corpus, and
+            //   corpus-zero is not unreachable.
+            // - `Bare` here is unreachable: with neither an unwrap nor a
+            //   wrapper it renders the argument unchanged, and `glue` returns
+            //   `Ok(None)` for every pairing that would need it. The one spec
+            //   that is a `Bare` core with neither, the owner view
+            //   (`option_view`, R583-8), takes its own key above, before
+            //   this match.
+            //
+            // Both are matched together because the classifier gave both the
+            // same answer; only the reachability claim differed.
+            (false, GlueCore::Bare | GlueCore::Index0) => "index",
+        }
+    }
+
+    /// Render the spec as the span layer's text. **Byte-identical to the
+    /// pre-reification `format!` set, and gated as such.**
+    ///
+    /// `None` when a length-bearing core carries no length. **This used to
+    /// substitute an empty string**, printing
+    /// `core::slice::from_raw_parts(p, () as usize)` — not merely invalid Rust
+    /// but a *silent length substitution*, in the one place this milestone's
+    /// hardest invariant says none may ever happen, while [`Self::len`]'s own
+    /// doc promised `None`-means-refused. Prose asserting a check the code did
+    /// not have, on the exact socket the HELD fabricated-length slice is
+    /// designed to plug into. The AST builder already refused this input and
+    /// counted it (`len_absent`); the renderer did not. Found by the
+    /// adversarial review.
+    ///
+    /// Unreachable through [`glue`], which returns [`SeamBlock::LengthUnknown`]
+    /// first — so this is fail-closed structure rather than a live path, and it
+    /// moves no corpus line.
+    pub(crate) fn render(&self, text: &str) -> Option<String> {
+        self.render_in_context(text, false)
+    }
+
+    /// Render with the enclosing function's preserved safety qualifier.
+    /// Edition-2018 legacy output omits a redundant inner `unsafe` block in an
+    /// existing `unsafe fn`; safe functions retain exactly one wrapper.
+    pub(crate) fn render_in_context(
+        &self,
+        text: &str,
+        enclosing_unsafe_fn: bool,
+    ) -> Option<String> {
+        if let Some(counted) = self.counted_byte {
+            return super::counted_void::render_bridge(self, counted, text);
+        }
+        if let Some(address) = &self.shared_address {
+            return address.render(text);
+        }
+        if let Some(mutable) = self.option_view {
+            return Some(format!(
+                "{text}.{}()",
+                if mutable { "as_deref_mut" } else { "as_deref" }
+            ));
+        }
+        // R465-5: an `Option` has no index, so when a spec carries BOTH the
+        // unwrap and a forward view the unwrap opens the base first —
+        // `&mut b.as_mut().unwrap()[e..]`, never `(&mut b[e..]).unwrap()`.
+        // The glue matrix never returns a forward view, so no spec built
+        // before wave-6o's computed-view arm carries both and nothing existing
+        // moves; `wave6o_the_unwrap_opens_the_base_before_the_view_shifts_it`
+        // pins the three renderings.
+        let opened = self
+            .forward_slice
+            .as_ref()
+            .and(self.unwrap)
+            .map(|found_mutable| unwrap_expr(text, found_mutable));
+        let shifted = self
+            .forward_slice
+            .as_ref()
+            .map(|view| view.render(opened.as_deref().unwrap_or(text)));
+        let unwrap_consumed = opened.is_some();
+        let text = shifted.as_deref().unwrap_or(text);
+        if let Some(weakening) = &self.shared_weakening {
+            return weakening.render(text);
+        }
+        let unsafe_expr = |inner: String| {
+            super::super::mechanical_receipt::present_unsafe_text(inner, enclosing_unsafe_fn)
+        };
+        if let Some(region) = &self.void_region {
+            return Some(if region.from_slice {
+                region.render_slice(text)
+            } else {
+                unsafe_expr(region.render(text, self.mutable))
+            });
+        }
+        if let Some(raw) = self.raw_boundary.as_ref() {
+            let rendered = if raw.force_explicit {
+                raw.template.render_explicit(
+                    text,
+                    raw.target_mutability,
+                    raw.box_slice,
+                    raw.cast_pointee.as_deref(),
+                )
+            } else {
+                raw.template.render(
+                    text,
+                    raw.target_mutability,
+                    raw.box_slice,
+                    raw.cast_pointee.as_deref(),
+                )
+            };
+            return match rendered.ok()? {
+                super::raw_boundary::BridgeRender::ZeroSyntax => Some(text.to_owned()),
+                super::raw_boundary::BridgeRender::Edit(replacement) if self.requires_unsafe() => {
+                    Some(unsafe_expr(replacement))
+                }
+                super::raw_boundary::BridgeRender::Edit(replacement) => Some(replacement),
+                super::raw_boundary::BridgeRender::Lifecycle => Some(text.to_owned()),
+            };
+        }
+        if self.null_arm == NullArm::LiteralNone {
+            return Some("None".to_owned());
+        }
+        let argument = text;
+        if self.null_arm == NullArm::PointerApi && matches!(self.core, GlueCore::RawOption) {
+            let method = if self.mutable { "as_mut" } else { "as_ref" };
+            return Some(unsafe_expr(format!("{argument}.{method}()")));
+        }
+        let checked_name = "__crat_call_adapter_ptr";
+        let text = if self.null_arm == NullArm::Checked {
+            checked_name
+        } else {
+            text
+        };
+        let base = match self.unwrap {
+            Some(found_mutable) if !unwrap_consumed => unwrap_expr(text, found_mutable),
+            Some(_) | None => text.to_owned(),
+        };
+        let inner = match self.core {
+            GlueCore::Bare => base,
+            GlueCore::Reborrow => {
+                let deref = format!("{}*{base}", amp(self.mutable));
+                // R1128-1: the NON-NULL raw-to-reference bridge (`c-raw-reborrow-*`) takes the
+                // switch's spelling; an unwrapped optional and the `Some(..)` forms keep `&*`.
+                if self.raw_operand
+                    && self.unwrap.is_none()
+                    && !self.optional
+                    && self.null_arm != NullArm::Checked
+                {
+                    unsafe_expr(crate::bo_rewriter::bridge_spelling::text(
+                        &base,
+                        self.mutable,
+                    ))
+                } else {
+                    unsafe_expr(deref)
+                }
+            }
+            GlueCore::RawOption => {
+                let method = if self.mutable { "as_mut" } else { "as_ref" };
+                unsafe_expr(format!("{base}.{method}()"))
+            }
+            GlueCore::First => {
+                let method = if self.mutable { "first_mut" } else { "first" };
+                format!("{base}.{method}().unwrap()")
+            }
+            GlueCore::Index0 => format!("{}{base}[0]", amp(self.mutable)),
+            GlueCore::Suffix { offset } => format!("{}{base}[{offset}..]", amp(self.mutable)),
+            GlueCore::FromRawParts => {
+                let ctor = if self.mutable {
+                    "from_raw_parts_mut"
+                } else {
+                    "from_raw_parts"
+                };
+                let call = match self.len.as_ref()? {
+                    // The C spelling is `size_t`/`c_int`/`c_ulong` depending on
+                    // the header and `from_raw_parts` takes `usize`, so the
+                    // companion is cast; parenthesised because it may be an
+                    // arbitrary expression.
+                    // R477-6: the masked companion's text is a call-site
+                    // expression like the licensed one and is rendered the same
+                    // way; only the receipt tells them apart.
+                    // wave-6l relay 077: a length that reads the NUL-walk's
+                    // bound base binds it, whichever variant carries it.
+                    SeamLen::Licensed(len) | SeamLen::NulWalk { text: len, .. }
+                        if len.contains(NUL_WALK_BASE) =>
+                    {
+                        format!(
+                            "{{ let {NUL_WALK_BASE} = {base}; core::slice::{ctor}({NUL_WALK_BASE}, ({len}) as usize) }}"
+                        )
+                    }
+                    // wave-6l R825-4a: a field-allocated length over a base
+                    // that may hold the field's null initializer.
+                    SeamLen::Licensed(len) if self.null_base_empty => {
+                        let empty = if self.mutable { "&mut []" } else { "&[]" };
+                        format!(
+                            "match ({base}, ({len}) as usize) {{ ({FIELD_BASE}, {FIELD_LEN}) => if {FIELD_BASE}.is_null() {{ {empty} }} else {{ core::slice::{ctor}({FIELD_BASE}, {FIELD_LEN}) }}, }}"
+                        )
+                    }
+                    SeamLen::Licensed(len)
+                    | SeamLen::MaskDerived(len)
+                    | SeamLen::Proven { text: len, .. }
+                    | SeamLen::NulWalk { text: len, .. }
+                    // R500-8: a positional count is a call-site expression too;
+                    // only the receipt tells it from a licensed one.
+                    | SeamLen::PositionalSibling { text: len, .. } => {
+                        format!("core::slice::{ctor}({base}, ({len}) as usize)")
+                    }
+                    // **No cast and no parentheses**: the const is declared
+                    // `usize`, and casting it would make a fabricated site
+                    // textually indistinguishable from a licensed one whose
+                    // companion happened to be a path.
+                    SeamLen::Fabricated | SeamLen::Refused(_) => {
+                        format!("core::slice::{ctor}({base}, {FABRICATED_LEN_PATH})")
+                    }
+                };
+                unsafe_expr(call)
+            }
+            GlueCore::FromRefMut => {
+                let ctor = if self.mutable { "from_mut" } else { "from_ref" };
+                format!("core::slice::{ctor}({base})")
+            }
+        };
+        Some(if self.null_arm == NullArm::Checked {
+            let ty = self.checked_binding_type.as_deref()?;
+            format!(
+                "{{ let {checked_name}: {ty} = {argument}; if {checked_name}.is_null() {{ None }} else {{ Some({inner}) }} }}"
+            )
+        } else if self.optional {
+            format!("Some({inner})")
+        } else {
+            inner
+        })
+    }
+}
+
+/// The glue that turns a value of `found` into one of `expected`.
+///
+/// - `Ok(None)` — the forms already agree, or coerce. **No edit.**
+/// - `Ok(Some(spec))` — the adapter, DESCRIBED.
+/// - `Err(block)` — this position cannot be adapted, with its reason.
+///
+/// # Half 2 of the option-A reification (2026-08-13)
+///
+/// Every arm used to `format!` its answer over the argument's source text.
+/// It now names a [`GlueSpec`], and the caller renders that spec over the same
+/// text — so `spec.render(text)` is the string this function used to return,
+/// **byte for byte**, and the argument no longer reaches this function at all.
+///
+/// That the text is not a parameter here is the substance of the change rather
+/// than a tidy-up: an adapter is a shape, the argument is a subtree, and the
+/// AST layer needs the first without being handed a rendering of the second.
+///
+/// **Reification only** — no arm's `(expected, found)` pattern, guard, family
+/// or `Err` moved. Each `format!` became the spec that renders to it.
+pub(crate) fn glue(
+    expected: Form,
+    found: Form,
+    len: Option<&str>,
+) -> Result<Option<(GlueSpec, SeamFamily)>, SeamBlock> {
+    glue_with_nonempty(expected, found, len, true)
+}
+
+fn glue_with_nonempty(
+    expected: Form,
+    found: Form,
+    len: Option<&str>,
+    nonempty: bool,
+) -> Result<Option<(GlueSpec, SeamFamily)>, SeamBlock> {
+    use Form::*;
+    // A shared borrow can never satisfy a `&mut` position, whatever the shapes
+    // either side. Checked first so every arm below may assume mutability is
+    // obtainable.
+    let shared_to_mut = |want: bool, have: bool| want && !have;
+
+    Ok(match (expected, found) {
+        (NestedSlice { .. }, _) | (_, NestedSlice { .. }) => {
+            return Err(SeamBlock::NestedBoundaryUnbuilt);
+        }
+        // A wrapper cursor handed whole to a slice position: the cursor's own
+        // use edit renders its tail view (`as_slice` / `as_slice_mut`) at the
+        // argument, so the seam adds nothing; mutability is still checked.
+        (Slice { mutable: w }, Cursor { mutable: h }) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            None
+        }
+        (Cursor { .. }, _) | (_, Cursor { .. }) => return Err(SeamBlock::CursorBoundaryUnbuilt),
+        // ---- identities and coercions: no edit ----
+        (Ref { mutable: w }, Ref { mutable: h }) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            None // `&mut T` coerces to `&T`
+        }
+        (Slice { mutable: w }, Slice { mutable: h }) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            None
+        }
+        (
+            Opt {
+                mutable: w,
+                slice: ws,
+            },
+            Opt {
+                mutable: h,
+                slice: hs,
+            },
+        ) if ws == hs => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            None
+        }
+
+        // ---- reborrow family: a raw base becomes a reference ----
+        (Ref { mutable }, Raw) => Some((
+            GlueSpec::core(GlueCore::Reborrow, mutable),
+            SeamFamily::Reborrow,
+        )),
+        (
+            Opt {
+                mutable,
+                slice: false,
+            },
+            Raw,
+        ) => Some((
+            GlueSpec::core(GlueCore::RawOption, mutable).pointer_option(),
+            SeamFamily::Reborrow,
+        )),
+
+        // ---- slice seams: a length from the CALL SITE, or FABRICATED ----
+        //
+        // Ruling B (2026-08-11): both adjacency arms license the companion
+        // argument as the length — `len` is that argument's own source text.
+        //
+        // **Ruling B's `None` arm is SUPERSEDED (2026-08-12).** Where no
+        // companion exists — `len-elsewhere` and `len-absent`, the full
+        // `seam-len-unknown` population — the position no longer refuses; it
+        // places the seam with the fabricated placeholder extent, uniformly.
+        // The premise is contribution scope: the guarantee is aliasing UB, not
+        // spatial bounds. The carve-out is per SITE and the site is TAGGED, so
+        // it stays countable apart from the licensed placements.
+        //
+        // `LengthUnknown` **stays in the enum** — it is still the honest name
+        // for the condition and the census reports the underlying evidence
+        // under it. What changed is that `glue` no longer returns it.
+        (Slice { mutable }, Raw) => Some((
+            with_length(GlueSpec::core(GlueCore::FromRawParts, mutable), len),
+            SeamFamily::Reborrow,
+        )),
+        (
+            Opt {
+                mutable,
+                slice: true,
+            },
+            Raw,
+        ) => Some((
+            with_length(GlueSpec::core(GlueCore::FromRawParts, mutable), len).checked(),
+            SeamFamily::Reborrow,
+        )),
+
+        // ---- safe family ----
+        (Slice { mutable: w }, Ref { mutable: h }) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            // `from_ref` accepts a `&mut T` by coercion, which is what makes the
+            // measured `&mut T → &[T]` row (30 positions) a safe one rather than
+            // a gap.
+            Some((GlueSpec::core(GlueCore::FromRefMut, w), SeamFamily::Safe))
+        }
+        (Ref { mutable: w }, Slice { mutable: h }) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            if !nonempty {
+                return Err(SeamBlock::NonemptyUnknown);
+            }
+            Some((
+                GlueSpec::core(GlueCore::First, w).with_nonempty_evidence(),
+                SeamFamily::Safe,
+            ))
+        }
+        (
+            Opt {
+                mutable: w,
+                slice: false,
+            },
+            Ref { mutable: h },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            Some((
+                GlueSpec::core(GlueCore::Bare, w).wrapped(),
+                SeamFamily::Safe,
+            ))
+        }
+        (
+            Opt {
+                mutable: w,
+                slice: true,
+            },
+            Ref { mutable: h },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            Some((
+                GlueSpec::core(GlueCore::FromRefMut, w).wrapped(),
+                SeamFamily::Safe,
+            ))
+        }
+        (
+            Opt {
+                mutable: w,
+                slice: false,
+            },
+            Slice { mutable: h },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            Some((
+                GlueSpec::core(GlueCore::Index0, w).wrapped(),
+                SeamFamily::Safe,
+            ))
+        }
+        // The FAT twin of the arm above: the slice is already the payload, so
+        // this is a bare wrap. Found by the exhaustiveness guard rather than by
+        // enumeration — the arms were written from the measured census, and the
+        // census has no `Slice → Option<&[T]>` row because nothing has reached
+        // that position yet.
+        (
+            Opt {
+                mutable: w,
+                slice: true,
+            },
+            Slice { mutable: h },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            Some((
+                GlueSpec::core(GlueCore::Bare, w).wrapped(),
+                SeamFamily::Safe,
+            ))
+        }
+
+        // Under §29, a required callee contract opens the nullable source by a
+        // one-evaluation unwrap. Cross-shape cases compose the same core used
+        // by the non-optional matrix.
+        (
+            Ref { mutable: w },
+            Opt {
+                mutable: h,
+                slice: false,
+            },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            Some((
+                GlueSpec::core(GlueCore::Bare, w).with_unwrap(h),
+                SeamFamily::Safe,
+            ))
+        }
+        (
+            Slice { mutable: w },
+            Opt {
+                mutable: h,
+                slice: true,
+            },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            Some((
+                GlueSpec::core(GlueCore::Bare, w).with_unwrap(h),
+                SeamFamily::Safe,
+            ))
+        }
+        (
+            Slice { mutable: w },
+            Opt {
+                mutable: h,
+                slice: false,
+            },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            Some((
+                GlueSpec::core(GlueCore::FromRefMut, w).with_unwrap(h),
+                SeamFamily::Safe,
+            ))
+        }
+        (
+            Ref { mutable: w },
+            Opt {
+                mutable: h,
+                slice: true,
+            },
+        ) => {
+            if shared_to_mut(w, h) {
+                return Err(SeamBlock::SharedToMut);
+            }
+            if !nonempty {
+                return Err(SeamBlock::NonemptyUnknown);
+            }
+            Some((
+                GlueSpec::core(GlueCore::First, w)
+                    .with_unwrap(h)
+                    .with_nonempty_evidence(),
+                SeamFamily::Safe,
+            ))
+        }
+        (Opt { slice: ws, .. }, Opt { slice: hs, .. }) => {
+            debug_assert_ne!(ws, hs, "identical optional twins matched above");
+            return Err(SeamBlock::NullabilityInsufficient);
+        }
+
+        // A raw position needs no adapter: `&mut T` coerces to `*mut T` at a
+        // call. Measured, and it is why E3b predicts no counter movement here.
+        (Raw, _) => None,
+    })
+}
+
+/// The §29 null-literal arm. Kept beside [`glue`] so both the span and AST
+/// consumers receive an ordinary carried [`GlueSpec`]; null is not a special
+/// rewrite path below the decision layer.
+fn glue_null(expected: Form) -> Result<Option<(GlueSpec, SeamFamily)>, SeamBlock> {
+    match expected {
+        Form::Opt { mutable, .. } => Ok(Some((GlueSpec::literal_none(mutable), SeamFamily::Safe))),
+        _ => Err(SeamBlock::UnnameableOperand),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use Form::*;
+
+    use super::*;
+
+    const T: &str = "p";
+
+    /// **THE RENDERER PARITY ORACLE — every emitting arm of [`glue`], by hand.**
+    ///
+    /// Condition 2 of the option-A ruling: spec + renderer must reproduce
+    /// today's text byte-identically. This pins the RENDERER half of that gate
+    /// now, before any arm is converted, so the conversion lands against a
+    /// fixed target rather than co-evolving with it.
+    ///
+    /// Each row is `(spec, expected text)` transcribed from the corresponding
+    /// `format!` in `glue`. The algebra is `[Some(] core([unwrap(] X [)]) [)]`,
+    /// and these fourteen rows are every composition `glue` can emit.
+    ///
+    /// *Mutation-tested:* dropping the parens in the `FromRawParts` cast, or
+    /// swapping `from_ref`/`from_mut`, fails here.
+    #[test]
+    fn render_reproduces_every_emitting_glue_arm_byte_for_byte() {
+        let cases: Vec<(GlueSpec, &str)> = vec![
+            // (Ref, Raw) and its optional twin
+            (
+                GlueSpec::core(GlueCore::Reborrow, true),
+                "unsafe { &mut *p }",
+            ),
+            (GlueSpec::core(GlueCore::Reborrow, false), "unsafe { &*p }"),
+            (
+                GlueSpec::core(GlueCore::RawOption, true).pointer_option(),
+                "unsafe { p.as_mut() }",
+            ),
+            // (Slice, Raw) and its optional twin
+            (
+                GlueSpec::core(GlueCore::FromRawParts, true).with_len("n"),
+                "unsafe { core::slice::from_raw_parts_mut(p, (n) as usize) }",
+            ),
+            (
+                GlueSpec::core(GlueCore::FromRawParts, false).with_len("n"),
+                "unsafe { core::slice::from_raw_parts(p, (n) as usize) }",
+            ),
+            (
+                GlueSpec::core(GlueCore::FromRawParts, true)
+                    .with_len("n")
+                    .checked()
+                    .with_checked_binding_type("*mut i32".to_owned()),
+                "{ let __crat_call_adapter_ptr: *mut i32 = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, (n) as usize) }) } }",
+            ),
+            // safe family
+            (
+                GlueSpec::core(GlueCore::FromRefMut, true),
+                "core::slice::from_mut(p)",
+            ),
+            (
+                GlueSpec::core(GlueCore::FromRefMut, false),
+                "core::slice::from_ref(p)",
+            ),
+            (GlueSpec::core(GlueCore::Index0, true), "&mut p[0]"),
+            (GlueSpec::core(GlueCore::Bare, false).wrapped(), "Some(p)"),
+            (
+                GlueSpec::core(GlueCore::FromRefMut, false).wrapped(),
+                "Some(core::slice::from_ref(p))",
+            ),
+            (
+                GlueSpec::core(GlueCore::Index0, false).wrapped(),
+                "Some(&p[0])",
+            ),
+            // the null-panic convention: unwrap under each core
+            (
+                GlueSpec::core(GlueCore::Bare, false).with_unwrap(false),
+                "p.unwrap()",
+            ),
+            (
+                GlueSpec::core(GlueCore::Index0, true).with_unwrap(true),
+                "&mut p.as_mut().unwrap()[0]",
+            ),
+        ];
+        for (spec, expected) in cases {
+            assert_eq!(
+                spec.render(T).expect("every emitting spec renders"),
+                expected,
+                "renderer must be byte-identical to the arm it replaces: {spec:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn u0_w1_all_unsafe_glue_cores_share_the_enclosing_context_rule() {
+        let cases = [
+            (
+                GlueSpec::core(GlueCore::Reborrow, false),
+                "&*p",
+                "unsafe { &*p }",
+            ),
+            (
+                GlueSpec::core(GlueCore::RawOption, false),
+                "p.as_ref()",
+                "unsafe { p.as_ref() }",
+            ),
+            (
+                GlueSpec::core(GlueCore::FromRawParts, false).with_len("n"),
+                "core::slice::from_raw_parts(p, (n) as usize)",
+                "unsafe { core::slice::from_raw_parts(p, (n) as usize) }",
+            ),
+            (
+                GlueSpec::core(GlueCore::Reborrow, false).wrapped(),
+                "Some(&*p)",
+                "Some(unsafe { &*p })",
+            ),
+        ];
+        for (spec, unsafe_body, safe_body) in cases {
+            assert_eq!(
+                spec.render_in_context("p", true).as_deref(),
+                Some(unsafe_body)
+            );
+            assert_eq!(
+                spec.render_in_context("p", false).as_deref(),
+                Some(safe_body)
+            );
+        }
+        // DF3B-00 (`always_wrap=true`) is killed by every unsafe-body row.
+    }
+
+    fn g(expected: Form, found: Form) -> Result<Option<(GlueSpec, SeamFamily)>, SeamBlock> {
+        glue(expected, found, None)
+    }
+
+    /// The glue's TEXT — `glue` names a spec and the caller renders it, which is
+    /// exactly what `seams` does in production. These assertions therefore still
+    /// read the string the span layer writes, over the same argument, and they
+    /// are the reason half 2 could not quietly change one.
+    fn text(expected: Form, found: Form) -> String {
+        rendered(g(expected, found), T)
+    }
+
+    fn rendered(got: Result<Option<(GlueSpec, SeamFamily)>, SeamBlock>, arg: &str) -> String {
+        let mut spec = got
+            .unwrap_or_else(|b| panic!("blocked: {b:?}"))
+            .unwrap_or_else(|| panic!("no edit"))
+            .0;
+        if spec.null_arm == NullArm::Checked && spec.checked_binding_type.is_none() {
+            spec = spec.with_checked_binding_type("*mut i32".to_owned());
+        }
+        spec.render(arg).expect("an emitting spec always renders")
+    }
+
+    /// **Reborrow, BOTH SIDES.** `*mut T → &mut T` needs glue; the reverse needs
+    /// none, because a reference coerces to a raw pointer at a call.
+    ///
+    /// A witness on one direction witnesses half a table: an implementation that
+    /// emitted `&mut *p` in *both* directions would pass a one-sided test and
+    /// produce `&mut *(&mut x)` at every raw position.
+    #[test]
+    fn reborrow_is_directional() {
+        assert_eq!(text(Ref { mutable: true }, Raw), "unsafe { &mut *p }");
+        assert_eq!(text(Ref { mutable: false }, Raw), "unsafe { &*p }");
+        assert_eq!(g(Raw, Ref { mutable: true }), Ok(None), "reverse: coercion");
+        assert_eq!(g(Raw, Slice { mutable: true }), Ok(None));
+    }
+
+    /// **Optional, BOTH SIDES.** `Some(..)` one way, `.unwrap()` the other —
+    /// the latter on `-3`'s null-panic convention.
+    #[test]
+    fn optional_wrap_and_required_unwrap_are_directional() {
+        assert_eq!(
+            text(
+                Opt {
+                    mutable: true,
+                    slice: false
+                },
+                Ref { mutable: true }
+            ),
+            "Some(p)"
+        );
+        assert_eq!(
+            text(
+                Ref { mutable: false },
+                Opt {
+                    mutable: false,
+                    slice: false
+                }
+            ),
+            "p.unwrap()"
+        );
+        assert_eq!(
+            text(
+                Ref { mutable: true },
+                Opt {
+                    mutable: true,
+                    slice: false
+                }
+            ),
+            "p.as_mut().unwrap()"
+        );
+    }
+
+    /// **THE UNWRAP SPELLING FOLLOWS THE *FOUND* SIDE — witnessed OFF THE
+    /// DIAGONAL.**
+    ///
+    /// [`unwrap_expr`]'s whole reason for existing is that `Option<&mut T>` is
+    /// not `Copy` and `.unwrap()` MOVES it, so the seam must spell that case
+    /// `.as_mut().unwrap()`. Which spelling applies is therefore a fact about
+    /// the value the caller HAS, never about the position it is going into.
+    ///
+    /// [`optional_wraps_one_way_and_unwraps_the_other`] pins both spellings but
+    /// only where the two sides agree, so it is blind to a `glue` that read the
+    /// EXPECTED side's mutability — the two are equal on the diagonal, which is
+    /// the shape this module's own reborrow test warns about ("a witness on one
+    /// direction witnesses half a table"). Found by mutation (M26): passing `w`
+    /// where `h` belongs left the entire suite green.
+    ///
+    /// A shared position fed from a mutable optional is the discriminating
+    /// case, and it is not exotic: `&T` is exactly what a read-only callee
+    /// parameter converts to.
+    #[test]
+    fn required_unwrap_reads_mutability_from_the_found_side() {
+        assert_eq!(
+            text(
+                Ref { mutable: false },
+                Opt {
+                    mutable: true,
+                    slice: false
+                }
+            ),
+            "p.as_mut().unwrap()"
+        );
+        // The other off-diagonal pairing cannot occur: `shared_to_mut` blocks a
+        // `&mut` position fed from a shared optional before any spec is built.
+        // Asserted so the pair above is not mistaken for half a table in turn.
+        assert_eq!(
+            g(
+                Ref { mutable: true },
+                Opt {
+                    mutable: false,
+                    slice: false
+                }
+            ),
+            Err(SeamBlock::SharedToMut)
+        );
+    }
+
+    /// **The `Slice`-expected-from-`Opt`-found arm, BOTH fat/thin twins.**
+    ///
+    /// The arm picks its core on the FOUND optional's fatness: a fat optional
+    /// already carries the slice and needs only the unwrap, while a thin one
+    /// yields a reference that must be widened by `from_ref`/`from_mut`.
+    /// Swapping the two produces glue that is well-formed and wrong in both
+    /// directions — `core::slice::from_ref` applied to a slice, and a slice
+    /// position handed a bare reference.
+    ///
+    /// Unwitnessed until mutation M25 swapped them and the suite stayed green.
+    #[test]
+    fn optional_to_required_uses_the_matching_cross_shape_core() {
+        assert_eq!(
+            text(
+                Slice { mutable: false },
+                Opt {
+                    mutable: false,
+                    slice: true
+                }
+            ),
+            "p.unwrap()"
+        );
+        assert_eq!(
+            text(
+                Slice { mutable: true },
+                Opt {
+                    mutable: true,
+                    slice: false
+                }
+            ),
+            "core::slice::from_mut(p.as_mut().unwrap())"
+        );
+        assert_eq!(
+            g(
+                Opt {
+                    mutable: false,
+                    slice: true
+                },
+                Opt {
+                    mutable: false,
+                    slice: false
+                }
+            ),
+            Err(SeamBlock::NullabilityInsufficient)
+        );
+        assert_eq!(
+            g(
+                Opt {
+                    mutable: false,
+                    slice: false
+                },
+                Opt {
+                    mutable: false,
+                    slice: true
+                }
+            ),
+            Err(SeamBlock::NullabilityInsufficient)
+        );
+    }
+
+    /// **Optional over a raw base uses the raw-pointer Option API directly.**
+    /// The method evaluates the source once and maps null to `None` without an
+    /// unconditional dereference.
+    #[test]
+    fn optional_over_raw_uses_as_mut_once() {
+        let (spec, fam) = g(
+            Opt {
+                mutable: true,
+                slice: false,
+            },
+            Raw,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(spec.render(T).unwrap(), "unsafe { p.as_mut() }");
+        assert_eq!(fam, SeamFamily::Reborrow, "the raw base carries the family");
+    }
+
+    /// **Slice, BOTH SIDES**, and the measured table amendment.
+    ///
+    /// `&mut T → &[T]` (30 positions) is SAFE: `from_ref` takes a `&mut T` by
+    /// coercion. The census found it; the ratified table did not have it.
+    #[test]
+    fn slice_construction_and_projection_are_both_safe() {
+        assert_eq!(
+            text(Slice { mutable: true }, Ref { mutable: true }),
+            "core::slice::from_mut(p)"
+        );
+        assert_eq!(
+            text(Slice { mutable: false }, Ref { mutable: false }),
+            "core::slice::from_ref(p)"
+        );
+        // THE AMENDMENT: shared slice expected, mutable reference supplied.
+        assert_eq!(
+            text(Slice { mutable: false }, Ref { mutable: true }),
+            "core::slice::from_ref(p)"
+        );
+        // The reverse projection.
+        assert_eq!(
+            text(Ref { mutable: true }, Slice { mutable: true }),
+            "p.first_mut().unwrap()"
+        );
+        assert_eq!(
+            text(Ref { mutable: false }, Slice { mutable: false }),
+            "p.first().unwrap()"
+        );
+        assert_eq!(
+            glue_with_nonempty(
+                Ref { mutable: false },
+                Slice { mutable: false },
+                None,
+                false,
+            ),
+            Err(SeamBlock::NonemptyUnknown),
+            "reverse conversion without the class's nonempty contract must hold"
+        );
+    }
+
+    /// **The length rule — evolved from a gate to an authorization**
+    /// (user ruling 2026-08-12).
+    ///
+    /// # What this witness USED to pin, and why it changed
+    ///
+    /// It read *"raw → {expected} must gate, never fabricate a length"*, over
+    /// 65.7 % of the measured market. The reasoning was sound and is
+    /// **unretracted**: `from_raw_parts` with an oversized extent is UB at
+    /// construction, so a fabricated length is unsound the moment it is built.
+    ///
+    /// The **policy** over that fact changed, on a premise the technical
+    /// objection does not own — contribution scope. The paper's guarantee is
+    /// aliasing UB, not spatial bounds; fabricated sites are a knowing,
+    /// **tagged, per-site** carve-out. The objection stays on record as the
+    /// flagged technical fact; it was not withdrawn and it is not wrong.
+    ///
+    /// # What it pins NOW
+    ///
+    /// The old guard's protection is being spent, so it is replaced by three
+    /// obligations rather than deleted — a guard that quietly changes meaning is
+    /// worse than one that is retired in the open:
+    ///
+    /// - **W1** a fabricated length is ALWAYS TAGGED,
+    /// - **W2** fabrication happens ONLY where no companion exists,
+    /// - **W3** the non-length-bearing cores never carry a length.
+    ///
+    /// **The builder-layer guard is deliberately NOT touched.**
+    /// `a_slice_seam_with_no_length_places_nothing_and_is_counted` pins *no
+    /// layer below the gate may invent a length*; fabrication happens **at** the
+    /// gate, so that guard stands and `len_absent` stays 0 on the corpus.
+    #[test]
+    fn every_raw_to_slice_direction_gets_a_length_or_a_fabricated_one() {
+        for expected in [
+            Slice { mutable: true },
+            Slice { mutable: false },
+            Opt {
+                mutable: true,
+                slice: true,
+            },
+            Opt {
+                mutable: false,
+                slice: true,
+            },
+        ] {
+            // ---- W1: a fabricated length is ALWAYS TAGGED ----
+            //
+            // The whole point of `SeamLen` being a two-arm type. A mutation
+            // that fabricates by building `Licensed("1024")` fails HERE, and it
+            // fails at the artifact too, because both read this one field.
+            let Ok(Some((spec, _))) = g(expected, Raw) else {
+                panic!("raw → {expected:?} must fabricate, not refuse")
+            };
+            assert_eq!(
+                spec.len,
+                Some(SeamLen::Fabricated),
+                "raw → {expected:?} with no companion must fabricate, TAGGED"
+            );
+
+            // ---- W2: fabrication ONLY where no companion exists ----
+            //
+            // The other direction of the same authorization rule: an arm that
+            // ignored its input and fabricated unconditionally would satisfy W1
+            // and destroy all 277 licensed placements.
+            let Ok(Some((spec, _))) = glue(expected, Raw, Some("n")) else {
+                panic!("a companion length must still place a licensed seam")
+            };
+            assert_eq!(
+                spec.len,
+                Some(SeamLen::Licensed("n".to_owned())),
+                "a companion was supplied — fabricating over it is forbidden"
+            );
+        }
+
+        // ---- W3: the NON-length-bearing cores never carry a length ----
+        //
+        // `with_length` is only reachable from the two `FromRawParts` arms; a
+        // mutation that routed a reborrow or a `from_ref` through it would
+        // render a length into a constructor that takes none.
+        for (expected, found) in [
+            (Ref { mutable: true }, Raw),
+            (Ref { mutable: false }, Raw),
+            (Slice { mutable: false }, Ref { mutable: false }),
+            (Slice { mutable: true }, Ref { mutable: true }),
+        ] {
+            if let Ok(Some((spec, _))) = glue(expected, found, None) {
+                assert_eq!(
+                    spec.len, None,
+                    "{expected:?} ← {found:?} needs no length and must carry none"
+                );
+            }
+        }
+    }
+
+    /// **The authorization rule, witnessed on the pure function itself** (R8).
+    ///
+    /// `with_length` is the single place that decides licensed-vs-fabricated.
+    /// Witnessing it here as well as through `glue` is not redundancy: `glue`'s
+    /// witness proves the two slice arms are wired to it, and this one proves
+    /// the rule those arms are wired to is the right rule — the split M28 and
+    /// M40 were banked for.
+    #[test]
+    fn the_authorization_rule_is_decided_by_the_companion_alone() {
+        let base = || GlueSpec::core(GlueCore::FromRawParts, false);
+        assert_eq!(
+            with_length(base(), Some("n")).len,
+            Some(SeamLen::Licensed("n".to_owned()))
+        );
+        assert_eq!(with_length(base(), None).len, Some(SeamLen::Fabricated));
+        // An EMPTY companion is still a companion: the call site supplied text,
+        // and inventing an extent over supplied text is the failure this rule
+        // exists to prevent. (`glue` never sees one — `span_to_snippet` of a
+        // real argument is non-empty — so this pins the rule, not the corpus.)
+        assert_eq!(
+            with_length(base(), Some("")).len,
+            Some(SeamLen::Licensed(String::new()))
+        );
+    }
+
+    /// **The two arms render DIFFERENT text, and the difference is auditable.**
+    ///
+    /// A fabricated site must be recognizable in the emitted crate by someone
+    /// holding the code and not the TSV — the ruling's own reason for rejecting
+    /// artifact-tag-only. `1024` spelled as a literal would be
+    /// indistinguishable from a real length that happens to be 1024; the named
+    /// const is not.
+    #[test]
+    fn a_fabricated_extent_is_named_in_the_emitted_text() {
+        let fabricated = GlueSpec::core(GlueCore::FromRawParts, false)
+            .with_fabricated_len()
+            .render("p")
+            .expect("fabricated specs render");
+        assert_eq!(
+            fabricated,
+            "unsafe { core::slice::from_raw_parts(p, crate::FALLBACK_SLICE_EXTENT) }"
+        );
+        assert!(
+            !fabricated.contains("268435456"),
+            "the extent is NAMED, never spelled as a bare literal: {fabricated}"
+        );
+        assert!(
+            !fabricated.contains("as usize"),
+            "the const is already `usize`; casting it would make a fabricated \
+             site textually indistinguishable from a licensed path companion"
+        );
+        // And the licensed arm is byte-identical to its pre-ruling text.
+        assert_eq!(
+            GlueSpec::core(GlueCore::FromRawParts, true)
+                .with_len("n")
+                .render("p")
+                .as_deref(),
+            Some("unsafe { core::slice::from_raw_parts_mut(p, (n) as usize) }")
+        );
+    }
+
+    /// The audit tag's two arms key differently, and the LICENSED bytes do not
+    /// move — which is what makes the fabricated count an addition to the
+    /// census rather than a re-keying of it.
+    #[test]
+    fn the_audit_tag_separates_fabricated_from_licensed() {
+        for e in [
+            LenEvidence::Following,
+            LenEvidence::Preceding,
+            LenEvidence::Elsewhere,
+            LenEvidence::None,
+        ] {
+            assert_eq!(LenArm::Licensed(e).key(), e.key(), "licensed bytes move");
+            assert_eq!(LenArm::Fabricated(e).key(), "len-fabricated");
+            // The signature evidence survives BOTH arms — bound-verification's
+            // derivability input (`Elsewhere` vs `None`) must not be erased by
+            // the fabrication that made the position placeable.
+            assert_eq!(LenArm::Fabricated(e).evidence(), e);
+            assert_eq!(LenArm::Licensed(e).evidence(), e);
+        }
+    }
+
+    /// **R464-3 — the call-site fallback extent must RECEIPT as fabricated.**
+    ///
+    /// The bridge renders identically whether the constant reaches it as a
+    /// fabricated length or as a "licensed" length whose text happens to be
+    /// [`FABRICATED_LEN_PATH`] — so the emitted code cannot tell the two apart
+    /// and only the receipt can. Routing the constant through `len_text` would
+    /// therefore produce a correct program with a WRONG audit: an
+    /// evidence-backed extent that no evidence backs. This pins the route.
+    #[test]
+    fn the_call_site_fallback_extent_receipts_as_fabricated() {
+        let fabricated = with_length(GlueSpec::core(GlueCore::FromRawParts, false), None);
+        assert_eq!(receipt_extent(&fabricated), BridgeExtentKind::Fallback);
+        assert_eq!(
+            fabricated.len.as_ref().map(SeamLen::text),
+            Some(FABRICATED_LEN_PATH)
+        );
+
+        // The mistake this test exists to catch: same rendering, wrong receipt.
+        let mis_licensed = with_length(
+            GlueSpec::core(GlueCore::FromRawParts, false),
+            Some(FABRICATED_LEN_PATH),
+        );
+        assert_eq!(
+            mis_licensed.len.as_ref().map(SeamLen::text),
+            Some(FABRICATED_LEN_PATH)
+        );
+        assert_ne!(receipt_extent(&mis_licensed), BridgeExtentKind::Fallback);
+    }
+
+    /// **Ruling B — a companion length turns the gate into a seam.**
+    ///
+    /// The same pair that gates with no length produces `from_raw_parts` with
+    /// one, and the length is the caller's own text, cast rather than rendered.
+    ///
+    /// *Mutation-tested:* drop the `as usize` cast and the emitted call fails to
+    /// type-check against `from_raw_parts`, whose length is a `usize` while the
+    /// C spelling is `size_t`/`c_int`/`c_ulong` depending on the header.
+    #[test]
+    fn a_companion_length_converts_the_gate_into_a_slice_seam() {
+        assert_eq!(
+            rendered(glue(Slice { mutable: true }, Raw, Some("n")), "p"),
+            "unsafe { core::slice::from_raw_parts_mut(p, (n) as usize) }"
+        );
+        assert_eq!(
+            rendered(glue(Slice { mutable: false }, Raw, Some("len")), "p"),
+            "unsafe { core::slice::from_raw_parts(p, (len) as usize) }"
+        );
+        // The fat optional composes the wrap around it.
+        assert_eq!(
+            rendered(
+                glue(
+                    Opt {
+                        mutable: true,
+                        slice: true
+                    },
+                    Raw,
+                    Some("n")
+                ),
+                "p"
+            ),
+            "{ let __crat_call_adapter_ptr: *mut i32 = p; if __crat_call_adapter_ptr.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts_mut(__crat_call_adapter_ptr, (n) as usize) }) } }"
+        );
+        // **Without one, the position now FABRICATES** (ruling 2026-08-12,
+        // superseding ruling item 4's `None` arm). What ruling B settled is
+        // untouched: adjacency licenses the companion, and a licensed companion
+        // is never overridden by an invented extent.
+        let Ok(Some((spec, _))) = glue(Slice { mutable: true }, Raw, None) else {
+            panic!("the no-companion position must place a fabricated seam")
+        };
+        assert_eq!(spec.len, Some(SeamLen::Fabricated));
+        assert_eq!(
+            spec.render("p").as_deref(),
+            Some("unsafe { core::slice::from_raw_parts_mut(p, crate::FALLBACK_SLICE_EXTENT) }")
+        );
+    }
+
+    /// The length is a **raw base**, so a slice seam is REBORROW family however
+    /// safe its constructor name reads.
+    ///
+    /// `from_raw_parts` is `unsafe` and carries the pointer-validity obligation;
+    /// filing it under `Safe` would put the corpus's largest adapter population
+    /// in the column that means "compiler-checked end to end".
+    #[test]
+    fn a_slice_seam_over_a_raw_base_is_reborrow_family() {
+        assert_eq!(
+            glue(Slice { mutable: true }, Raw, Some("n"))
+                .unwrap()
+                .unwrap()
+                .1,
+            SeamFamily::Reborrow
+        );
+    }
+
+    /// **A shared borrow never satisfies a `&mut` position**, in every pair that
+    /// can express the mismatch.
+    ///
+    /// *Mutation-tested:* drop the `shared_to_mut` guard from any arm and the
+    /// corresponding row here fails — the glue would compile-fail at `E0596`
+    /// instead of degrading with a reason, turning an attributable gate into a
+    /// revert.
+    #[test]
+    fn a_shared_borrow_never_satisfies_a_mut_position() {
+        let shared = Ref { mutable: false };
+        for expected in [
+            Ref { mutable: true },
+            Slice { mutable: true },
+            Opt {
+                mutable: true,
+                slice: false,
+            },
+            Opt {
+                mutable: true,
+                slice: true,
+            },
+        ] {
+            assert_eq!(
+                g(expected, shared),
+                Err(SeamBlock::SharedToMut),
+                "{expected:?} from a shared borrow must gate"
+            );
+        }
+        // ... and the same-form case, which has its own arm.
+        assert_eq!(
+            g(Slice { mutable: true }, Slice { mutable: false }),
+            Err(SeamBlock::SharedToMut)
+        );
+    }
+
+    /// Matching forms produce **no edit at all** — the 58.6 % of positions §4
+    /// measured as needing no caller-side text.
+    #[test]
+    fn matching_forms_need_no_edit() {
+        for f in [
+            Ref { mutable: true },
+            Slice { mutable: false },
+            Opt {
+                mutable: true,
+                slice: false,
+            },
+        ] {
+            assert_eq!(g(f, f), Ok(None), "{f:?} against itself must need no glue");
+        }
+        // `&mut T` supplied where `&T` is wanted: coercion, still no edit.
+        assert_eq!(g(Ref { mutable: false }, Ref { mutable: true }), Ok(None));
+    }
+
+    /// **THE CAST PEEL, at the side that decides it.**
+    ///
+    /// [`text_span_of`] is the whole of the decision layer's answer to *which
+    /// subtree survives inside the adapter*, and getting it wrong is silent: the
+    /// span layer replaces the whole argument either way, so a `&mut *(q as *mut
+    /// u8)` would differ from the span layer's `&mut *q` only in the corpus
+    /// differential, and only if this corpus places a seam on a cast at all.
+    ///
+    /// Mutation M28 collapsed the two cast arms onto the argument span and the
+    /// entire suite stayed green — because the mapping lived inside a loop that
+    /// needs a `TyCtxt`, a call site and a decision map to run. Lifting it out
+    /// is what makes it witnessable.
+    ///
+    /// The `None` arms matter as much as the `Some` ones: a default of
+    /// `arg.span` for an unnameable operand would hand the AST layer a subtree
+    /// the replacement was never built from.
+    #[test]
+    fn the_replacement_text_comes_from_the_cast_operand_and_nowhere_else() {
+        rustc_span::create_default_session_globals_then(|| {
+            let whole = Span::with_root_ctxt(rustc_span::BytePos(100), rustc_span::BytePos(120));
+            let operand = Span::with_root_ctxt(rustc_span::BytePos(100), rustc_span::BytePos(101));
+            let hir = HirId::INVALID;
+
+            // The shapes that read their OWN span.
+            assert_eq!(text_span_of(ArgShape::BareLocal(hir), whole), Some(whole));
+            assert_eq!(
+                text_span_of(
+                    ArgShape::AddrOf {
+                        mutable: true,
+                        base: None,
+                        through_deref: false
+                    },
+                    whole
+                ),
+                Some(whole)
+            );
+
+            // The two that read the cast's OPERAND, which is strictly inside.
+            assert_eq!(
+                text_span_of(
+                    ArgShape::AddrOfCast {
+                        mutable: true,
+                        inner: operand
+                    },
+                    whole
+                ),
+                Some(operand),
+                "the replacement is built from the operand's snippet, so the \
+                 operand is the subtree that must survive"
+            );
+            assert_eq!(
+                text_span_of(
+                    ArgShape::CastOfLocal {
+                        binding: hir,
+                        inner: operand
+                    },
+                    whole
+                ),
+                Some(operand)
+            );
+            assert_ne!(
+                operand, whole,
+                "the assertions above only mean anything if the two spans differ"
+            );
+
+            // A null literal is now a nameable whole-argument target: the AST
+            // layer replaces it with `None` and deliberately keeps no payload.
+            assert_eq!(text_span_of(ArgShape::NullLit, whole), Some(whole));
+            assert_eq!(
+                text_span_of(ArgShape::RawExpr { root: None }, whole),
+                Some(whole)
+            );
+            // The genuinely unnameable shapes still answer NOTHING.
+            assert_eq!(text_span_of(ArgShape::Cast { inner: operand }, whole), None);
+            assert_eq!(text_span_of(ArgShape::Other, whole), None);
+        });
+    }
+
+    /// **THE RETIRED CLASSIFIER, kept as this test's oracle.**
+    ///
+    /// A verbatim transcription of the ten prefix tests `seam_tsv` ran over
+    /// `edit.replacement` before condition 5 replaced them with
+    /// [`GlueSpec::shape_key`]. Kept here and nowhere else: the census must
+    /// carry the shape, and the only remaining question is *where the carried
+    /// answer differs from the inferred one*, which needs both.
+    fn inferred_shape(r: &str) -> &'static str {
+        if r.starts_with("core::slice::from_raw_parts") {
+            "from_raw_parts"
+        } else if r.starts_with("Some(core::slice::from_raw_parts") {
+            "some_from_raw_parts"
+        } else if r.contains(".as_mut().unwrap()") {
+            "as_mut_unwrap"
+        } else if r.contains(".unwrap()") {
+            "unwrap"
+        } else if r.starts_with("Some(&mut *") || r.starts_with("Some(&*") {
+            "some_reborrow"
+        } else if r.starts_with("Some(core::slice::from_") {
+            "some_from_ref_mut"
+        } else if r.starts_with("Some(") {
+            "some_wrap"
+        } else if r.starts_with("&mut *") || r.starts_with("&*") {
+            "reborrow"
+        } else if r.starts_with("core::slice::from_") {
+            "from_ref_mut"
+        } else {
+            "index"
+        }
+    }
+
+    /// **Every spec `glue` can name agrees with the retired classifier — over a
+    /// WELL-BEHAVED argument.** Condition 5's "same column" as a measurement.
+    ///
+    /// The argument is a bare identifier here deliberately, because that is the
+    /// case in which the prefix classifier was *right*. The cases in which it
+    /// was not are the next test, and they are the schema movement.
+    #[test]
+    fn the_carried_shape_agrees_with_the_retired_classifier() {
+        for spec in every_emitting_spec().into_iter().filter(|spec| {
+            spec.null_arm == NullArm::None
+                && !matches!(
+                    spec.core,
+                    GlueCore::Reborrow
+                        | GlueCore::RawOption
+                        | GlueCore::First
+                        | GlueCore::FromRawParts
+                )
+        }) {
+            assert_eq!(
+                spec.shape_key(),
+                inferred_shape(&spec.render("p").expect("emitting spec renders")),
+                "carried and inferred shapes must agree on a bare argument: {spec:?}"
+            );
+        }
+        // The owner views (R583-8) are the one bare-argument case where the
+        // carried keys depart from the classifier ON PURPOSE (main 116 §2):
+        // `p.as_deref()` matches none of its prefixes, so it fell through to
+        // `index`, and the core match called the same spec `scalar-reference`.
+        for spec in every_owner_view_spec() {
+            let mutable = spec.option_view.expect("an owner view");
+            // Each column keeps its own vocabulary (R588-5).
+            let keys = if mutable {
+                ("owner_option_view_mut", "owner-option-view-mut")
+            } else {
+                ("owner_option_view", "owner-option-view")
+            };
+            let rendered = spec.render("p").expect("an owner view renders");
+            assert_eq!(inferred_shape(&rendered), "index", "{rendered}");
+            assert_eq!(
+                (spec.shape_key(), spec.template_key()),
+                keys,
+                "an owner view carries its own glue shape and bridge kind: {spec:?}"
+            );
+        }
+    }
+
+    /// **THE RENDERER REFUSES A LENGTH-LESS SLICE ADAPTER.**
+    ///
+    /// It used to substitute an empty string and print
+    /// `core::slice::from_raw_parts(p, () as usize)`. That is not merely
+    /// "invalid Rust the compiler catches" — it is a **silent length
+    /// substitution**, produced by the layer whose own field doc promises
+    /// `None`-means-refused, at the socket the HELD fabricated-length slice
+    /// plugs into. The AST builder refused the same input and counted it
+    /// (`len_absent`), so the two halves of one contract disagreed and only the
+    /// half with a witness was right.
+    ///
+    /// Unreachable through [`glue`] — asserted below — so this is fail-closed
+    /// structure rather than a behaviour change, and it moves no corpus line.
+    #[test]
+    fn the_renderer_refuses_a_slice_adapter_with_no_length() {
+        let lengthless = GlueSpec::core(GlueCore::FromRawParts, false);
+        assert_eq!(
+            lengthless.render("p"),
+            None,
+            "a length-bearing core with no length must REFUSE, never render \
+             `() as usize` around an empty string"
+        );
+        assert_eq!(
+            lengthless.wrapped().render("p"),
+            None,
+            "and the `Some` wrapper must not launder it either"
+        );
+        // With a length it renders normally, so the refusal is the missing
+        // length rather than the shape.
+        assert_eq!(
+            GlueSpec::core(GlueCore::FromRawParts, false)
+                .with_len("n")
+                .render("p")
+                .as_deref(),
+            Some("unsafe { core::slice::from_raw_parts(p, (n) as usize) }")
+        );
+        // The gate is UPSTREAM and STAYS upstream after the fabrication ruling
+        // — what changed is which answer it gives. `glue` still never names the
+        // refusing shape: a `None` companion now yields a FABRICATED length, so
+        // this renderer arm remains fail-closed structure with no live path.
+        //
+        // **This is the distinction the ruling's guard-evolution turns on.**
+        // Fabrication happens AT the gate; no layer *below* it may invent a
+        // length, so the refusal above is untouched.
+        assert!(
+            matches!(
+                glue(Slice { mutable: false }, Raw, None),
+                Ok(Some((
+                    GlueSpec {
+                        len: Some(SeamLen::Fabricated),
+                        ..
+                    },
+                    _
+                )))
+            ),
+            "glue must fabricate, not refuse — and the renderer's own refusal \
+             must therefore stay unreachable through it"
+        );
+        assert!(
+            every_emitting_spec()
+                .iter()
+                .all(|s| s.render("p").is_some()),
+            "and every spec `glue` CAN name must still render, or the corpus \
+             would move"
+        );
+    }
+
+    /// **`index` IS REACHABLE, and `Bare`-without-a-wrapper is not** — the two
+    /// halves of `shape_key`'s fallback arm, separated by measurement.
+    ///
+    /// The doc on that arm originally called the whole pairing unreachable
+    /// "matched only to keep the function total". That is true of `Bare` and
+    /// **false of `Index0`**: `glue`'s `(Ref, Slice)` arm builds exactly
+    /// `core(Index0, w)`, which renders `&w X[0]` and classifies `index`. It is
+    /// corpus-zero on the frozen corpus — and corpus-zero is not unreachable,
+    /// which is the distinction this project has had to re-learn by name.
+    ///
+    /// Found by the maintainability reviewer at the arm-3 boundary. The code
+    /// was right; the prose was not, so this is the witness the corrected prose
+    /// needed rather than a second correction of it.
+    #[test]
+    fn first_and_optional_index_shapes_are_both_reachable() {
+        let (spec, family) = glue(Ref { mutable: true }, Slice { mutable: true }, None)
+            .expect("a mutable reference from a mutable slice is adaptable")
+            .expect("and it needs an edit");
+        assert_eq!(
+            spec.shape_key(),
+            "first",
+            "reached through `glue`, not by hand"
+        );
+        assert_eq!(spec.render("p").unwrap(), "p.first_mut().unwrap()");
+        assert_eq!(family, SeamFamily::Safe);
+        assert!(
+            !spec.optional && spec.unwrap.is_none(),
+            "and with neither wrapper nor source unwrap: {spec:?}"
+        );
+
+        // The other half: no pairing `glue` accepts produces a bare core with
+        // neither an unwrap nor a wrapper. Asserted over the SAME enumeration
+        // the agreement test uses, so the claim is checked rather than argued.
+        assert!(
+            every_emitting_spec()
+                .iter()
+                .all(|s| !(matches!(s.core, GlueCore::Bare) && !s.optional && s.unwrap.is_none())),
+            "a bare core with no wrapper renders the argument unchanged; `glue` \
+             returns `Ok(None)` for every pairing that would need it"
+        );
+        // `Index0` remains reachable for the optional thin target over a slice.
+        assert!(
+            every_emitting_spec()
+                .iter()
+                .any(|s| matches!(s.core, GlueCore::Index0)),
+            "the enumeration must still reach the optional `index` arm"
+        );
+    }
+
+    /// **Where the two DISAGREE, and why that is the point of carrying it.**
+    ///
+    /// The classifier reads a string the argument's own text contributes to, so
+    /// an argument that happens to start with `*` or contain `.unwrap()` moves
+    /// the inferred label while the decision is unchanged. These rows are the
+    /// schema semantics change condition 5 requires to be recorded — *strictly
+    /// better provenance*, stated as a witness rather than as a claim.
+    #[test]
+    fn the_classifier_was_argument_text_sensitive_and_the_carried_shape_is_not() {
+        // An `Index0` wrap over an argument spelled `*q` renders `Some(&*q[0])`,
+        // whose prefix is `Some(&*` — the classifier called that `some_reborrow`.
+        let index0_wrapped = GlueSpec::core(GlueCore::Index0, false).wrapped();
+        assert_eq!(index0_wrapped.render("*q").unwrap(), "Some(&*q[0])");
+        assert_eq!(
+            inferred_shape(&index0_wrapped.render("*q").unwrap()),
+            "some_reborrow"
+        );
+        assert_eq!(index0_wrapped.shape_key(), "some_wrap");
+
+        // An argument that is itself an `.unwrap()` call captured rule 4, which
+        // sits ABOVE every `Some(` test.
+        let some_wrap = GlueSpec::core(GlueCore::Bare, false).wrapped();
+        assert_eq!(
+            inferred_shape(&some_wrap.render("o.unwrap()").unwrap()),
+            "unwrap"
+        );
+        assert_eq!(some_wrap.shape_key(), "some_wrap");
+
+        // And the carried answer does not move with the argument at all — the
+        // property that makes the column mean the decision.
+        for arg in ["p", "*q", "o.unwrap()", "(*s).ptr", "&mut *raw"] {
+            assert_eq!(
+                some_wrap.shape_key(),
+                "some_wrap",
+                "the carried shape must not depend on the argument text ({arg})"
+            );
+        }
+    }
+
+    /// D5-W1 — PAIR's T2 view has form-specific templates rather than
+    /// reusing the ordinary boundary selector, whose write-evidence gate and
+    /// subject assumptions do not describe this already-selected PAIR role.
+    #[test]
+    fn d5_w1_pair_t2_raw_views_cover_shared_slice_option_and_raw_expressions() {
+        use super::super::raw_boundary::{RawMutability, RawTargetType};
+
+        let target = |mutability: RawMutability| RawTargetType {
+            rendered: format!(
+                "*{} i32",
+                if mutability == RawMutability::Mut {
+                    "mut"
+                } else {
+                    "const"
+                }
+            ),
+            pointee: "i32".to_owned(),
+            mutability,
+            depth2: None,
+        };
+        let shared = Decision::Ref { mutable: false };
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&shared),
+                &target(RawMutability::Const),
+                "value",
+                "bare-local",
+            ),
+            Some("core::ptr::from_ref(value)".to_owned())
+        );
+        let shared_slice = Decision::Slice {
+            mutable: false,
+            uses: Vec::new(),
+        };
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&shared_slice),
+                &target(RawMutability::Const),
+                "values",
+                "bare-local",
+            ),
+            Some("values.as_ptr()".to_owned())
+        );
+        let mutable_slice = Decision::Slice {
+            mutable: true,
+            uses: Vec::new(),
+        };
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&mutable_slice),
+                &target(RawMutability::Mut),
+                "values",
+                "bare-local",
+            ),
+            Some("values.as_mut_ptr()".to_owned())
+        );
+        let optional = Decision::Opt {
+            mutable: false,
+            slice: false,
+            uses: Vec::new(),
+        };
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&optional),
+                &target(RawMutability::Const),
+                "value",
+                "bare-local",
+            ),
+            Some(
+                "value.as_deref().map_or(core::ptr::null::<i32>(), core::ptr::from_ref)".to_owned()
+            )
+        );
+        let optional_slice = Decision::Opt {
+            mutable: true,
+            slice: true,
+            uses: Vec::new(),
+        };
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&optional_slice),
+                &target(RawMutability::Mut),
+                "values",
+                "bare-local",
+            ),
+            Some(
+                "values.as_deref_mut().map_or(core::ptr::null_mut::<i32>(), |slice| slice.as_mut_ptr())"
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                None,
+                &target(RawMutability::Const),
+                "array.as_ptr()",
+                "raw-expr",
+            ),
+            Some("array.as_ptr()".to_owned()),
+            "buffer/libzahl raw expressions are already a valid raw view"
+        );
+        assert_eq!(
+            super::super::raw_boundary::pair_raw_view_expression(
+                Some(&shared),
+                &target(RawMutability::Mut),
+                "value",
+                "bare-local",
+            ),
+            None,
+            "R-B forbids manufacturing a mutable raw pointer from shared data"
+        );
+    }
+
+    /// Every `(spec, family)` `glue` can return, enumerated by driving `glue`
+    /// over the whole `(expected, found)` product rather than by transcribing
+    /// the arms a second time.
+    ///
+    /// Transcription is what the renderer oracle does, and doing it twice would
+    /// make both copies agree with each other instead of with the function.
+    fn every_emitting_spec() -> Vec<GlueSpec> {
+        let forms = [
+            Raw,
+            Ref { mutable: true },
+            Ref { mutable: false },
+            Slice { mutable: true },
+            Slice { mutable: false },
+            Opt {
+                mutable: true,
+                slice: false,
+            },
+            Opt {
+                mutable: false,
+                slice: false,
+            },
+            Opt {
+                mutable: true,
+                slice: true,
+            },
+            Opt {
+                mutable: false,
+                slice: true,
+            },
+        ];
+        let mut out = Vec::new();
+        for expected in forms {
+            for found in forms {
+                if let Ok(Some((spec, _))) = glue(expected, found, Some("n")) {
+                    out.push(if spec.null_arm == NullArm::Checked {
+                        spec.with_checked_binding_type("*mut i32".to_owned())
+                    } else {
+                        spec
+                    });
+                }
+            }
+        }
+        // **THE EXACT CARDINALITY, not a floor.** Wave 3 opens the twelve
+        // §29 required-unwrap cells over the former 26-cell matrix.
+        assert_eq!(
+            out.len(),
+            38,
+            "the product must reach every emitting arm exactly; got {}",
+            out.len()
+        );
+        out
+    }
+
+    /// Every owner view `owner_view_candidate` can name, by driving it over
+    /// `(owner shape, optional owner, formal form)`: an optional `Box` owner at
+    /// an optional formal of its own shape, `as_deref()` / `as_deref_mut()`.
+    fn every_owner_view_spec() -> Vec<GlueSpec> {
+        use crate::bo_rewriter::decision::box_facts::{BoxPlan, BoxShape};
+        let owner = |shape, optional| {
+            Decision::Box(BoxPlan {
+                shape,
+                optional,
+                expr_edits: Vec::new(),
+                delete_statements: Vec::new(),
+                receipts: Vec::new(),
+                fabricated_extent: false,
+                pointee_override: None,
+                inferred_binding: false,
+                overwrite_spans: Vec::new(),
+                retained_sink: false,
+                implicit_scope_close: false,
+            })
+        };
+        let forms = [
+            Raw,
+            Ref { mutable: true },
+            Ref { mutable: false },
+            Slice { mutable: true },
+            Slice { mutable: false },
+            Opt {
+                mutable: true,
+                slice: false,
+            },
+            Opt {
+                mutable: false,
+                slice: false,
+            },
+            Opt {
+                mutable: true,
+                slice: true,
+            },
+            Opt {
+                mutable: false,
+                slice: true,
+            },
+        ];
+        let mut out = Vec::new();
+        for shape in [BoxShape::Sized, BoxShape::Slice] {
+            for optional in [true, false] {
+                for expected in forms {
+                    if let Some(candidate) =
+                        owner_view_candidate(Some(&owner(shape, optional)), expected, "p")
+                        && candidate.spec.option_view.is_some()
+                    {
+                        out.push(candidate.spec);
+                    }
+                }
+            }
+        }
+        // Exactly the two optional owners at the two optional formals of
+        // their own shape, shared and mutable.
+        assert_eq!(out.len(), 4, "owner views: {out:?}");
+        out
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The call-site walk
+// ---------------------------------------------------------------------------
+
+use rustc_hash::FxHashMap;
+use rustc_hir::{HirId, def_id::LocalDefId};
+use rustc_middle::ty::TyCtxt;
+
+use super::{Decision, DecisionTable, Subject, SubjectKind, emitability::ArgShape};
+
+/// What the walk produced: placed adapters, and every position it refused with
+/// the reason it refused it.
+///
+/// **Blocked positions are carried, not dropped.** The ledger rule this module
+/// exists under: an unadapted position becomes a revert, and a revert with no
+/// reason is a yield number nobody can attribute.
+/// **R556-4 joint (c)** — one argument whose Box owner's raw view went to its
+/// base path: the owner's element edit there is retired, and the whole argument
+/// is what an A5 wrapper selecting it takes as its raw value (`(α)` over
+/// containment).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoxBaseViewRetirement {
+    /// The Box owner, `(caller, binding)`.
+    pub(crate) node: (LocalDefId, HirId),
+    /// The retired element edit's span, `*X.offset(k)`.
+    pub(crate) element: Span,
+    /// The base path `X`, where the view's edit sits.
+    pub(crate) base: Span,
+    /// The whole argument, `&mut *X.offset(k)`.
+    pub(crate) argument: Span,
+}
+
+/// **R575-6** — a call `counted_void::aliased_storage_twin` refused: a converted
+/// position's storage root is also a raw position's root, the callee is no leaf,
+/// so its pristine raw twin cannot be emitted and every position holds
+/// `SiteOverlap`. Recorded so the post-seam withdrawal keys on exactly this gate
+/// and never on a look-alike `SiteOverlap`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AliasedTwinRefusal {
+    pub(crate) caller: LocalDefId,
+    pub(crate) callee: LocalDefId,
+    pub(crate) call_span: Span,
+    /// The converted positions: the callee's parameter index and its subject.
+    pub(crate) converted: Vec<(usize, HirId)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SeamPlan {
+    /// wave-5d relay 205: the computed suffix views a callee class renders at
+    /// its converted slice formal, for that callee's withdrawn input form.
+    pub(crate) computed_view_inputs: Vec<super::slice_forms::ComputedViewInput>,
+    /// **R801-2 (USER: P7 extended)**: sites whose delivered form rides a
+    /// stated premise, one receipt each (`call_result_option`'s declaration
+    /// views without a dereference on every non-null path).
+    pub(crate) premise_receipts: Vec<super::call_result_option::PremiseReceipt>,
+    /// **R544-3** — degraded partners whose blocked-class D4 was paid by a pair
+    /// certificate against every converting sibling, set where the arm
+    /// requirements are derived (after the seam):
+    /// `d4-paid-by-pair-certificate:<partner> siblings=<s>:<kind>,...`.
+    pub(crate) d4_pair_discharges: Vec<String>,
+    /// R538-7: the sites where a raw argument loaded from a field of a
+    /// converted root was proved not to be that root's alias.
+    pub(crate) field_load_exemptions: Vec<super::counted_void::FieldLoadExemption>,
+    /// **R541-2 (wave-6f 065 STOP 3)** — raw-boundary glues NOT planned because an
+    /// applied owning field transaction renders the argument:
+    /// `owned-field-renders:<struct>.<field> caller=<fn> param=<i>`.
+    pub(crate) owned_field_glue_yields: Vec<String>,
+    pub(crate) shared_read_calls: Vec<super::shared_read_pairs::SharedCall>,
+    pub shared_required: Vec<super::overlapping_pairs::consumer::Permission>,
+    pub(crate) native_return_sites: Vec<super::emitability::ReturnSiteFact>,
+    pub(crate) outbound_expressions: super::outbound_expression::OutboundExpressionPlans,
+    pub(crate) raw_receivers: super::raw_receiver::RawReceiverPlans,
+    /// wave-6l: native results consumed at deref / cast / assignment positions.
+    pub(crate) native_result_expressions:
+        super::native_result_expression::NativeResultExpressionPlans,
+    pub(crate) receiver_inputs: super::receiver_input::ReceiverInputMap,
+    pub(crate) callee_parameter_inputs: super::callee_parameter_input::InputPlans,
+    pub(crate) surface_arguments: Vec<super::surface_argument::SurfaceArgumentPlan>,
+    pub(crate) surface_argument_failures: Vec<super::surface_argument::SurfaceArgumentFailure>,
+    pub edits: Vec<SeamEdit>,
+    pub body_edits: Vec<BodyEdit>,
+    pub body_blocked: Vec<BlockedBody>,
+    /// S8: the body sites the rule could not glue (a side-effecting, null,
+    /// cast or unnameable right-hand side, a render refusal, `&` to `&mut`),
+    /// receipted as `body-skipped` and left to the verify gate: unlike
+    /// `body_blocked` they hold no signature class.
+    pub body_skipped: Vec<BlockedBody>,
+    /// Rejected call positions, including the candidate and peer facts that
+    /// existed before the gate.
+    ///
+    /// **The callee rides here because the CALLER is the wrong axis for
+    /// pricing** (2026-08-12). A refused seam costs the *callee's* conversion —
+    /// [`SeamEdit::owner_fn`] is the callee for exactly that reason, so that a
+    /// reverted callee takes its seams with it — while this row named only the
+    /// caller. Anything asking *"which functions would gain if this refusal
+    /// went away"* was therefore answerable only on the axis that does not
+    /// revert.
+    ///
+    /// Two names rather than one, because they are two different functions and
+    /// collapsing them is what made the question unanswerable.
+    pub blocked: Vec<BlockedSeam>,
+    /// Every syntactic site-overlap position, including clear positions whose
+    /// candidate is `none` and therefore has no placed/blocked edit row.
+    pub overlap_proofs: Vec<A5PositionProof>,
+    /// **Ruling item 4a — companion-length coverage**, one row per
+    /// length-gated position: `(callee path, pointer param index, evidence)`.
+    ///
+    /// MEASUREMENT ONLY. Nothing branches on it and no seam is placed from it:
+    /// the ruling sequences the instrument ahead of the decision, so this
+    /// answers *whether a length exists* without yet claiming which expression
+    /// it is.
+    pub length_evidence: Vec<(String, usize, LenEvidence)>,
+    /// Pairs that fired with **no row in the measured census** — rule 1
+    /// (2026-08-11): coverage derives from the type-level matrix, and the census
+    /// is a prioritization overlay. A pair appearing here is not an error; it is
+    /// the overlay being incomplete, which is expected and must be visible.
+    pub uncensused: Vec<(Form, Form)>,
+    /// Raw-boundary T1/T2/blocked receipts, including zero-syntax sites.
+    pub raw_boundary_receipts: String,
+    /// Exact site atoms grouped by their converted subject. This is the sole
+    /// source for declaration/use dependency closure during atom reverts.
+    pub raw_boundary_atom_groups:
+        rustc_hash::FxHashMap<(LocalDefId, HirId), Vec<super::raw_boundary::SubjectAtomKey>>,
+    /// Exact call-argument regions already owned by a subject-use edit.
+    ///
+    /// A raw-boundary bridge over the same expression would be a second edit
+    /// with an obsolete view of that expression.  These rows are the loud
+    /// disposition of that collision: the existing use edit remains the sole
+    /// owner and the raw arm emits no competing edit.
+    pub raw_boundary_edit_region_owned: Vec<(String, String)>,
+    /// **R556-4 joint (c).** A Box owner's element edits (`*X.offset(k)`) whose
+    /// argument now takes the owner's raw view at its base: the element stays raw
+    /// arithmetic over that view, so the owner's own edit there is retired
+    /// (`box-expression:retired-under-base-view`) — applied to the table after
+    /// every synthesis, which is what both the planner and the AST read.
+    pub box_base_view_retirements: Vec<BoxBaseViewRetirement>,
+    /// **R575-6** — the calls the aliased-storage twin refused, read by the
+    /// post-seam withdrawal in `finish_decide`.
+    pub aliased_twin_refusals: Vec<AliasedTwinRefusal>,
+    /// Typed PAIR sites, including zero-syntax and blocked roles, retained for
+    /// signature-class completeness rather than reconstructed from TSV.
+    pub pair_sites: Vec<super::co_conversion::PairSiteDecision>,
+    /// Raw-boundary sites whose source had a safe presentation but whose
+    /// required bridge was held. These become terminal dropped class sites.
+    pub raw_boundary_blocked: Vec<BlockedRawBoundary>,
+    /// Inference-sensitive declaration shapes carried with their final type.
+    pub explicit_declarations: Vec<ExplicitDeclarationSite>,
+    /// Generated/zero-syntax bridge sites that still require plan and terminal
+    /// receipts in their owning signature class.
+    pub zero_bridges: Vec<ZeroBridgeSite>,
+    /// Same-object T2 raw views grouped by call so every raw temp is created
+    /// before any surviving safe borrow in the call expression.
+    pub pair_raw_calls: Vec<PairRawViewCall>,
+    /// A5 proof-site T2 views for non-plain safe forms. Like PAIR views, these
+    /// are grouped at the call so raw/extent temporaries are evaluated before
+    /// the safe primary argument.
+    pub a5_raw_calls: Vec<A5RawViewCall>,
+    /// Latent input-form adapters for decided-form zero-syntax call positions.
+    pub revert_found_form_edits: Vec<RevertFoundFormEdit>,
+    /// Counted-void calls snapshotted as a closure call so every argument is
+    /// evaluated before any generated byte view (wave-6v).
+    pub counted_void_calls: Vec<super::counted_void::CallPlan>,
+    /// Every resolved MIR call position whose callee parameter is emitted in a
+    /// safe form. This inventory is independent of pointer-subject membership.
+    pub interface_inventory: Vec<InterfaceInventorySite>,
+    /// Required MIR sites derived directly from the emitted signature diff.
+    ///
+    /// Kept separate from `interface_inventory`: the latter is the observed
+    /// receipt population and therefore cannot also be the control universe.
+    pub emitted_signature_required_sites: BTreeSet<InterfaceInventoryKey>,
+    pub interface_required_sites: BTreeSet<InterfaceInventoryKey>,
+    /// A zero-syntax safe/safe site relies on the caller class remaining live.
+    /// The callee therefore depends on that caller and follows its reversion.
+    /// An optional argument at an optional formal also relies on the CALLEE
+    /// converting (no coercion to its raw formal), so that caller depends on
+    /// the callee too (wave-6o, relay 015).
+    pub interface_dependencies: Vec<(SignatureClassId, SignatureClassId)>,
+    /// A surfaced caller body names the callee's generated safe inner. The
+    /// caller is therefore Ready only while the defining callee class is Ready.
+    pub generated_item_dependencies: Vec<(SignatureClassId, SignatureClassId)>,
+}
+
+impl SeamPlan {
+    pub(crate) fn converted_callee_without_site_receipt(&self) -> usize {
+        let receipted = self
+            .interface_inventory
+            .iter()
+            .map(|site| site.key)
+            .collect::<BTreeSet<_>>();
+        self.emitted_signature_required_sites
+            .difference(&receipted)
+            .map(|key| key.callee)
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    pub(crate) fn sites_from_non_subject_arguments(&self) -> usize {
+        self.interface_inventory
+            .iter()
+            .filter(|site| site.non_subject)
+            .count()
+    }
+
+    pub(crate) fn interface_inventory_tsv(&self, tcx: TyCtxt<'_>) -> String {
+        let mut out = String::from(
+            "caller\tcallee\tblock\targument_index\tsource_shape\tnon_subject\tdisposition\n",
+        );
+        let mut rows = self.interface_inventory.clone();
+        rows.sort_by_key(|site| site.key);
+        for site in rows {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                tcx.def_path_str(site.key.caller.local_def_id().to_def_id()),
+                tcx.def_path_str(site.key.callee.local_def_id().to_def_id()),
+                site.key.block,
+                site.key.argument_index,
+                site.source_shape,
+                u8::from(site.non_subject),
+                site.disposition,
+            ));
+        }
+        out
+    }
+}
+
+/// **R1128-1 / relay 334 — whether a seam operand is KNOWN to be a raw pointer**, so that a non-null
+/// reborrow of it may take the `CRAT_BRIDGE_SPELLING` method form. `local` is `Some(decision)` for a
+/// bare (or cast) local argument, `None` for any other shape. A local is raw only as a subject whose
+/// final decision is `Degraded` (a `Box` or a reference subject, and a non-subject binding such as a
+/// `let ref mut` reference, are not); another shape only as an array decay (`….as_mut_ptr()` /
+/// `….as_ptr()`, a raw pointer by its type). Anything else keeps `&*` / `&mut *`.
+pub(crate) fn known_raw_operand(local: Option<Option<&Decision>>, text: Option<&str>) -> bool {
+    match local {
+        Some(decision) => matches!(decision, Some(Decision::Degraded(_))),
+        None => text.is_some_and(|text| {
+            let text = text.trim_end();
+            text.ends_with(".as_mut_ptr()") || text.ends_with(".as_ptr()")
+        }),
+    }
+}
+
+/// Deliberate faults for [`raw_expression_operand`]'s witness, test builds only.
+#[cfg(test)]
+pub(crate) static RAW_EXPRESSION_FAULT: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// The witness's function: a fault reaches only it (the suite runs in parallel).
+#[cfg(test)]
+pub(crate) const RAW_EXPRESSION_TEST_FN: &str = "__crat_w6a_167_f";
+
+fn raw_expression_fault(tcx: TyCtxt<'_>, owner: LocalDefId, n: u8) -> bool {
+    #[cfg(test)]
+    {
+        RAW_EXPRESSION_FAULT.load(std::sync::atomic::Ordering::SeqCst) == n
+            && tcx.item_name(owner.to_def_id()).as_str() == RAW_EXPRESSION_TEST_FN
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (tcx, owner, n);
+        false
+    }
+}
+
+/// **R1128-1 / relay wave-6a/167 — a raw EXPRESSION operand KNOWN to be raw as emitted**, so its
+/// non-null reborrow takes the `CRAT_BRIDGE_SPELLING` method form like a degraded local's (libtree's
+/// `strncmp(&mut *((*st).arr).offset(i), …)`, json.h's `&*((*value).payload as …)`). The argument at
+/// `span` in `owner`'s body is raw by its emitted type when, peeling `offset`-family steps:
+/// - it is a cast to a raw pointer type, or an array decay (`as_mut_ptr()` / `as_ptr()`): raw by
+///   construction, whatever its operand became;
+/// - it reads a field of a raw-pointer type that no field transaction converts (`field_kept_raw`),
+///   whatever the base became;
+/// - it is a local `local_raw` admits (a subject whose final decision is `Degraded`).
+///
+/// Anything else (a call result, a converted field, a reference or `Box` local, a non-subject
+/// binding) is not known raw and keeps `&*` / `&mut *`.
+pub(crate) fn raw_expression_operand(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    span: Span,
+    local_raw: &dyn Fn(HirId) -> bool,
+    field_kept_raw: &dyn Fn(LocalDefId, usize) -> bool,
+) -> bool {
+    use rustc_hir::{ExprKind, QPath, def::Res, intravisit};
+    struct At<'tcx> {
+        span: Span,
+        found: Option<&'tcx rustc_hir::Expr<'tcx>>,
+    }
+    impl<'tcx> intravisit::Visitor<'tcx> for At<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if self.found.is_none() && e.span == self.span {
+                self.found = Some(e);
+                return;
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let mut at = At { span, found: None };
+    intravisit::Visitor::visit_body(&mut at, tcx.hir_body_owned_by(owner));
+    let Some(mut e) = at.found else {
+        return false;
+    };
+    let typeck = tcx.typeck(owner);
+    let raw = |e: &rustc_hir::Expr<'_>| {
+        matches!(
+            typeck.expr_ty(e).kind(),
+            rustc_middle::ty::TyKind::RawPtr(..)
+        )
+    };
+    loop {
+        if !raw(e) {
+            return false;
+        }
+        e = match e.kind {
+            ExprKind::Cast(..) if !raw_expression_fault(tcx, owner, 3) => return true,
+            ExprKind::MethodCall(segment, receiver, ..) => match segment.ident.as_str() {
+                "as_mut_ptr" | "as_ptr" => return true,
+                "offset" | "add" | "sub" | "wrapping_offset" | "wrapping_add" | "wrapping_sub" => {
+                    receiver
+                }
+                _ => return false,
+            },
+            ExprKind::Field(base, _) => {
+                let Some(index) = typeck.opt_field_index(e.hir_id) else {
+                    return false;
+                };
+                let base_ty = typeck.expr_ty_adjusted(base).peel_refs();
+                let rustc_middle::ty::TyKind::Adt(adt, _) = base_ty.kind() else {
+                    return false;
+                };
+                return adt.did().as_local().is_some_and(|did| {
+                    raw_expression_fault(tcx, owner, 2) || field_kept_raw(did, index.as_usize())
+                });
+            }
+            ExprKind::Path(QPath::Resolved(None, path)) => {
+                return match path.res {
+                    Res::Local(local) => raw_expression_fault(tcx, owner, 1) || local_raw(local),
+                    _ => false,
+                };
+            }
+            _ => return false,
+        };
+    }
+}
+
+/// The form a decision emits.
+pub(crate) fn form_of(decision: &Decision) -> Form {
+    match decision {
+        Decision::Cursor { mutable, .. } => Form::Cursor { mutable: *mutable },
+        Decision::Ref { mutable } | Decision::InferredRef { mutable, .. } => {
+            Form::Ref { mutable: *mutable }
+        }
+        Decision::NestedSlice {
+            mutable,
+            inner_mutable,
+            ..
+        } => Form::NestedSlice {
+            mutable: *mutable,
+            inner_mutable: *inner_mutable,
+        },
+        Decision::Slice { mutable, .. } => Form::Slice { mutable: *mutable },
+        Decision::Opt { mutable, slice, .. } => Form::Opt {
+            mutable: *mutable,
+            slice: *slice,
+        },
+        // A degraded subject keeps its raw pointer type.
+        Decision::Box(_) | Decision::Degraded(_) => Form::Raw,
+    }
+}
+
+pub(crate) fn receipt_arm(expected: Form, found: Form) -> &'static str {
+    if expected != Form::Raw && found != Form::Raw {
+        "glue"
+    } else {
+        "c"
+    }
+}
+
+pub(crate) fn receipt_extent(spec: &GlueSpec) -> BridgeExtentKind {
+    match spec.len.as_ref() {
+        Some(SeamLen::Licensed(source)) => BridgeExtentKind::Evidence(source.clone()),
+        Some(SeamLen::Proven { text, premises }) => {
+            BridgeExtentKind::Evidence(format!("extent-proof:{premises}:{text}"))
+        }
+        Some(SeamLen::NulWalk { receipt, .. }) => BridgeExtentKind::Evidence(receipt.clone()),
+        Some(SeamLen::MaskDerived(source)) => BridgeExtentKind::MaskPlusOne(source.clone()),
+        // R500-8: the text is the caller's own argument, the receipt is a fallback.
+        Some(SeamLen::PositionalSibling { .. }) => BridgeExtentKind::Fallback,
+        Some(SeamLen::Fabricated) => BridgeExtentKind::Fallback,
+        Some(SeamLen::Refused(reason)) => BridgeExtentKind::Refused(reason.clone()),
+        None => BridgeExtentKind::None,
+    }
+}
+
+/// The 17 `(found, expected)` rows the 2026-08-11 census measured. **Not a
+/// coverage bound** — see [`SeamPlan::uncensused`].
+fn in_census(found: Form, expected: Form) -> bool {
+    use Form::*;
+    matches!(
+        (found, expected),
+        (Raw, Ref { .. })
+            | (Raw, Slice { .. })
+            | (Raw, Opt { slice: false, .. })
+            | (Raw, Opt { slice: true, .. })
+            | (Ref { .. }, Opt { slice: false, .. })
+            | (Ref { .. }, Slice { .. })
+            | (Ref { .. }, Raw)
+    )
+}
+
+#[derive(Clone)]
+struct Candidate {
+    spec: GlueSpec,
+    family: SeamFamily,
+    replacement: String,
+    len_arm: Option<LenArm>,
+    retention: BridgeRetentionTier,
+    waiver_id: Option<String>,
+}
+
+impl Candidate {
+    fn into_input_rendering(self, found: Form) -> SeamInputRendering {
+        SeamInputRendering::Adapter {
+            replacement: self.replacement,
+            spec: self.spec,
+            family: self.family,
+            found,
+            len_arm: self.len_arm,
+            retention: self.retention,
+            waiver_id: self.waiver_id,
+        }
+    }
+}
+
+/// wave-6p (R407-5): an `&mut place` argument at a SHARED formal. Replaces the
+/// zero-syntax coercion (`&T` expected) or the bare `Some(p)` wrap
+/// (`Option<&T>` expected) with the weaker borrow `&(place)` /
+/// `Some(&(place))`; every other candidate is left alone.
+fn shared_weakening_candidate(
+    tcx: TyCtxt<'_>,
+    weakenings: &super::shared_weakening::SharedWeakenings,
+    expected: Form,
+    argument_span: Span,
+    text: &str,
+    current: &Result<Option<Candidate>, SeamBlock>,
+) -> Option<Candidate> {
+    let optional = match (expected, current) {
+        (Form::Ref { mutable: false }, Ok(None)) => false,
+        (
+            Form::Opt {
+                mutable: false,
+                slice: false,
+                ..
+            },
+            Ok(Some(candidate)),
+        ) if candidate.spec.core == GlueCore::Bare
+            && candidate.spec.optional
+            && candidate.spec.unwrap.is_none()
+            && candidate.spec.null_arm == NullArm::None
+            && candidate.spec.shared_address.is_none()
+            && candidate.spec.raw_boundary.is_none() =>
+        {
+            true
+        }
+        _ => return None,
+    };
+    let weakening = weakenings.at(tcx, argument_span, optional)?;
+    let replacement = weakening.render(text)?;
+    let mut spec = GlueSpec::core(GlueCore::Bare, false);
+    spec.optional = optional;
+    spec.shared_weakening = Some(weakening);
+    Some(Candidate {
+        spec,
+        replacement,
+        family: SeamFamily::Safe,
+        len_arm: None,
+        retention: BridgeRetentionTier::None,
+        waiver_id: None,
+    })
+}
+
+fn shared_candidate(
+    address: &super::overlapping_pairs::consumer::SharedAddress,
+    text: &str,
+) -> Result<Option<Candidate>, SeamBlock> {
+    let mut spec = GlueSpec::core(GlueCore::Bare, false);
+    spec.shared_address = Some(address.clone());
+    let replacement = spec.render(text).ok_or(SeamBlock::UnnameableOperand)?;
+    Ok(Some(Candidate {
+        spec,
+        replacement,
+        family: SeamFamily::Safe,
+        len_arm: None,
+        retention: BridgeRetentionTier::None,
+        waiver_id: None,
+    }))
+}
+
+/// wave-6a (relay wave-6a/012 §3, R422-5): **the owner-view glue** — an
+/// argument whose root the ladder decided `Box` (a `Box<[T]>` /
+/// `Option<Box<..>>` owner: an allocation-return receiver, a contract
+/// allocation, a chain member) at a CONVERTED formal. `form_of(Box)` is
+/// `Raw`, so the type-level matrix would write `from_raw_parts(x, n)` at a
+/// slice formal (E0308 for a `Box<[T]>`) or `&*x` at a thin one (`&[T]`, not
+/// `&T`). The owner's own view is the argument instead, spelled in the seam
+/// algebra the AST layer renders: `&mut *x` / `&*x` at a slice formal (a
+/// `Box<[T]>` reborrow IS `&mut [T]`); `&mut x[0]` / `&x[0]` at a thin one;
+/// an optional owner through `x.as_mut().unwrap()` first (`&*x.as_mut()
+/// .unwrap()` is `&Box<[T]>`, which deref-coerces to `&[T]` at the call);
+/// `Some(..)` at an optional formal from a non-optional owner. An optional
+/// owner at an optional formal of its own shape takes its own view,
+/// `x.as_deref()` / `x.as_deref_mut()` (R583-8 wall 1: avl's re-seated
+/// `insert::node` lent to `getBalance(N: Option<&Node>)`). No raw boundary is
+/// crossed, so no retention tier. A non-optional SIZED owner keeps the
+/// matrix's `&*x` (A1's receivers).
+/// Keyed on the argument's decision, not a new `Form` variant.
+/// The binding whose own view the R422-5 owner-view glue renders: the owner
+/// passed bare, never a place derived from it.
+fn owner_argument(arg: &super::emitability::Arg) -> Option<HirId> {
+    // An element address of a Box owner (`box_facts::box_element_address`,
+    // R557-4) is one element, not the owner: it keeps its own form (R555-1).
+    if arg.element_of.is_some() {
+        return None;
+    }
+    match arg.shape {
+        ArgShape::BareLocal(root) => Some(root),
+        ArgShape::AddrOf { .. }
+        | ArgShape::AddrOfCast { .. }
+        | ArgShape::CastOfLocal { .. }
+        | ArgShape::RawExpr { .. }
+        | ArgShape::NullLit
+        | ArgShape::Cast { .. }
+        | ArgShape::Other => None,
+    }
+}
+
+fn owner_view_candidate(
+    decision: Option<&Decision>,
+    expected: Form,
+    text: &str,
+) -> Option<Candidate> {
+    let Some(Decision::Box(plan)) = decision else { return None };
+    let slice = plan.shape == super::box_facts::BoxShape::Slice;
+    if !slice && !plan.optional {
+        return None;
+    }
+    if let Form::Opt {
+        mutable,
+        slice: formal_slice,
+    } = expected
+        && formal_slice == slice
+        && plan.optional
+    {
+        let mut spec = GlueSpec::core(GlueCore::Bare, mutable);
+        spec.option_view = Some(mutable);
+        let replacement = spec.render(text)?;
+        return Some(Candidate {
+            spec,
+            family: SeamFamily::Safe,
+            replacement,
+            len_arm: None,
+            retention: BridgeRetentionTier::None,
+            waiver_id: None,
+        });
+    }
+    let (mutable, core, wrapped) = match expected {
+        Form::Slice { mutable } if slice => (mutable, GlueCore::Reborrow, false),
+        Form::Ref { mutable } if slice => (mutable, GlueCore::Index0, false),
+        Form::Ref { mutable } => (mutable, GlueCore::Reborrow, false),
+        Form::Opt {
+            mutable,
+            slice: true,
+        } if slice && !plan.optional => (mutable, GlueCore::Reborrow, true),
+        Form::Opt {
+            mutable,
+            slice: false,
+        } if slice && !plan.optional => (mutable, GlueCore::Index0, true),
+        Form::Slice { .. }
+        | Form::Opt { .. }
+        | Form::Raw
+        | Form::NestedSlice { .. }
+        | Form::Cursor { .. } => return None,
+    };
+    let mut spec = GlueSpec::core(core, mutable);
+    if plan.optional {
+        // `.as_mut().unwrap()`: a shared `.unwrap()` would MOVE the owner
+        // out of its `Option`.
+        spec = spec.with_unwrap(true);
+    }
+    if wrapped {
+        spec = spec.wrapped();
+    }
+    let replacement = spec.render(text)?;
+    Some(Candidate {
+        spec,
+        family: SeamFamily::Safe,
+        replacement,
+        len_arm: None,
+        retention: BridgeRetentionTier::None,
+        waiver_id: None,
+    })
+}
+
+/// **Wave-6o (relay 121, R738-1).** An optional reference at a callee formal
+/// whose FINAL form is raw. A plain `&T` / `&mut T` coerces to `*const T` /
+/// `*mut T` at a call, so `glue(Raw, _)` adds nothing; an `Option<&T>` does not
+/// coerce. The formal may be decided a reference in the hypothetical the raw
+/// boundary planned against and only fall back to raw at its own boundary site
+/// (brotli's `stat::__path`, blocked `write-through-shared-view` at `__xstat`),
+/// so the boundary pass never saw this site as a raw target. The bridge is the
+/// raw boundary's own optional template, selected by the callee formal's type
+/// as `bridge_template` selects it — for the FAT form only (`OptSliceToRaw`, the
+/// slice carries its extent); a THIN optional is held (relay 122:
+/// `held:thin-cstring-to-libc` / `held:thin-optional-to-raw-formal`), never cast;
+/// a shared fat optional at a `*mut` formal is refused shared-to-mut.
+fn optional_into_raw_formal(
+    tcx: TyCtxt<'_>,
+    callee: LocalDefId,
+    index: usize,
+    expected: Form,
+    found: Form,
+    literal_null: bool,
+    text: &str,
+) -> Option<Result<Option<Candidate>, SeamBlock>> {
+    use super::raw_boundary::{BridgeTemplate, RawMutability};
+    let (Form::Raw, Form::Opt { mutable, slice }) = (expected, found) else { return None };
+    if literal_null {
+        return None;
+    }
+    let formal = *tcx
+        .fn_sig(callee.to_def_id())
+        .skip_binder()
+        .skip_binder()
+        .inputs()
+        .get(index)?;
+    let target = super::raw_boundary::raw_target_type(tcx, formal)?;
+    let template = match (slice, mutable, target.mutability) {
+        (true, true, RawMutability::Mut) | (true, _, RawMutability::Const) => {
+            BridgeTemplate::OptSliceToRaw
+        }
+        (true, false, RawMutability::Mut) => return Some(Err(SeamBlock::SharedToMut)),
+        // Relay 122: never cast a THIN reference into a raw formal — one
+        // element of provenance for an access the callee may extend (a C
+        // string to its NUL). Hold, receipted.
+        (false, ..) => {
+            let c_char = matches!(target.pointee.trim_start_matches("::"), "i8" | "u8")
+                || target.pointee.ends_with("c_char")
+                || target.pointee.ends_with("c_uchar")
+                || target.pointee.ends_with("c_schar");
+            return Some(Err(if c_char {
+                SeamBlock::ThinCStringToRaw
+            } else {
+                SeamBlock::ThinOptionalToRaw
+            }));
+        }
+    };
+    let spec = GlueSpec::raw_boundary_target(template, &target, false, true);
+    let replacement = spec.render(text)?;
+    Some(Ok(Some(Candidate {
+        spec,
+        family: SeamFamily::Safe,
+        replacement,
+        len_arm: None,
+        retention: BridgeRetentionTier::None,
+        waiver_id: None,
+    })))
+}
+
+/// **main 202 — a formal that ended raw after the raw boundary's hypothesis.**
+/// The collateral reasons wave-6o reads (relay 121), and the pair hold (R864-1),
+/// which holds a formal for an overlap at ANOTHER call: the model's reading of
+/// the formal stands, so the lend the Box plan proved against it stands. A
+/// retained-access hold (the callee may keep the pointer) or a release through
+/// an indirect call (the callee may free it) is not read here: a lend to such a
+/// formal is exactly what the hold says is unproved, and the compile gate
+/// reverts the caller as before.
+///
+/// **Relay 321 (main 213 §5): the cascade of a pair hold** (`into-held-formal`,
+/// the formal handed whole to a formal a pair hold makes raw) is read the same
+/// way, where its root is a pair hold ([`into_held_rooted_in_a_pair`]) and no
+/// retained-access or released-through-indirect-call predicate names the formal
+/// (`excluded`): the pair at the root claims nothing about what the callee does
+/// with the pointer it is lent. `formal_of` finds a formal's decision by the
+/// callee path and 0-based index the cascade's detail names.
+///
+/// **The stand-in review of relay 321 (F1 / F2): the cascade's view is read only
+/// for an owner a certificate made** (`certified`: the return-certificate, the
+/// allocator-contract and the Box-parameter plans, whose every lend the
+/// `LendOracle` walk proved to neither keep, release, copy nor hand the pointer to
+/// an indirect call). The hold bookkeeping cannot stand in for that proof: the
+/// retained-access check reads delivered subjects only, so a formal already held
+/// never carries its receipt, and a cascade records one root per binding.
+pub(crate) fn late_raw_formal<'d>(
+    decision: &Decision,
+    excluded: bool,
+    certified: bool,
+    formal_of: &dyn Fn(&str, usize) -> Option<&'d Decision>,
+) -> bool {
+    match decision {
+        Decision::Degraded(record) => match &record.reason {
+            super::DegradeReason::SilentCoercion { .. }
+            | super::DegradeReason::ClassBlocked { .. }
+            | super::DegradeReason::SignatureClassHeld { .. }
+            | super::DegradeReason::PairNotShownDisjoint { .. } => true,
+            super::DegradeReason::IntoHeldFormal { detail } => {
+                certified && !excluded && into_held_rooted_in_a_pair(detail, formal_of)
+            }
+            _ => false,
+        },
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::Slice { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Cursor { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_) => false,
+    }
+}
+
+/// **Relay 321: is this `into-held-formal` cascade rooted in a pair hold?** The
+/// detail names the held formal the binding is handed to
+/// (`into-held-formal:<callee>#<1-based index>`, `settled_holds`); follow it, and
+/// any further cascade, to the hold at the root. Only `held:pair-not-shown-disjoint`
+/// answers yes: a retained-access root, a release through an indirect call, a
+/// binding's cascade (`into-held-binding:`), a formal `formal_of` does not give
+/// (a retained or released predicate names it) or a chain longer than eight is no.
+pub(crate) fn into_held_rooted_in_a_pair<'d>(
+    detail: &str,
+    formal_of: &dyn Fn(&str, usize) -> Option<&'d Decision>,
+) -> bool {
+    let mut detail = detail.to_owned();
+    for _ in 0..8 {
+        let Some(rest) = detail.strip_prefix("into-held-formal:") else {
+            return false;
+        };
+        let Some((path, index)) = rest.rsplit_once('#') else {
+            return false;
+        };
+        let Some(index) = index.parse::<usize>().ok().and_then(|k| k.checked_sub(1)) else {
+            return false;
+        };
+        let next = match formal_of(path, index) {
+            Some(Decision::Degraded(record)) => match &record.reason {
+                super::DegradeReason::PairNotShownDisjoint { .. } => return true,
+                super::DegradeReason::IntoHeldFormal { detail } => detail.clone(),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        detail = next;
+    }
+    false
+}
+
+/// **main 202 — a `Box` owner lent to a formal that ended raw late.** The raw
+/// boundary's own owner templates (`BoxBorrowViewToRaw` /
+/// `OptionalBoxBorrowViewToRaw`, R452-3(3)): the owner's view, as raw as the
+/// formal (`x.as_deref_mut().map_or(null_mut(), |s| s.as_mut_ptr())`). The
+/// owner keeps its allocation; the callee borrows it for the call. A void or
+/// depth-2 formal needs a cast these templates do not spell: not bridged.
+fn owner_into_raw_formal(
+    tcx: TyCtxt<'_>,
+    callee: LocalDefId,
+    index: usize,
+    decision: Option<&Decision>,
+    text: &str,
+) -> Option<Result<Option<Candidate>, SeamBlock>> {
+    use super::raw_boundary::BridgeTemplate;
+    let Some(Decision::Box(plan)) = decision else { return None };
+    let formal = *tcx
+        .fn_sig(callee.to_def_id())
+        .skip_binder()
+        .skip_binder()
+        .inputs()
+        .get(index)?;
+    let target = super::raw_boundary::raw_target_type(tcx, formal)?;
+    if target.is_void_pointee() || target.depth2.is_some() {
+        return None;
+    }
+    let template = if plan.optional {
+        BridgeTemplate::OptionalBoxBorrowViewToRaw
+    } else {
+        BridgeTemplate::BoxBorrowViewToRaw
+    };
+    let spec = GlueSpec::raw_boundary_target(
+        template,
+        &target,
+        plan.shape == super::box_facts::BoxShape::Slice,
+        true,
+    );
+    let replacement = spec.render(text)?;
+    Some(Ok(Some(Candidate {
+        spec,
+        family: SeamFamily::Safe,
+        replacement,
+        len_arm: None,
+        retention: BridgeRetentionTier::None,
+        waiver_id: None,
+    })))
+}
+
+/// Test seam for [`optional_into_raw_formal`]: the rendered bridge, or the
+/// block's key.
+#[cfg(test)]
+pub(crate) fn optional_into_raw_formal_for_tests(
+    tcx: TyCtxt<'_>,
+    callee: LocalDefId,
+    index: usize,
+    found: Form,
+    text: &str,
+) -> Result<String, &'static str> {
+    match optional_into_raw_formal(tcx, callee, index, Form::Raw, found, false, text) {
+        Some(Ok(Some(candidate))) => Ok(candidate.replacement),
+        Some(Err(block)) => Err(block.key()),
+        _ => Err("none"),
+    }
+}
+
+/// **R622-1 / R628-2 — which positions the row's extent conjunct reads.** A
+/// one-element claim may be narrower than its referent only where the argument
+/// is a thin subject (a bare or cast local, possibly into an array) or the
+/// address of an ELEMENT (R641-2 (1)/(2), read from the HIR, casts included:
+/// `&*p.offset(k)`, lodepng's `lodepng_read32bitInt` shape, `&mut buf[k]`,
+/// `&mut *p.offset(k) as *mut T`). The address of a local or field place
+/// (`&mut x`, golden g24) is exactly one object: a UB-free input (§28) cannot
+/// index past it on that path, so `from_ref` there is faithful and stays.
+/// A cursor's tail view (R217-2(a)) is never one element: the cursor family
+/// renders it with the tail's full extent, so the caller passes `false`.
+///
+/// **R761-1 (the re-cut for 54): the ELEMENT-ADDRESS arm only.** `0a40583c1` also
+/// refused a thin bare / cast subject (shape (i)) and paired that refusal with the
+/// thin-caller hold, since a refused adapter leaves the delivered thin reference
+/// coercing into the withdrawn raw formal (golden g25). The hold is ruled out of
+/// 54, so shape (i) keeps its `from_ref` until 55's thin-into-fat rule delivers it
+/// as a slice. Refusing an element address of a raw base (shape (ii),
+/// `from_ref(&*p.offset(k))`) needs no hold: no delivered reference is left behind.
+///
+/// **R1313-3 (relay main/371 step B) amends R761-1's cut:** shape (i), a bare or
+/// cast thin subject, is refused too. The decision layer holds such a subject
+/// first (`decision::one_element_holds`, op `one-element-into-slice-formal`),
+/// so its caller's raw pointer reaches the slice formal through the C arm; this
+/// row is the backstop, and no delivered thin reference is left behind.
+fn one_element_into_wide(
+    wide: bool,
+    source_shape: &str,
+    element_address: bool,
+    expected: Form,
+) -> bool {
+    wide && match source_shape {
+        "addr-of" | "addr-of-mut" | "addr-of-cast" | "addr-of-mut-cast" => element_address,
+        // R1313-3: a formal decided a slice only; a cursor formal's caller is
+        // the cursor family's own adaptation.
+        "bare-local" | "cast-of-local" => {
+            matches!(expected, Form::Slice { .. } | Form::Opt { slice: true, .. })
+        }
+        _ => false,
+    }
+}
+
+/// **R641-2 (3) — R217-2(a)'s cursor-element view, and its slice twin.** The
+/// position's root is a cursor carrying its `cursor-element` edit at exactly
+/// this span: the cursor family renders the tail view
+/// (`ToUpperCase(&mut *dst.offset(k))`), which carries the tail's extent. Or the
+/// argument is exactly the element spine `&*root.offset(e)` / `&mut
+/// *root.offset(e)` of a root decided a slice (`Arg::element_of`;
+/// `ReplicateValue(&mut *table.offset(k), ..)`): the slice family's computed
+/// view renders it as the suffix `&mut table[k..]`, the base's own extent
+/// (wave-6s W6S-14). A nested place under the element
+/// (`&mut (*table.offset(i)).arr[k]`) has no such view and stays refused. A view
+/// the slice family then cannot render degrades the root and keeps the adapter:
+/// the landed reading, named in main 131a.
+fn cursor_element_view(
+    decision_of: &FxHashMap<(LocalDefId, HirId), &Decision>,
+    caller: LocalDefId,
+    root: Option<HirId>,
+    span: Span,
+    element_spine_of_root: bool,
+) -> bool {
+    let Some(decision) = root.and_then(|root| decision_of.get(&(caller, root)).copied()) else {
+        return false;
+    };
+    match decision {
+        Decision::Cursor { plan, .. } => plan
+            .uses
+            .iter()
+            .any(|edit| edit.span == span && edit.bridge_kind == "cursor-element"),
+        Decision::Slice { .. } | Decision::Opt { slice: true, .. } => element_spine_of_root,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Degraded(_) => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_candidate(
+    expected: Form,
+    found: Form,
+    text: &str,
+    source_type: &str,
+    literal_null: bool,
+    len_text: Option<&str>,
+    len_masked: bool,
+    len_evidence: Option<LenEvidence>,
+    enclosing_unsafe_fn: bool,
+    retention_facts: &super::raw_boundary::RetentionSummaries,
+    callee: LocalDefId,
+    argument_index: usize,
+    callee_accesses_wide: bool,
+    return_tied: bool,
+    counted: Option<(&super::counted_void::Contract, super::counted_void::Route)>,
+    field_tied: bool,
+    region: Option<&super::void_region::Region>,
+    raw_operand: bool,
+) -> Result<Option<Candidate>, SeamBlock> {
+    if counted.is_some() && found != Form::Raw {
+        return Err(SeamBlock::UnnameableOperand);
+    }
+    // wave-6b: a region position takes a raw buffer expression, or — for a
+    // width reader only — a delivered slice, read as a checked prefix. Every
+    // other found form is a view the region bridge cannot re-derive.
+    let region_from_slice = region.is_some_and(|region| {
+        region.shape == super::void_region::Shape::WidthRead && matches!(found, Form::Slice { .. })
+    });
+    if region.is_some() && !region_from_slice && (found != Form::Raw || literal_null) {
+        return Err(SeamBlock::UnnameableOperand);
+    }
+    let answer = if literal_null {
+        glue_null(expected)?
+    } else if region_from_slice {
+        // A delivered slice into a width reader: `&s[..N]`, a safe prefix
+        // view rather than the zero-syntax pass-through a slice-to-slice
+        // position would otherwise take.
+        Some((GlueSpec::core(GlueCore::Bare, false), SeamFamily::Safe))
+    } else {
+        glue(expected, found, len_text)?
+    };
+    let Some((mut spec, family)) = answer else {
+        return Ok(None);
+    };
+    spec.raw_operand = raw_operand;
+    // **R622-1 / R628-2 — the extent conjunct on the `(Slice, Ref)` row
+    // (R416-5).** `from_ref` / `from_mut` hands the callee ONE element; a formal
+    // the callee accesses past it (offset or index, a cast from `c_void`, or a
+    // bare hand-on to one that does) then panics on its checked index where C
+    // read on — brotli's `dist_cache` into `BrotliZopfliCreateCommands`,
+    // lodepng's `&*in_0.offset(k)` into `lodepng_read32bitInt`. The row admits
+    // the thin argument only into a formal accessed at one element; anything
+    // else is refused here, whatever the decisions upstream left standing (a
+    // withdrawn family can leave the subject's Core `ref`).
+    if matches!(spec.core, GlueCore::FromRefMut) && callee_accesses_wide {
+        return Err(SeamBlock::OneElementIntoWider);
+    }
+    let spec = if spec.null_arm == NullArm::Checked {
+        spec.with_checked_binding_type(source_type.to_owned())
+    } else {
+        spec
+    };
+    let mut spec = spec;
+    // **wave-6l R825-4a (R517-10).** A licensed field's length holds only
+    // while the field holds its allocation; the field's null initializer
+    // (brotli's `RingBufferInit`, before `InitBuffer`) can reach the use with
+    // the length still above zero, so a null base is the empty slice.
+    if len_evidence == Some(LenEvidence::FieldAlloc)
+        && spec.core == GlueCore::FromRawParts
+        && spec.null_arm == NullArm::None
+        && matches!(spec.len, Some(SeamLen::Licensed(_)))
+    {
+        spec.null_base_empty = true;
+    }
+    // **R477-6.** The text came from the call site, so `glue` licensed it; the
+    // chain also proved it is a MASK, which the receipt must say.
+    if len_masked && let Some(SeamLen::Licensed(text)) = spec.len.clone() {
+        spec.len = Some(SeamLen::MaskDerived(text));
+    }
+    // **R500-8.** The count was picked by POSITION — the sibling following the
+    // pointer — so the emitted length is that argument's own text and the
+    // receipt is a fabricated extent under §77, counted beside the 1024s.
+    if let Some((contract, _)) = counted
+        && let Some(param) = &contract.count_positional
+        && let Some(SeamLen::Licensed(text)) = spec.len.clone()
+    {
+        spec.len = Some(SeamLen::PositionalSibling {
+            text,
+            param: param.clone(),
+        });
+    }
+    if let Some((contract, route)) = counted {
+        // **R464-3 — the fallback extent at the CALL SITE.** A raw caller of a
+        // header-path view has no length to supply: the callee's count is the
+        // ruled fallback extent (R457-5), not one of the call's arguments. That
+        // is the same condition the declaration was granted the waiver for, one
+        // layer out, so the same waiver applies — `glue` has already installed
+        // `SeamLen::Fabricated` here, and the receipt reads
+        // `fallback(FALLBACK_SLICE_EXTENT=1024)`.
+        //
+        // **Read positions only.** A fabricated extent on a `&mut [u8]` claims
+        // writable bytes, which is a different and worse claim than a read; the
+        // prove side already refuses a written-through cursor, so this is a
+        // declared redundancy (R312-1) kept because it is the soundness line
+        // the ruling drew.
+        let fallback_extent = contract
+            .width
+            .as_ref()
+            .is_some_and(super::binn_counted::WidthTable::is_fallback_extent)
+            && matches!(
+                expected,
+                Form::Slice { mutable: false }
+                    | Form::Opt {
+                        mutable: false,
+                        slice: true
+                    }
+            );
+        if len_text.is_none() && !fallback_extent {
+            return Err(SeamBlock::LengthUnknown);
+        }
+        spec.counted_byte = Some(super::counted_void::CountedByte {
+            element: contract.element,
+            arg_index: argument_index,
+            route,
+            handle_pointee: contract.handle.as_deref().map(rustc_span::Symbol::intern),
+        });
+    }
+    if let Some(region) = region {
+        if region_from_slice {
+            spec.void_region = Some(super::void_region::Bridge::from_slice(region));
+        } else {
+            if spec.core != GlueCore::FromRawParts {
+                return Err(SeamBlock::UnnameableOperand);
+            }
+            spec.void_region = Some(super::void_region::Bridge::of(region));
+        }
+        spec.len = Some(match region.len_text() {
+            Some(exact) => SeamLen::Licensed(exact),
+            None => SeamLen::Fabricated,
+        });
+    }
+    let replacement = spec
+        .render_in_context(text, enclosing_unsafe_fn)
+        .ok_or(SeamBlock::LengthUnknown)?;
+    let len_arm = spec.len.as_ref().zip(len_evidence).map(|(len, evidence)| {
+        if len.is_fabricated() {
+            LenArm::Fabricated(evidence)
+        } else {
+            LenArm::Licensed(evidence)
+        }
+    });
+    let (retention, waiver_id) = if let Some(region) = region {
+        // wave-6b: the accessor RETURNS a raw pointer into the bridged region
+        // by design, and the bridged view is a temporary of the call — no safe
+        // view of the buffer outlives it. The retained raw alias is receipted
+        // under the T2 waiver like every return-carried alias.
+        super::void_region::retention(region)
+    } else if found == Form::Raw && expected != Form::Raw {
+        inbound_retention(
+            retention_facts,
+            callee,
+            argument_index,
+            return_tied,
+            field_tied,
+        )?
+    } else {
+        (BridgeRetentionTier::None, None)
+    };
+    Ok(Some(Candidate {
+        spec,
+        family,
+        replacement,
+        len_arm,
+        retention,
+        waiver_id,
+    }))
+}
+
+pub(crate) fn decision_for_safe_form(form: Form) -> Option<super::Decision> {
+    match form {
+        Form::NestedSlice { .. } | Form::Cursor { .. } => None,
+        Form::Raw => None,
+        Form::Ref { mutable } => Some(super::Decision::Ref { mutable }),
+        Form::Slice { mutable } => Some(super::Decision::Slice {
+            mutable,
+            uses: Vec::new(),
+        }),
+        Form::Opt { mutable, slice } => Some(super::Decision::Opt {
+            mutable,
+            slice,
+            uses: Vec::new(),
+        }),
+    }
+}
+
+/// Replays the plan-time argument-expression form derivation over a terminal
+/// subject form. An address-of expression is a reference regardless of whether
+/// its root subject was itself placed; bare/cast locals inherit the terminal
+/// form of that subject.
+pub(crate) fn a5_argument_expression_form(
+    argument_shape: &str,
+    terminal_subject_form: Form,
+) -> Option<Form> {
+    match argument_shape {
+        "bare-local" | "cast-of-local" => Some(terminal_subject_form),
+        "addr-of" | "addr-of-cast" => Some(Form::Ref { mutable: false }),
+        "addr-of-mut" | "addr-of-mut-cast" => Some(Form::Ref { mutable: true }),
+        // wave-5d2 (b): a raw-pointer EXPRESSION is a raw value whatever form
+        // its root subject takes — `p.offset(k) as *const T` stays a raw
+        // pointer when `p`'s owner converts. The view is the passthrough,
+        // never the reference arm over an already-raw operand.
+        "raw-expr" => Some(Form::Raw),
+        _ => None,
+    }
+}
+
+/// Rebuild one A5 raw view from sealed plan evidence and a terminal form pair.
+/// This is the same template derivation used initially; no analysis query is
+/// available or permitted at finalization.
+pub(crate) fn replan_a5_raw_view(
+    view: &A5RawViewTemp,
+    terminal_expected: Form,
+    terminal_found: Form,
+) -> Result<A5RawViewTemp, SeamBlock> {
+    use super::raw_boundary::{BridgeRender, RawBoundaryBlockReason};
+
+    // R231: a raw-view obligation cannot reconstruct a protected target.
+    if terminal_expected != Form::Raw {
+        return Err(SeamBlock::A5RawViewUnavailable);
+    }
+
+    let (raw_expression, raw_template) = if terminal_found == Form::Raw {
+        // A cast shape's argument expression is its operand: the raw temporary
+        // restates the argument's own cast to the formal's type (main 186: a
+        // source the decision layer held raw at `obj as *mut c_void` rendered
+        // `let t: *mut c_void = obj;`, E0308, and the verify loop reverted the
+        // callee's class).
+        let raw = match view.argument_shape {
+            "cast-of-local" | "cast" => {
+                format!("{} as {}", view.argument_expression, view.target.rendered)
+            }
+            _ => view.argument_expression.clone(),
+        };
+        (raw, "raw-passthrough".to_owned())
+    } else {
+        let source_decision =
+            decision_for_safe_form(terminal_found).ok_or(SeamBlock::A5RawViewUnavailable)?;
+        let negative_write = view.negative_write.is_some();
+        // **R766-2 / R784-2 (main 159 §2a).** A BARE local at a depth-2 formal is
+        // the outer pointer itself, so its raw view is the depth-1 one. The
+        // depth-2 NPO view (`from_mut(&mut p).cast()`) is for an INNER pointer's
+        // `&mut p` storage; over a bare `&mut *mut T` it takes one address too
+        // many (brotli's `next_out#6`, E0308 `*mut *mut *mut u8`).
+        let outer_view;
+        let target = if view.argument_shape == "bare-local" && view.target.depth2.is_some() {
+            outer_view = super::raw_boundary::RawTargetType {
+                depth2: None,
+                ..view.target.clone()
+            };
+            &outer_view
+        } else {
+            &view.target
+        };
+        let template =
+            super::raw_boundary::template_for(&source_decision, target, None, negative_write)
+                .map_err(|reason| match reason {
+                    RawBoundaryBlockReason::SharedToMut => SeamBlock::A5NegativeWriteAbsent,
+                    _ => SeamBlock::A5RawViewUnavailable,
+                })?;
+        let rendered = match template
+            .render_explicit(
+                &view.argument_expression,
+                target.mutability,
+                false,
+                Some(target.pointee.as_str()),
+            )
+            .map_err(|_| SeamBlock::A5RawViewUnavailable)?
+        {
+            BridgeRender::Edit(expression) => expression,
+            BridgeRender::ZeroSyntax => view.argument_expression.clone(),
+            BridgeRender::Lifecycle => return Err(SeamBlock::A5RawViewUnavailable),
+        };
+        (rendered, template.key().to_owned())
+    };
+
+    // The operand is rendered peeled of its casts (`a5_role_operand_span`), so
+    // a cast argument's raw view would carry the operand's pointee, not the
+    // formal's (binn `copy_be32(.., &mut int32 as *mut i32 as *mut u32)`:
+    // `from_mut(&mut int32)` against `*mut u32`). The program's own cast is
+    // put back, to the formal's raw type.
+    let raw_expression = if matches!(
+        view.argument_shape,
+        "addr-of-cast" | "addr-of-mut-cast" | "cast-of-local"
+    ) {
+        let pointer = match view.target.mutability {
+            super::raw_boundary::RawMutability::Mut => "*mut _",
+            super::raw_boundary::RawMutability::Const => "*const _",
+        };
+        format!(
+            "({raw_expression} as {pointer} as {})",
+            view.target.rendered
+        )
+    } else {
+        raw_expression
+    };
+    let mut template = raw_template;
+    if terminal_found != Form::Raw && view.negative_write.is_some() {
+        template.push_str(":negative-write=foster-immutable");
+    }
+
+    let mut replanned = view.clone();
+    replanned.raw_expression = raw_expression;
+    replanned.adapted_expression = super::super::c9::A5_RAW_VALUE_PLACEHOLDER.to_owned();
+    replanned.extent_expression = None;
+    replanned.template = template;
+    replanned.unsafe_context = None;
+    replanned.negative_write = (terminal_found != Form::Raw)
+        .then_some(view.negative_write)
+        .flatten();
+    replanned.expected_form = terminal_expected;
+    replanned.found_form = terminal_found;
+    Ok(replanned)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_a5_raw_view(
+    tcx: TyCtxt<'_>,
+    mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    argument_index: usize,
+    expected: Form,
+    found: Form,
+    argument: &str,
+    source_shape: &'static str,
+    target: Option<&super::raw_boundary::RawTargetType>,
+    proof_site_key: A5ProofSiteKey,
+    source_node: Option<(LocalDefId, HirId)>,
+) -> Result<A5RawViewTemp, SeamBlock> {
+    use rustc_middle::mir::Local;
+
+    if !matches!(
+        source_shape,
+        "bare-local"
+            | "cast-of-local"
+            | "addr-of"
+            | "addr-of-mut"
+            | "addr-of-cast"
+            | "addr-of-mut-cast"
+    ) && !super::raw_boundary::a5_raw_expr_view_admits(source_shape, argument)
+    {
+        return Err(SeamBlock::A5RawViewUnavailable);
+    }
+    let target = target.ok_or(SeamBlock::A5RawViewUnavailable)?;
+    let parameter = Local::from_usize(argument_index + 1);
+    let negative_write =
+        !mut_facts.is_defaulted(callee, parameter) && !mut_facts.is_mutable(callee, parameter);
+    let seed = A5RawViewTemp {
+        argument_index,
+        argument_expression: argument.to_owned(),
+        argument_shape: source_shape,
+        raw_expression: String::new(),
+        target_type: target.rendered.clone(),
+        target: target.clone(),
+        adapted_expression: String::new(),
+        extent_expression: None,
+        template: String::new(),
+        proof_site_key,
+        unsafe_context: None,
+        negative_write: negative_write
+            .then_some(super::raw_boundary::NegativeWriteEvidence::FosterImmutable),
+        expected_form: expected,
+        found_form: found,
+        source_node,
+        enclosing_unsafe_fn: enclosing_function_is_unsafe(tcx, caller),
+        input_rendering: None,
+    };
+    // Discovery requests Raw; role feedback settles that endpoint before planning.
+    // A raw-pointer expression's own form is Raw (see `a5_argument_expression_form`).
+    let found = a5_argument_expression_form(source_shape, found).unwrap_or(found);
+    replan_a5_raw_view(&seed, Form::Raw, found)
+}
+
+fn inbound_retention(
+    retention: &super::raw_boundary::RetentionSummaries,
+    callee: LocalDefId,
+    argument_index: usize,
+    return_tied: bool,
+    field_tied: bool,
+) -> Result<(BridgeRetentionTier, Option<String>), SeamBlock> {
+    use super::raw_boundary::{RetentionEventKind, RetentionVerdict};
+
+    match retention.get(callee, argument_index) {
+        Some(RetentionVerdict::NoRetain { .. }) => Ok((BridgeRetentionTier::T1, None)),
+        Some(RetentionVerdict::Retains { sink, .. })
+            if sink.kind == RetentionEventKind::Return && return_tied =>
+        {
+            Ok((BridgeRetentionTier::T1, None))
+        }
+        // wave-6f: the retention is a store into a converting struct field and
+        // the callee's signature ties the parameter to that struct's lifetime;
+        // the reference escapes the call exactly as the type says it does.
+        Some(RetentionVerdict::Retains { sink, .. })
+            if matches!(
+                sink.kind,
+                RetentionEventKind::FieldOrGlobalStore | RetentionEventKind::OutputStorage
+            ) && field_tied =>
+        {
+            Ok((BridgeRetentionTier::T1, None))
+        }
+        // wave-6r (report 036): binn's `*_get_value` / `*_next` are blocked
+        // HERE, not at the A5 site proof — their tag is
+        // `seam-positive-retention:seam-positive-retention`, heman's was
+        // `a5-site-proof-reclassified:…`. wave-6v2's certificate answers the
+        // row: the position's only positive sinks are stores through its own
+        // out-parameter, and every inventoried call supplies them from
+        // frame-confined caller locals.
+        Some(RetentionVerdict::Retains { .. })
+            if retention.output_storage_settled(callee, argument_index) =>
+        {
+            Ok((BridgeRetentionTier::T1, None))
+        }
+        Some(RetentionVerdict::Retains { .. }) => Err(SeamBlock::PositiveRetention),
+        Some(RetentionVerdict::Unknown { .. }) | None => Ok((
+            BridgeRetentionTier::T2,
+            Some(RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+        )),
+    }
+}
+
+fn root_label(
+    labels: &FxHashMap<(LocalDefId, HirId), String>,
+    owner: LocalDefId,
+    root: Option<HirId>,
+) -> String {
+    root.and_then(|hir| labels.get(&(owner, hir)).cloned())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn blocked_call(
+    caller: LocalDefId,
+    callee: LocalDefId,
+    index: usize,
+    span: Span,
+    block: SeamBlock,
+) -> BlockedSeam {
+    BlockedSeam {
+        caller,
+        callee,
+        index,
+        span,
+        block,
+        expected: None,
+        found: None,
+        source_shape: "-",
+        candidate_template: "unavailable".to_owned(),
+        null_arm: "unavailable".to_owned(),
+        extent_arm: "unavailable".to_owned(),
+        root_identity: "-".to_owned(),
+        blind: false,
+        peers: Vec::new(),
+        overlap: None,
+    }
+}
+
+fn block_pair_raw_view(
+    plan: &mut SeamPlan,
+    pair: &super::co_conversion::PairSiteDecision,
+    reason: &str,
+) {
+    plan.raw_boundary_blocked.push(BlockedRawBoundary {
+        owner_class: SignatureClassId::of(pair.callee),
+        bridge: BridgeSitePlan {
+            caller: pair.caller,
+            callee: BridgeCalleeId::Local(pair.callee),
+            arm: "pair".to_owned(),
+            position: format!("arg{}", pair.argument_index),
+            bridge_kind: "pair-t2-raw-view".to_owned(),
+            expected_form: "raw".to_owned(),
+            found_form: "safe-pair-source".to_owned(),
+            argument_kind: pair.source_shape.to_owned(),
+            extent: BridgeExtentKind::None,
+            retention: BridgeRetentionTier::T2,
+            waiver_id: Some(RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+            unsafe_context: None,
+        },
+        span: pair.span,
+        reason: reason.to_owned(),
+    });
+}
+
+fn call_spans_match(left: Span, right: Span) -> bool {
+    let left = left.source_callsite();
+    let right = right.source_callsite();
+    left == right || left.contains(right) || right.contains(left)
+}
+
+fn existing_interface_disposition(
+    plan: &SeamPlan,
+    caller: LocalDefId,
+    callee: LocalDefId,
+    call_span: Span,
+    index: usize,
+) -> Option<&'static str> {
+    if plan.edits.iter().any(|edit| {
+        edit.bridge.caller == caller
+            && edit.owner_class.local_def_id() == callee
+            && edit.param_index == index
+            && call_spans_match(edit.call_span, call_span)
+    }) {
+        return Some("bridged");
+    }
+    if plan.a5_raw_calls.iter().any(|call| {
+        call.caller == caller
+            && call.callee == callee
+            && call_spans_match(call.call_span, call_span)
+            && call.views.iter().any(|view| view.argument_index == index)
+    }) {
+        return Some("a5-t2-raw-view");
+    }
+    // **R738-1** — a call routed to the callee's pristine raw twin takes the
+    // input's arguments at every position (the seam renders zero syntax
+    // there): a bridge rendered here would hand the twin's raw formal a safe
+    // form (brotli's `__crat_raw_ProcessSingleCodeLength(…,
+    // from_raw_parts_mut(..), ..)`, E0308).
+    if plan.counted_void_calls.iter().any(|call| {
+        call.route == super::counted_void::Route::RawTwin
+            && call.caller == caller
+            && call.callee == callee
+            && call_spans_match(call.call_span, call_span)
+    }) {
+        return Some("raw-twin-original");
+    }
+    if plan.blocked.iter().any(|site| {
+        site.caller == caller
+            && site.callee == callee
+            && site.index == index
+            && call_spans_match(site.span, call_span)
+    }) || plan.raw_boundary_blocked.iter().any(|site| {
+        site.bridge.caller == caller
+            && matches!(site.bridge.callee, BridgeCalleeId::Local(did) if did == callee)
+            && site.bridge.position == format!("arg{index}")
+            && call_spans_match(site.span, call_span)
+    }) {
+        return Some("held");
+    }
+    if plan.pair_sites.iter().any(|site| {
+        site.caller == caller
+            && site.callee == callee
+            && site.argument_index == index
+            && call_spans_match(site.call_span, call_span)
+    }) {
+        return Some("pair");
+    }
+    if plan.zero_bridges.iter().any(|site| {
+        site.caller == caller
+            && site.owner_class.local_def_id() == callee
+            && site.position == format!("arg{index}")
+            && site
+                .span
+                .is_some_and(|span| call_spans_match(span, call_span))
+    }) {
+        return Some("zero-syntax");
+    }
+    None
+}
+
+pub(crate) fn argument_form(
+    caller: LocalDefId,
+    shape: &ArgShape,
+    decisions: &FxHashMap<(LocalDefId, HirId), &Decision>,
+) -> Form {
+    match *shape {
+        ArgShape::BareLocal(hir) | ArgShape::CastOfLocal { binding: hir, .. } => decisions
+            .get(&(caller, hir))
+            .map_or(Form::Raw, |decision| form_of(decision)),
+        ArgShape::AddrOf { mutable, .. } | ArgShape::AddrOfCast { mutable, .. } => {
+            Form::Ref { mutable }
+        }
+        ArgShape::RawExpr { .. } | ArgShape::NullLit | ArgShape::Cast { .. } | ArgShape::Other => {
+            Form::Raw
+        }
+    }
+}
+
+/// **R466-6** — the expression bridge the glue matrix already returns at a non-subject
+/// interface argument, or `None` when the position must keep its hold.
+///
+/// Three ways to decline, and each is a refusal rather than a gap:
+///   * `glue` refuses or answers `None` — there is no bridge, or none is needed;
+///   * the argument's text cannot be recovered from its span — nothing to render onto;
+///   * the argument is doubly passed or returned — see the caller.
+fn inventory_expression_bridge<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expected: Form,
+    found: Form,
+    argument: &super::emitability::Arg,
+    doubly_passed: bool,
+) -> Option<(GlueSpec, SeamFamily, String)> {
+    if doubly_passed {
+        return None;
+    }
+    let Ok(Some((spec, family))) = glue(expected, found, None) else {
+        return None;
+    };
+    let span = text_span_of(argument.shape, argument.span).unwrap_or(argument.span);
+    let text = tcx.sess.source_map().span_to_snippet(span).ok()?;
+    let replacement = spec.render(&text)?;
+    Some((spec, family, replacement))
+}
+
+fn complete_interface_inventory<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    facts: &super::emitability::EmitabilityFacts,
+    table: &DecisionTable,
+    c9_marks: &[crate::analyses::borrow_ownership::overlap_producer::PlannedCopyMark],
+    lifetime_eligibility: &super::lifetime::LifetimeEligibility,
+    decisions: &FxHashMap<(LocalDefId, HirId), &Decision>,
+    params: &FxHashMap<(LocalDefId, usize), (LocalDefId, HirId)>,
+    plan: &mut SeamPlan,
+) {
+    let Some(web) = lifetime_eligibility.fnptr_web() else {
+        return;
+    };
+    let native_owned_spans =
+        super::ownership_fields_native::owned_argument_spans(table.entries.iter());
+
+    // Derive the required universe before observing any bridge/inventory row.
+    // Base-path parameter decisions are the source of truth for emitted type
+    // changes; lifetime plans and wrapper surfaces can add signature syntax,
+    // but their pointer parameter positions are already represented here.
+    let emitted_parameters = params
+        .iter()
+        .filter_map(|(&(callee, index), node)| {
+            decisions
+                .get(node)
+                .map(|decision| super::cursor_native::wrapper::parameter_form(decision))
+                .filter(|form| *form != Form::Raw)
+                .map(|form| ((callee, index), form))
+        })
+        .collect::<FxHashMap<_, _>>();
+    let mut emitted_signature_classes = emitted_parameters
+        .keys()
+        .map(|&(callee, _)| callee)
+        .collect::<rustc_hash::FxHashSet<_>>();
+    emitted_signature_classes.extend(table.lifetime_plan.functions().map(|(callee, _)| callee));
+    if let Some(exposure) = table.exposure.as_ref() {
+        emitted_signature_classes.extend(exposure.functions().iter().filter_map(|row| {
+            (!matches!(
+                row.plan,
+                super::exposure::ExposureSurfacePlan::NotApplicable
+            ))
+            .then_some(row.did)
+        }));
+    }
+    for mir_site in web.mir_call_sites() {
+        if let Some(exposure) = table.exposure.as_ref()
+            && matches!(
+                exposure.plan(mir_site.caller),
+                super::exposure::ExposureSurfacePlan::PositiveSeedShim
+                    | super::exposure::ExposureSurfacePlan::FnPtrRawWrapper
+            )
+            && matches!(
+                exposure.plan(mir_site.callee),
+                super::exposure::ExposureSurfacePlan::PositiveSeedShim
+                    | super::exposure::ExposureSurfacePlan::FnPtrRawWrapper
+            )
+            && mir_site.caller != mir_site.callee
+        {
+            plan.generated_item_dependencies.push((
+                SignatureClassId::of(mir_site.caller),
+                SignatureClassId::of(mir_site.callee),
+            ));
+        }
+        if !emitted_signature_classes.contains(&mir_site.callee) {
+            continue;
+        }
+        for index in 0..mir_site.argument_count {
+            if !emitted_parameters.contains_key(&(mir_site.callee, index)) {
+                continue;
+            }
+            plan.emitted_signature_required_sites
+                .insert(InterfaceInventoryKey {
+                    caller: SignatureClassId::of(mir_site.caller),
+                    callee: SignatureClassId::of(mir_site.callee),
+                    block: mir_site.block,
+                    argument_index: index,
+                });
+        }
+    }
+
+    for mir_site in web.mir_call_sites() {
+        let hir_site = facts.call_args.get(&mir_site.callee).and_then(|sites| {
+            sites.iter().find(|site| {
+                site.caller == mir_site.caller && call_spans_match(site.span, mir_site.span)
+            })
+        });
+        let c9_positions = hir_site.map_or_else(rustc_hash::FxHashSet::default, |site| {
+            super::co_conversion::retained_c9_shared_params(c9_marks, site, mir_site.callee)
+        });
+        for index in 0..mir_site.argument_count {
+            let Some(&expected) = emitted_parameters.get(&(mir_site.callee, index)) else {
+                continue;
+            };
+            let key = InterfaceInventoryKey {
+                caller: SignatureClassId::of(mir_site.caller),
+                callee: SignatureClassId::of(mir_site.callee),
+                block: mir_site.block,
+                argument_index: index,
+            };
+            plan.interface_required_sites.insert(key);
+            let argument =
+                hir_site.and_then(|site| site.args.iter().find(|arg| arg.index == index));
+            let argument_span = argument.map_or(mir_site.span, |arg| arg.span);
+            // **R466-6's restriction.** A position whose argument text appears at more
+            // than one index of this same call keeps its hold: rendering it once leaves
+            // the other position reading the ORIGINAL text, and the two would disagree
+            // about the same value. `native_owned_spans` carries the returned half --
+            // an owned argument span is one the caller hands on rather than keeps.
+            let doubly_passed = hir_site.is_some_and(|site| {
+                site.args
+                    .iter()
+                    .filter(|other| other.span == argument_span)
+                    .count()
+                    > 1
+            }) || native_owned_spans
+                .contains(&(mir_site.caller, argument_span));
+            let non_subject = argument.is_none_or(|arg| {
+                !matches!(
+                    arg.shape,
+                    ArgShape::BareLocal(hir) if decisions.contains_key(&(mir_site.caller, hir))
+                )
+            });
+
+            let disposition = if c9_positions.contains(&index) {
+                "c9-snapshot"
+            } else if let Some(disposition) = existing_interface_disposition(
+                plan,
+                mir_site.caller,
+                mir_site.callee,
+                mir_site.span,
+                index,
+            ) {
+                disposition
+            } else if let Some(argument) = argument {
+                // W6F-3: an owned field's argument is rendered in its
+                // consumer's form by the field transaction.
+                let found = table
+                    .field_transactions
+                    .argument_form(argument.span)
+                    .unwrap_or_else(|| argument_form(mir_site.caller, &argument.shape, decisions));
+                // A native Box lend/transfer renders this argument in the
+                // emitted form itself; the interface is satisfied without
+                // glue, and the callee's class depends on the caller's
+                // ownership transaction exactly as on any safe source.
+                let native_owned = native_owned_spans.contains(&(mir_site.caller, argument.span));
+                if native_owned {
+                    plan.zero_bridges.push(ZeroBridgeSite {
+                        owner_class: SignatureClassId::of(mir_site.callee),
+                        caller: mir_site.caller,
+                        span: Some(argument.span),
+                        arm: receipt_arm(expected, found),
+                        position: format!("arg{index}"),
+                        // The identity carrier the callee-parameter input
+                        // maps; `found_form` names the ownership arm.
+                        bridge_kind: "interface-call-zero-syntax",
+                        expected_form: expected.key(),
+                        found_form: "native-box-lend",
+                        argument_kind: argument.shape.key(),
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                        unsafe_context: None,
+                    });
+                    if mir_site.caller != mir_site.callee {
+                        plan.interface_dependencies.push((
+                            SignatureClassId::of(mir_site.callee),
+                            SignatureClassId::of(mir_site.caller),
+                        ));
+                    }
+                    "zero-syntax"
+                } else if matches!(glue(expected, found, None), Ok(None)) {
+                    plan.zero_bridges.push(ZeroBridgeSite {
+                        owner_class: SignatureClassId::of(mir_site.callee),
+                        caller: mir_site.caller,
+                        span: Some(argument.span),
+                        arm: receipt_arm(expected, found),
+                        position: format!("arg{index}"),
+                        bridge_kind: "interface-call-zero-syntax",
+                        expected_form: expected.key(),
+                        found_form: found.key(),
+                        argument_kind: argument.shape.key(),
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                        unsafe_context: None,
+                    });
+                    // R217-2(a) (slicecursor 027, wave-6s reviews): a borrowed
+                    // ELEMENT of a cursor — the c2rust idiom handed straight to a
+                    // local callee, `ToUpperCase(&mut *dst.offset(k))` — carries
+                    // the same dependency as a bare local. The caller renders the
+                    // cursor's tail view there, so the callee's delivered-slice
+                    // parameter and the caller's cursor must stand or fall
+                    // together; without the edge the interface path restores the
+                    // caller's family and the view is lost. Guarded to a CURSOR
+                    // found form through a deref: every other borrowed place keeps
+                    // the standing reading (no edge, the borrow coerces).
+                    let cursor_element_view = matches!(found, Form::Cursor { .. })
+                        && matches!(
+                            argument.shape,
+                            ArgShape::AddrOf {
+                                base: Some(_),
+                                through_deref: true,
+                                ..
+                            }
+                        );
+                    if (matches!(
+                        argument.shape,
+                        ArgShape::BareLocal(_) | ArgShape::CastOfLocal { .. }
+                    ) || cursor_element_view)
+                        && found != Form::Raw
+                        && mir_site.caller != mir_site.callee
+                    {
+                        plan.interface_dependencies.push((
+                            SignatureClassId::of(mir_site.callee),
+                            SignatureClassId::of(mir_site.caller),
+                        ));
+                    }
+                    "zero-syntax"
+                } else if non_subject
+                    && let Some((spec, family, replacement)) =
+                        inventory_expression_bridge(tcx, expected, found, argument, doubly_passed)
+                {
+                    // **R466-6 — the interface-inventory arm.** The glue matrix already
+                    // returns the expression this position needs; the inventory path
+                    // asked it only whether the answer was `None` (zero-syntax) and
+                    // threw the bridge away otherwise, holding a site it had the text
+                    // for. `GlueSpec::render` is the same renderer every other argument
+                    // arm uses, so this writes the identical expression they would.
+                    //
+                    // A doubly-passed or returned argument KEEPS the hold: rendering it
+                    // once would leave the second position reading the original text,
+                    // and a returned one escapes the caller's frame entirely.
+                    plan.edits.push(SeamEdit {
+                        raw_outbound: None,
+                        zero_syntax: false,
+                        span: argument.span,
+                        call_span: mir_site.span,
+                        replacement,
+                        owner_class: SignatureClassId::of(mir_site.callee),
+                        bridge: BridgeSitePlan::local(
+                            mir_site.caller,
+                            mir_site.callee,
+                            receipt_arm(expected, found),
+                            format!("arg{index}"),
+                            "interface-inventory-expression",
+                        )
+                        .with_forms(
+                            expected.key(),
+                            found.key(),
+                            argument.shape.key(),
+                        ),
+                        owner_fn: tcx.def_path_str(mir_site.callee.to_def_id()),
+                        lifetime_plan_digest: None,
+                        caller_fn: tcx.def_path_str(mir_site.caller.to_def_id()),
+                        param_index: index,
+                        source_shape: argument.shape.key(),
+                        family,
+                        len_arm: None,
+                        spec,
+                        arg_span: argument.span,
+                        expected,
+                        found,
+                        source_node: None,
+                        input_rendering: None,
+                        root_identity: "interface-inventory".to_owned(),
+                        blind: false,
+                        overlap: None,
+                        atom_ids: Vec::new(),
+                    });
+                    if mir_site.caller != mir_site.callee {
+                        plan.interface_dependencies.push((
+                            SignatureClassId::of(mir_site.callee),
+                            SignatureClassId::of(mir_site.caller),
+                        ));
+                    }
+                    "interface-inventory-expression"
+                } else {
+                    plan.raw_boundary_blocked.push(BlockedRawBoundary {
+                        owner_class: SignatureClassId::of(mir_site.callee),
+                        bridge: BridgeSitePlan::local(
+                            mir_site.caller,
+                            mir_site.callee,
+                            receipt_arm(expected, found),
+                            format!("arg{index}"),
+                            "inventory-non-subject-held",
+                        )
+                        .with_forms(
+                            expected.key(),
+                            found.key(),
+                            argument.shape.key(),
+                        ),
+                        span: argument.span,
+                        reason: "inventory-missing-expression-bridge".to_owned(),
+                    });
+                    "held"
+                }
+            } else if table.exposure.as_ref().is_some_and(|exposure| {
+                matches!(
+                    exposure.plan(mir_site.callee),
+                    super::exposure::ExposureSurfacePlan::PositiveSeedShim
+                        | super::exposure::ExposureSurfacePlan::FnPtrRawWrapper
+                )
+            }) {
+                plan.zero_bridges.push(ZeroBridgeSite {
+                    owner_class: SignatureClassId::of(mir_site.callee),
+                    caller: mir_site.caller,
+                    span: Some(mir_site.span),
+                    arm: "surface",
+                    position: format!("arg{index}"),
+                    bridge_kind: "interface-fnptr-raw-wrapper",
+                    expected_form: expected.key(),
+                    found_form: Form::Raw.key(),
+                    argument_kind: "mir-only",
+                    retention: BridgeRetentionTier::None,
+                    waiver_id: None,
+                    unsafe_context: None,
+                });
+                "raw-wrapper"
+            } else {
+                plan.raw_boundary_blocked.push(BlockedRawBoundary {
+                    owner_class: SignatureClassId::of(mir_site.callee),
+                    bridge: BridgeSitePlan::local(
+                        mir_site.caller,
+                        mir_site.callee,
+                        receipt_arm(expected, Form::Raw),
+                        format!("arg{index}"),
+                        "inventory-non-subject-held",
+                    )
+                    .with_forms(expected.key(), Form::Raw.key(), "mir-only"),
+                    span: mir_site.span,
+                    reason: "inventory-missing-hir-argument-site".to_owned(),
+                });
+                "held"
+            };
+            plan.interface_inventory.push(InterfaceInventorySite {
+                key,
+                call_span: mir_site.span,
+                argument_span,
+                source_shape: argument.map_or("mir-only", |arg| arg.shape.key()),
+                non_subject,
+                disposition,
+            });
+        }
+    }
+    plan.interface_inventory.sort_by_key(|site| site.key);
+    plan.interface_inventory.dedup_by_key(|site| site.key);
+    plan.interface_dependencies.sort();
+    plan.interface_dependencies.dedup();
+    plan.generated_item_dependencies.sort();
+    plan.generated_item_dependencies.dedup();
+}
+
+#[cfg(test)]
+/// Compute every seam adapter the crate needs.
+///
+/// Driven by the **type-level matrix**: the walk asks [`glue`] about every
+/// `(expected, found)` pair it meets and the `match` there is exhaustive, so a
+/// pair with no census row is adapted rather than skipped. The census only says
+/// which pairs are *common*.
+pub(crate) fn synthesize(
+    tcx: TyCtxt<'_>,
+    facts: &super::emitability::EmitabilityFacts,
+    subjects: &[Subject],
+    table: &DecisionTable,
+    c9_marks: &[crate::analyses::borrow_ownership::overlap_producer::PlannedCopyMark],
+    a5_site_proofs: &A5SeamProofIndex,
+    retention: &super::raw_boundary::RetentionSummaries,
+    lifetime_eligibility: &super::lifetime::LifetimeEligibility,
+) -> SeamPlan {
+    let coconv = super::co_conversion::CoConv::default();
+    synthesize_with_raw_boundary(
+        tcx,
+        facts,
+        subjects,
+        table,
+        c9_marks,
+        a5_site_proofs,
+        &super::raw_boundary::RawBoundaryDispositionIndex::default(),
+        &coconv,
+        retention,
+        lifetime_eligibility,
+        &crate::analyses::borrow_ownership::mutability_facts::MutFacts::all_mut(),
+    )
+}
+
+fn enclosing_function_is_unsafe(tcx: TyCtxt<'_>, owner: LocalDefId) -> bool {
+    tcx.fn_sig(owner.to_def_id())
+        .skip_binder()
+        .skip_binder()
+        .safety
+        .is_unsafe()
+}
+
+pub(crate) fn unsafe_context_for(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    spec: &GlueSpec,
+) -> Option<super::super::mechanical_receipt::UnsafeContextPresentation> {
+    spec.requires_unsafe().then(|| {
+        let unsafe_fn = enclosing_function_is_unsafe(tcx, owner);
+        super::super::mechanical_receipt::UnsafeContextPresentation {
+            unsafe_fn,
+            wrapper_inserted: !unsafe_fn,
+            edition: 2018,
+            requires_unsafe: true,
+        }
+    })
+}
+
+pub(crate) fn synthesize_with_raw_boundary(
+    tcx: TyCtxt<'_>,
+    facts: &super::emitability::EmitabilityFacts,
+    subjects: &[Subject],
+    table: &DecisionTable,
+    c9_marks: &[crate::analyses::borrow_ownership::overlap_producer::PlannedCopyMark],
+    a5_site_proofs: &A5SeamProofIndex,
+    raw_boundary: &super::raw_boundary::RawBoundaryDispositionIndex,
+    coconv: &super::co_conversion::CoConv,
+    retention: &super::raw_boundary::RetentionSummaries,
+    lifetime_eligibility: &super::lifetime::LifetimeEligibility,
+    mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
+) -> SeamPlan {
+    let sm = tcx.sess.source_map();
+    let mut plan = SeamPlan::default();
+    let shared_pairs = super::overlapping_pairs::consumer::discover(
+        tcx,
+        facts,
+        table,
+        table.exposure.as_ref(),
+        a5_site_proofs,
+        lifetime_eligibility,
+        mut_facts,
+    );
+    plan.shared_required = shared_pairs
+        .calls
+        .values()
+        .map(|call| call.permission.clone())
+        .collect();
+    plan.shared_required
+        .sort_by_key(|permission| permission.receipt());
+    plan.pair_sites = coconv.pair_sites().to_vec();
+    // wave-6p (R407-5): `&mut place` at a shared formal → `&(place)`.
+    let shared_weakenings = super::shared_weakening::SharedWeakenings::derive(tcx, facts);
+    let mut a5_raw_calls = BTreeMap::<(u32, u32, u32, u32), A5RawViewCall>::new();
+    // wave-6b: accessor regions of one buffer that a caller would hold live
+    // together must be disjoint ranges.
+    let overlapping_regions = super::void_region::overlapping_calls(tcx, facts, table);
+    let mut counted_void_calls = BTreeMap::new();
+
+    // subject key -> decision, and (fn, param index) -> subject key.
+    let mut decision_of: FxHashMap<(LocalDefId, HirId), &Decision> = FxHashMap::default();
+    let mut labels: FxHashMap<(LocalDefId, HirId), String> = FxHashMap::default();
+    for (subject, decision) in &table.entries {
+        decision_of.insert((subject.fn_did, subject.hir_id), decision);
+        labels.insert((subject.fn_did, subject.hir_id), subject.label.clone());
+    }
+    // Argument spans the ownership family already renders: a native Box
+    // owner's lend/transfer (through the owner or one of its views) IS the
+    // argument text, so no call glue is planned there — exactly as an
+    // A5-owned or PAIR-owned position is left to its arm.
+    let native_owned_spans =
+        super::ownership_fields_native::owned_argument_spans(table.entries.iter());
+    let mut param_key: FxHashMap<(LocalDefId, usize), (LocalDefId, HirId)> = FxHashMap::default();
+    for subject in subjects {
+        if let SubjectKind::Param { hir_index } = subject.kind {
+            param_key.insert(
+                (subject.fn_did, hir_index),
+                (subject.fn_did, subject.hir_id),
+            );
+        }
+    }
+    // Relay 321: the late view's cascade reading (`late_raw_formal`) — a formal by
+    // the callee path and index a cascade's detail names, less the formals a
+    // retained-access or released-through-indirect-call predicate names.
+    let late_view_excluded: rustc_hash::FxHashSet<(LocalDefId, HirId)> = table
+        .settled_hold_receipts
+        .iter()
+        .filter(|receipt| {
+            receipt.predicate == "held:retained-alias"
+                || receipt.predicate == super::released_indirect::KEY
+        })
+        .map(|receipt| receipt.node)
+        .collect();
+    let formal_by_path: FxHashMap<(String, usize), (LocalDefId, HirId)> = param_key
+        .iter()
+        .map(|((callee, index), key)| ((tcx.def_path_str(callee.to_def_id()), *index), *key))
+        .collect();
+    // The owners whose every lend a certificate's walk proved (the review's F1).
+    let certified_owner = |node: &(LocalDefId, HirId)| {
+        table.return_certificates.plans.contains_key(node)
+            || table.allocator_contracts.plans.contains_key(node)
+            || table.box_params.plans.contains_key(node)
+    };
+    let formal_of = |path: &str, index: usize| {
+        formal_by_path
+            .get(&(path.to_owned(), index))
+            .filter(|key| !late_view_excluded.contains(*key))
+            .and_then(|key| decision_of.get(key).copied())
+    };
+
+    // Deterministic callee order: `FxHashMap` iteration permutes between runs,
+    // and D19 makes a report whose order permutes non-comparable.
+    let mut callees: Vec<&LocalDefId> = facts.call_args.keys().collect();
+    callees.sort_unstable_by_key(|d| d.local_def_index.as_u32());
+
+    // wave-6l relay 071: which callee parameters read past a masked index by
+    // a runtime length (`masked_runtime::held`), memoized.
+    let masked_readers: std::cell::RefCell<rustc_hash::FxHashMap<(LocalDefId, usize), bool>> =
+        Default::default();
+    for callee in callees {
+        for site in &facts.call_args[callee] {
+            let marked_shared =
+                super::co_conversion::retained_c9_shared_params(c9_marks, site, *callee);
+            // ---- pass 1: what each position will look like after conversion ----
+            //
+            // Computed for the WHOLE site before any edit is emitted, because
+            // the overlap gate below is a within-site question and cannot be
+            // answered one argument at a time.
+            //
+            // A named struct rather than a tuple: `positions` deliberately does
+            // NOT align with `site.args` (raw and unnameable positions are
+            // dropped), so every field a later pass needs must be carried here.
+            // Recovering the span by re-searching `site.args` was the first
+            // shape and it reconstructed an alignment this list does not have.
+            struct Pos {
+                span: Span,
+                /// The CALLEE's parameter index — item 4a asks about the
+                /// signature, so the position must carry which parameter it is.
+                index: usize,
+                expected: Form,
+                found: Form,
+                text: Option<String>,
+                /// **Where `text` was read from.** Equal to `span` for every
+                /// shape except the two cast shapes, whose snippet comes from
+                /// the cast's OPERAND while the replaced range is the whole
+                /// argument. Carried because the AST layer must keep that
+                /// operand as its subtree, and only this side knows which it
+                /// was.
+                text_span: Span,
+                root: Option<HirId>,
+                blind: bool,
+                /// wave-5d 145c: a local that stays raw, reborrowed through a
+                /// raw base (`&mut *p`) that borrowck does not see.
+                raw_local: bool,
+                /// wave-5d 146e (the fourth review's HIGH-1): a raw local at a
+                /// counted (non-handle) position. The counted route decides
+                /// its pairs with OTHER counted positions (`disjoint_roots`),
+                /// never one with a delivered sibling (`[only]` skips it).
+                counted_raw_local: bool,
+                /// R1128-1 / relay 334: the argument is KNOWN raw (see `GlueSpec::raw_operand`).
+                raw_operand: bool,
+                /// A literal `None` carries no borrow and therefore cannot
+                /// participate in the site's overlap relation.
+                borrows: bool,
+                literal_null: bool,
+                /// The raw-boundary arm already owns (or has rendered inert)
+                /// this position. It enters PAIR for proof/receipt coverage,
+                /// never so this seam stage can block or edit it.
+                raw_boundary_observation: bool,
+                /// Wave-6o (relay 121): an OPTIONAL bare local at a formal that
+                /// ended raw COLLATERALLY (its class blocked or held), which no
+                /// earlier stage bridged.
+                late_raw_optional: bool,
+                /// main 202: a bare `Box` owner at a formal that ended raw
+                /// after the raw boundary's hypothesis (`late_raw_formal`),
+                /// which no earlier stage bridged.
+                late_raw_owner: bool,
+                source_shape: &'static str,
+                source_type: String,
+                target: Option<super::raw_boundary::RawTargetType>,
+                /// `&mut (*p).f`: the borrowed place is reached through a
+                /// deref of the root (wave-6r's shared-root bridge shape).
+                through_deref: bool,
+                /// Relay 371 step 3: the argument's cast keeps the pointee, so where
+                /// the forms already agree the edit is the operand alone.
+                identity_strip: bool,
+            }
+            let mut positions: Vec<Pos> = Vec::new();
+            for arg in &site.args {
+                // C-9 rewrites this argument to `&snapshot_tmp` after the
+                // ordinary use/seam passes. No seam or within-site overlap
+                // gate applies to the original expression at this position.
+                if marked_shared.contains(&arg.index) {
+                    continue;
+                }
+                let expected = param_key
+                    .get(&(*callee, arg.index))
+                    .and_then(|k| decision_of.get(k))
+                    .map_or(Form::Raw, |d| {
+                        super::cursor_native::wrapper::parameter_form(d)
+                    });
+                let raw_boundary_observation = raw_boundary.tracks_call_argument(
+                    site.caller,
+                    &tcx.def_path_str(callee.to_def_id()),
+                    arg.span,
+                    arg.index,
+                );
+                // A raw parameter needs nothing: a reference coerces to a raw
+                // pointer at a call, so every found form satisfies it. The
+                // raw-boundary market is the one exception to dropping the
+                // position entirely: PAIR owes its A5 receipt even when the
+                // boundary bridge itself rendered as zero syntax.
+                // Wave-6o (relay 121): an OPTIONAL local is the exception to
+                // the exception — `Option<&T>` does not coerce, so its position
+                // is kept for `optional_into_raw_formal`'s bridge.
+                // Only where the formal ended raw collaterally — a formal raw on
+                // its own evidence was raw when the Option stage planned the
+                // actual's uses, and its `body-option-raw-view` edits own it.
+                let late_raw_optional = matches!(expected, Form::Raw)
+                    && !raw_boundary_observation
+                    && param_key
+                        .get(&(*callee, arg.index))
+                        .and_then(|k| decision_of.get(k))
+                        .is_some_and(|d| {
+                            matches!(d, Decision::Degraded(record) if matches!(
+                                record.reason,
+                                super::DegradeReason::SilentCoercion { .. }
+                                    | super::DegradeReason::ClassBlocked { .. }
+                                    | super::DegradeReason::SignatureClassHeld { .. }
+                            ))
+                        })
+                    && matches!(arg.shape, ArgShape::BareLocal(hir)
+                        if decision_of
+                            .get(&(site.caller, hir))
+                            .is_some_and(|d| matches!(form_of(d), Form::Opt { .. })));
+                // main 202: a `Box` owner does not coerce either. The owner
+                // view R422-5 renders is for a CONVERTED formal, and the raw
+                // boundary bridged only the formals its hypothesis read raw: a
+                // formal a later stage made raw (brotli's
+                // `BrotliZopfliComputeShortestPath::nodes`, held by R864-1's
+                // pair) received the owner bare (`E0308`). The boundary may
+                // track the argument and still render nothing: its site's
+                // target converted in the hypothesis. Only a lend the Box plan
+                // left unspelled: a hand-over or a cast argument is the plan's
+                // own edit.
+                let late_raw_owner = matches!(expected, Form::Raw)
+                    && !raw_boundary.renders_call_argument(
+                        site.caller,
+                        &tcx.def_path_str(callee.to_def_id()),
+                        arg.span,
+                        arg.index,
+                    )
+                    && param_key.get(&(*callee, arg.index)).is_some_and(|k| {
+                        decision_of.get(k).is_some_and(|d| {
+                            late_raw_formal(
+                                d,
+                                late_view_excluded.contains(k),
+                                owner_argument(arg)
+                                    .is_some_and(|root| certified_owner(&(site.caller, root))),
+                                &formal_of,
+                            )
+                        })
+                    })
+                    && owner_argument(arg)
+                        .and_then(|root| decision_of.get(&(site.caller, root)))
+                        .is_some_and(|d| {
+                            matches!(d, Decision::Box(plan) if !plan
+                                .expr_edits
+                                .iter()
+                                .any(|edit| edit.span.overlaps(arg.span)))
+                        })
+                    // The stand-in review's HIGH-1: one owner at two positions of
+                    // the call takes no view here — each view is its own reborrow
+                    // of the Box, and the second invalidates the first (Stacked
+                    // Borrows pops it; under Tree Borrows a write through one
+                    // disables the other). The call keeps its text and the compile
+                    // gate takes the caller back.
+                    && owner_argument(arg).is_some_and(|root| {
+                        !site.args.iter().any(|other| {
+                            other.index != arg.index
+                                && (other.shape.place_root() == Some(root)
+                                    || other.element_of == Some(root))
+                        })
+                    });
+                if matches!(expected, Form::Raw)
+                    && !raw_boundary_observation
+                    && !late_raw_optional
+                    && !late_raw_owner
+                {
+                    continue;
+                }
+                // wave-6b (R609-4): at a byte-region formal an `&mut x as ..`
+                // cast is read WHOLE — text and subtree alike.
+                let whole_cast = matches!(arg.shape, ArgShape::AddrOfCast { .. })
+                    && param_key
+                        .get(&(*callee, arg.index))
+                        .and_then(|k| table.void_region.get(k))
+                        .is_some_and(|region| {
+                            region.shape == super::void_region::Shape::ScalarBytes
+                        });
+                // The third element is the span `text` is read from — carried
+                // out of this match rather than reconstructed below, because
+                // the two cast shapes read the OPERAND's snippet while every
+                // other shape reads the argument's own.
+                let (found, text, blind, borrows, literal_null) = match arg.shape {
+                    ArgShape::BareLocal(hir) => (
+                        decision_of
+                            .get(&(site.caller, hir))
+                            .map_or(Form::Raw, |d| form_of(d)),
+                        sm.span_to_snippet(arg.span).ok(),
+                        false,
+                        true,
+                        false,
+                    ),
+                    ArgShape::AddrOf {
+                        mutable,
+                        base,
+                        through_deref,
+                    } => {
+                        // §5a: a borrow rooted through a RAW deref is invisible
+                        // to borrowck. Blind exactly when the base does not
+                        // itself convert.
+                        let blind = match (base, through_deref) {
+                            (None, _) => true,
+                            (Some(b), true) => !decision_of
+                                .get(&(site.caller, b))
+                                .is_some_and(|d| !matches!(d, Decision::Degraded(_))),
+                            (Some(_), false) => false,
+                        };
+                        (
+                            Form::Ref { mutable },
+                            sm.span_to_snippet(arg.span).ok(),
+                            blind,
+                            true,
+                            false,
+                        )
+                    }
+                    // wave-6b (R609-4): a byte-region formal takes the WHOLE
+                    // cast as its raw pointer (`&mut x as *mut c_int as *mut
+                    // T`), never the typed borrow inside it.
+                    ArgShape::AddrOfCast { .. } if whole_cast => (
+                        Form::Raw,
+                        sm.span_to_snippet(arg.span).ok(),
+                        true,
+                        true,
+                        false,
+                    ),
+                    ArgShape::AddrOfCast { mutable, inner } => (
+                        Form::Ref { mutable },
+                        sm.span_to_snippet(inner).ok(),
+                        true,
+                        true,
+                        false,
+                    ),
+                    ArgShape::CastOfLocal { binding, inner } => (
+                        decision_of
+                            .get(&(site.caller, binding))
+                            .map_or(Form::Raw, |d| form_of(d)),
+                        sm.span_to_snippet(inner).ok(),
+                        false,
+                        true,
+                        false,
+                    ),
+                    // W6F-3: an owned field's call argument is rendered by the
+                    // field transaction in the consumer's own form; the seam
+                    // sees that form, not the raw place.
+                    ArgShape::RawExpr { .. } => (
+                        table
+                            .field_transactions
+                            .argument_form(arg.span)
+                            .unwrap_or(Form::Raw),
+                        sm.span_to_snippet(arg.span).ok(),
+                        arg.array_start_blind.unwrap_or(true),
+                        true,
+                        false,
+                    ),
+                    ArgShape::NullLit if matches!(expected, Form::Opt { .. }) => (
+                        Form::Raw,
+                        sm.span_to_snippet(arg.span).ok(),
+                        false,
+                        false,
+                        true,
+                    ),
+                    // Not an expression this slice can name.
+                    ArgShape::NullLit | ArgShape::Cast { .. } | ArgShape::Other => {
+                        plan.blocked.push(blocked_call(
+                            site.caller,
+                            *callee,
+                            arg.index,
+                            arg.span,
+                            SeamBlock::UnnameableOperand,
+                        ));
+                        continue;
+                    }
+                };
+                // The two reads are kept in step by CONSTRUCTION: `text` is
+                // the snippet of exactly this span, so a shape whose operand
+                // moves moves both or neither.
+                let Some(text_span) = (if whole_cast {
+                    Some(arg.span)
+                } else {
+                    text_span_of(arg.shape, arg.span)
+                })
+                .map(|span| super::array_start::text_span(arg, span)) else {
+                    // Unreachable — the shapes with no nameable operand are
+                    // blocked above. Fail-closed rather than defaulting to
+                    // `arg.span`, which would hand the AST layer a subtree the
+                    // replacement was not built from.
+                    plan.blocked.push(blocked_call(
+                        site.caller,
+                        *callee,
+                        arg.index,
+                        arg.span,
+                        SeamBlock::UnnameableOperand,
+                    ));
+                    continue;
+                };
+                // wave-5d 145c / 146a: a local that stays raw. Not at a
+                // COUNTED raw position: wave-6v's snapshot route proves its own
+                // disjointness there (`counted_void::disjoint_roots`: provably
+                // distinct allocations split, else the raw twin, else held).
+                let stays_raw_local = match arg.shape {
+                    ArgShape::BareLocal(binding) | ArgShape::CastOfLocal { binding, .. } => {
+                        !decision_of
+                            .get(&(site.caller, binding))
+                            .is_some_and(|d| !matches!(d, Decision::Degraded(_)))
+                    }
+                    _ => false,
+                };
+                let counted_raw_local = stays_raw_local
+                    && found == Form::Raw
+                    && super::counted_void::parameter(table, *callee, arg.index)
+                        .is_some_and(|contract| contract.handle.is_none());
+                let raw_local = stays_raw_local && !counted_raw_local;
+                // R1128-1 / relay 334: the operand is KNOWN raw only as a subject whose final decision is
+                // `Degraded` (not a `Box`, not a non-subject binding such as a `let ref mut` reference)
+                // or as an array decay; anything else keeps `&*` under the bridge spelling.
+                let raw_operand = known_raw_operand(
+                    match arg.shape {
+                        ArgShape::BareLocal(binding) | ArgShape::CastOfLocal { binding, .. } => {
+                            Some(decision_of.get(&(site.caller, binding)).copied())
+                        }
+                        _ => None,
+                    },
+                    text.as_deref(),
+                ) || (matches!(arg.shape, ArgShape::RawExpr { .. })
+                    && found == Form::Raw
+                    // relay wave-6a/167: a raw EXPRESSION operand, raw by its emitted type.
+                    && raw_expression_operand(
+                        tcx,
+                        site.caller,
+                        arg.span,
+                        &|local| {
+                            matches!(
+                                decision_of.get(&(site.caller, local)),
+                                Some(Decision::Degraded(_))
+                            )
+                        },
+                        &|did, index| {
+                            !table.field_transactions.applied.iter().any(|t| {
+                                t.key.struct_did == did && t.key.field_index == index
+                            })
+                        },
+                    ));
+                // wave-6a (R422-5): a Box-decided argument the owner-view glue
+                // renders IS the expected form at the call (`&*x`,
+                // `x.as_deref().unwrap()`, ..): the position is a glue-arm
+                // seam of the callee's, not a C-arm crossing. The view is the
+                // OWNER's: only the owner passed bare takes it. An element
+                // address (`&mut *owner.offset(i)`) is `&mut T` once the Box
+                // plan renders the element, and keeps its own form (R555-1).
+                let found = if owner_argument(arg)
+                    .and_then(|root| decision_of.get(&(site.caller, root)).copied())
+                    .and_then(|decision| owner_view_candidate(Some(decision), expected, "x"))
+                    .is_some()
+                {
+                    expected
+                } else {
+                    found
+                };
+                positions.push(Pos {
+                    span: arg.span,
+                    index: arg.index,
+                    expected,
+                    found,
+                    text,
+                    text_span,
+                    root: arg.shape.place_root(),
+                    blind,
+                    raw_local,
+                    counted_raw_local,
+                    raw_operand,
+                    borrows,
+                    literal_null,
+                    raw_boundary_observation,
+                    late_raw_optional,
+                    late_raw_owner,
+                    source_shape: arg.shape.key(),
+                    source_type: arg.source_type.clone(),
+                    target: arg.target.clone(),
+                    through_deref: matches!(
+                        arg.shape,
+                        ArgShape::AddrOf {
+                            through_deref: true,
+                            ..
+                        }
+                    ),
+                    identity_strip: arg
+                        .identity_cast
+                        .as_ref()
+                        .is_some_and(super::identity_cast::admitted),
+                });
+            }
+
+            // ---- pass 1.5: build every candidate BEFORE the site gate ----
+            //
+            // The old tuple receipt was poor because the gate ran before the
+            // only `glue` call. Building here is observational: no AST node is
+            // claimed and no edit is emitted until pass 3.
+            let enclosing_unsafe_fn = enclosing_function_is_unsafe(tcx, site.caller);
+            // A converted position whose storage root is also the root of a
+            // RAW argument of the same call takes the callee's pristine raw
+            // twin: no view is formed beside a raw alias (wave-6v, R408-7).
+            // A call the PAIR machinery owns (a same-object PAIR view placed
+            // by co-conversion) keeps its own ordering proof instead.
+            let pair_owned_call = coconv.pair_sites().iter().any(|pair| {
+                pair.caller == site.caller
+                    && pair.callee == *callee
+                    && pair
+                        .call_span
+                        .source_callsite()
+                        .contains(site.span.source_callsite())
+                    && pair.role != super::co_conversion::PairRole::Blocked
+            });
+            // R785-6: the twin check is root-granular; the A5 site proof is
+            // per pair. A raw argument proven disjoint from a converted one
+            // (`Clear`) does not alias it, so it does not send the call to the
+            // twin (brotli's `InitializeHx(&mut (*hasher).common,
+            // &mut (*hasher).privat._Hx, ..)`, `InitBlockSplitter*(.., &mut
+            // (*mb).literal_split, &mut (*mb).literal_histograms, ..)`). An
+            // unavailable or unproved pair stays an alias.
+            let proven_disjoint = |converted: usize, other: usize| {
+                let span = |index: usize| {
+                    positions
+                        .iter()
+                        .find(|pos| pos.index == index)
+                        .map(|pos| pos.span)
+                };
+                let (Some(left), Some(right)) = (span(converted), span(other)) else {
+                    return false;
+                };
+                a5_site_proofs
+                    .lookup(
+                        site.caller.local_def_index.as_u32(),
+                        callee.local_def_index.as_u32(),
+                        converted,
+                        other,
+                        left,
+                        right,
+                    )
+                    .verdict
+                    == A5SiteProofVerdict::Clear
+            };
+            let aliased_twin = (!pair_owned_call)
+                .then(|| {
+                    super::counted_void::aliased_storage_twin(
+                        tcx,
+                        table,
+                        site,
+                        *callee,
+                        &positions
+                            .iter()
+                            .map(|pos| (pos.index, pos.expected, pos.found))
+                            .collect::<Vec<_>>(),
+                        &proven_disjoint,
+                    )
+                })
+                .flatten();
+            // R538-7: receipt every raw argument the field-load exemption
+            // cleared at this site, once.
+            if !pair_owned_call {
+                for receipt in super::counted_void::field_load_exemptions(
+                    tcx,
+                    site,
+                    &positions
+                        .iter()
+                        .map(|pos| (pos.index, pos.expected, pos.found))
+                        .collect::<Vec<_>>(),
+                ) {
+                    if !plan.field_load_exemptions.contains(&receipt) {
+                        plan.field_load_exemptions.push(receipt);
+                    }
+                }
+            }
+            match &aliased_twin {
+                Some(Ok(indices)) => super::counted_void::record_alias_twin(
+                    table,
+                    &mut counted_void_calls,
+                    site,
+                    *callee,
+                    indices,
+                ),
+                Some(Err(_)) => plan.aliased_twin_refusals.push(AliasedTwinRefusal {
+                    caller: site.caller,
+                    callee: *callee,
+                    call_span: site.span,
+                    converted: positions
+                        .iter()
+                        .filter(|pos| pos.expected != Form::Raw)
+                        .filter_map(|pos| {
+                            param_key
+                                .get(&(*callee, pos.index))
+                                .map(|(_, hir)| (pos.index, *hir))
+                        })
+                        .collect(),
+                }),
+                None => {}
+            }
+            // A converted `&mut` place beside an argument that READS the same
+            // local: the unconverted arguments are hoisted before the call
+            // (wave-6v; json.h's E0503). The positions themselves are ordinary.
+            if aliased_twin.is_none()
+                && !pair_owned_call
+                && !positions
+                    .iter()
+                    .any(|pos| super::counted_void::parameter(table, *callee, pos.index).is_some())
+                && let Some(indices) = super::counted_void::aliased_read_hoist(
+                    tcx,
+                    site,
+                    &positions
+                        .iter()
+                        .map(|pos| (pos.index, pos.expected, pos.found))
+                        .collect::<Vec<_>>(),
+                )
+            {
+                super::counted_void::record_hoist(
+                    table,
+                    &mut counted_void_calls,
+                    site,
+                    *callee,
+                    &indices,
+                );
+            }
+            let return_tied = table
+                .lifetime_plan
+                .function(*callee)
+                .and_then(|plan| plan.lifetime_for(super::lifetime::FnSignatureSlot::RETURN))
+                .is_some();
+            // wave-6f: parameters a field transaction ties to the callee's
+            // struct lifetime — the retention is in the signature.
+            let field_tied_params = table.field_transactions.tied_parameters(*callee);
+            let mut candidates = Vec::with_capacity(positions.len());
+            let mut input_candidates = Vec::with_capacity(positions.len());
+            for pos in &positions {
+                match &aliased_twin {
+                    Some(Ok(_)) => {
+                        // Zero syntax at every position: the twin takes the
+                        // original arguments.
+                        candidates.push(Ok(None));
+                        input_candidates.push(Ok(None));
+                        continue;
+                    }
+                    Some(Err(block)) => {
+                        candidates.push(Err(*block));
+                        input_candidates.push(Err(*block));
+                        continue;
+                    }
+                    None => {}
+                }
+                let Some(text) = pos.text.as_deref() else {
+                    candidates.push(Err(SeamBlock::UnnameableOperand));
+                    input_candidates.push(Err(SeamBlock::UnnameableOperand));
+                    continue;
+                };
+                // A safe-found argument at a counted position is an ordinary
+                // safe-to-safe seam; the counted plan is for raw arguments.
+                let counted = (pos.found == Form::Raw)
+                    .then(|| super::counted_void::parameter(table, *callee, pos.index))
+                    .flatten();
+                // A counted view (a snapshotted call) at a call a PAIR row owns
+                // would stand beside that row's raw view of storage no
+                // disjointness certificate separates: the position holds typed
+                // here (R410-2(d), the receipted form of the graft's yield).
+                if pair_owned_call && counted.is_some_and(|contract| contract.handle.is_none()) {
+                    candidates.push(Err(SeamBlock::SiteOverlap));
+                    input_candidates.push(Err(SeamBlock::SiteOverlap));
+                    continue;
+                }
+                let wants_len = matches!(
+                    pos.expected,
+                    Form::Slice { .. } | Form::Opt { slice: true, .. }
+                ) && !pos.literal_null;
+                let counted_len = counted.map(|contract| {
+                    super::counted_void::count_argument(
+                        tcx,
+                        table,
+                        site,
+                        *callee,
+                        contract,
+                        pos.index,
+                        a5_site_proofs.pair_certificates(),
+                    )
+                });
+                if let Some(Err(block)) = counted_len {
+                    candidates.push(Err(block));
+                    input_candidates.push(Err(block));
+                    continue;
+                }
+                let region = super::void_region::parameter(table, *callee, pos.index);
+                if region.is_some() && overlapping_regions.contains(&(site.caller, site.span)) {
+                    candidates.push(Err(SeamBlock::PositiveRetention));
+                    input_candidates.push(Err(SeamBlock::PositiveRetention));
+                    continue;
+                }
+                let counted = counted.and_then(|contract| match &counted_len {
+                    Some(Ok((_, route))) => Some((contract, *route)),
+                    _ => None,
+                });
+                // wave-6l relay 063: why a companion was refused, for the
+                // fallback's receipt (`fallback(extent-refused:<reason>)`).
+                let mut refused: Option<String> = None;
+                // wave-6l relay 067: a companion only the extent prover
+                // licensed, with its premises, for the receipt.
+                let mut proven: Option<String> = None;
+                let (len_text, len_masked, len_evidence) = if let Some(Ok((count, _))) = counted_len
+                {
+                    // wave-6v2 (R457-5): the header path's count IS the ruled
+                    // fallback path constant; `None` here is what makes the
+                    // spec fabricate and receipt it as such.
+                    if count == FABRICATED_LEN_PATH {
+                        (None, false, Some(LenEvidence::Elsewhere))
+                    } else {
+                        (Some(count), false, Some(LenEvidence::Elsewhere))
+                    }
+                } else if let Some(region) = region {
+                    // wave-6b: the byte length is the callee's own region.
+                    (region.len_text(), false, Some(LenEvidence::Elsewhere))
+                } else if wants_len {
+                    // Wave-4 #1b: a contract-extent promotion with an exact
+                    // count names the companion argument itself. The count
+                    // is licensed only when its spelling contains no call
+                    // (`n`, `n as usize`, `2 * n`): a call would be evaluated
+                    // once per construction, so it takes the fabricated
+                    // extent instead and stays evaluated exactly once as the
+                    // surviving scalar argument.
+                    // The exact count is spelled inside the CALLEE (`n` at its
+                    // own foreign call); it names the caller's argument only
+                    // when it is one of the callee's parameters, by name.
+                    // A contract whose count is NOT one parameter (`(4) * (n)`)
+                    // still owns the arm: adjacency must not license the
+                    // wrong operand over it, so the construction fabricates.
+                    let contract_count = param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| table.contract_extent_promotions.get(key))
+                        .and_then(|promotion| match &promotion.length {
+                            super::contract_extent::LengthPlan::Evidence {
+                                elements,
+                                source: super::contract_extent::LengthSource::ExactContract { .. },
+                            } => Some(elements.trim().to_owned()),
+                            _ => None,
+                        });
+                    let parameter_named = |elements: &str| {
+                        tcx.fn_arg_idents(callee.to_def_id())
+                            .iter()
+                            .position(|ident| {
+                                ident.is_some_and(|ident| ident.name.as_str() == elements)
+                            })
+                    };
+                    let contract_companion = contract_count.as_deref().and_then(parameter_named);
+                    // R408-1: ruling B's adjacency arm licenses the adjacent
+                    // integer ONLY with evidence that it is a COUNT — a count
+                    // position of the callee parameter's own pinned contract
+                    // names it (`strncpy(dst, src, n)`: `n` bounds `src`; D1's
+                    // op-fact discipline). An adjacent VALUE (`mask`, `CRC`) is
+                    // not a length: the construction fabricates, and the arm
+                    // keeps its signature evidence for the derivability split.
+                    let count_companions = param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| table.contract_extent_promotions.get(key))
+                        .map(|promotion| {
+                            promotion
+                                .sites
+                                .iter()
+                                .filter_map(|site| match &site.requirement {
+                                    super::contract_extent::Requirement::ExactAccess(Some(
+                                        count,
+                                    ))
+                                    | super::contract_extent::Requirement::UpperBound(Some(
+                                        count,
+                                    ))
+                                    | super::contract_extent::Requirement::ElementCount(Some(
+                                        count,
+                                    )) => count.elements.as_deref().ok(),
+                                    _ => None,
+                                })
+                                .filter_map(|elements| parameter_named(elements.trim()))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    // wave-5c's thin-count proof is the same evidence from the
+                    // callee's own body: the reader walks exactly
+                    // `count_parameter` elements of the parameter.
+                    let count_companions = param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| {
+                            table
+                                .entries
+                                .iter()
+                                .find(|(subject, _)| (subject.fn_did, subject.hir_id) == *key)
+                        })
+                        .and_then(|(subject, _)| {
+                            super::thin_counted::prove(tcx, subject, facts).ok()
+                        })
+                        .map_or(count_companions.clone(), |proof| {
+                            let mut companions = count_companions.clone();
+                            companions.push(proof.count_parameter);
+                            companions
+                        });
+                    // R425-3: wave-5c's reader chain proves the same thing for
+                    // a parameter it decided `Slice` on its own companion —
+                    // the accessing callee's indexes are bounded by exactly
+                    // that integer (`slice_input::index_bound_by_companion`).
+                    let count_companions = param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| table.slice_input_companions.get(key))
+                        .map_or(count_companions.clone(), |companion| {
+                            let mut companions = count_companions.clone();
+                            companions.push(*companion);
+                            companions
+                        });
+                    // wave-6l relay 067: the extent prover's companion, where
+                    // no producer above licensed it.
+                    let extent_proven = param_key
+                        .get(&(*callee, pos.index))
+                        .and_then(|key| table.extent_proof_companions.get(key))
+                        .filter(|(companion, _)| !count_companions.contains(companion))
+                        .cloned();
+                    let count_companions = match &extent_proven {
+                        Some((companion, _)) => {
+                            let mut companions = count_companions.clone();
+                            companions.push(*companion);
+                            companions
+                        }
+                        None => count_companions,
+                    };
+                    let arm = if contract_count.is_some() {
+                        LenEvidence::Contract
+                    } else {
+                        length_evidence(tcx, *callee, pos.index)
+                    };
+                    let companion = match arm {
+                        LenEvidence::Following => Some(pos.index + 1),
+                        LenEvidence::Preceding => pos.index.checked_sub(1),
+                        LenEvidence::Contract => contract_companion,
+                        LenEvidence::Elsewhere
+                        | LenEvidence::None
+                        | LenEvidence::ArrayType
+                        | LenEvidence::CalleeAccess
+                        | LenEvidence::FieldAlloc
+                        | LenEvidence::NulWalk
+                        | LenEvidence::CalleeBound { .. } => None,
+                    }
+                    .filter(|index| {
+                        arm == LenEvidence::Contract
+                            || count_companions.contains(index)
+                            // wave-6f (R411 §2): the fat field the parameter
+                            // is stored into names its own count — the
+                            // sibling field the same store fills.
+                            || table
+                                .field_transactions
+                                .count_companions(*callee, pos.index)
+                                .contains(index)
+                    });
+                    // A CALL in the spelling (`f(`, `(next)(`, `size_of::<T>(`)
+                    // is the hazard on every companion arm: the length repeats
+                    // the argument's text, so a call in it would run twice
+                    // (R884-3 item 3, wave-4's `r107_cb8`). Grouping
+                    // parentheses are not a call.
+                    let licensed_spelling = |text: &str| {
+                        !text.match_indices('(').any(|(at, _)| {
+                            text[..at].trim_end().chars().next_back().is_some_and(|c| {
+                                c.is_alphanumeric() || c == '_' || c == '>' || c == ')'
+                            })
+                        })
+                    };
+                    // **R477-6 — the masked companion licenses `+ 1`.** Where
+                    // the chain proved the companion MASKS the accessing
+                    // callee's indexes (`data.offset((ix & mask))`), every
+                    // index is `<= mask`, so the length that covers them is
+                    // `mask + 1`. `wrapping_add` because a mask of `usize::MAX`
+                    // is representable and a debug overflow there would be a
+                    // panic this rule did not intend; the extent it produces is
+                    // then `0`, which constructs an empty slice rather than a
+                    // wrong one.
+                    let masked = param_key
+                        .get(&(*callee, pos.index))
+                        .is_some_and(|key| table.slice_input_mask_companions.contains(key));
+                    // **R491-7 — the C-string extent.** Where the chain proved
+                    // the callee walks this parameter to a NUL and the walk is
+                    // licensed exact (it reaches the NUL on every path, or the
+                    // pointer goes to a libc string function whose contract
+                    // requires a terminated string), the length is the string's
+                    // own: `strlen(p) + 1`, computed from the argument the call
+                    // already passes. No companion is involved and none is
+                    // needed.
+                    // The licence is the callee's own walk, or this caller's
+                    // string call on the very pointer it passes (relay 060).
+                    let nul_exact = table.nul_exact_parameters.contains(&(*callee, pos.index))
+                        || pos.root.is_some_and(|root| {
+                            table.nul_exact_callers.contains(&(site.caller, root))
+                        });
+                    if nul_exact {
+                        // `CStr::from_ptr` walks to the NUL exactly as the
+                        // callee does, and on a UB-free input (§28) the
+                        // terminator is there. `core::ffi` rather than `libc`
+                        // so the emitted crate needs no dependency it did not
+                        // already have. `+ 1` for the terminator, which is part
+                        // of the object the callee reads.
+                        (
+                            Some(format!(
+                                "core::ffi::CStr::from_ptr({text} as *const core::ffi::c_char).to_bytes().len().wrapping_add(1)"
+                            )),
+                            false,
+                            Some(LenEvidence::Elsewhere),
+                        )
+                    } else if let Some(elements) = contract_count
+                        .as_deref()
+                        .filter(|elements| elements.parse::<u64>().is_ok())
+                    {
+                        // wave-6l (R615-7): an exact contract count that is a
+                        // CONSTANT element count (brotli `dist_cache`: 16
+                        // bytes of `c_int` = 4) names no argument and is the
+                        // same value in every caller's scope.
+                        (Some(elements.to_owned()), false, Some(arm))
+                    } else {
+                        let argument = companion
+                            .and_then(|i| site.args.iter().find(|argument| argument.index == i));
+                        // Relay 063: refusals of a licensed companion, each
+                        // receipted; the root takes the fallback.
+                        //  * (R631-4 (iv)) a companion only ever `0`;
+                        //  * (item 6) a mask as a count, on the adjacency arms
+                        //    (R477-6's masked arm licenses `mask + 1` on its
+                        //    own proof, and a contract's count is the count);
+                        //  * (relay 066) the masked arm's `mask + 1` of a
+                        //    constant (no-op) mask.
+                        let adjacency = arm != LenEvidence::Contract;
+                        let mask_formal = companion
+                            .and_then(|i| tcx.fn_arg_idents(callee.to_def_id()).get(i).copied())
+                            .flatten()
+                            .is_some_and(|ident| {
+                                super::masked_runtime::mask_named(ident.name.as_str())
+                            });
+                        refused = argument.and_then(|argument| {
+                            if super::masked_runtime::always_zero(tcx, site.caller, argument.span) {
+                                Some("only-zero".to_owned())
+                            } else if adjacency
+                                && !masked
+                                && (mask_formal
+                                    || super::masked_runtime::mask_operand(
+                                        tcx,
+                                        site.caller,
+                                        argument.span,
+                                    ))
+                            {
+                                Some(format!(
+                                    "mask-as-count:{}",
+                                    sm.span_to_snippet(argument.span).unwrap_or_default()
+                                ))
+                            } else if masked
+                                && super::masked_runtime::constant_mask(
+                                    tcx,
+                                    facts,
+                                    site.caller,
+                                    argument.span,
+                                )
+                            {
+                                // Relay 066 (R666-2): R477-6's `mask + 1`
+                                // holds for a ring buffer, not a constant
+                                // (no-op) mask such as `!0 >> 1`.
+                                Some(format!(
+                                    "no-op-mask:{}",
+                                    sm.span_to_snippet(argument.span).unwrap_or_default()
+                                ))
+                            } else {
+                                None
+                            }
+                        });
+                        if refused.is_none() && !masked {
+                            proven = extent_proven
+                                .as_ref()
+                                .filter(|(proven_companion, _)| {
+                                    Some(*proven_companion) == companion
+                                })
+                                .map(|(_, premises)| {
+                                    if premises.is_empty() {
+                                        "none".to_owned()
+                                    } else {
+                                        premises.join("+")
+                                    }
+                                });
+                        }
+                        (
+                            argument
+                                .filter(|_| refused.is_none())
+                                .and_then(|argument| sm.span_to_snippet(argument.span).ok())
+                                .filter(|text| licensed_spelling(text))
+                                .map(|text| masked_len_text(text, masked)),
+                            masked,
+                            Some(arm),
+                        )
+                    }
+                } else {
+                    (None, false, None)
+                };
+                // wave-6l relay 077 (R776-4): the NUL-walk extent, where nothing
+                // above licensed a length; `nul_walk_used` records that the arm
+                // below chose it, so the receipt names it (R491-7's own exact
+                // extent renders the same text and keeps its receipt).
+                let nul_walk = site
+                    .args
+                    .iter()
+                    .find(|argument| argument.index == pos.index)
+                    .and_then(|argument| table.nul_walk_sites.get(&(site.caller, argument.span)));
+                // The length names the BOUND base (`NUL_WALK_BASE`), not the
+                // argument's input spelling: the argument may itself be
+                // rewritten (`*argv.offset(1)` → `argv[1]`), and the construction
+                // binds it once (`{ let base = ARG; from_raw_parts(base, LEN) }`).
+                let nul_walk_len = nul_walk.map(|_| {
+                    format!(
+                        "core::ffi::CStr::from_ptr({NUL_WALK_BASE} as *const core::ffi::c_char).to_bytes().len().wrapping_add(1)"
+                    )
+                });
+                let nul_walk_used = std::cell::Cell::new(false);
+                // Relay 063: a fallback a refusal caused says so, on the
+                // candidate and on its input-form twin alike.
+                let mark_refused = |mut candidate: Candidate| {
+                    if let Some(reason) = &refused
+                        && candidate.spec.len == Some(SeamLen::Fabricated)
+                    {
+                        candidate.spec.len = Some(SeamLen::Refused(reason.clone()));
+                    }
+                    // wave-6l relay 067: the extent prover's licence says so.
+                    if let Some(premises) = &proven
+                        && let Some(SeamLen::Licensed(text)) = candidate.spec.len.clone()
+                    {
+                        candidate.spec.len = Some(SeamLen::Proven {
+                            text,
+                            premises: premises.clone(),
+                        });
+                    }
+                    if nul_walk_used.get()
+                        && let Some(site) = nul_walk
+                        && let Some(SeamLen::Licensed(text)) = candidate.spec.len.clone()
+                        && Some(&text) == nul_walk_len.as_ref()
+                    {
+                        candidate.spec.len = Some(SeamLen::NulWalk {
+                            text,
+                            receipt: site.receipt(),
+                        });
+                    }
+                    candidate
+                };
+                // R625: a raw pointer to element 0 of a `[T; N]`, passed where no
+                // companion, contract, region or C string names a length, is
+                // bounded by the array itself: `N`, not the fabricated extent.
+                let (len_text, len_evidence) = match len_text {
+                    None if pos.found == Form::Raw
+                        && matches!(
+                            pos.expected,
+                            Form::Slice { .. } | Form::Opt { slice: true, .. }
+                        ) =>
+                    {
+                        match site
+                            .args
+                            .iter()
+                            .find(|argument| argument.index == pos.index)
+                            .and_then(|argument| argument.array_extent)
+                        {
+                            Some(elements) => {
+                                (Some(elements.to_string()), Some(LenEvidence::ArrayType))
+                            }
+                            // **R677-6** — nor an array: the callee's own
+                            // straight-line accesses, where they prove one
+                            // (`element_extent`), rather than the fabricated extent.
+                            None => match super::element_extent::constant_access_extent(
+                                tcx, *callee, pos.index,
+                            ) {
+                                Some(elements) => {
+                                    (Some(elements.to_string()), Some(LenEvidence::CalleeAccess))
+                                }
+                                // wave-6l relay 071 (R697-7): nor a constant
+                                // access extent: a licensed field's allocation
+                                // length, read from the same object.
+                                None => match site
+                                    .args
+                                    .iter()
+                                    .find(|argument| argument.index == pos.index)
+                                    .and_then(|argument| {
+                                        table.field_alloc_lengths.get(&(site.caller, argument.span))
+                                    }) {
+                                    Some(length) => {
+                                        (Some(length.clone()), Some(LenEvidence::FieldAlloc))
+                                    }
+                                    // wave-6l relay 077 (R776-4): nor a field's
+                                    // allocation: a C string's `strlen + 1`.
+                                    None => match &nul_walk_len {
+                                        Some(len) => {
+                                            nul_walk_used.set(true);
+                                            (Some(len.clone()), Some(LenEvidence::NulWalk))
+                                        }
+                                        None => (None, len_evidence),
+                                    },
+                                },
+                            },
+                        }
+                    }
+                    text => (text, len_evidence),
+                };
+                // wave-6l relay 071 (R697-7 (b)): a masked reader that reads
+                // past its masked index by a runtime length is never handed a
+                // fabricated length (the fallback, or `mask + 1`): its call is
+                // not adapted. The hold keeps such readers raw where every root
+                // is fabricated; this is the guard for a reader released on a
+                // real root and reached through a forwarder that stayed raw.
+                // (R823-3: with the narrowing reverted no reader is released,
+                // so this guard does not fire; it stays for the narrowing's
+                // return in 56.)
+                // (The relay 071 review's (9): keyed on the length the reader
+                // would receive, whatever form it comes from, save a slice it
+                // already has; a byte region only where it has no exact length.)
+                if (len_text.is_none() || len_masked)
+                    && region.is_none_or(|region| region.len_text().is_none())
+                    && !matches!(
+                        pos.found,
+                        Form::Slice { .. } | Form::Opt { slice: true, .. }
+                    )
+                    && matches!(
+                        pos.expected,
+                        Form::Slice { .. } | Form::Opt { slice: true, .. }
+                    )
+                    && *masked_readers
+                        .borrow_mut()
+                        .entry((*callee, pos.index))
+                        .or_insert_with(|| {
+                            super::masked_runtime::held(tcx, *callee, pos.index).is_some()
+                        })
+                {
+                    candidates.push(Err(SeamBlock::LengthUnknown));
+                    input_candidates.push(Err(SeamBlock::LengthUnknown));
+                    continue;
+                }
+                // R641-2 (2)/(3): the HIR's element fact and the cursor's tail
+                // view, read once for both candidates below.
+                let element_address = site
+                    .args
+                    .iter()
+                    .find(|argument| argument.index == pos.index)
+                    .is_some_and(|argument| argument.element_address);
+                let element_spine_of_root = site
+                    .args
+                    .iter()
+                    .find(|argument| argument.index == pos.index)
+                    .and_then(|argument| argument.element_of)
+                    .is_some_and(|owner| pos.root == Some(owner));
+                let cursor_element = cursor_element_view(
+                    &decision_of,
+                    site.caller,
+                    pos.root,
+                    pos.span,
+                    element_spine_of_root,
+                );
+                // **R674-9 — the element address's longer rendering.** C2Rust
+                // spells `&a[k]` as `&*a.offset(k)`: one element to the
+                // `(Slice, Ref)` glue, which R622-1 refuses into a formal read
+                // past it. The pointer under the `&*` carries the allocation, so
+                // the raw arm takes it where the callee's own straight-line body
+                // proves the extent (`element_extent`: it reads or writes
+                // elements `0..N` on every call). A count companion still waits
+                // for a licence that bounds every index by it (relay 067).
+                //
+                // **R761-1 as ruled (relay 263) — otherwise the site FABRICATES
+                // (§77).** The refusal used to stand, and a refused site is
+                // dropped: the callee's formal is held raw, its class with it,
+                // and every other caller of that formal is stranded (lodepng's
+                // whole-program revert at batch 54; brotli's six held callees and
+                // the 227 rows behind them). The pointer under the `&*` carries
+                // the allocation, and the input dereferenced it, so it is not
+                // null (R517-10): the raw arm takes it with the fabricated
+                // extent, receipted as every other fabricated extent is.
+                let element_pointer = (one_element_into_wide(
+                    table.wide_access_parameters.contains(&(*callee, pos.index)),
+                    pos.source_shape,
+                    element_address,
+                    pos.expected,
+                ) && !cursor_element
+                    && matches!(pos.expected, Form::Slice { .. }))
+                .then(|| {
+                    site.args
+                        .iter()
+                        .find(|argument| argument.index == pos.index)
+                })
+                .flatten()
+                .and_then(|argument| argument.deref_pointer)
+                .and_then(|span| sm.span_to_snippet(span).ok())
+                .map(|pointer| {
+                    let elements =
+                        super::element_extent::constant_access_extent(tcx, *callee, pos.index)
+                            .map(|elements| elements.to_string());
+                    (pointer, elements)
+                });
+                // **R674-6 (iii-a) — the exemption belongs to the decided form
+                // only.** For a SLICE root the decided candidate is the root's
+                // own tail view (a `Suffix`), and the exemption exists so that
+                // the INPUT-form candidate does not block the site (R641-2,
+                // main 131a). But the input form is what the call renders when
+                // the root does not deliver, and then there is no tail view: a
+                // one-element adapter there is exactly the claim R416-5
+                // refuses (batch 52: `FindLongestMatchH5::data`, unplaced, fed
+                // `from_ref(&*data.offset(k))` to `HashBytesH5`'s four-byte
+                // read). Such a position keeps NO input rendering: the argument
+                // keeps its text and verification takes the site back.
+                let spine_only = cursor_element
+                    && pos.root.is_some_and(|root| {
+                        matches!(
+                            decision_of.get(&(site.caller, root)).copied(),
+                            Some(Decision::Slice { .. } | Decision::Opt { slice: true, .. })
+                        )
+                    })
+                    && one_element_into_wide(
+                        table.wide_access_parameters.contains(&(*callee, pos.index)),
+                        pos.source_shape,
+                        element_address,
+                        pos.expected,
+                    );
+                let owner_view = pos
+                    .root
+                    .filter(|_| pos.source_shape == "bare-local")
+                    .and_then(|root| decision_of.get(&(site.caller, root)).copied())
+                    .and_then(|decision| owner_view_candidate(Some(decision), pos.expected, text));
+                let len_text = super::slice_return_evidence::companion_for_tail(
+                    table,
+                    raw_boundary,
+                    *callee,
+                    pos.index,
+                    len_text,
+                );
+                // **R707** — no companion, contract, region, C string, array,
+                // field count, callee access (R677-6) or tail companion: the
+                // callee's own accesses, instantiated with this call's
+                // arguments, rather than the fabricated extent. Last of the
+                // evidence arms (R780-2), so it replaces only a fallback.
+                let (len_text, len_evidence) = match len_text {
+                    None if pos.found == Form::Raw
+                        && matches!(
+                            pos.expected,
+                            Form::Slice { .. } | Form::Opt { slice: true, .. }
+                        ) =>
+                    {
+                        match super::callee_bound::at_call_site(
+                            tcx,
+                            *callee,
+                            pos.index,
+                            site.caller,
+                            site.span,
+                            sm,
+                        ) {
+                            Some((text, key)) => {
+                                (Some(text), Some(LenEvidence::CalleeBound { key }))
+                            }
+                            None => (None, len_evidence),
+                        }
+                    }
+                    text => (text, len_evidence),
+                };
+                candidates.push(
+                    if let Some(address) = shared_pairs
+                        .at(*callee, site)
+                        .and_then(|call| call.addresses.get(&pos.index))
+                    {
+                        shared_candidate(address, text)
+                    } else if let Some(candidate) = owner_view {
+                        Ok(Some(candidate))
+                    } else if let Some(bridged) = pos
+                        .late_raw_owner
+                        .then(|| {
+                            owner_into_raw_formal(
+                                tcx,
+                                *callee,
+                                pos.index,
+                                pos.root
+                                    .and_then(|root| decision_of.get(&(site.caller, root)).copied()),
+                                text,
+                            )
+                        })
+                        .flatten()
+                    {
+                        bridged
+                    } else if let Some(bridged) = pos
+                        .late_raw_optional
+                        .then(|| {
+                            optional_into_raw_formal(tcx, *callee, pos.index, pos.expected, pos.found, pos.literal_null, text)
+                        })
+                        .flatten()
+                    {
+                        bridged
+                    } else if let Some((pointer, elements)) = &element_pointer {
+                        build_candidate(
+                            pos.expected,
+                            Form::Raw,
+                            pointer,
+                            &pos.source_type,
+                            false,
+                            elements.as_deref(),
+                            false,
+                            elements
+                                .as_ref()
+                                .map_or(len_evidence, |_| Some(LenEvidence::CalleeAccess)),
+                            enclosing_unsafe_fn,
+                            retention,
+                            *callee,
+                            pos.index,
+                            false,
+                            return_tied,
+                            None,
+                            field_tied_params.contains(&pos.index),
+                            None,
+                            false,
+                        )
+                        .map(|candidate| candidate.map(mark_refused))
+                    } else {
+                        build_candidate(
+                            pos.expected,
+                            pos.found,
+                            text,
+                            &pos.source_type,
+                            pos.literal_null,
+                            len_text.as_deref(),
+                            len_masked,
+                            len_evidence,
+                            enclosing_unsafe_fn,
+                            retention,
+                            *callee,
+                            pos.index,
+                            one_element_into_wide(
+                                table.wide_access_parameters.contains(&(*callee, pos.index)),
+                                pos.source_shape,
+                                element_address,
+                                pos.expected,
+                            ) && !cursor_element,
+                            return_tied,
+                            counted,
+                            field_tied_params.contains(&pos.index),
+                            region,
+                            pos.raw_operand,
+                        )
+                        // wave-6b (R609-4 (a)): a byte-region write side whose
+                        // read-side peer stayed raw because the pair is not
+                        // proven disjoint AT THIS CALL is receipted T2 here.
+                        .map(|candidate| {
+                            candidate.map(|mut candidate| {
+                                if region.is_some_and(|region| {
+                                    region.shape == super::void_region::Shape::ScalarBytes
+                                }) && super::void_region::pair_unproven_at(
+                                    table,
+                                    *callee,
+                                    pos.index,
+                                    site,
+                                    a5_site_proofs,
+                                ) {
+                                    candidate.retention = BridgeRetentionTier::T2;
+                                    candidate.waiver_id = Some(
+                                        crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID
+                                            .to_owned(),
+                                    );
+                                }
+                                mark_refused(candidate)
+                            })
+                        })
+                    },
+                );
+                // Relay 371 step 3: where the forms agree (`&mut T` into `&mut T`),
+                // the identity cast is stripped — the edit is the operand alone.
+                // Only between two safe forms: a raw formal's argument is the
+                // raw-boundary arm's, whose bridge renders the operand itself.
+                if pos.identity_strip
+                    && pos.expected != Form::Raw
+                    && pos.found != Form::Raw
+                    && let Some(current @ Ok(None)) = candidates.last_mut()
+                {
+                    let mutable = matches!(
+                        pos.expected,
+                        Form::Ref { mutable: true }
+                            | Form::Slice { mutable: true }
+                            | Form::Opt { mutable: true, .. }
+                    );
+                    *current = Ok(Some(Candidate {
+                        spec: GlueSpec::core(GlueCore::Bare, mutable),
+                        family: SeamFamily::Safe,
+                        replacement: text.to_owned(),
+                        len_arm: None,
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                    }));
+                }
+                // wave-6l relay 077: every branch above that took the NUL-walk
+                // length (an owner view reads `len_text` too) names it in its
+                // receipt.
+                if nul_walk_used.get()
+                    && let Some(site) = nul_walk
+                    && let Some(Ok(Some(candidate))) = candidates.last_mut()
+                    && let Some(SeamLen::Licensed(text)) = candidate.spec.len.clone()
+                    && Some(&text) == nul_walk_len.as_ref()
+                {
+                    candidate.spec.len = Some(SeamLen::NulWalk {
+                        text,
+                        receipt: site.receipt(),
+                    });
+                }
+                // Only a place of the caller's OWN object (`&mut local.f`, no
+                // deref): a place through a pointer root (`&mut (*s).f`) is
+                // wave-6r's shared-root bridge shape, whose address edit sits
+                // inside this argument's interval; and not at a READ/READ pair
+                // wave-6k's consumer owns.
+                if pos.source_shape == "addr-of-mut"
+                    && !pos.through_deref
+                    && shared_pairs.at(*callee, site).is_none()
+                    && let Some(current) = candidates.last_mut()
+                    && let Some(weakened) = shared_weakening_candidate(
+                        tcx,
+                        &shared_weakenings,
+                        pos.expected,
+                        pos.span,
+                        text,
+                        current,
+                    )
+                {
+                    *current = Ok(Some(weakened));
+                }
+                let input = if pos.root.is_some() {
+                    let input_found = a5_argument_expression_form(pos.source_shape, Form::Raw)
+                        .unwrap_or(Form::Raw);
+                    let input_candidate = if let Some(address) = shared_pairs
+                        .at(*callee, site)
+                        .and_then(|call| call.addresses.get(&pos.index))
+                    {
+                        shared_candidate(address, text)
+                    } else if let Some((pointer, elements)) = &element_pointer {
+                        build_candidate(
+                            pos.expected,
+                            Form::Raw,
+                            pointer,
+                            &pos.source_type,
+                            false,
+                            elements.as_deref(),
+                            false,
+                            elements
+                                .as_ref()
+                                .map_or(len_evidence, |_| Some(LenEvidence::CalleeAccess)),
+                            enclosing_unsafe_fn,
+                            retention,
+                            *callee,
+                            pos.index,
+                            false,
+                            return_tied,
+                            None,
+                            field_tied_params.contains(&pos.index),
+                            None,
+                            false,
+                        )
+                        .map(|candidate| candidate.map(mark_refused))
+                    } else {
+                        // wave-6l relay 077: a position decided in a safe form
+                        // never reached the raw length chain; its INPUT form is
+                        // raw, and the NUL-walk extent is the base's own, so the
+                        // twin a revert activates takes it too (urlparser's
+                        // literal-bound locals, decided thin and reverted).
+                        let (input_len, input_evidence) = match (&len_text, &nul_walk_len) {
+                            (None, Some(len))
+                                if wants_len
+                                    && pos.found != Form::Raw
+                                    && input_found == Form::Raw =>
+                            {
+                                nul_walk_used.set(true);
+                                (Some(len.clone()), Some(LenEvidence::NulWalk))
+                            }
+                            _ => (len_text.clone(), len_evidence),
+                        };
+                        build_candidate(
+                            pos.expected,
+                            input_found,
+                            text,
+                            &pos.source_type,
+                            pos.literal_null,
+                            input_len.as_deref(),
+                            len_masked,
+                            input_evidence,
+                            enclosing_unsafe_fn,
+                            retention,
+                            *callee,
+                            pos.index,
+                            one_element_into_wide(
+                                table.wide_access_parameters.contains(&(*callee, pos.index)),
+                                pos.source_shape,
+                                element_address,
+                                pos.expected,
+                            ) && !cursor_element,
+                            return_tied,
+                            counted,
+                            field_tied_params.contains(&pos.index),
+                            region,
+                            pos.raw_operand,
+                        )
+                        .map(|candidate| candidate.map(mark_refused))
+                    };
+                    // R561-5: the same weakening when the CALLER is emitted in
+                    // its input form beside a converted callee — `&mut place`
+                    // twice at shared formals is E0499 there too (brotli's
+                    // `metablock`). Same conditions as the current candidate.
+                    let input_candidate = if pos.source_shape == "addr-of-mut"
+                        && !pos.through_deref
+                        && shared_pairs.at(*callee, site).is_none()
+                        && let Some(weakened) = shared_weakening_candidate(
+                            tcx,
+                            &shared_weakenings,
+                            pos.expected,
+                            pos.span,
+                            text,
+                            &input_candidate,
+                        ) {
+                        Ok(Some(weakened))
+                    } else {
+                        input_candidate
+                    };
+                    input_candidate.map(|candidate| {
+                        Some(candidate.map_or(
+                            SeamInputRendering::ZeroSyntax { found: input_found },
+                            |candidate| candidate.into_input_rendering(input_found),
+                        ))
+                    })
+                } else {
+                    Ok(None)
+                };
+                input_candidates.push(if spine_only { Ok(None) } else { input });
+            }
+
+            // ---- pass 2: THE SITE GATES, applied to adapter-generated
+            // arguments exactly as to converted ones (ruling item 3) ----
+            //
+            // No bypass. The reborrow family puts its borrow in the region §5a
+            // measured borrowck as blind in, so this gate is the only thing
+            // standing between a seam and silent UB.
+            let is_mut = |f: &Form| {
+                matches!(
+                    f,
+                    Form::Ref { mutable: true }
+                        | Form::Slice { mutable: true }
+                        | Form::Opt { mutable: true, .. }
+                )
+            };
+            let mut conflicts = vec![Vec::<PeerConflict>::new(); positions.len()];
+            let mut conflict_edges = Vec::<(usize, usize, A5PeerProof)>::new();
+            for i in 0..positions.len() {
+                for j in (i + 1)..positions.len() {
+                    if !positions[i].borrows || !positions[j].borrows {
+                        continue;
+                    }
+                    // Two SHARED borrows of one place are legal, so a conflict
+                    // needs at least one `&mut`.
+                    let left_form = if positions[i].raw_boundary_observation {
+                        positions[i].found
+                    } else {
+                        positions[i].expected
+                    };
+                    let right_form = if positions[j].raw_boundary_observation {
+                        positions[j].found
+                    } else {
+                        positions[j].expected
+                    };
+                    if !is_mut(&left_form)
+                        && !is_mut(&right_form)
+                        && shared_pairs.at(*callee, site).is_none()
+                    {
+                        continue;
+                    }
+                    let same_root = !matches!(
+                        (positions[i].root, positions[j].root),
+                        (Some(x), Some(y)) if x != y
+                    );
+                    // An active raw-boundary pair already owns its syntax and
+                    // therefore cannot be blocked here, but the external PAIR
+                    // control still requires the attested A5 verdict even when
+                    // the syntactic roots look distinct. Ordinary seam pairs
+                    // retain the established same-root/blind trigger exactly.
+                    let boundary_observation = positions[i].raw_boundary_observation
+                        && positions[j].raw_boundary_observation;
+                    // wave-5d 145c: two DELIVERED formals, one handed a raw
+                    // local (`q = p; f(p, q)` renders `f(&mut *p, &*q)`), must
+                    // ask the proof. A formal that stays raw beside a
+                    // reference is R864-1 (a)'s class, out of 57 (145).
+                    // A counted raw local is exempt only from a pair whose other
+                    // side is counted too: the route decides that pair; beside a
+                    // delivered sibling it decides nothing (146e).
+                    // The counted-copy arm's own certificate answers where it
+                    // exists (R896-1): `disjoint_roots` never splits a copy.
+                    // Only where the A5 proofs are available (the attested
+                    // census world): an unattested or baseline run has no audit
+                    // row, so the asked pair would carry no proof site and
+                    // break the receipt ledger's ownership invariant (wave-5d
+                    // 147); there the record's gate stands.
+                    let raw_local_pair = a5_site_proofs.is_available()
+                        && (positions[i].raw_local
+                            || positions[j].raw_local
+                            || positions[i].counted_raw_local != positions[j].counted_raw_local)
+                        && positions[i].expected != Form::Raw
+                        && positions[j].expected != Form::Raw
+                        && !super::counted_void::disjoint_argument_roots(
+                            tcx,
+                            site,
+                            positions[i].index,
+                            positions[j].index,
+                        );
+                    if same_root
+                        || positions[i].blind
+                        || positions[j].blind
+                        || raw_local_pair
+                        || boundary_observation
+                        || shared_pairs.at(*callee, site).is_some()
+                    {
+                        let (left_blind, right_blind) = if positions[i].index <= positions[j].index
+                        {
+                            (positions[i].blind, positions[j].blind)
+                        } else {
+                            (positions[j].blind, positions[i].blind)
+                        };
+                        let mut proof = a5_site_proofs.lookup(
+                            site.caller.local_def_index.as_u32(),
+                            callee.local_def_index.as_u32(),
+                            positions[i].index,
+                            positions[j].index,
+                            positions[i].span,
+                            positions[j].span,
+                        );
+                        // R838: the classifier's proof over an operand loaded
+                        // from memory is not taken (era-5c 148).
+                        super::loaded_operand::read_loaded_operands(
+                            site,
+                            *callee,
+                            positions[i].index,
+                            positions[j].index,
+                            &mut proof,
+                            |callee, index| {
+                                matches!(
+                                    retention.get(callee, index),
+                                    Some(super::raw_boundary::RetentionVerdict::NoRetain { .. })
+                                )
+                            },
+                        );
+                        super::array_decay::read_array_decays(
+                            site,
+                            positions[i].index,
+                            positions[j].index,
+                            &mut proof,
+                        );
+                        a5_site_proofs.certify_refused(
+                            &mut proof,
+                            site.caller.local_def_index.as_u32(),
+                            callee.local_def_index.as_u32(),
+                            positions[i].index,
+                            positions[j].index,
+                            positions[i].span,
+                            positions[j].span,
+                        );
+                        super::outside_byte_view::read_under_p8(
+                            facts,
+                            site,
+                            positions[i].index,
+                            positions[j].index,
+                            &mut proof,
+                        );
+                        let conflict = PeerConflict {
+                            left: positions[i].index.min(positions[j].index),
+                            right: positions[i].index.max(positions[j].index),
+                            same_root,
+                            left_blind,
+                            right_blind,
+                            proof: proof.clone(),
+                        };
+                        conflicts[i].push(conflict.clone());
+                        conflicts[j].push(conflict);
+                        conflict_edges.push((i, j, proof));
+                    }
+                }
+            }
+
+            let role_entries = conflict_edges
+                .iter()
+                .flat_map(|(left, right, proof)| {
+                    let left_index = positions[*left].index;
+                    let right_index = positions[*right].index;
+                    let positive = |index| {
+                        matches!(
+                            retention.get(*callee, index),
+                            Some(super::raw_boundary::RetentionVerdict::Retains { .. })
+                        )
+                    };
+                    [
+                        (left_index, right_index, proof.verdict, positive(left_index)),
+                        (
+                            right_index,
+                            left_index,
+                            proof.verdict,
+                            positive(right_index),
+                        ),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let (mut a5_roles, forced_cover) =
+                super::co_conversion::resolve_pair_roles_with_rule(&role_entries);
+            if shared_pairs.at(*callee, site).is_some() {
+                a5_roles.insert(0, super::co_conversion::PairRole::Primary);
+                a5_roles.insert(1, super::co_conversion::PairRole::Primary);
+            }
+
+            // Native immutable facts discharge only the shared/read consumer
+            // hold. Preserve the A5 verdict and all incident peer receipts.
+            let shared_read_call = super::shared_read_pairs::prepare(
+                tcx,
+                table,
+                *callee,
+                site,
+                a5_site_proofs.pair_certificates(),
+            );
+            let mut shared_read_positions = positions
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, pos)| {
+                    (shared_read_call.is_some()
+                        && super::shared_read_pairs::admits(
+                            mut_facts,
+                            *callee,
+                            pos.index,
+                            pos.expected,
+                            conflicts[idx]
+                                .iter()
+                                .filter(|peer| peer.proof.verdict != A5SiteProofVerdict::Clear)
+                                .map(|peer| {
+                                    let index = if peer.left == pos.index {
+                                        peer.right
+                                    } else {
+                                        peer.left
+                                    };
+                                    let form = positions
+                                        .iter()
+                                        .find(|position| position.index == index)
+                                        .expect("conflict peer comes from positions")
+                                        .expected;
+                                    (index, form)
+                                }),
+                        ))
+                    .then_some(pos.index)
+                })
+                .collect::<BTreeSet<_>>();
+            // The two safe views and every address operator are one grant.
+            if shared_read_positions.len() != 2 {
+                shared_read_positions.clear();
+            } else if let Some(call) = shared_read_call {
+                plan.shared_read_calls.push(call);
+            }
+            for &index in &shared_read_positions {
+                a5_roles.insert(index, super::co_conversion::PairRole::Primary);
+            }
+
+            // ---- pass 3: emit ----
+            for (idx, pos) in positions.iter().enumerate() {
+                let (candidate_template, null_arm, extent_arm) = match &candidates[idx] {
+                    Ok(Some(candidate)) => (
+                        candidate.spec.template_key().to_owned(),
+                        match candidate.spec.null_arm_key() {
+                            "-" => "none".to_owned(),
+                            value => value.to_owned(),
+                        },
+                        match candidate.spec.extent_arm_key() {
+                            "-" => "none".to_owned(),
+                            value => value.to_owned(),
+                        },
+                    ),
+                    Ok(None) => ("none".to_owned(), "none".to_owned(), "none".to_owned()),
+                    Err(block) => (
+                        format!("error:{}", block.key()),
+                        "unavailable".to_owned(),
+                        "unavailable".to_owned(),
+                    ),
+                };
+                let mut overlap = (!conflicts[idx].is_empty()).then(|| {
+                    A5PositionProof::from_conflicts(
+                        site.caller,
+                        *callee,
+                        pos.index,
+                        pos.span,
+                        pos.expected,
+                        pos.found,
+                        pos.source_shape,
+                        candidate_template.clone(),
+                        &conflicts[idx],
+                        a5_site_proofs,
+                    )
+                });
+                if let Some(call) = shared_pairs.at(*callee, site) {
+                    if let Some(proof) = &mut overlap {
+                        proof.shared_permission = Some(call.permission.clone());
+                    }
+                }
+                let pair_owned = coconv.pair_sites().iter().any(|pair| {
+                    pair.caller == site.caller
+                        && pair.callee == *callee
+                        && pair.argument_index == pos.index
+                        && pair
+                            .call_span
+                            .source_callsite()
+                            .contains(site.span.source_callsite())
+                        && pair.role != super::co_conversion::PairRole::Blocked
+                });
+                let mut a5_call_owns_argument = false;
+                let mut a5_block = None;
+                if let Some(proof) = overlap.as_mut()
+                    && proof.verdict != A5SiteProofVerdict::Clear
+                    && !pair_owned
+                {
+                    let positive_retention = matches!(
+                            retention.get(*callee, pos.index),
+                            Some(super::raw_boundary::RetentionVerdict::Retains { .. })
+                        ) && !retention.returned_alias_settled(site.caller, *callee, pos.index)
+                            // wave-6v2's certificate answers the other shape:
+                            // the position's only positive sinks are stores
+                            // through its out-parameter, and every inventoried
+                            // call supplies them from frame-confined caller
+                            // locals (binn's `*_get_value` / `*_next`).
+                            && !retention.output_storage_settled(*callee, pos.index);
+                    let role = a5_roles
+                        .get(&pos.index)
+                        .copied()
+                        .unwrap_or(super::co_conversion::PairRole::Blocked);
+                    if positive_retention {
+                        proof.fallback = A5ProofSiteFallback::Held {
+                            reason: SeamBlock::PositiveRetention.key().to_owned(),
+                        };
+                        a5_block = Some(SeamBlock::PositiveRetention);
+                    } else {
+                        match role {
+                            super::co_conversion::PairRole::Clear
+                            | super::co_conversion::PairRole::Primary => {
+                                proof.fallback = A5ProofSiteFallback::Primary;
+                                if shared_read_positions.contains(&pos.index) {
+                                    proof.reason.push_str(";native-shared-read-peers");
+                                }
+                                if forced_cover.contains(&pos.index) {
+                                    proof.reason.push_str(";pair-forced-cover");
+                                }
+                            }
+                            super::co_conversion::PairRole::RawView => {
+                                if forced_cover.contains(&pos.index) {
+                                    proof.reason.push_str(";pair-forced-cover");
+                                }
+                                if let (Some(proof_site_key), Some(argument)) =
+                                    (proof.proof_site_key, pos.text.as_deref())
+                                {
+                                    match build_a5_raw_view(
+                                        tcx,
+                                        mut_facts,
+                                        site.caller,
+                                        *callee,
+                                        pos.index,
+                                        pos.expected,
+                                        pos.found,
+                                        argument,
+                                        pos.source_shape,
+                                        pos.target.as_ref(),
+                                        proof_site_key,
+                                        pos.root.map(|root| (site.caller, root)),
+                                    ) {
+                                        Ok(view) => {
+                                            proof.fallback = A5ProofSiteFallback::T2RawView {
+                                                template: view.template.clone(),
+                                                negative_write: view.negative_write,
+                                            };
+                                            let key = (
+                                                site.caller.local_def_index.as_u32(),
+                                                callee.local_def_index.as_u32(),
+                                                site.span.lo().0,
+                                                site.span.hi().0,
+                                            );
+                                            a5_raw_calls
+                                                .entry(key)
+                                                .or_insert_with(|| A5RawViewCall {
+                                                    owner_class: SignatureClassId::of(*callee),
+                                                    caller: site.caller,
+                                                    callee: *callee,
+                                                    call_span: site.span,
+                                                    views: Vec::new(),
+                                                })
+                                                .views
+                                                .push(view);
+                                            if site.caller != *callee {
+                                                plan.interface_dependencies.push((
+                                                    SignatureClassId::of(*callee),
+                                                    SignatureClassId::of(site.caller),
+                                                ));
+                                            }
+                                            a5_call_owns_argument = true;
+                                        }
+                                        Err(block) => {
+                                            proof.fallback = A5ProofSiteFallback::Held {
+                                                reason: format!(
+                                                    "a5-fallback-unrenderable:{}",
+                                                    block.key()
+                                                ),
+                                            };
+                                            a5_block = Some(block);
+                                        }
+                                    }
+                                } else {
+                                    proof.fallback = A5ProofSiteFallback::Held {
+                                        reason:
+                                            "a5-fallback-unrenderable:proof-site-key-unavailable"
+                                                .to_owned(),
+                                    };
+                                    a5_block = Some(SeamBlock::A5RawViewUnavailable);
+                                }
+                            }
+                            super::co_conversion::PairRole::Blocked => {
+                                proof.fallback = A5ProofSiteFallback::Held {
+                                    reason: "a5-primary-ambiguous".to_owned(),
+                                };
+                                a5_block = Some(SeamBlock::SiteOverlap);
+                            }
+                        }
+                    }
+                }
+                if !pair_owned && let Some(proof) = &overlap {
+                    plan.overlap_proofs.push(proof.clone());
+                }
+                if let Some(block) = a5_block {
+                    plan.blocked.push(BlockedSeam {
+                        caller: site.caller,
+                        callee: *callee,
+                        index: pos.index,
+                        span: pos.span,
+                        block,
+                        expected: Some(pos.expected),
+                        found: Some(pos.found),
+                        source_shape: pos.source_shape,
+                        candidate_template: candidate_template.clone(),
+                        null_arm: null_arm.clone(),
+                        extent_arm: extent_arm.clone(),
+                        root_identity: root_label(&labels, site.caller, pos.root),
+                        blind: pos.blind,
+                        peers: conflicts[idx].clone(),
+                        overlap,
+                    });
+                    continue;
+                }
+                if overlap.as_ref().is_some_and(|proof| {
+                    !proof.clears_site_overlap()
+                        && matches!(proof.fallback, A5ProofSiteFallback::Held { .. })
+                }) && !pos.raw_boundary_observation
+                    && !pair_owned
+                {
+                    plan.blocked.push(BlockedSeam {
+                        caller: site.caller,
+                        callee: *callee,
+                        index: pos.index,
+                        span: pos.span,
+                        block: SeamBlock::SiteOverlap,
+                        expected: Some(pos.expected),
+                        found: Some(pos.found),
+                        source_shape: pos.source_shape,
+                        candidate_template: candidate_template.clone(),
+                        null_arm: null_arm.clone(),
+                        extent_arm: extent_arm.clone(),
+                        root_identity: root_label(&labels, site.caller, pos.root),
+                        blind: pos.blind,
+                        peers: conflicts[idx].clone(),
+                        overlap,
+                    });
+                    continue;
+                }
+                if a5_call_owns_argument || native_owned_spans.contains(&(site.caller, pos.span)) {
+                    continue;
+                }
+                let input_rendering = match &input_candidates[idx] {
+                    Ok(rendering) => rendering.clone(),
+                    Err(block) => {
+                        plan.blocked.push(BlockedSeam {
+                            caller: site.caller,
+                            callee: *callee,
+                            index: pos.index,
+                            span: pos.span,
+                            block: *block,
+                            expected: Some(pos.expected),
+                            found: Some(Form::Raw),
+                            source_shape: pos.source_shape,
+                            candidate_template: format!("input-form-error:{}", block.key()),
+                            null_arm: "unavailable".to_owned(),
+                            extent_arm: "unavailable".to_owned(),
+                            root_identity: root_label(&labels, site.caller, pos.root),
+                            blind: pos.blind,
+                            peers: Vec::new(),
+                            overlap: None,
+                        });
+                        continue;
+                    }
+                };
+                // R217-2(a) (slicecursor report 027, wave-6s reviews): a borrowed
+                // ELEMENT of a CURSOR at a delivered-slice formal — the c2rust
+                // idiom handed straight to a local callee,
+                // `ToUpperCase(&mut *dst.offset(k))`. The position reads
+                // `found = Ref` (an `&mut` place) and the seam would render its
+                // own `from_mut(..)` over the same interval the cursor family has
+                // already rewritten to that cursor's tail view, so the two edits
+                // collide and the class withdraws the caller's family. The
+                // cursor's edit is the rendering; the seam receipts the site
+                // under the callee's C arm and registers the dependency, so the
+                // two classes stand or fall together. Guarded to a position whose
+                // ROOT is a cursor carrying an edit at exactly this span.
+                if let Some(root) = pos.root
+                    && let Some(Decision::Cursor { plan: cursor, .. }) =
+                        decision_of.get(&(site.caller, root)).copied()
+                    && cursor
+                        .uses
+                        .iter()
+                        .any(|edit| edit.span == pos.span && edit.bridge_kind == "cursor-element")
+                {
+                    plan.zero_bridges.push(ZeroBridgeSite {
+                        owner_class: SignatureClassId::of(*callee),
+                        caller: site.caller,
+                        span: Some(pos.span),
+                        arm: "c",
+                        position: format!("arg{}", pos.index),
+                        bridge_kind: "interface-call-cursor-element-view",
+                        expected_form: pos.expected.key(),
+                        found_form: "cursor-element",
+                        argument_kind: pos.source_shape,
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                        unsafe_context: None,
+                    });
+                    if site.caller != *callee {
+                        plan.interface_dependencies.push((
+                            SignatureClassId::of(*callee),
+                            SignatureClassId::of(site.caller),
+                        ));
+                    }
+                    continue;
+                }
+                match &candidates[idx] {
+                    Ok(None) => {
+                        // slicecursor (09-16): a cursor argument at a delivered
+                        // slice formal is the cursor's own view (`as_slice()`),
+                        // rendered by its use edit. Where the callee's class was
+                        // premised on the raw source (arm C: the candidate was
+                        // raw hypothetically, admitted as a cursor since), that
+                        // view is the C adaptation and is receipted under it.
+                        if matches!(pos.found, Form::Cursor { .. })
+                            && param_key.get(&(*callee, pos.index)).is_some_and(|node| {
+                                coconv.required_arms(*node).contains(super::Arm::C)
+                            })
+                        {
+                            plan.zero_bridges.push(ZeroBridgeSite {
+                                owner_class: SignatureClassId::of(*callee),
+                                caller: site.caller,
+                                span: Some(pos.span),
+                                arm: "c",
+                                position: format!("arg{}", pos.index),
+                                bridge_kind: "interface-call-cursor-view",
+                                expected_form: pos.expected.key(),
+                                found_form: pos.found.key(),
+                                argument_kind: pos.source_shape,
+                                retention: BridgeRetentionTier::None,
+                                waiver_id: None,
+                                unsafe_context: None,
+                            });
+                        }
+                        // Wave-6o (relay 015): an optional argument at an
+                        // optional formal is zero-syntax, but `Option<&T>`
+                        // does not coerce to the raw formal a HELD callee
+                        // keeps — so the caller depends on the callee's
+                        // class from the Core stage on. A reference argument
+                        // coerces at the call and records no edge.
+                        if matches!(pos.found, Form::Opt { .. })
+                            && matches!(pos.expected, Form::Opt { .. })
+                            && pos.root.is_some()
+                            && site.caller != *callee
+                        {
+                            plan.interface_dependencies.push((
+                                SignatureClassId::of(site.caller),
+                                SignatureClassId::of(*callee),
+                            ));
+                        }
+                        if let (Some(source), Some(input @ SeamInputRendering::Adapter { .. })) =
+                            (pos.root, input_rendering)
+                        {
+                            plan.revert_found_form_edits.push(RevertFoundFormEdit {
+                                span: pos.span,
+                                arg_span: pos.text_span,
+                                owner_class: SignatureClassId::of(*callee),
+                                source_node: (site.caller, source),
+                                input,
+                            });
+                        }
+                    }
+                    Ok(Some(candidate)) => {
+                        if let Some(emitted_type) = candidate.spec.checked_binding_type.clone() {
+                            plan.explicit_declarations.push(ExplicitDeclarationSite {
+                                owner_class: SignatureClassId::of(*callee),
+                                caller: site.caller,
+                                node: None,
+                                span: Some(pos.span),
+                                category: "local-temp",
+                                emitted_type,
+                                replacement: None,
+                                arm: "glue",
+                            });
+                        }
+                        // Rule 1 (2026-08-11): the census is a prioritization
+                        // overlay, so a pair with no row is REPORTED, not
+                        // refused.
+                        if !in_census(pos.found, pos.expected) {
+                            plan.uncensused.push((pos.found, pos.expected));
+                        }
+                        // The `lengated` census row is keyed on the SPEC too,
+                        // for the same reason: it exists to preserve the 42/51
+                        // derivability split across fabrication, so it must fire
+                        // exactly where fabrication happened.
+                        if let Some(LenArm::Fabricated(e)) = candidate.len_arm {
+                            plan.length_evidence.push((
+                                tcx.def_path_str(callee.to_def_id()),
+                                pos.index,
+                                e,
+                            ));
+                        }
+                        super::counted_void::record_call(
+                            tcx,
+                            table,
+                            &mut counted_void_calls,
+                            site,
+                            *callee,
+                            pos.index,
+                            &candidate.spec,
+                        );
+                        plan.edits.push(SeamEdit {
+                            raw_outbound: None,
+                            zero_syntax: false,
+                            span: pos.span,
+                            call_span: site.span,
+                            replacement: candidate.replacement.clone(),
+                            // Wave-6o (relay 121): an optional actual at a formal
+                            // that stays raw is bridged for the CALLER's decision,
+                            // not the callee's — the callee is raw either way, so
+                            // the edit lives and reverts with the caller's class
+                            // (a held callee class, brotli's `stat`, must not
+                            // drop it).
+                            owner_class: if pos.late_raw_optional || pos.late_raw_owner {
+                                SignatureClassId::of(site.caller)
+                            } else {
+                                SignatureClassId::of(*callee)
+                            },
+                            bridge: BridgeSitePlan {
+                                caller: site.caller,
+                                callee: BridgeCalleeId::Local(*callee),
+                                arm: receipt_arm(pos.expected, pos.found).to_owned(),
+                                position: format!("arg{}", pos.index),
+                                bridge_kind: candidate.spec.template_key().to_owned(),
+                                expected_form: pos.expected.key().to_owned(),
+                                found_form: pos.found.key().to_owned(),
+                                argument_kind: pos.source_shape.to_owned(),
+                                extent: receipt_extent(&candidate.spec),
+                                retention: candidate.retention,
+                                waiver_id: candidate.waiver_id.clone(),
+                                unsafe_context: unsafe_context_for(
+                                    tcx,
+                                    site.caller,
+                                    &candidate.spec,
+                                ),
+                            },
+                            owner_fn: tcx.def_path_str(callee.to_def_id()),
+                            lifetime_plan_digest: table
+                                .lifetime_plan
+                                .function(*callee)
+                                .map(super::lifetime::FunctionPlan::digest),
+                            caller_fn: tcx.def_path_str(site.caller.to_def_id()),
+                            param_index: pos.index,
+                            source_shape: pos.source_shape,
+                            family: candidate.family,
+                            len_arm: candidate.len_arm,
+                            spec: candidate.spec.clone(),
+                            arg_span: pos.text_span,
+                            expected: pos.expected,
+                            found: pos.found,
+                            source_node: pos.root.map(|root| (site.caller, root)),
+                            input_rendering,
+                            root_identity: root_label(&labels, site.caller, pos.root),
+                            blind: pos.blind,
+                            overlap,
+                            atom_ids: Vec::new(),
+                        });
+                    }
+                    Err(block) => {
+                        plan.blocked.push(BlockedSeam {
+                            caller: site.caller,
+                            callee: *callee,
+                            index: pos.index,
+                            span: pos.span,
+                            block: *block,
+                            expected: Some(pos.expected),
+                            found: Some(pos.found),
+                            source_shape: pos.source_shape,
+                            candidate_template: format!("error:{}", block.key()),
+                            null_arm: "unavailable".to_owned(),
+                            extent_arm: "unavailable".to_owned(),
+                            root_identity: root_label(&labels, site.caller, pos.root),
+                            blind: pos.blind,
+                            peers: Vec::new(),
+                            overlap,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    plan.a5_raw_calls = a5_raw_calls.into_values().collect();
+    plan.counted_void_calls = counted_void_calls.into_values().collect();
+    for call in &mut plan.a5_raw_calls {
+        call.views.sort_by_key(|view| view.argument_index);
+        call.views
+            .dedup_by_key(|view| (view.argument_index, view.proof_site_key));
+    }
+
+    // Raw-boundary wave 1 — explicit safe-to-raw sites. Zero-syntax and
+    // lifecycle templates remain in the receipt but produce no edit.
+    plan.raw_boundary_receipts = raw_boundary.receipts_tsv();
+    plan.raw_boundary_atom_groups = raw_boundary.subject_atom_groups();
+    for pair in coconv
+        .pair_sites()
+        .iter()
+        .filter(|pair| pair.role == super::co_conversion::PairRole::RawView)
+    {
+        if let Some(node) = pair.source_node {
+            plan.raw_boundary_atom_groups.entry(node).or_default().push(
+                super::raw_boundary::SubjectAtomKey {
+                    id: pair.atom_id(),
+                    node,
+                    owner: tcx.def_path_str(pair.caller.to_def_id()),
+                },
+            );
+        }
+    }
+    for atoms in plan.raw_boundary_atom_groups.values_mut() {
+        atoms.sort_by(|left, right| left.id.cmp(&right.id));
+        atoms.dedup_by(|left, right| left.id == right.id);
+    }
+    for (key, disposition, site) in raw_boundary.emission_sites() {
+        let Some(mut template) = disposition.template() else {
+            // A delivered counted byte view (wave-6v2) converts after the
+            // co-conversion gate ran, so a blocked outbound site on it is
+            // registered here as a dropped class site — the class withdraws —
+            // rather than left without a bridge (an ill-typed tree).
+            if let super::raw_boundary::RawBoundaryDisposition::Blocked { reason, .. } = disposition
+                && let Some((owner_did, node)) = site.node
+                && (site.target.depth2.is_some()
+                    || table.counted_void.contains_key(&(owner_did, node)))
+                && decision_of
+                    .get(&(owner_did, node))
+                    .is_some_and(|decision| !matches!(decision, Decision::Degraded(_)))
+            {
+                plan.raw_boundary_blocked.push(BlockedRawBoundary {
+                    owner_class: SignatureClassId::of(owner_did),
+                    bridge: BridgeSitePlan {
+                        caller: owner_did,
+                        callee: site.callee_local.map_or_else(
+                            || BridgeCalleeId::Foreign(key.callee.path.clone()),
+                            BridgeCalleeId::Local,
+                        ),
+                        arm: "c".to_owned(),
+                        position: format!("arg{}", key.argument_index),
+                        bridge_kind: if site.target.depth2.is_some() {
+                            "depth2-npo-bridge".to_owned()
+                        } else {
+                            reason.key().to_owned()
+                        },
+                        expected_form: "raw".to_owned(),
+                        found_form: "safe-subject".to_owned(),
+                        argument_kind: site.source_shape.to_owned(),
+                        extent: BridgeExtentKind::None,
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                        unsafe_context: None,
+                    },
+                    span: site.span,
+                    reason: reason.key().to_owned(),
+                });
+            }
+            continue;
+        };
+        // **R556-4 joint (c) — the owner's raw view at the BASE.** A Box view's
+        // template is written for the owner itself. At an element address of that
+        // owner (`&mut *X.offset(k)`, brotli's `BrotliClusterHistograms*` /
+        // `Quality10` / HqZopfli) it would wrap one element as if it were the owner
+        // (E0599). The view goes over the base path `X` instead and the input's
+        // `&mut *….offset(k)` stays around it; the owner's own element edit is
+        // retired (`box_base_view_retirements`), since its product — a one-element
+        // place — is what must not reach a formal that walks a range.
+        //
+        // **R568-3 — the view takes the ADDRESS's mutability.** The view bridges
+        // `X`, the raw pointer the input's arithmetic runs on, not the formal:
+        // `&mut *X.offset(k)` needs a `*mut` view whatever the formal, and the
+        // `&mut T` around it coerces to a `*const T` formal exactly as the
+        // input's did (brotli's Quality10, `nodes: *const ZopfliNode`). A shared
+        // address at a `*mut` formal cannot type in the input; it declines.
+        let base_view = matches!(
+            template,
+            super::raw_boundary::BridgeTemplate::BoxBorrowViewToRaw
+                | super::raw_boundary::BridgeTemplate::OptionalBoxBorrowViewToRaw
+        )
+        .then(|| {
+            let (owner, root) = site.node?;
+            super::emitability::owner_element_address_at(tcx, owner, site.span).filter(|address| {
+                address.root == root
+                    && (address.mutable
+                        || site.target.mutability == super::raw_boundary::RawMutability::Const)
+            })
+        })
+        .flatten();
+        let view_target = base_view
+            .filter(|address| {
+                address.mutable
+                    && site.target.mutability == super::raw_boundary::RawMutability::Const
+            })
+            .map(|_| super::raw_boundary::RawTargetType {
+                rendered: format!("*mut {}", site.target.pointee),
+                mutability: super::raw_boundary::RawMutability::Mut,
+                ..site.target.clone()
+            });
+        let target = view_target.as_ref().unwrap_or(&site.target);
+        let edit_span = base_view.map_or(site.span, |address| address.base);
+        let argument_span = base_view.map_or_else(
+            || {
+                site.direct_storage_span
+                    .unwrap_or(site.adapter_operand_span)
+            },
+            |address| address.base,
+        );
+        let Ok(mut argument) = sm.span_to_snippet(argument_span) else {
+            continue;
+        };
+        let mut spec = GlueSpec::raw_boundary_target(template, target, site.box_slice, false);
+        let exact_subject_use = site
+            .node
+            .and_then(|node| decision_of.get(&node).copied())
+            .into_iter()
+            .flat_map(|decision| match decision {
+                Decision::Cursor { plan, .. } => plan.uses.as_slice(),
+                Decision::Slice { uses, .. }
+                | Decision::NestedSlice { uses, .. }
+                | Decision::Opt { uses, .. } => uses.as_slice(),
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Box(_)
+                | Decision::Degraded(_) => &[],
+            })
+            .filter(|edit| edit.span == site.span)
+            .collect::<Vec<_>>();
+        if exact_subject_use.len() == 1 {
+            // slicecursor (09-16): a cursor's derived value at the argument
+            // (`s.offset_by(k)`, an offset chain rooted at the cursor) is not
+            // the raw view; the bridge renders over the rewritten operand and
+            // the AST pass wraps the grafted subtree (use, then seam).
+            if exact_subject_use[0].bridge_kind == "cursor-advance"
+                && site.target.mutability == super::raw_boundary::RawMutability::Const
+            {
+                argument = exact_subject_use[0].replacement.clone();
+                template = super::raw_boundary::BridgeTemplate::SliceToRawConst;
+                spec = GlueSpec::raw_boundary_target(template, &site.target, site.box_slice, false);
+            } else {
+                plan.raw_boundary_edit_region_owned.push((
+                    super::raw_boundary::site_atom_id(key),
+                    "raw-boundary-edit-region-owned".to_owned(),
+                ));
+                continue;
+            }
+        }
+        let Some(replacement) = spec.render_in_context(
+            &argument,
+            site.node
+                .is_some_and(|(owner, _)| enclosing_function_is_unsafe(tcx, owner)),
+        ) else {
+            continue;
+        };
+        let zero_syntax = match template.render(
+            &argument,
+            target.mutability,
+            site.box_slice,
+            spec.raw_boundary
+                .as_ref()
+                .and_then(|raw| raw.cast_pointee.as_deref()),
+        ) {
+            Ok(super::raw_boundary::BridgeRender::Edit(_)) => false,
+            Ok(super::raw_boundary::BridgeRender::ZeroSyntax) => true,
+            Ok(super::raw_boundary::BridgeRender::Lifecycle) | Err(_) => continue,
+        };
+        // wave-6b: an argument site inside an admitted region rewrite is
+        // replaced with the whole returned expression it sits in; it has no
+        // seam of its own.
+        if site
+            .node
+            .is_some_and(|(owner, _)| super::void_region::owns_span(table, owner, site.span))
+        {
+            continue;
+        }
+        let found = site
+            .node
+            .and_then(|node| decision_of.get(&node).copied())
+            .map_or(Form::Raw, form_of);
+        let atom_ids = site
+            .node
+            .and_then(|node| plan.raw_boundary_atom_groups.get(&node))
+            .map(|atoms| atoms.iter().map(|atom| atom.id.clone()).collect())
+            .unwrap_or_default();
+        let Some((owner_did, _)) = site.node else {
+            continue;
+        };
+        let (retention, waiver_id) = match disposition {
+            super::raw_boundary::RawBoundaryDisposition::T1 { .. } => {
+                (BridgeRetentionTier::T1, None)
+            }
+            super::raw_boundary::RawBoundaryDisposition::T2 { waiver_id, .. } => {
+                // R481-2: a T2 site carries either the v1 bridge waiver or
+                // the tier-2 RETENTION waiver the user confirmed.
+                debug_assert!(
+                    *waiver_id == RAW_BOUNDARY_T2_WAIVER_ID
+                        || *waiver_id == super::raw_boundary::RAW_BOUNDARY_RETENTION_WAIVER_ID,
+                    "unexpected T2 waiver id {waiver_id}"
+                );
+                (BridgeRetentionTier::T2, Some((*waiver_id).to_owned()))
+            }
+            super::raw_boundary::RawBoundaryDisposition::Blocked { .. }
+            | super::raw_boundary::RawBoundaryDisposition::OwnedByOtherArm { .. } => continue,
+        };
+        let ownership = super::raw_boundary_contracts::classify_contract(
+            &key.callee,
+            key.argument_index,
+            &site.target,
+        )
+        .ok()
+        .map(|contract| contract.ownership);
+        let original_expression = sm
+            .span_to_snippet(edit_span)
+            .expect("located outbound argument has original source");
+        if let Some(address) = base_view {
+            plan.box_base_view_retirements.push(BoxBaseViewRetirement {
+                node: (owner_did, address.root),
+                element: address.element,
+                base: address.base,
+                argument: site.span,
+            });
+        }
+        plan.edits.push(SeamEdit {
+            raw_outbound: Some(RawOutboundEndpoint {
+                return_independent: raw_boundary.return_independent(key).cloned(),
+                returned_child: raw_boundary.returned_child_evidence(key).cloned(),
+                mutable_binding_required: site.mutable_binding_required,
+                target: target.clone(),
+                original_expression,
+                operand_expression: argument.clone(),
+                ownership,
+                negative_write: raw_boundary.negative_write_evidence(key).is_some(),
+                box_slice: site.box_slice,
+                enclosing_unsafe_fn: enclosing_function_is_unsafe(tcx, owner_did),
+                callee_may_yield_pointer: raw_boundary.callee_may_yield_pointer(key),
+                child_access: raw_boundary.type_backed_child_access_for(key).cloned(),
+            }),
+            zero_syntax,
+            span: edit_span,
+            call_span: site.call_span,
+            replacement,
+            owner_class: SignatureClassId::of(owner_did),
+            bridge: BridgeSitePlan {
+                caller: owner_did,
+                callee: site.callee_local.map_or_else(
+                    || BridgeCalleeId::Foreign(key.callee.path.clone()),
+                    BridgeCalleeId::Local,
+                ),
+                arm: "c".to_owned(),
+                position: format!("arg{}", key.argument_index),
+                bridge_kind: template.key().to_owned(),
+                expected_form: Form::Raw.key().to_owned(),
+                found_form: found.key().to_owned(),
+                argument_kind: site.source_shape.to_owned(),
+                extent: receipt_extent(&spec),
+                retention,
+                waiver_id,
+                unsafe_context: None,
+            },
+            owner_fn: key.caller.clone(),
+            lifetime_plan_digest: None,
+            caller_fn: key.caller.clone(),
+            param_index: key.argument_index,
+            source_shape: site.source_shape,
+            family: SeamFamily::Safe,
+            len_arm: None,
+            spec,
+            arg_span: argument_span,
+            expected: Form::Raw,
+            found,
+            source_node: site.node,
+            input_rendering: Some(SeamInputRendering::ZeroSyntax { found: Form::Raw }),
+            root_identity: key.subject.clone(),
+            blind: false,
+            overlap: None,
+            atom_ids,
+        });
+    }
+
+    // PAIR raw views are grouped by call. Their temps must be evaluated before
+    // any surviving safe borrow, so an argument-local edit is insufficient.
+    let mut pair_raw_calls = BTreeMap::<(u32, u32, u32, u32), PairRawViewCall>::new();
+    for pair in coconv.pair_sites().iter().filter(|pair| {
+        pair.role == super::co_conversion::PairRole::RawView && pair.a5_fallback.is_none()
+    }) {
+        if pair.tier != super::co_conversion::PairTier::T2 {
+            continue;
+        }
+        let Some(target) = pair.target.as_ref() else {
+            block_pair_raw_view(&mut plan, pair, "pair-raw-view-target-missing");
+            continue;
+        };
+        let Ok(argument) = sm.span_to_snippet(pair.span) else {
+            block_pair_raw_view(&mut plan, pair, "pair-raw-view-source-unplaceable");
+            continue;
+        };
+        let source_decision = pair
+            .source_node
+            .and_then(|source_node| decision_of.get(&source_node).copied());
+        let raw_expression = super::raw_boundary::pair_raw_view_expression(
+            source_decision,
+            target,
+            &argument,
+            pair.source_shape,
+        );
+        let Some(raw_expression) = raw_expression else {
+            block_pair_raw_view(&mut plan, pair, "pair-raw-view-template-unavailable");
+            continue;
+        };
+        let input_rendering = if let Some(source_node) = pair.source_node {
+            let input_subject = table
+                .input_interfaces
+                .subject_forms
+                .get(&source_node)
+                .copied();
+            let input_form = match pair.source_shape {
+                "bare-local" | "cast-of-local" => input_subject
+                    .and_then(|form| a5_argument_expression_form(pair.source_shape, form)),
+                // These expressions supply their own reference form even if
+                // the root is an ordinary scalar, not a pointer subject.
+                "addr-of" | "addr-of-cast" | "addr-of-mut" | "addr-of-mut-cast" => {
+                    a5_argument_expression_form(pair.source_shape, Form::Raw)
+                }
+                // The collector classifies these original expressions as
+                // raw-pointer values; their root's type is not their result.
+                "raw-expr" | "cast" => Some(Form::Raw),
+                _ => None,
+            };
+            let rendering = input_form.and_then(|form| {
+                let input_decision = decision_for_safe_form(form);
+                super::raw_boundary::pair_raw_view_expression(
+                    input_decision.as_ref(),
+                    target,
+                    &argument,
+                    pair.source_shape,
+                )
+                .map(|raw_expression| PairRawViewRendering {
+                    raw_expression,
+                    target_type: target.rendered.clone(),
+                })
+            });
+            let Some(rendering) = rendering else {
+                block_pair_raw_view(
+                    &mut plan,
+                    pair,
+                    "a5-fallback-unrenderable:pair-input-form-unavailable",
+                );
+                continue;
+            };
+            Some(rendering)
+        } else {
+            None
+        };
+        let key = (
+            pair.caller.local_def_index.as_u32(),
+            pair.callee.local_def_index.as_u32(),
+            pair.call_span.lo().0,
+            pair.call_span.hi().0,
+        );
+        let call = pair_raw_calls
+            .entry(key)
+            .or_insert_with(|| PairRawViewCall {
+                owner_class: SignatureClassId::of(pair.callee),
+                caller: pair.caller,
+                callee: pair.callee,
+                call_span: pair.call_span,
+                views: Vec::new(),
+                reasons: Vec::new(),
+                atom_ids: Vec::new(),
+            });
+        call.views.push(PairRawViewTemp {
+            argument_index: pair.argument_index,
+            raw_expression,
+            target_type: target.rendered.clone(),
+            source_node: pair.source_node,
+            argument_expression: argument,
+            argument_shape: pair.source_shape,
+            target: target.clone(),
+            input_rendering,
+        });
+        call.reasons.push(pair.reason.clone());
+        call.atom_ids.push(pair.atom_id());
+    }
+    plan.pair_raw_calls = pair_raw_calls.into_values().collect();
+    for call in &mut plan.pair_raw_calls {
+        call.views.sort_by_key(|view| view.argument_index);
+        call.reasons.sort();
+        call.reasons.dedup();
+        call.atom_ids.sort();
+        call.atom_ids.dedup();
+    }
+    for site in raw_boundary.address_sites() {
+        // **A subject the final table leaves raw (relay 297; libzahl `zor`, and
+        // the stand-in review's M3).** The address views are planned once, on
+        // the raw boundary's hypothesis, before the holds and the learned A5
+        // roles: an operand decided raw since keeps its raw text, as any raw
+        // operand of a comparison does. Its pre-hold reference view is either
+        // ill-typed (`from_ref(c).cast_mut()` over a `*mut`, `E0308`: libzahl
+        // `zor` under the hold, `zneg` / `zbset` at the frame under a learned
+        // `pair-raw-view`) or a silent reborrow of a raw pointer
+        // (`from_mut(&mut *c)`), a retag the input never made.
+        let raw_now = match decision_of.get(&site.node) {
+            None | Some(Decision::Degraded(_)) => true,
+            Some(
+                Decision::Ref { .. }
+                | Decision::InferredRef { .. }
+                | Decision::Slice { .. }
+                | Decision::NestedSlice { .. }
+                | Decision::Cursor { .. }
+                | Decision::Opt { .. }
+                | Decision::Box(_),
+            ) => false,
+        };
+        if raw_now {
+            continue;
+        }
+        let Ok(argument) = sm.span_to_snippet(site.span) else {
+            continue;
+        };
+        let spec = GlueSpec::raw_boundary_target(site.template, &site.target, false, true);
+        let Some(replacement) =
+            spec.render_in_context(&argument, enclosing_function_is_unsafe(tcx, site.node.0))
+        else {
+            continue;
+        };
+        let found = decision_of
+            .get(&site.node)
+            .copied()
+            .map_or(Form::Raw, form_of);
+        let atom_ids = plan
+            .raw_boundary_atom_groups
+            .get(&site.node)
+            .map(|atoms| atoms.iter().map(|atom| atom.id.clone()).collect())
+            .unwrap_or_default();
+        plan.edits.push(SeamEdit {
+            raw_outbound: None,
+            zero_syntax: super::counted_void::owns_address(table, site)
+                || super::void_region::owns_address(table, site),
+            span: site.span,
+            call_span: site.span,
+            replacement,
+            owner_class: SignatureClassId::of(site.node.0),
+            bridge: BridgeSitePlan {
+                caller: site.node.0,
+                callee: BridgeCalleeId::Local(site.node.0),
+                arm: "addr".to_owned(),
+                position: format!(
+                    "{}={}:hir{}@{}..{}:target={}:sink={}",
+                    if site.op == "ptr-eq" {
+                        if site.operand_index == 0 {
+                            "lhs"
+                        } else {
+                            "rhs"
+                        }
+                    } else {
+                        "operand"
+                    },
+                    site.op,
+                    site.node.1.local_id.as_u32(),
+                    site.span.lo().0,
+                    site.span.hi().0,
+                    site.target.rendered,
+                    site.target_type,
+                ),
+                bridge_kind: site.bridge_kind.to_owned(),
+                expected_form: Form::Raw.key().to_owned(),
+                found_form: found.key().to_owned(),
+                argument_kind: "address-observation".to_owned(),
+                extent: receipt_extent(&spec),
+                retention: BridgeRetentionTier::None,
+                waiver_id: None,
+                unsafe_context: None,
+            },
+            owner_fn: site.owner.clone(),
+            lifetime_plan_digest: None,
+            caller_fn: site.owner.clone(),
+            param_index: usize::MAX,
+            source_shape: "raw-op-address-observation",
+            family: SeamFamily::Safe,
+            len_arm: None,
+            spec,
+            arg_span: site.span,
+            expected: Form::Raw,
+            found,
+            source_node: None,
+            input_rendering: None,
+            root_identity: format!("address:{}:{}", site.op, site.span.lo().0),
+            blind: false,
+            overlap: None,
+            atom_ids,
+        });
+    }
+
+    // Return seams are owned by the returning function's signature class. The
+    // original expression is raw, so even a converted local receives the same
+    // explicit reborrow algebra as an inbound raw boundary. A typed origin
+    // permit is mandatory and supplies the lifetime-plan receipt.
+    let mut return_sites = facts.return_sites.clone();
+    return_sites.sort_by_key(|site| {
+        (
+            site.owner.local_def_index.as_u32(),
+            site.span.lo().0,
+            site.span.hi().0,
+        )
+    });
+    for site in return_sites {
+        let Some(function_plan) = table.lifetime_plan.function(site.owner) else {
+            continue;
+        };
+        if function_plan
+            .lifetime_for(super::lifetime::FnSignatureSlot::RETURN)
+            .is_none()
+        {
+            continue;
+        }
+        let signature = tcx
+            .fn_sig(site.owner.to_def_id())
+            .skip_binder()
+            .skip_binder();
+        let output = signature.output();
+        let rustc_middle::ty::TyKind::RawPtr(_, output_mutability) = *output.kind() else {
+            continue;
+        };
+        let expected = table
+            .return_interfaces
+            .functions
+            .get(&site.owner)
+            .map(|interface| interface.form)
+            .unwrap_or(Form::Ref {
+                mutable: output_mutability == rustc_middle::ty::Mutability::Mut,
+            });
+        let expected_mutable = match expected {
+            Form::NestedSlice { mutable, .. } => mutable,
+            Form::Cursor { mutable } => mutable,
+            Form::Ref { mutable } | Form::Slice { mutable } | Form::Opt { mutable, .. } => mutable,
+            Form::Raw => false,
+        };
+        if table.return_interfaces.failures.contains_key(&site.owner) {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::ReturnInterfaceUnavailable,
+                expected: Some(expected),
+                found: None,
+                source_shape: "return-seam",
+                candidate_template: "return-interface".into(),
+                null_arm: "none".into(),
+                extent_arm: "none".into(),
+                root_identity: root_label(&labels, site.owner, site.root),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        }
+        if site.source_shape == "null-lit"
+            && matches!(expected, Form::Opt { .. })
+            && table.return_interfaces.functions.contains_key(&site.owner)
+        {
+            // None creates no borrowed origin. The selected optional interface
+            // and native RETURN lifetime above own this exact branch.
+            let spec = GlueSpec::literal_none(expected_mutable);
+            let digest = function_plan.digest();
+            plan.edits.push(SeamEdit {
+                raw_outbound: None,
+                zero_syntax: false,
+                span: site.span,
+                call_span: site.span,
+                replacement: "None".to_owned(),
+                owner_class: SignatureClassId::of(site.owner),
+                bridge: BridgeSitePlan {
+                    caller: site.owner,
+                    callee: BridgeCalleeId::Local(site.owner),
+                    arm: "glue".to_owned(),
+                    position: format!(
+                        "return@{}..{}:target={}:lifetime_plan={digest}",
+                        site.span.lo().0,
+                        site.span.hi().0,
+                        site.source_type.rendered,
+                    ),
+                    bridge_kind: "return-null-to-option".to_owned(),
+                    expected_form: expected.key().to_owned(),
+                    found_form: Form::Raw.key().to_owned(),
+                    argument_kind: "null-lit".to_owned(),
+                    extent: BridgeExtentKind::None,
+                    retention: BridgeRetentionTier::None,
+                    waiver_id: None,
+                    unsafe_context: unsafe_context_for(tcx, site.owner, &spec),
+                },
+                owner_fn: tcx.def_path_str(site.owner.to_def_id()),
+                lifetime_plan_digest: Some(digest),
+                caller_fn: tcx.def_path_str(site.owner.to_def_id()),
+                param_index: usize::MAX,
+                source_shape: "null-lit",
+                family: SeamFamily::Safe,
+                len_arm: None,
+                spec,
+                arg_span: site.span,
+                expected,
+                found: Form::Raw,
+                source_node: None,
+                input_rendering: None,
+                root_identity: "-".to_owned(),
+                blind: false,
+                overlap: None,
+                atom_ids: Vec::new(),
+            });
+            continue;
+        }
+        let Some(root) = site.root else {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::ReturnLifetimeAbsent,
+                expected: Some(expected),
+                found: Some(Form::Raw),
+                source_shape: "return-seam",
+                candidate_template: "return-raw-to-ref".to_owned(),
+                null_arm: "none".to_owned(),
+                extent_arm: "none".to_owned(),
+                root_identity: "-".to_owned(),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        };
+        let node = (site.owner, root);
+        if lifetime_eligibility.return_permit(node).is_none() {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::ReturnLifetimeAbsent,
+                expected: Some(expected),
+                found: Some(Form::Raw),
+                source_shape: "return-seam",
+                candidate_template: "return-raw-to-ref".to_owned(),
+                null_arm: "none".to_owned(),
+                extent_arm: "none".to_owned(),
+                root_identity: root_label(&labels, site.owner, Some(root)),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        }
+        // W6L-1: a return reached through raw storage borrows the parameter's
+        // LIFETIME, not its pointee, so the returned view's mutability follows
+        // the raw return type rather than the parameter's own permission.
+        let through_raw_field = function_plan.through_raw_field();
+        let final_mutable = decision_of.get(&node).is_some_and(|decision| {
+            matches!(
+                decision,
+                Decision::Ref { mutable: true }
+                    | Decision::InferredRef { mutable: true, .. }
+                    | Decision::Slice { mutable: true, .. }
+                    | Decision::Opt { mutable: true, .. }
+            )
+        });
+        if expected_mutable && !final_mutable && through_raw_field.is_none() {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::SharedToMut,
+                expected: Some(expected),
+                found: Some(Form::Raw),
+                source_shape: "return-seam",
+                candidate_template: "return-raw-to-ref".to_owned(),
+                null_arm: "none".to_owned(),
+                extent_arm: "none".to_owned(),
+                root_identity: root_label(&labels, site.owner, Some(root)),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        }
+        let (operand_span, suffix_offset) = match site.expression_shape {
+            super::emitability::ReturnExprShape::Other => (site.span, None),
+            super::emitability::ReturnExprShape::ConstantReslice {
+                receiver_span,
+                offset,
+                ..
+            } => (receiver_span, Some(offset)),
+        };
+        let Ok(text) = sm.span_to_snippet(operand_span) else {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::UnnameableOperand,
+                expected: Some(expected),
+                found: Some(Form::Raw),
+                source_shape: "return-seam",
+                candidate_template: "return-raw-to-ref".to_owned(),
+                null_arm: "none".to_owned(),
+                extent_arm: "none".to_owned(),
+                root_identity: root_label(&labels, site.owner, Some(root)),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        };
+        // W6L-1: a return manufactured from raw storage is always a raw
+        // expression at the site, whatever the parameter's own form.
+        let same_borrowed_family = through_raw_field.is_none()
+            && matches!(expected, Form::Slice { .. } | Form::Opt { .. });
+        let found = if same_borrowed_family {
+            decision_of
+                .get(&node)
+                .map(|decision| form_of(decision))
+                .unwrap_or(Form::Raw)
+        } else {
+            Form::Raw
+        };
+        let wrap_borrowed_payload = match (expected, found) {
+            (
+                Form::Opt {
+                    mutable: target,
+                    slice: false,
+                },
+                Form::Ref { mutable: source },
+            )
+            | (
+                Form::Opt {
+                    mutable: target,
+                    slice: true,
+                },
+                Form::Slice { mutable: source },
+            ) => target == source,
+            _ => false,
+        };
+        let suffix_compatible = suffix_offset.is_none()
+            || matches!(
+                (expected, found),
+                (Form::Slice { mutable: target }, Form::Slice { mutable: source })
+                    | (Form::Opt { mutable: target, slice: true }, Form::Slice { mutable: source })
+                    if target == source
+            );
+        if !suffix_compatible
+            || (same_borrowed_family && found != expected && !wrap_borrowed_payload)
+        {
+            plan.blocked.push(BlockedSeam {
+                caller: site.owner,
+                callee: site.owner,
+                index: usize::MAX,
+                span: site.span,
+                block: SeamBlock::ReturnInterfaceUnavailable,
+                expected: Some(expected),
+                found: Some(found),
+                source_shape: "return-seam",
+                candidate_template: "return-interface".into(),
+                null_arm: "none".into(),
+                extent_arm: "none".into(),
+                root_identity: root_label(&labels, site.owner, Some(root)),
+                blind: false,
+                peers: Vec::new(),
+                overlap: None,
+            });
+            continue;
+        }
+        // Move the existing borrowed value into its return slot, optionally
+        // adding Some. Borrowing a local wrapper would lose the origin lifetime.
+        let slice_from_raw = through_raw_field.is_some_and(|reuse| reuse.slice)
+            && matches!(expected, Form::Slice { .. });
+        let mut spec = GlueSpec::core(
+            if let Some(offset) = suffix_offset {
+                GlueCore::Suffix { offset }
+            } else if slice_from_raw {
+                // W6L-1 wave 2: `core::slice::from_raw_parts{_mut}(E,
+                // FALLBACK_SLICE_EXTENT)` — the addendum-77 fabricated extent,
+                // receipted below.
+                GlueCore::FromRawParts
+            } else if same_borrowed_family {
+                GlueCore::Bare
+            } else {
+                GlueCore::Reborrow
+            },
+            expected_mutable,
+        );
+        if slice_from_raw {
+            spec = spec.with_fabricated_len();
+        }
+        if wrap_borrowed_payload {
+            spec = spec.wrapped();
+        }
+        let Some(replacement) =
+            spec.render_in_context(&text, enclosing_function_is_unsafe(tcx, site.owner))
+        else {
+            continue;
+        };
+        let digest = function_plan.digest();
+        // W6L-1: the reference is manufactured from raw storage; retention of
+        // raw aliases to the same memory is unknown, so the bridge rides the
+        // named T2 waiver and the receipt names the collapsed traversal.
+        let (retention, waiver_id, traversal) = match through_raw_field {
+            Some(reuse) => (
+                BridgeRetentionTier::T2,
+                Some(crate::bo_rewriter::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+                format!(
+                    ":through_raw_field={}{}",
+                    reuse.traversal.join(","),
+                    if reuse.untied {
+                        ":untied-return-view"
+                    } else {
+                        ""
+                    }
+                ),
+            ),
+            None => (BridgeRetentionTier::T1, None, String::new()),
+        };
+        plan.edits.push(SeamEdit {
+            raw_outbound: None,
+            zero_syntax: same_borrowed_family && !wrap_borrowed_payload && suffix_offset.is_none(),
+            span: site.span,
+            call_span: site.span,
+            replacement,
+            owner_class: SignatureClassId::of(site.owner),
+            bridge: BridgeSitePlan {
+                caller: site.owner,
+                callee: BridgeCalleeId::Local(site.owner),
+                arm: "glue".to_owned(),
+                position: format!(
+                    "return@{}..{}:target={}:lifetime_plan={digest}{traversal}",
+                    site.span.lo().0,
+                    site.span.hi().0,
+                    site.source_type.rendered,
+                ),
+                bridge_kind: "return-raw-to-ref".to_owned(),
+                expected_form: expected.key().to_owned(),
+                found_form: found.key().to_owned(),
+                argument_kind: "return-seam".to_owned(),
+                extent: receipt_extent(&spec),
+                retention,
+                waiver_id,
+                unsafe_context: unsafe_context_for(tcx, site.owner, &spec),
+            },
+            owner_fn: tcx.def_path_str(site.owner.to_def_id()),
+            lifetime_plan_digest: Some(digest),
+            caller_fn: tcx.def_path_str(site.owner.to_def_id()),
+            param_index: usize::MAX,
+            source_shape: "return-seam",
+            family: if same_borrowed_family {
+                SeamFamily::Safe
+            } else {
+                SeamFamily::Reborrow
+            },
+            len_arm: slice_from_raw.then_some(LenArm::Fabricated(LenEvidence::None)),
+            spec,
+            arg_span: operand_span,
+            expected,
+            found,
+            source_node: same_borrowed_family.then_some(node),
+            input_rendering: None,
+            root_identity: root_label(&labels, site.owner, Some(root)),
+            blind: false,
+            overlap: None,
+            atom_ids: if same_borrowed_family {
+                plan.raw_boundary_atom_groups
+                    .get(&node)
+                    .into_iter()
+                    .flatten()
+                    .map(|atom| atom.id.clone())
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        });
+    }
+
+    super::wave5r::complete_casts(tcx, table, &mut plan);
+    super::construction_values::complete(tcx, table, &mut plan);
+    super::raw_place_values::complete(tcx, table, &mut plan);
+    super::call_result_option::complete(tcx, table, &mut plan);
+    super::raw_initializer::complete(tcx, table, &mut plan);
+    super::ownership_fields_native::complete_declarations(tcx, table, &mut plan);
+    super::source_typed_local::complete(tcx, table, &mut plan);
+    super::source_typed_local::complete_derived(tcx, table, &mut plan);
+    // S8 (the user's word in main's session 11-03): the scalar-reference body
+    // adapters, a rule over every function (Item E wave 2 ran them in eight
+    // named corpus functions). They run after the dedicated producers above and
+    // leave every span those already edited or held; a right-hand side they
+    // cannot glue is a typed skip (`body_skipped`), never a hold, so the verify
+    // gate decides that class as it does for any site without an adapter.
+    let mut body_sites = facts.body_adapters.clone();
+    body_sites.sort_by_key(|site| {
+        (
+            site.owner.local_def_index.as_u32(),
+            site.rhs_span.lo().0,
+            site.rhs_span.hi().0,
+        )
+    });
+    for site in body_sites {
+        let taken = |span: Span| span.lo() < site.rhs_span.hi() && site.rhs_span.lo() < span.hi();
+        if plan.body_edits.iter().any(|edit| taken(edit.span))
+            || plan.body_blocked.iter().any(|blocked| taken(blocked.span))
+            || plan.body_skipped.iter().any(|skipped| taken(skipped.span))
+        {
+            continue;
+        }
+        let Some(destination_decision) = decision_of.get(&(site.owner, site.destination)) else {
+            continue;
+        };
+        let expected = form_of(destination_decision);
+        if !matches!(expected, Form::Ref { .. }) {
+            continue;
+        }
+        let owner_fn = tcx.def_path_str(site.owner.to_def_id());
+        let destination = labels
+            .get(&(site.owner, site.destination))
+            .cloned()
+            .unwrap_or_else(|| format!("{owner_fn}::<unknown-destination>"));
+        if site.side_effecting {
+            plan.body_skipped.push(BlockedBody {
+                owner_class: SignatureClassId::of(site.owner),
+                owner_fn,
+                destination,
+                span: site.rhs_span,
+                context: site.context,
+                block: BodyBlock::SideEffectingRhs,
+                expected,
+                found: Some(Form::Raw),
+                source_shape: site.shape.key(),
+                candidate_template: None,
+                root_identity: root_label(&labels, site.owner, site.shape.place_root()),
+                blind: true,
+            });
+            continue;
+        }
+
+        let (found, text_span, root, blind) = match site.shape {
+            ArgShape::BareLocal(hir) => (
+                decision_of
+                    .get(&(site.owner, hir))
+                    .map_or(Form::Raw, |decision| form_of(decision)),
+                site.rhs_span,
+                Some(hir),
+                false,
+            ),
+            ArgShape::AddrOf {
+                mutable,
+                base,
+                through_deref,
+            } => {
+                let blind = match (base, through_deref) {
+                    (None, _) => true,
+                    (Some(binding), true) => !decision_of
+                        .get(&(site.owner, binding))
+                        .is_some_and(|decision| !matches!(decision, Decision::Degraded(_))),
+                    (Some(_), false) => false,
+                };
+                (Form::Ref { mutable }, site.rhs_span, base, blind)
+            }
+            ArgShape::AddrOfCast { mutable, inner } => (Form::Ref { mutable }, inner, None, true),
+            // S9: a cast of a local that stays raw is a raw value whose cast is
+            // part of it (`shape as *mut Circle` for a `*const c_void` shape):
+            // the glue takes the whole right-hand side, as for a raw
+            // expression. A cast of a safe local keeps S8's reading.
+            ArgShape::CastOfLocal { binding, inner } => {
+                let found = decision_of
+                    .get(&(site.owner, binding))
+                    .map_or(Form::Raw, |decision| form_of(decision));
+                let text_span = if found == Form::Raw {
+                    site.rhs_span
+                } else {
+                    inner
+                };
+                (found, text_span, Some(binding), false)
+            }
+            ArgShape::NullLit => {
+                plan.body_skipped.push(BlockedBody {
+                    owner_class: SignatureClassId::of(site.owner),
+                    owner_fn,
+                    destination,
+                    span: site.rhs_span,
+                    context: site.context,
+                    block: BodyBlock::NullRequiredRef,
+                    expected,
+                    found: Some(Form::Raw),
+                    source_shape: site.shape.key(),
+                    candidate_template: None,
+                    root_identity: "-".to_owned(),
+                    blind: false,
+                });
+                continue;
+            }
+            // wave-5d2 (c): a raw-pointer EXPRESSION without effects (the HIR
+            // producer's own verdict) is a raw source like a raw local — it
+            // takes the same raw → reference glue over its whole text
+            // (`&*((*array).start)`), under the same receipts.
+            ArgShape::RawExpr { root } if !site.side_effecting => {
+                (Form::Raw, site.rhs_span, root, true)
+            }
+            ArgShape::RawExpr { .. } | ArgShape::Cast { .. } | ArgShape::Other => {
+                plan.body_skipped.push(BlockedBody {
+                    owner_class: SignatureClassId::of(site.owner),
+                    owner_fn,
+                    destination,
+                    span: site.rhs_span,
+                    context: site.context,
+                    block: BodyBlock::UnnameableRhs,
+                    expected,
+                    found: Some(Form::Raw),
+                    source_shape: site.shape.key(),
+                    candidate_template: None,
+                    root_identity: root_label(&labels, site.owner, site.shape.place_root()),
+                    blind: true,
+                });
+                continue;
+            }
+        };
+        let text = sm.span_to_snippet(text_span).ok();
+        let result = glue(expected, found, None);
+        match result {
+            Ok(None) => {}
+            Ok(Some((spec, family))) => {
+                let Some(text) = text.as_deref() else {
+                    plan.body_skipped.push(BlockedBody {
+                        owner_class: SignatureClassId::of(site.owner),
+                        owner_fn,
+                        destination,
+                        span: site.rhs_span,
+                        context: site.context,
+                        block: BodyBlock::RenderRefused,
+                        expected,
+                        found: Some(found),
+                        source_shape: site.shape.key(),
+                        candidate_template: Some(spec.template_key()),
+                        root_identity: root_label(&labels, site.owner, root),
+                        blind,
+                    });
+                    continue;
+                };
+                let Some(replacement) =
+                    spec.render_in_context(text, enclosing_function_is_unsafe(tcx, site.owner))
+                else {
+                    plan.body_skipped.push(BlockedBody {
+                        owner_class: SignatureClassId::of(site.owner),
+                        owner_fn,
+                        destination,
+                        span: site.rhs_span,
+                        context: site.context,
+                        block: BodyBlock::RenderRefused,
+                        expected,
+                        found: Some(found),
+                        source_shape: site.shape.key(),
+                        candidate_template: Some(spec.template_key()),
+                        root_identity: root_label(&labels, site.owner, root),
+                        blind,
+                    });
+                    continue;
+                };
+                plan.body_edits.push(BodyEdit {
+                    span: site.rhs_span,
+                    replacement,
+                    owner_class: SignatureClassId::of(site.owner),
+                    bridge: BridgeSitePlan {
+                        caller: site.owner,
+                        callee: BridgeCalleeId::Local(site.owner),
+                        arm: "glue".to_owned(),
+                        position: format!("body:{}", site.context.key()),
+                        bridge_kind: spec.template_key().to_owned(),
+                        expected_form: expected.key().to_owned(),
+                        found_form: found.key().to_owned(),
+                        argument_kind: site.shape.key().to_owned(),
+                        extent: receipt_extent(&spec),
+                        retention: BridgeRetentionTier::None,
+                        waiver_id: None,
+                        unsafe_context: unsafe_context_for(tcx, site.owner, &spec),
+                    },
+                    owner_fn,
+                    destination,
+                    context: site.context,
+                    source_shape: site.shape.key(),
+                    family,
+                    spec,
+                    arg_span: text_span,
+                    expected,
+                    found,
+                    root_identity: root_label(&labels, site.owner, root),
+                    blind,
+                });
+            }
+            Err(SeamBlock::SharedToMut) => plan.body_skipped.push(BlockedBody {
+                owner_class: SignatureClassId::of(site.owner),
+                owner_fn,
+                destination,
+                span: site.rhs_span,
+                context: site.context,
+                block: BodyBlock::SharedToMut,
+                expected,
+                found: Some(found),
+                source_shape: site.shape.key(),
+                candidate_template: None,
+                root_identity: root_label(&labels, site.owner, root),
+                blind,
+            }),
+            Err(_) => plan.body_skipped.push(BlockedBody {
+                owner_class: SignatureClassId::of(site.owner),
+                owner_fn,
+                destination,
+                span: site.rhs_span,
+                context: site.context,
+                block: BodyBlock::UnnameableRhs,
+                expected,
+                found: Some(found),
+                source_shape: site.shape.key(),
+                candidate_template: None,
+                root_identity: root_label(&labels, site.owner, root),
+                blind,
+            }),
+        }
+    }
+    complete_interface_inventory(
+        tcx,
+        facts,
+        table,
+        c9_marks,
+        lifetime_eligibility,
+        &decision_of,
+        &param_key,
+        &mut plan,
+    );
+    // The inventory dedups only when the fn-pointer web is available.
+    plan.interface_dependencies.sort();
+    plan.interface_dependencies.dedup();
+    yield_owned_field_glues(tcx, table, &mut plan);
+    plan
+}
+
+/// **R541-2 (wave-6f 065 STOP 3) — the seam plans no glue over a site an owned-field
+/// transaction renders.** A raw-boundary glue over `(*p).f`, where `f` has an APPLIED
+/// owning transaction, is planned against the field's input (raw) type while the
+/// transaction renders the load in the field's delivered form (`Option<Box<T>>`):
+/// the glue is ill-typed there, and was inert only because the field's wrap claims
+/// the node first (claim order is not a contract). Asked after
+/// `field_reference::finalize`, which is the only point the delivered form exists
+/// (the seam is synthesized after it). The site is left to the transaction and
+/// receipted.
+fn yield_owned_field_glues(tcx: TyCtxt<'_>, table: &DecisionTable, plan: &mut SeamPlan) {
+    if !table.field_transactions.applied.iter().any(|t| t.owning) {
+        return;
+    }
+    let mut yields = Vec::new();
+    plan.edits.retain(|edit| {
+        if edit.spec.raw_boundary.is_none() {
+            return true;
+        }
+        let Some(field) = owned_field_load_at(tcx, table, edit.span) else {
+            return true;
+        };
+        yields.push(format!(
+            "owned-field-renders:{field} caller={} param={}",
+            edit.caller_fn, edit.param_index
+        ));
+        false
+    });
+    plan.owned_field_glue_yields.extend(yields);
+}
+
+/// `Some("<struct>.<field>")` when the expression at `span` is a load of a field
+/// with an applied owning transaction (`super::field_reference::owning_field_form`).
+fn owned_field_load_at(tcx: TyCtxt<'_>, table: &DecisionTable, span: Span) -> Option<String> {
+    use rustc_hir::intravisit::{self, Visitor};
+    struct Find<'tcx> {
+        span: Span,
+        found: Option<&'tcx rustc_hir::Expr<'tcx>>,
+    }
+    impl<'tcx> Visitor<'tcx> for Find<'tcx> {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if self.found.is_none() && e.span == self.span {
+                self.found = Some(e);
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let owner = tcx
+        .hir_body_owners()
+        .find(|owner| tcx.hir_body_owned_by(*owner).value.span.contains(span))?;
+    let mut find = Find { span, found: None };
+    find.visit_expr(tcx.hir_body_owned_by(owner).value);
+    let mut expr = find.found?;
+    while let rustc_hir::ExprKind::Cast(inner, _) | rustc_hir::ExprKind::DropTemps(inner) =
+        expr.kind
+    {
+        expr = inner;
+    }
+    let rustc_hir::ExprKind::Field(base, field) = expr.kind else {
+        return None;
+    };
+    let typeck = tcx.typeck(owner);
+    let rustc_middle::ty::TyKind::Adt(adt, _) = typeck.expr_ty(base).kind() else {
+        return None;
+    };
+    let index = typeck.opt_field_index(expr.hir_id)?;
+    super::field_reference::owning_field_form(tcx, table, adt.did(), index.as_usize())?;
+    Some(format!("{}.{}", tcx.item_name(adt.did()), field.name))
+}
+
+/// **Where an argument's REPLACEMENT TEXT is read from**, which is not always
+/// the argument's own span.
+///
+/// The two cast shapes build from the cast's OPERAND while the replaced range
+/// stays the whole argument, so the surviving subtree is nested one level inside
+/// the node the span layer overwrites. Everything else reads its own span.
+///
+/// A free function rather than three lines inside the position loop, because
+/// that loop needs a `TyCtxt`, a call site and a decision map to run at all —
+/// and a mapping that only a corpus sweep can exercise is a mapping with no
+/// witness. Mutation M28 collapsed it onto `arg.span` and the entire suite
+/// stayed green.
+///
+/// `None` for the shapes that carry no nameable operand; those positions are
+/// already blocked as `UnnameableOperand` before any text is read.
+fn text_span_of(shape: ArgShape, arg_span: Span) -> Option<Span> {
+    match shape {
+        ArgShape::BareLocal(_)
+        | ArgShape::AddrOf { .. }
+        | ArgShape::RawExpr { .. }
+        | ArgShape::NullLit => Some(arg_span),
+        ArgShape::AddrOfCast { inner, .. } | ArgShape::CastOfLocal { inner, .. } => Some(inner),
+        ArgShape::Cast { .. } | ArgShape::Other => None,
+    }
+}
+
+/// **Ruling item 4a — is there a companion length in the callee's signature?**
+///
+/// Reads the RESOLVED signature, on the `ptr_params` precedent: a C2Rust alias
+/// lowers to a path, so a syntactic test would miss exactly the parameters this
+/// corpus is made of.
+pub(crate) fn length_evidence(tcx: TyCtxt<'_>, callee: LocalDefId, index: usize) -> LenEvidence {
+    let sig = tcx.fn_sig(callee).skip_binder().skip_binder();
+    let inputs = sig.inputs();
+    let is_int = |i: usize| {
+        inputs.get(i).is_some_and(|ty| {
+            matches!(
+                ty.kind(),
+                rustc_middle::ty::TyKind::Int(_) | rustc_middle::ty::TyKind::Uint(_)
+            )
+        })
+    };
+    if index + 1 < inputs.len() && is_int(index + 1) {
+        LenEvidence::Following
+    } else if index > 0 && is_int(index - 1) {
+        LenEvidence::Preceding
+    } else if (0..inputs.len()).any(is_int) {
+        LenEvidence::Elsewhere
+    } else {
+        LenEvidence::None
+    }
+}
+
+#[cfg(test)]
+mod interface_inventory_arm_tests {
+    use super::*;
+
+    /// **R466-6** — the arm writes the expression the glue matrix ALREADY returns.
+    ///
+    /// The inventory path used to ask `glue` only whether the answer was `None`
+    /// (zero-syntax) and throw the bridge away otherwise, holding 19 sites it had the
+    /// text for with `inventory-missing-expression-bridge`. This pins the property the
+    /// arm rests on: for every shape the inventory meets, `render` produces the SAME
+    /// expression any other argument arm would write, so the arm adds no new vocabulary.
+    #[test]
+    fn r466_6_every_inventory_shape_renders_the_glue_matrix_expression() {
+        use Form::*;
+
+        for (expected, found, arg, want) in [
+            (Ref { mutable: false }, Raw, "p", "unsafe { &*p }"),
+            (Ref { mutable: true }, Raw, "p", "unsafe { &mut *p }"),
+        ] {
+            let Ok(Some((spec, _))) = glue(expected, found, None) else {
+                panic!("{expected:?} <- {found:?} must answer with a bridge");
+            };
+            let rendered = spec.render(arg).expect("the matrix renders this shape");
+            assert_eq!(
+                rendered, want,
+                "the arm must write the matrix's own expression for {expected:?} <- {found:?}"
+            );
+            // And it carries the `unsafe` the bridge needs rather than degrading the
+            // subject to avoid it -- the emission philosophy of addendum 130, which the
+            // arm inherits for free precisely because it reuses this renderer.
+            assert!(
+                rendered.starts_with("unsafe {"),
+                "a raw-sourced bridge is emitted WITH its unsafe: {rendered}"
+            );
+        }
+    }
+
+    /// **R477-1 — the restriction the rule is NAMED for, and which I shipped without.**
+    ///
+    /// R466-6 says the arm writes the bridge "at a NON-SUBJECT argument". `non_subject`
+    /// was computed and only RECORDED; it gated nothing, so the arm also fired on three
+    /// subject arguments in brotli. A subject argument already has an owner, so a second
+    /// edit landed on a span another family plans, and the nested composition could no
+    /// longer find the inner text it expected inside the outer's product —
+    /// `nested-composition:inner-text-not-found:291037..291127`, which cost batch20 its
+    /// brotli row and the whole aggregate.
+    ///
+    /// This pins the gate's PRESENCE in the chain, because the arm's own behaviour is
+    /// identical either way at a non-subject position: nothing about rendering can
+    /// witness a condition that decides whether rendering is attempted at all.
+    #[test]
+    fn r477_1_the_arm_fires_only_at_a_non_subject_argument() {
+        let source = include_str!("seam.rs");
+        let arm = source
+            .split("inventory_expression_bridge(tcx, expected, found, argument, doubly_passed)")
+            .next()
+            .expect("the arm exists");
+        let guard = arm
+            .rfind("} else if non_subject")
+            .expect("the arm is guarded by non_subject");
+        // and the guard is the arm's OWN condition, not an outer block's: nothing
+        // separates it from the call but the `&& let` that follows.
+        assert!(
+            arm[guard..].matches("else if").count() == 1,
+            "the non_subject guard must be this arm's own condition"
+        );
+    }
+
+    /// The restriction, as a property of the helper's own gate: a doubly-passed or
+    /// returned argument keeps its hold even though the matrix would render it.
+    ///
+    /// Rendering it once would leave the other position reading the ORIGINAL text, so the
+    /// two occurrences of one value would disagree -- which is worse than a hold.
+    #[test]
+    fn r466_6_a_doubly_passed_argument_keeps_the_hold() {
+        let expected = Form::Ref { mutable: false };
+        let found = Form::Raw;
+        // The matrix does have an answer for this position ...
+        assert!(matches!(glue(expected, found, None), Ok(Some(_))));
+        // ... and the gate is what withholds it. The helper returns early on the flag
+        // before it ever consults `glue`, so no bridge can be rendered for such a site.
+        assert!(
+            super::inventory_expression_bridge_declines_when_doubly_passed(),
+            "the doubly-passed gate must precede the matrix, not filter after it"
+        );
+    }
+}
+
+/// Test-visible statement of the gate's ORDER (R466-6): the doubly-passed check runs
+/// before `glue`, so a restricted position never renders at all.
+#[cfg(test)]
+fn inventory_expression_bridge_declines_when_doubly_passed() -> bool {
+    // The helper's first statement is the early return; this mirrors it so the witness
+    // fails if the gate is ever moved after the matrix call.
+    let source = include_str!("seam.rs");
+    let helper = source
+        .split("fn inventory_expression_bridge")
+        .nth(1)
+        .expect("the helper exists");
+    let gate = helper.find("if doubly_passed").expect("the gate exists");
+    let matrix = helper
+        .find("glue(expected, found, None)")
+        .expect("the matrix call");
+    gate < matrix
+}
+
+/// **R738-1 (main 141a) — the census's N reaches the emitted const.** The emitted declaration,
+/// the mechanical receipt and the bridge receipt's fallback text all carry N = 2^28.
+#[cfg(test)]
+mod r738_1_census_n_override {
+    #[test]
+    fn r738_1_the_emitted_const_and_the_receipts_carry_the_census_n() {
+        let expected = 268_435_456;
+        assert_eq!(super::FALLBACK_SLICE_EXTENT, expected);
+        let item = rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2021,
+            &[],
+            None,
+            super::fabricated_len_item,
+        );
+        assert!(
+            item.contains(&format!("const FALLBACK_SLICE_EXTENT: usize = {expected};")),
+            "{item}"
+        );
+        let receipt = crate::bo_rewriter::mechanical_receipt::fallback_extent_receipt();
+        assert!(
+            receipt.ends_with(&format!("FALLBACK_SLICE_EXTENT={expected}")),
+            "{receipt}"
+        );
+    }
+}
+
+/// R1128-1 / relay 334 (wave-5d 154): the method spelling reaches only an operand KNOWN to be raw.
+#[cfg(test)]
+mod bridge_spelling_operand_tests {
+    use super::{Decision, Form, GlueCore, GlueSpec, known_raw_operand, owner_view_candidate};
+    use crate::bo_rewriter::decision::{
+        Degradation, DegradeReason,
+        box_facts::{BoxPlan, BoxShape},
+    };
+
+    fn degraded() -> Decision {
+        Decision::Degraded(Degradation {
+            subject: "p".to_owned(),
+            site: "-".to_owned(),
+            reason: DegradeReason::ReturnNotAdapted,
+        })
+    }
+
+    fn boxed() -> Decision {
+        Decision::Box(BoxPlan {
+            shape: BoxShape::Sized,
+            optional: true,
+            expr_edits: Vec::new(),
+            delete_statements: Vec::new(),
+            receipts: Vec::new(),
+            fabricated_extent: false,
+            pointee_override: None,
+            inferred_binding: false,
+            overwrite_spans: Vec::new(),
+            retained_sink: false,
+            implicit_scope_close: false,
+        })
+    }
+
+    /// A reference operand (a converted formal, a copy source) keeps `&*`: its subject decides `Ref`,
+    /// so it is not KNOWN raw, and a spec not marked raw renders the deref spelling with the switch on.
+    #[test]
+    fn a_reference_operand_keeps_the_deref_spelling() {
+        let reference = Decision::Ref { mutable: false };
+        assert!(!known_raw_operand(Some(Some(&reference)), Some("p")));
+        assert!(
+            !known_raw_operand(Some(None), Some("fresh")),
+            "a non-subject binding (`let ref mut`)"
+        );
+        assert!(
+            !known_raw_operand(None, Some("(*s).ptr")),
+            "a field place: its delivered form is not seen"
+        );
+        assert!(known_raw_operand(Some(Some(&degraded())), Some("p")));
+        assert!(known_raw_operand(None, Some("tmp.as_mut_ptr()")));
+        let mut spec = GlueSpec::core(GlueCore::Reborrow, false);
+        let text = spec.render("p").unwrap();
+        assert!(text.contains("&*p") && !text.contains("as_ref"), "{text}");
+        spec.raw_operand = true;
+        let text = spec.render("p").unwrap();
+        assert!(text.contains("p.as_ref().unwrap()"), "{text}");
+    }
+
+    /// A `Box` operand keeps `&*`: its subject is not KNOWN raw, and the owner's view (wave-6a's
+    /// `area(&*s)`) renders the deref spelling with the switch on (`s.as_ref()` would be `AsRef`).
+    #[test]
+    fn a_box_operand_keeps_the_deref_spelling() {
+        let owner = boxed();
+        assert!(!known_raw_operand(Some(Some(&owner)), Some("s")));
+        let view = owner_view_candidate(Some(&owner), Form::Ref { mutable: false }, "s")
+            .expect("an optional owner has a reference view");
+        assert!(
+            view.replacement.contains("&*s") && !view.replacement.contains("as_ref"),
+            "{}",
+            view.replacement
+        );
+    }
+}
+
+/// **Relay wave-6a/167**: a raw EXPRESSION operand known raw by its emitted type takes the bridge
+/// spelling; a reference operand (a converted local, a converted field) keeps `&*`.
+#[cfg(test)]
+mod raw_expression_operand_tests {
+    use std::sync::atomic::Ordering;
+
+    use rustc_hir::{ExprKind, intravisit};
+    use rustc_span::Span;
+
+    use super::{RAW_EXPRESSION_FAULT, RAW_EXPRESSION_TEST_FN, raw_expression_operand};
+
+    /// libtree's `((*st).arr).offset(i)` (a raw field, not converted), json.h's
+    /// `(*value).payload as *mut u8` (a cast), `src.offset(k)` (a degraded local), and the
+    /// controls: `q.offset(k)` (a local delivered as a reference), `(*st).conv` (a converted field).
+    const SRC: &str = "#![allow(dead_code, unused_mut)]\n\
+        pub struct st_t { pub arr: *mut u8, pub conv: *mut u8, pub payload: *mut u8 }\n\
+        unsafe fn take(_: *mut u8) {}\n\
+        pub unsafe fn __crat_w6a_167_f(mut st: *mut st_t, mut src: *mut u8, mut q: *mut u8, mut i: isize) {\n\
+            take(((*st).arr).offset(i));\n\
+            take((*st).payload as *mut u8);\n\
+            take(src.offset(i));\n\
+            take(q.offset(i));\n\
+            take((*st).conv);\n\
+        }\n";
+
+    /// Per call argument of `take`, in order: whether it is known raw.
+    fn observe() -> Vec<bool> {
+        ::utils::compilation::run_compiler_on_str(SRC, |tcx| {
+            let owner = tcx
+                .hir_body_owners()
+                .find(|&owner| tcx.item_name(owner.to_def_id()).as_str() == RAW_EXPRESSION_TEST_FN)
+                .expect("the witness function");
+            struct Args(Vec<Span>);
+            impl<'tcx> intravisit::Visitor<'tcx> for Args {
+                fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+                    if let ExprKind::Call(_, [argument]) = e.kind {
+                        self.0.push(argument.span);
+                    }
+                    intravisit::walk_expr(self, e);
+                }
+            }
+            let mut args = Args(Vec::new());
+            intravisit::Visitor::visit_body(&mut args, tcx.hir_body_owned_by(owner));
+            let name_of = |local| tcx.hir_name(local).to_string();
+            args.0
+                .into_iter()
+                .map(|span| {
+                    raw_expression_operand(
+                        tcx,
+                        owner,
+                        span,
+                        // `src` degraded; `q` delivered as a reference.
+                        &|local| name_of(local) == "src",
+                        // `conv` (field 1) is converted by a field transaction.
+                        &|_, index| index != 1,
+                    )
+                })
+                .collect()
+        })
+        .expect("compiles")
+    }
+
+    #[test]
+    fn w6a_167_a_raw_expression_operand_known_raw_takes_the_spelling_and_a_reference_keeps_deref() {
+        RAW_EXPRESSION_FAULT.store(0, Ordering::SeqCst);
+        assert_eq!(observe(), vec![true, true, true, false, false]);
+        // Three faults, each caught: the local check off makes `q` raw; the field check off makes
+        // `conv` raw; the cast arm off loses json.h's payload cast.
+        let mut caught = Vec::new();
+        for fault in 1..=3u8 {
+            RAW_EXPRESSION_FAULT.store(fault, Ordering::SeqCst);
+            let seen = observe();
+            caught.push(match fault {
+                1 => seen[3],
+                2 => seen[4],
+                _ => !seen[1],
+            });
+        }
+        RAW_EXPRESSION_FAULT.store(0, Ordering::SeqCst);
+        assert_eq!(caught, vec![true; 3], "every fault is caught");
+    }
+}

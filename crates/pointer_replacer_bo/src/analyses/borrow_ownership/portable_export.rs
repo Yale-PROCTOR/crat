@@ -1,0 +1,1495 @@
+//! Complete captured observations with compiler identities resolved before transport.
+//! This transport grants neither ownership nor a missing proof correspondence.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use super::{crate_slots::CrateSlots, export::BoExport};
+use crate::utils::rustc::RustProgram;
+
+/// v2 adds `move-store-obligations`, so the store-as-move obligations travel
+/// with the export. A v1 export carries no such family.
+pub(crate) const SCHEMA: &str = "bo-portable-export-v2";
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ExportFamily {
+    OwnershipVersions,
+    OwnershipValues,
+    SourceSelectors,
+    SinkSelectors,
+    Loans,
+    ResidualConflicts,
+    ReallocVersions,
+    ReallocCases,
+    SourceInventory,
+    ReplaySourceInventory,
+    EntryProtection,
+    EntryAccesses,
+    EntryWitnesses,
+    RetirementFinal,
+    RetirementRounds,
+    Comparisons,
+    QualifierFacts,
+    ArrayFields,
+    DemandEvidence,
+    ProofEvidence,
+    /// One row per qualifying store-as-move.
+    MoveStoreObligations,
+    /// One row per argument-order application (the call and the lent
+    /// pointer).
+    ArgOrderApplied,
+    /// One row per index-range discharge (relay era-5c/267): the access, the
+    /// loan, the base and both byte ranges.
+    RangeDisjoint,
+    /// One row per call with two or more views of one subject among its
+    /// arguments, one through a copy the relaxation's call arm admits (relay
+    /// era-5c/269): the subject, the call and the argument positions.
+    MultiView,
+}
+
+pub(crate) const REQUIRED_FAMILIES: [ExportFamily; 24] = [
+    ExportFamily::OwnershipVersions,
+    ExportFamily::OwnershipValues,
+    ExportFamily::SourceSelectors,
+    ExportFamily::SinkSelectors,
+    ExportFamily::Loans,
+    ExportFamily::ResidualConflicts,
+    ExportFamily::ReallocVersions,
+    ExportFamily::ReallocCases,
+    ExportFamily::SourceInventory,
+    ExportFamily::ReplaySourceInventory,
+    ExportFamily::EntryProtection,
+    ExportFamily::EntryAccesses,
+    ExportFamily::EntryWitnesses,
+    ExportFamily::RetirementFinal,
+    ExportFamily::RetirementRounds,
+    ExportFamily::Comparisons,
+    ExportFamily::QualifierFacts,
+    ExportFamily::ArrayFields,
+    ExportFamily::DemandEvidence,
+    ExportFamily::ProofEvidence,
+    ExportFamily::MoveStoreObligations,
+    ExportFamily::ArgOrderApplied,
+    ExportFamily::RangeDisjoint,
+    ExportFamily::MultiView,
+];
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+pub(crate) enum CaptureAvailability {
+    Captured,
+    /// In particular, the existing guarded-repair residual certificate is not recorded.
+    NotRecorded {
+        reason: String,
+    },
+}
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScopeGap {
+    OwnershipOccurrenceConstructionNotRecorded,
+    OwnershipValuesAreLatestSuppliedValuation,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum CanonicalOwner {
+    Local {
+        function: String,
+        local: u32,
+    },
+    Field {
+        structure: String,
+        field: String,
+        field_index: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum CanonicalBorrower {
+    Assign { owner: CanonicalOwner },
+    CallArg { callee: String, arg_index: usize },
+}
+
+/// Fields contain canonical source/slot/site/projection/owner/callee data.
+/// A field holding an erased compiler definition index is never valid output.
+/// Repeated stable keys are permitted: ER2 can contain repeated observations
+/// across internal constructions. Retain multiplicity, do not invent a scope.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PortableRecord {
+    pub(crate) key: String,
+    pub(crate) references: Vec<String>,
+    pub(crate) fields: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PortableFamily {
+    pub(crate) availability: CaptureAvailability,
+    /// Count from the actual capture, before conversion. No row deduplication.
+    pub(crate) source_rows: usize,
+    pub(crate) records: Vec<PortableRecord>,
+}
+
+/// Diagnostic labels are transported without becoming source identities.
+/// Unreferenced Var valuations belong here; an old occurrence is not silently
+/// assigned a value from a later construction's reused Var number.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DiagnosticRecord {
+    pub(crate) family: ExportFamily,
+    pub(crate) source_key: String,
+    pub(crate) labels: BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PortableExport {
+    pub(crate) schema: String,
+    pub(crate) licensing_in_origin_evidence: bool,
+    /// Resolved canonical identities; references never rely on numeric handles.
+    pub(crate) identities: BTreeSet<String>,
+    pub(crate) scope_gaps: BTreeSet<ScopeGap>,
+    pub(crate) families: BTreeMap<ExportFamily, PortableFamily>,
+    pub(crate) diagnostics: Vec<DiagnosticRecord>,
+}
+
+impl PortableExport {
+    #[cfg(test)]
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.schema != SCHEMA || !self.licensing_in_origin_evidence {
+            return Err("portable export schema/licensing mismatch".into());
+        }
+        if self.families.keys().copied().collect::<BTreeSet<_>>()
+            != REQUIRED_FAMILIES.into_iter().collect()
+        {
+            return Err("missing or extra portable export family".into());
+        }
+        for (family, payload) in &self.families {
+            match &payload.availability {
+                CaptureAvailability::Captured => {}
+                CaptureAvailability::NotRecorded { reason }
+                    if matches!(
+                        family,
+                        ExportFamily::ResidualConflicts
+                            | ExportFamily::MoveStoreObligations
+                            | ExportFamily::ArgOrderApplied
+                            | ExportFamily::RangeDisjoint
+                            | ExportFamily::MultiView
+                    ) && !reason.is_empty()
+                        && payload.source_rows == 0
+                        && payload.records.is_empty() => {}
+                _ => return Err(format!("required capture unavailable: {family:?}")),
+            }
+            if payload.source_rows != payload.records.len() {
+                return Err(format!("incomplete portable family: {family:?}"));
+            }
+            if matches!(
+                family,
+                ExportFamily::RetirementFinal
+                    | ExportFamily::DemandEvidence
+                    | ExportFamily::ProofEvidence
+            ) && payload.records.len() != 1
+            {
+                return Err(format!("missing singleton portable capture: {family:?}"));
+            }
+            for row in &payload.records {
+                if row.key != record_key(*family, &row.fields)? {
+                    return Err(format!("portable source identity mismatch: {family:?}"));
+                }
+                if row.key.is_empty()
+                    || !self.identities.contains(&row.key)
+                    || row
+                        .references
+                        .iter()
+                        .any(|key| !self.identities.contains(key))
+                {
+                    return Err(format!("unresolved portable identity: {family:?}"));
+                }
+            }
+        }
+        if !self
+            .scope_gaps
+            .contains(&ScopeGap::OwnershipOccurrenceConstructionNotRecorded)
+            || !self
+                .scope_gaps
+                .contains(&ScopeGap::OwnershipValuesAreLatestSuppliedValuation)
+        {
+            return Err("ownership occurrence/valuation scope gap erased".into());
+        }
+        for row in &self.diagnostics {
+            if !self.families.contains_key(&row.family)
+                || !self.identities.contains(&row.source_key)
+            {
+                return Err("dangling diagnostic source identity".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn canonical_json(&self) -> Result<String, String> {
+        self.validate()?;
+        let mut ordered = self.clone();
+        for family in ordered.families.values_mut() {
+            // Sorting retains repeated identical observations and ordered paths.
+            family
+                .records
+                .sort_by_cached_key(|row| serde_json::to_string(row).expect("record JSON"));
+        }
+        ordered
+            .diagnostics
+            .sort_by_cached_key(|row| serde_json::to_string(row).expect("diagnostic JSON"));
+        serde_json::to_string(&ordered).map_err(|error| error.to_string())
+    }
+}
+
+// Only compiler identity lookup occurs here; no model, origin, or loan analysis.
+use rustc_middle::mir::{Local, Location};
+use rustc_span::def_id::LocalDefId;
+use serde_json::{Value, json};
+
+use super::{
+    export as e, protected_entry as pe, realloc as ra, retirement as rt, slots::SlotOwner,
+    solver::SlotRef, source_events as se,
+};
+
+fn tag(value: impl std::fmt::Debug) -> Value {
+    json!(format!("{value:?}"))
+}
+fn location(value: Location) -> Value {
+    json!({"block": value.block.as_u32(), "statement": value.statement_index})
+}
+fn mir_location(value: super::guarded_repair::MirLocationKey) -> Value {
+    json!({"block": value.block, "statement": value.statement_index})
+}
+fn place(value: &e::PlaceKey) -> Value {
+    use e::ProjKey;
+    let projections = value.proj.iter().map(|projection| match *projection {
+        ProjKey::Deref => json!({"kind":"deref"}),
+        ProjKey::Field(field) => json!({"kind":"field", "field":field}),
+        ProjKey::Index(local) => json!({"kind":"index", "local":local}),
+        ProjKey::ConstantIndex {offset,min_length,from_end} => json!({"kind":"constant-index", "offset":offset,"min_length":min_length,"from_end":from_end}),
+        ProjKey::Subslice {from,to,from_end} => json!({"kind":"subslice","from":from,"to":to,"from_end":from_end}),
+        ProjKey::Downcast(variant) => json!({"kind":"downcast","variant":variant}),
+        ProjKey::OpaqueCast => json!({"kind":"opaque-cast"}),
+        ProjKey::Subtype => json!({"kind":"subtype"}),
+        ProjKey::UnwrapUnsafeBinder => json!({"kind":"unwrap-unsafe-binder"}),
+    }).collect::<Vec<_>>();
+    json!({"local":value.local.as_u32(),"projections":projections})
+}
+fn source_key(key: &se::SourceEventKey) -> Value {
+    json!({"function":key.function,"block":key.block,"statement":key.statement,
+        "phase":tag(key.phase),"role":tag(key.role),"storage_local":key.storage_local,"condition":tag(key.condition)})
+}
+fn realloc_key(key: &ra::ReallocSiteKey) -> Value {
+    json!({"function":key.function,"block":key.block,"statement":key.statement,"phase":tag(key.phase)})
+}
+fn source_event(event: &se::SourceRetirement) -> Value {
+    let object = match &event.object {
+        se::SourceObject::HeapThrough(p) => json!({"kind":"heap-through","place":place(p)}),
+        se::SourceObject::PointerStorage(p) => json!({"kind":"pointer-storage","place":place(p)}),
+        se::SourceObject::Storage(p) => json!({"kind":"storage","place":place(p)}),
+        se::SourceObject::Null => json!({"kind":"null"}),
+        se::SourceObject::UnknownOperand => json!({"kind":"unknown-operand"}),
+        se::SourceObject::FreshBuffer { local, sites } => {
+            json!({"kind":"fresh-buffer","local":local,
+            "sites":sites.iter().map(|site| location(*site)).collect::<Vec<_>>()})
+        }
+    };
+    json!({"key":source_key(&event.key),"object":object,"coverage":tag(event.coverage),
+        "generation":tag(event.generation),"region":tag(event.region)})
+}
+fn source_route(route: &se::SourceCallRoute) -> Value {
+    json!({"caller":route.caller,"callee":route.callee,"block":route.block,
+        "events":route.events.iter().map(source_key).collect::<Vec<_>>(),
+        "arguments":route.arguments.iter().map(|p|p.as_ref().map(place)).collect::<Vec<_>>(),
+        "storage_relation_missing":route.storage_relation_missing})
+}
+fn transport(row: &ra::ResultTransport) -> Value {
+    json!({"location":location(row.location),"source":row.source.as_u32(),"destination":row.destination.as_u32()})
+}
+fn realloc_site(site: &ra::ReallocSite) -> Value {
+    let continuation = |row: &ra::ReallocContinuation| {
+        let witness = row.witness.as_ref().map(|w| match w {
+            ra::ReallocUseWitness::DirectDeref{location:loc,place:p,access_bytes} => json!({"kind":"direct-deref","location":location(*loc),"place":place(p),"access_bytes":access_bytes}),
+            ra::ReallocUseWitness::LocalCall{location:loc,callee,argument,callee_deref,access_bytes} => json!({"kind":"local-call","location":location(*loc),"callee":callee,"argument":argument,"callee_deref":location(*callee_deref),"access_bytes":access_bytes}),
+        });
+        json!({"old":row.old.map(Local::as_u32),"old_place":row.old_place.as_ref().map(place),
+            "result":row.result.map(Local::as_u32),"result_place":place(&row.result_place),
+            "normal":row.normal.as_u32(),"transports":row.transports.iter().map(transport).collect::<Vec<_>>(),"witness":witness})
+    };
+    let result = match &site.result {
+        ra::ReallocResult::DirectBranch(row) => {
+            json!({"kind":"direct-branch","old":row.old.map(Local::as_u32),"result":row.result.as_u32(),"test":location(row.test),"success":row.success.as_u32(),"failure":row.failure.as_u32(),"transports":row.transports.iter().map(transport).collect::<Vec<_>>()})
+        }
+        ra::ReallocResult::SuccessImplied(row) => {
+            json!({"kind":"success-implied","continuation":continuation(row)})
+        }
+        ra::ReallocResult::Unobserved(row) => {
+            json!({"kind":"unobserved","continuation":continuation(row)})
+        }
+        ra::ReallocResult::FieldBranch {
+            branch,
+            continuation: row,
+            field_transports,
+        } => {
+            json!({"kind":"field-branch","branch":{"old":branch.old.map(Local::as_u32),"result":branch.result.as_u32(),"test":location(branch.test),"success":branch.success.as_u32(),"failure":branch.failure.as_u32()},"continuation":continuation(row),"field_transports":field_transports.iter().map(|r|json!({"location":location(r.location),"source":place(&r.source),"destination":place(&r.destination)})).collect::<Vec<_>>()})
+        }
+        ra::ReallocResult::FallbackBothOutcomes(row) => {
+            json!({"kind":"fallback-both-outcomes","receipt":site.result.result_test_receipt().map(|r|r.label()),"continuation":continuation(row)})
+        }
+        ra::ReallocResult::Discarded => json!({"kind":"discarded"}),
+        ra::ReallocResult::UnresolvedTest => json!({"kind":"unresolved-test"}),
+    };
+    let callee = match &site.callee {
+        ra::ReallocCalleeIdentity::ForeignC(name) => json!({"kind":"foreign-c","name":name}),
+        #[cfg(test)]
+        ra::ReallocCalleeIdentity::LocalFunction(name) => {
+            json!({"kind":"local-function","name":name})
+        }
+        #[cfg(test)]
+        ra::ReallocCalleeIdentity::Other => json!({"kind":"other"}),
+    };
+    let zero = site.zero_size.map(|z| match z {
+        ra::ZeroSizeFeasibility::Possible => json!({"kind":"possible"}),
+        ra::ZeroSizeFeasibility::ExcludedBySourceGuard(loc) => {
+            json!({"kind":"excluded-by-source-guard","location":location(loc)})
+        }
+    });
+    json!({"key":realloc_key(&site.key),"callee":callee,"old_input":tag(site.old_input),"size":tag(site.size),"zero_size":zero,"result":result,"success_address":tag(site.success_address)})
+}
+
+struct Resolver<'a, 'tcx> {
+    program: &'a RustProgram<'tcx>,
+    slots: &'a CrateSlots,
+}
+impl Resolver<'_, '_> {
+    fn function(&self, did: LocalDefId) -> Result<String, String> {
+        if !self.program.functions.contains(&did) {
+            return Err("unresolved function identity".into());
+        }
+        Ok(self.program.tcx.def_path_str(did.to_def_id()))
+    }
+
+    fn named_function(&self, name: &str) -> Result<LocalDefId, String> {
+        self.program
+            .functions
+            .iter()
+            .copied()
+            .find(|did| self.program.tcx.def_path_str(did.to_def_id()) == name)
+            .ok_or_else(|| format!("unresolved source function: {name}"))
+    }
+
+    fn local(&self, function: LocalDefId, local: u32) -> Result<Value, String> {
+        let name = self.function(function)?;
+        let body = self
+            .program
+            .tcx
+            .mir_drops_elaborated_and_const_checked(function)
+            .borrow();
+        if local as usize >= body.local_decls.len() {
+            return Err("unresolved MIR local".into());
+        }
+        Ok(json!({"function":name,"local":local}))
+    }
+
+    fn field(&self, erased: u32, index: usize) -> Result<CanonicalOwner, String> {
+        let did = self
+            .program
+            .structs
+            .iter()
+            .copied()
+            .find(|did| did.local_def_index.as_u32() == erased)
+            .ok_or("unresolved erased field owner")?;
+        let ty = self.program.tcx.type_of(did).skip_binder();
+        let rustc_middle::ty::TyKind::Adt(adt, _) = ty.kind() else {
+            return Err("field owner is not ADT".into());
+        };
+        let field = adt
+            .all_fields()
+            .nth(index)
+            .ok_or("unresolved field index")?;
+        Ok(CanonicalOwner::Field {
+            structure: self.program.tcx.def_path_str(did.to_def_id()),
+            field: field.name.to_string(),
+            field_index: index,
+        })
+    }
+
+    fn owner(&self, function: LocalDefId, owner: e::OwnerKey) -> Result<CanonicalOwner, String> {
+        match owner {
+            e::OwnerKey::Local(local) => {
+                self.local(function, local)?;
+                Ok(CanonicalOwner::Local {
+                    function: self.function(function)?,
+                    local,
+                })
+            }
+            e::OwnerKey::Field {
+                struct_did,
+                field_index,
+            } => self.field(struct_did, field_index),
+        }
+    }
+
+    fn slot(&self, reference: SlotRef) -> Result<String, String> {
+        let (universe, id) = match reference {
+            SlotRef::Local(function, id) => (
+                self.slots
+                    .fn_local_slots
+                    .get(&function)
+                    .ok_or("unknown slot function")?,
+                id,
+            ),
+            SlotRef::Field(id) => (&self.slots.field_slots, id),
+        };
+        if id.as_usize() >= universe.len() {
+            return Err("unresolved slot index".into());
+        }
+        let row = universe.slot(id);
+        match (reference, row.owner) {
+            (SlotRef::Local(function, _), SlotOwner::Local(local)) => {
+                self.local(function, local.as_u32())?;
+                Ok(super::slot_key::local_key(
+                    self.program.tcx,
+                    function,
+                    local.as_usize(),
+                    row.depth,
+                ))
+            }
+            (SlotRef::Field(_), SlotOwner::Field(field)) => {
+                self.field(field.struct_did.local_def_index.as_u32(), field.field_index)?;
+                Ok(super::slot_key::field_key(
+                    self.program.tcx,
+                    field.struct_did,
+                    field.field_index,
+                    row.depth,
+                ))
+            }
+            _ => Err("slot owner kind mismatch".into()),
+        }
+    }
+
+    fn borrower(&self, function: LocalDefId, borrower: e::BorrowerKind) -> Result<Value, String> {
+        let canonical = match borrower {
+            e::BorrowerKind::Assign { owner } => CanonicalBorrower::Assign {
+                owner: self.owner(function, owner)?,
+            },
+            e::BorrowerKind::CallArg { callee, arg_index } => {
+                let did = self
+                    .program
+                    .functions
+                    .iter()
+                    .copied()
+                    .find(|did| did.local_def_index.as_u32() == callee)
+                    .ok_or("unresolved erased callee")?;
+                let body = self
+                    .program
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(did)
+                    .borrow();
+                if arg_index >= body.arg_count {
+                    return Err(format!(
+                        "unresolved callee argument: {} argument {arg_index} of {} (c-variadic: {})",
+                        self.program.tcx.def_path_str(did.to_def_id()),
+                        body.arg_count,
+                        self.program.tcx.fn_sig(did).skip_binder().c_variadic()
+                    ));
+                }
+                CanonicalBorrower::CallArg {
+                    callee: self.function(did)?,
+                    arg_index,
+                }
+            }
+        };
+        serde_json::to_value(canonical).map_err(|e| e.to_string())
+    }
+
+    fn entry(&self, row: pe::EntryKey) -> Result<Value, String> {
+        Ok(
+            json!({"function":self.function(row.function)?,"parameter":row.parameter.as_u32(),"depth":row.depth,"slot":self.slot(row.slot)?}),
+        )
+    }
+
+    fn target(&self, row: pe::IncomingTarget) -> Result<Value, String> {
+        Ok(json!({"entry":self.entry(row.entry)?,"dereferences":row.dereferences}))
+    }
+
+    fn fact(&self, row: &pe::EntryFact) -> Result<Value, String> {
+        Ok(match row {
+            pe::EntryFact::Entry(row) => {
+                json!({"kind":"entry","entry":self.entry(row.key)?,"target":self.target(row.target)?,"condition":tag(row.condition),"representation":tag(row.representation)})
+            }
+            pe::EntryFact::Observation(row) => {
+                let binding = match row.current_binding {
+                    pe::CurrentBinding::Incoming(t) => {
+                        json!({"kind":"incoming","target":self.target(t)?})
+                    }
+                    pe::CurrentBinding::Unknown => json!({"kind":"unknown"}),
+                };
+                json!({"kind":"observation","entry":self.entry(row.entry)?,"target":self.target(row.target)?,"location":location(row.location),"phase":tag(row.phase),"moment":tag(row.moment),"live":row.live,"demand":row.demand.map(|e|self.entry(e)).transpose()?,"current_binding":binding})
+            }
+            pe::EntryFact::Binding(row) => {
+                json!({"kind":"binding","function":self.function(row.function)?,"local":row.local.as_u32(),"depth":row.depth,"location":location(row.location),"phase":tag(row.phase),"moment":tag(row.moment),"target":self.target(row.target)?})
+            }
+        })
+    }
+
+    fn steps(&self, rows: &[rt::RouteStep]) -> Result<Vec<Value>, String> {
+        rows.iter().map(|row|Ok(json!({"caller":self.function(row.caller)?,"callee":self.function(row.callee)?,"location":location(row.location)}))).collect()
+    }
+
+    fn route_reason(&self, reason: &rt::RouteReason) -> Result<Value, String> {
+        use rt::RouteReason as R;
+        Ok(match reason {
+            R::UnknownFunction(name) => json!({"kind":"unknown-function","name":name}),
+            R::ForeignInputFrame(f) => {
+                json!({"kind":"foreign-input-frame","function":self.function(*f)?})
+            }
+            R::Recursive(f) => json!({"kind":"recursive","function":self.function(*f)?}),
+            R::MissingArgument { parameter, depth } => {
+                json!({"kind":"missing-argument","parameter":parameter,"depth":depth})
+            }
+            R::InvalidEvent
+            | R::InvalidCall
+            | R::MissingSourceEvent
+            | R::MissingRouteEvent
+            | R::UnreachableRouteEvent
+            | R::UnknownObject
+            | R::DropEffects => json!({"kind":tag(reason)}),
+        })
+    }
+
+    fn unresolved(&self, row: &rt::RetirementUnresolved) -> Result<(Value, Value), String> {
+        use rt::UnresolvedReason as R;
+        let mut diagnostic = Value::Null;
+        let reason = match &row.reason {
+            R::Route(problem) => {
+                json!({"kind":"route","source":problem.source.as_ref().map(source_event),"route":problem.route.as_ref().map(source_route),"reason":self.route_reason(&problem.reason)?})
+            }
+            R::Entry(error) => {
+                let (kind, key, loc) = match *error {
+                    pe::EntryCoverageError::MissingEntry(key) => ("missing-entry", key, None),
+                    pe::EntryCoverageError::MissingPoint(key, loc) => {
+                        ("missing-point", key, Some(loc))
+                    }
+                    pe::EntryCoverageError::InconsistentDemand(key, loc) => {
+                        ("inconsistent-demand", key, Some(loc))
+                    }
+                };
+                json!({"kind":kind,"entry":self.entry(key)?,"location":loc.map(location)})
+            }
+            R::MissingOwner { loan, owner } => {
+                diagnostic = json!({"loan":loan});
+                let owner = owner
+                    .map(|owner| {
+                        self.owner(
+                            row.function.ok_or("missing owner function context")?,
+                            e::OwnerKey::from_owner(owner),
+                        )
+                    })
+                    .transpose()?;
+                json!({"kind":"missing-owner","owner":owner})
+            }
+            R::MissingSlotKey(slot) => json!({"kind":"missing-slot-key","slot":self.slot(*slot)?}),
+            R::MissingEntryFacts
+            | R::DifferentEntryFacts
+            | R::MissingContext
+            | R::DuplicateContext
+            | R::UnexpectedContext
+            | R::MissingSourceEvent => json!({"kind":tag(&row.reason)}),
+        };
+        Ok((
+            json!({"source":row.source.as_ref().map(source_key),"function":row.function.map(|f|self.function(f)).transpose()?,"location":row.location.map(location),"phase":row.phase.map(tag),"route":self.steps(&row.route)?,"reason":reason}),
+            diagnostic,
+        ))
+    }
+
+    #[cfg(test)]
+    fn review(&self, review: &rt::RetirementReview) -> Result<(Value, Value), String> {
+        let mut diagnostics = Vec::new();
+        let conflicts=review.conflicts.iter().map(|row|{
+            let target=self.slot(row.target)?;
+            if target!=row.target_key{return Err("retirement target canonical key mismatch".into());}
+            let loan=row.loan.as_ref().map(|loan|{
+                let owners=loan.owners.iter().map(|owner|self.owner(row.function,e::OwnerKey::from_owner(*owner))).collect::<Result<Vec<_>,_>>()?;
+                let value=json!({"reservation":location(loan.reservation),"borrowed":place(&loan.borrowed),"owners":owners});
+                diagnostics.push(json!({"source":source_key(&row.source),"function":self.function(row.function)?,"loan":loan.index,"loan_key":value}));
+                Ok::<_,String>(value)
+            }).transpose()?;
+            Ok(json!({"function":self.function(row.function)?,"target":target,"source":source_key(&row.source),"phase":tag(row.phase),"location":location(row.location),"route":self.steps(&row.route)?,"loan":loan,"entry":row.entry.map(|e|self.entry(e)).transpose()?,"overlap":tag(row.overlap)}))
+        }).collect::<Result<Vec<_>,String>>()?;
+        let unresolved = review
+            .unresolved
+            .iter()
+            .map(|row| {
+                let (value, labels) = self.unresolved(row)?;
+                if !labels.is_null() {
+                    diagnostics.push(json!({"source":value,"labels":labels}));
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let coverage=review.coverage.iter().map(|row|Ok(json!({"source":source_key(&row.source),"function":self.function(row.function)?,"location":location(row.location),"phase":tag(row.phase),"route":self.steps(&row.route)?,"disposition":tag(row.disposition),"receipt":(row.disposition==rt::CoverageDisposition::IrrelevantNoSafeHolder).then_some("retirement:irrelevant-no-safe-holder")}))).collect::<Result<Vec<_>,String>>()?;
+        let demotions=review.demotions.iter().map(|row|Ok(json!({"source":source_key(&row.source),"function":self.function(row.function)?,"location":location(row.location),"phase":tag(row.phase),"route":self.steps(&row.route)?,"holder":self.slot(row.holder)?,"receipt":row.reason.label(),"chain":row.chain.iter().map(|slot|self.slot(*slot)).collect::<Result<Vec<_>,_>>()?}))).collect::<Result<Vec<_>,String>>()?;
+        let terminal = review
+            .terminal
+            .iter()
+            .map(|(key, state)| {
+                json!({
+                    "source":source_key(key),"disposition":tag(state),
+                    "receipt":(*state == rt::EventDisposition::CheckedWithoutConflict)
+                        .then_some("retirement:checked-without-conflict")
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut value = json!({"conflicts":conflicts,"demotions":demotions,"unresolved":unresolved,"coverage":coverage,"ordinary_error_points":review.ordinary_error_points,"terminal":terminal,"known_stack_entries":review.known_stack_entries});
+        // Additive, and absent when nothing was discharged, so an entry
+        // without a discharge is byte-identical to one written without this key.
+        if !review.discharged.is_empty() {
+            let discharged=review.discharged.iter().map(|row|{
+                let target=self.slot(row.target)?;
+                if target!=row.target_key{return Err("retirement discharge target canonical key mismatch".into());}
+                Ok(json!({"function":self.function(row.function)?,"target":target,"source":source_key(&row.source),"phase":tag(row.phase),"location":location(row.location),"route":self.steps(&row.route)?,"receipt":row.receipt()}))
+            }).collect::<Result<Vec<_>,String>>()?;
+            value["discharged"] = json!(discharged);
+        }
+        Ok((value, json!(diagnostics)))
+    }
+}
+
+// A diagnostic number, a loan attribute, and a later valuation do not
+// participate in a source occurrence's identity.
+fn record_key(family: ExportFamily, fields: &BTreeMap<String, Value>) -> Result<String, String> {
+    use ExportFamily as F;
+    let selected: Vec<&str> = match family {
+        F::Loans => vec!["function", "place", "location", "borrower"],
+        F::OwnershipVersions => vec!["owner", "location"],
+        F::OwnershipValues => vec!["scope"],
+        F::SourceSelectors | F::SinkSelectors => vec!["role", "call"],
+        F::ReallocVersions => vec!["function", "event", "outcome", "edge", "location", "local"],
+        F::ReallocCases if fields.get("kind").and_then(Value::as_str) == Some("coverage-hold") => {
+            vec!["event", "kind"]
+        }
+        F::ReallocCases => vec!["event", "outcome"],
+        F::RetirementRounds => vec!["round"],
+        F::RetirementFinal | F::DemandEvidence | F::ProofEvidence => vec![],
+        F::MoveStoreObligations => vec!["function", "store"],
+        F::ArgOrderApplied => vec!["function", "call", "lent"],
+        F::RangeDisjoint => vec!["function", "access", "loan", "issuer"],
+        F::MultiView => vec!["function", "subject", "call"],
+        _ => fields.keys().map(String::as_str).collect(),
+    };
+    let identity = selected
+        .into_iter()
+        .map(|key| {
+            fields
+                .get(key)
+                .cloned()
+                .map(|value| (key, value))
+                .ok_or_else(|| format!("missing identity field: {key}"))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    Ok(format!(
+        "{family:?}/{}",
+        serde_json::to_string(&identity).map_err(|e| e.to_string())?
+    ))
+}
+
+/// The typed row of the `arg-order-applied`
+/// family. `call` is the receiving call's MIR location, `span` its `fn_span`,
+/// `lent` the pointer whose reborrow the call receives (the subject the
+/// emission's hoist matches), `owner` the receiving temporary.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ArgOrderRow {
+    pub(crate) function: String,
+    pub(crate) call: MoveStoreLocation,
+    pub(crate) span: super::ownership_occurrence::SourceSpan,
+    pub(crate) lent: u32,
+    pub(crate) owner: u32,
+}
+
+/// Why the family is `NotRecorded`: the arm was off.
+pub(crate) const ARG_ORDER_NOT_RECORDED: &str =
+    "argument-order receipts not recorded: no argument read was admitted";
+
+/// The rows a producer recorded, in the portable form; `None` = arm off.
+pub(crate) fn arg_order_rows(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    export: &BoExport,
+) -> Result<Option<Vec<ArgOrderRow>>, String> {
+    let Some(rows) = &export.arg_order_applied else {
+        return Ok(None);
+    };
+    let tcx = program.tcx;
+    let resolver = Resolver { program, slots };
+    let mut out = rows
+        .iter()
+        .map(|row| {
+            Ok(ArgOrderRow {
+                function: resolver.function(row.function)?,
+                call: MoveStoreLocation {
+                    block: row.location.block.as_u32(),
+                    statement: row.location.statement_index,
+                },
+                span: super::ownership_occurrence::SourceSpan {
+                    file: tcx
+                        .sess
+                        .source_map()
+                        .span_to_filename(row.span)
+                        .prefer_local()
+                        .to_string(),
+                    lo: row.span.lo().0,
+                    hi: row.span.hi().0,
+                },
+                lent: row.lent.as_u32(),
+                owner: row.owner.as_u32(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    out.sort_by(arg_order_order);
+    Ok(Some(out))
+}
+
+fn arg_order_order(a: &ArgOrderRow, b: &ArgOrderRow) -> std::cmp::Ordering {
+    // Total: two receipts of one call and lent differ in their owner.
+    (&a.function, a.call.block, a.call.statement, a.lent, a.owner).cmp(&(
+        &b.function,
+        b.call.block,
+        b.call.statement,
+        b.lent,
+        b.owner,
+    ))
+}
+
+/// The consumer's accessor: a family that is `NotRecorded` or rows that do not
+/// decode are refused.
+pub(crate) fn decode_arg_order(
+    availability: &CaptureAvailability,
+    records: &[BTreeMap<String, Value>],
+) -> Result<Vec<ArgOrderRow>, String> {
+    if let CaptureAvailability::NotRecorded { reason } = availability {
+        return Err(format!("arg-order receipts not recorded: {reason}"));
+    }
+    let mut rows = records
+        .iter()
+        .map(|fields| {
+            serde_json::from_value(Value::Object(fields.clone().into_iter().collect()))
+                .map_err(|e| format!("arg-order row: {e}"))
+        })
+        .collect::<Result<Vec<ArgOrderRow>, String>>()?;
+    rows.sort_by(arg_order_order);
+    Ok(rows)
+}
+
+impl PortableExport {
+    /// The rows, or a refusal: a missing family or `NotRecorded`.
+    #[cfg(test)]
+    pub(crate) fn arg_order_applied(&self) -> Result<Vec<ArgOrderRow>, String> {
+        let family = self
+            .families
+            .get(&ExportFamily::ArgOrderApplied)
+            .ok_or("arg-order-applied family missing")?;
+        let records: Vec<_> = family.records.iter().map(|r| r.fields.clone()).collect();
+        decode_arg_order(&family.availability, &records)
+    }
+}
+
+/// The typed row of the `range-disjoint` family (relay era-5c/267): at
+/// `access` in `function`, the access did not invalidate the loan issued at
+/// `loan` to `issuer`, because both reach only their own bytes of the pointer
+/// formal `base` (`[lo, hi)`, `None` when nothing is reached). The emission owes
+/// both ranges. `summaries` are the `callee#formal` extents used, `premises` the
+/// §28 operations the bounds rest on.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RangeDisjointRow {
+    pub(crate) function: String,
+    pub(crate) access: MoveStoreLocation,
+    pub(crate) loan: MoveStoreLocation,
+    pub(crate) issuer: u32,
+    pub(crate) base: u32,
+    pub(crate) loan_bytes: Option<[i64; 2]>,
+    pub(crate) loan_writes: bool,
+    pub(crate) access_bytes: Option<[i64; 2]>,
+    pub(crate) access_writes: bool,
+    pub(crate) summaries: Vec<String>,
+    pub(crate) premises: Vec<String>,
+}
+
+/// Why the family is `NotRecorded`: no round was recorded.
+pub(crate) const RANGE_DISJOINT_NOT_RECORDED: &str =
+    "range-disjoint receipts not recorded: no round was recorded";
+
+/// The rows a producer recorded, in the portable form; `None` = not recorded.
+pub(crate) fn range_disjoint_rows(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    export: &BoExport,
+) -> Result<Option<Vec<RangeDisjointRow>>, String> {
+    let Some(rows) = &export.range_disjoint else {
+        return Ok(None);
+    };
+    let resolver = Resolver { program, slots };
+    let location = |l: rustc_middle::mir::Location| MoveStoreLocation {
+        block: l.block.as_u32(),
+        statement: l.statement_index,
+    };
+    let mut out = rows
+        .iter()
+        .map(|row| {
+            Ok(RangeDisjointRow {
+                function: resolver.function(row.function)?,
+                access: location(row.access),
+                loan: location(row.loan),
+                issuer: row.issuer.as_u32(),
+                base: row.base.as_u32(),
+                loan_bytes: row.loan_bytes.map(|(lo, hi)| [lo, hi]),
+                loan_writes: row.loan_writes,
+                access_bytes: row.access_bytes.map(|(lo, hi)| [lo, hi]),
+                access_writes: row.access_writes,
+                summaries: row
+                    .summaries
+                    .iter()
+                    .map(|(callee, formal)| Ok(format!("{}#{formal}", resolver.function(*callee)?)))
+                    .collect::<Result<Vec<_>, String>>()?,
+                premises: row.premises.iter().map(|p| (*p).to_owned()).collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    out.sort_by(|a, b| {
+        (
+            &a.function,
+            a.access.block,
+            a.access.statement,
+            a.loan.block,
+            a.loan.statement,
+            a.issuer,
+        )
+            .cmp(&(
+                &b.function,
+                b.access.block,
+                b.access.statement,
+                b.loan.block,
+                b.loan.statement,
+                b.issuer,
+            ))
+    });
+    Ok(Some(out))
+}
+
+/// The typed row of the `multi-view` family (relay era-5c/269 §1.3): at
+/// `call` in `function`, the arguments `arguments` (by position, `k` of them,
+/// two or more) are views of the local `subject`. The emission owes them ONE
+/// raw pointer (`copy_relax`'s module doc).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MultiViewRow {
+    pub(crate) function: String,
+    pub(crate) subject: u32,
+    pub(crate) call: MoveStoreLocation,
+    pub(crate) k: u32,
+    pub(crate) arguments: Vec<u32>,
+}
+
+/// Why the family is `NotRecorded`: no solve was recorded. A reader takes it
+/// as unknown, never as no obligation.
+pub(crate) const MULTI_VIEW_NOT_RECORDED: &str =
+    "multi-view rows not recorded: no solve was recorded";
+
+/// The rows a solve recorded, in the portable form; `None` = not recorded.
+pub(crate) fn multi_view_rows(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    export: &BoExport,
+) -> Result<Option<Vec<MultiViewRow>>, String> {
+    let Some(rows) = &export.multi_view else {
+        return Ok(None);
+    };
+    let resolver = Resolver { program, slots };
+    let mut out = rows
+        .iter()
+        .map(|row| {
+            Ok(MultiViewRow {
+                function: resolver.function(row.function)?,
+                subject: row.subject.as_u32(),
+                call: MoveStoreLocation {
+                    block: row.call.block.as_u32(),
+                    statement: row.call.statement_index,
+                },
+                k: row.arguments.len() as u32,
+                arguments: row.arguments.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    out.sort_by(|a, b| {
+        (&a.function, a.call.block, a.call.statement, a.subject).cmp(&(
+            &b.function,
+            b.call.block,
+            b.call.statement,
+            b.subject,
+        ))
+    });
+    Ok(Some(out))
+}
+
+/// The typed row of the `move-store-obligations` family. The
+/// writer serializes it and every reader decodes it, so the two cannot drift.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveStoreRow {
+    pub(crate) function: String,
+    pub(crate) store: MoveStoreLocation,
+    pub(crate) span: super::ownership_occurrence::SourceSpan,
+    pub(crate) container: u32,
+    pub(crate) field: MoveStoreField,
+    pub(crate) alias: Vec<u32>,
+    pub(crate) uses: Vec<MoveStoreUse>,
+    pub(crate) kept: Vec<u32>,
+    pub(crate) kept_uses: Vec<MoveStoreUse>,
+    /// The members whose loans the store cleared, with their round kinds.
+    pub(crate) cleared: Vec<MoveStoreCleared>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveStoreCleared {
+    pub(crate) local: u32,
+    /// `owning` or `ref`: a `Raw` member keeps its loan (3.2).
+    pub(crate) kind: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveStoreLocation {
+    pub(crate) block: u32,
+    pub(crate) statement: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveStoreField {
+    pub(crate) structure: String,
+    pub(crate) field_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MoveStoreUse {
+    pub(crate) location: MoveStoreLocation,
+    pub(crate) span: super::ownership_occurrence::SourceSpan,
+    pub(crate) local: u32,
+    pub(crate) kind: String,
+    pub(crate) dominated: bool,
+}
+
+/// Why the family is `NotRecorded`: the arm was off, so no loan was removed.
+pub(crate) const MOVE_STORE_NOT_RECORDED: &str =
+    "store-as-move receipts not recorded: no loan was removed";
+
+/// The rows a producer recorded, in the portable form; `None` = arm off.
+pub(crate) fn move_store_rows(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    export: &BoExport,
+) -> Result<Option<Vec<MoveStoreRow>>, String> {
+    let Some(rows) = &export.move_store_obligations else {
+        return Ok(None);
+    };
+    let tcx = program.tcx;
+    let span = |span: rustc_span::Span| super::ownership_occurrence::SourceSpan {
+        file: tcx
+            .sess
+            .source_map()
+            .span_to_filename(span)
+            .prefer_local()
+            .to_string(),
+        lo: span.lo().0,
+        hi: span.hi().0,
+    };
+    let location = |location: Location| MoveStoreLocation {
+        block: location.block.as_u32(),
+        statement: location.statement_index,
+    };
+    let uses = |uses: &[super::move_store::ObligationUse]| {
+        uses.iter()
+            .map(|u| MoveStoreUse {
+                location: location(u.location),
+                span: span(u.span),
+                local: u.local.as_u32(),
+                kind: u.kind.as_str().into(),
+                dominated: u.dominated,
+            })
+            .collect::<Vec<_>>()
+    };
+    let resolver = Resolver { program, slots };
+    rows.iter()
+        .map(|row| {
+            Ok(MoveStoreRow {
+                function: resolver.function(row.function)?,
+                store: location(row.store),
+                span: span(row.span),
+                container: row.container.as_u32(),
+                field: MoveStoreField {
+                    structure: tcx.def_path_str(row.field.struct_did),
+                    field_index: row.field.field_index,
+                },
+                alias: row.alias.iter().map(|l| l.as_u32()).collect(),
+                uses: uses(&row.uses),
+                kept: row.kept.iter().map(|l| l.as_u32()).collect(),
+                kept_uses: uses(&row.kept_uses),
+                cleared: row
+                    .cleared
+                    .iter()
+                    .map(|&(local, kind)| MoveStoreCleared {
+                        local: local.as_u32(),
+                        kind: match kind {
+                            super::SlotKind::Raw => "raw",
+                            super::SlotKind::Ref => "ref",
+                            super::SlotKind::Owning => "owning",
+                        }
+                        .into(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map(|mut rows| {
+            rows.sort_by(move_store_order);
+            Some(rows)
+        })
+}
+
+/// The family's one row order, for the writer and every reader alike: the
+/// portable family keeps its records by key, not in production order.
+fn move_store_order(a: &MoveStoreRow, b: &MoveStoreRow) -> std::cmp::Ordering {
+    (&a.function, a.store.block, a.store.statement).cmp(&(
+        &b.function,
+        b.store.block,
+        b.store.statement,
+    ))
+}
+
+/// The consumer's accessor (the rewriter's discharge reads these): a
+/// family that is `NotRecorded` or rows that do not decode are refused.
+#[cfg(test)]
+pub(crate) fn decode_move_store(
+    availability: &CaptureAvailability,
+    records: &[BTreeMap<String, Value>],
+) -> Result<Vec<MoveStoreRow>, String> {
+    if let CaptureAvailability::NotRecorded { reason } = availability {
+        return Err(format!("move-store obligations not recorded: {reason}"));
+    }
+    let mut rows = records
+        .iter()
+        .map(|fields| {
+            serde_json::from_value(Value::Object(fields.clone().into_iter().collect()))
+                .map_err(|e| format!("move-store row: {e}"))
+        })
+        .collect::<Result<Vec<MoveStoreRow>, String>>()?;
+    rows.sort_by(move_store_order);
+    Ok(rows)
+}
+
+impl PortableExport {
+    /// The rows, or a refusal: a v1 export, a missing family, or `NotRecorded`.
+    #[cfg(test)]
+    pub(crate) fn move_store_obligations(&self) -> Result<Vec<MoveStoreRow>, String> {
+        if self.schema != SCHEMA {
+            return Err(format!(
+                "move-store obligations need {SCHEMA}, got {}",
+                self.schema
+            ));
+        }
+        let family = self
+            .families
+            .get(&ExportFamily::MoveStoreObligations)
+            .ok_or("move-store obligations family missing")?;
+        let records: Vec<_> = family.records.iter().map(|r| r.fields.clone()).collect();
+        decode_move_store(&family.availability, &records)
+    }
+}
+
+impl PortableExport {
+    #[cfg(test)]
+    fn add(&mut self, family: ExportFamily, fields: Value, labels: Value) -> Result<(), String> {
+        let Value::Object(fields) = fields else {
+            return Err("portable row is not an object".into());
+        };
+        let fields = fields.into_iter().collect::<BTreeMap<_, _>>();
+        let key = record_key(family, &fields)?;
+        self.identities.insert(key.clone());
+        if !labels.is_null() {
+            self.diagnostics.push(DiagnosticRecord {
+                family,
+                source_key: key.clone(),
+                labels: BTreeMap::from([("labels".into(), labels)]),
+            });
+        }
+        let payload = self
+            .families
+            .get_mut(&family)
+            .ok_or("unregistered export family")?;
+        payload.records.push(PortableRecord {
+            key,
+            references: vec![],
+            fields,
+        });
+        payload.source_rows += 1;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn collect(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    export: &BoExport,
+) -> Result<PortableExport, String> {
+    use ExportFamily as F;
+    let resolver = Resolver { program, slots };
+    let required = |present: bool, name: &str| {
+        if present {
+            Ok(())
+        } else {
+            Err(format!("missing required capture: {name}"))
+        }
+    };
+    required(export.source_events.is_some(), "source inventory")?;
+    required(
+        export.replay_source_events.is_some(),
+        "replay source inventory",
+    )?;
+    required(export.entry_protection.is_some(), "entry protection")?;
+    required(export.source_retirement.is_some(), "retirement final")?;
+    required(export.version_owns.is_some(), "ownership values")?;
+    required(export.comparisons.is_some(), "comparison ledger")?;
+    required(export.qualifier_facts.is_some(), "qualifier facts")?;
+    required(export.array_fields.is_some(), "array fields")?;
+    required(export.demand_evidence.is_some(), "demand evidence")?;
+    let mut out = PortableExport {
+        schema: SCHEMA.into(),
+        licensing_in_origin_evidence: true,
+        identities: BTreeSet::new(),
+        scope_gaps: BTreeSet::from([
+            ScopeGap::OwnershipOccurrenceConstructionNotRecorded,
+            ScopeGap::OwnershipValuesAreLatestSuppliedValuation,
+        ]),
+        families: REQUIRED_FAMILIES
+            .into_iter()
+            .map(|family| {
+                (
+                    family,
+                    PortableFamily {
+                        availability: CaptureAvailability::Captured,
+                        source_rows: 0,
+                        records: vec![],
+                    },
+                )
+            })
+            .collect(),
+        diagnostics: vec![],
+    };
+    // Index only actual registered slots, never reconstructed erased SlotIds.
+    for (&function, universe) in &slots.fn_local_slots {
+        for index in 0..universe.len() {
+            out.identities.insert(resolver.slot(SlotRef::Local(
+                function,
+                super::slots::SlotId::from_usize(index),
+            ))?);
+        }
+    }
+    for index in 0..slots.field_slots.len() {
+        out.identities
+            .insert(resolver.slot(SlotRef::Field(super::slots::SlotId::from_usize(index)))?);
+    }
+    for row in &export.version_sites {
+        out.add(F::OwnershipVersions,json!({"owner":resolver.local(row.fn_did,row.local.as_u32())?,"location":mir_location(row.location),"use_present":row.use_var.is_some(),"def_present":row.def_var.is_some(),"construction_correspondence":"not-recorded"}),json!({"use_var":row.use_var.map(|v|v.as_u32()),"def_var":row.def_var.map(|v|v.as_u32())}))?;
+    }
+    for (var, owns) in export.version_owns.as_ref().unwrap().iter_enumerated() {
+        out.add(F::OwnershipValues,json!({"owns":owns,"scope":"latest-supplied-valuation","occurrence_correspondence":"not-recorded"}),json!({"var":var.as_u32()}))?;
+    }
+    for (family, rows) in [
+        (F::SourceSelectors, &export.source_sites),
+        (F::SinkSelectors, &export.sink_sites),
+    ] {
+        for row in rows {
+            let call=row.call.as_ref().map(|call| -> Result<Value, String> {
+                let function=resolver.function(call.fn_did)?;
+                if function!=call.function_path{return Err("selector function path mismatch".into());}
+                Ok(json!({"function":function,"location":mir_location(call.location),"callee":call.callee}))
+            }).transpose()?;
+            out.add(family,json!({"role":tag(row.role),"call":call,"operand_correspondence":"not-recorded","construction_correspondence":"not-recorded"}),json!({"var":row.var.as_u32()}))?;
+        }
+    }
+    for row in &export.loans {
+        let function = resolver.function(row.key.fn_did)?;
+        let mut fields = json!({"function":function,"place":place(&row.key.place),"location":mir_location(row.key.location),"borrower":resolver.borrower(row.key.fn_did,row.key.borrower)?,"kind":tag(row.kind),"class":tag(row.class),"invalid":row.invalid});
+        let matches: Vec<_> = export.traversal_replay.iter().flatten().filter(|receipt| {
+            let call = &receipt.origin.candidate.call;
+            call.caller == function && call.block == row.key.location.block && call.statement == row.key.location.statement_index
+                && receipt.target.local == row.key.place.local.as_u32() && receipt.target.projection == row.key.place.proj
+                && matches!(row.key.borrower, e::BorrowerKind::CallArg {arg_index, ..} if arg_index == receipt.origin.native.argument_index)
+        }).collect();
+        if let [receipt] = matches.as_slice() {
+            fields["returned_borrow"] = serde_json::to_value(receipt).map_err(|e| e.to_string())?;
+        } else if !matches.is_empty() {
+            return Err("ambiguous returned-borrow native loan".into());
+        }
+        out.add(F::Loans, fields, json!({"loan":row.run_local_handle}))?;
+    }
+    if let Some(rows) = &export.residual_conflicts {
+        for row in rows {
+            out.add(F::ResidualConflicts,json!({"function":resolver.function(row.fn_did)?,"issuer":row.issuer.map(|s|resolver.slot(s)).transpose()?,"requirers":row.requirers.iter().map(|s|resolver.slot(*s)).collect::<Result<Vec<_>,_>>()?}),Value::Null)?;
+        }
+    } else {
+        out.families
+            .get_mut(&F::ResidualConflicts)
+            .unwrap()
+            .availability = CaptureAvailability::NotRecorded {
+            reason: "producer did not record a guarded-repair residual certificate".into(),
+        };
+    }
+    match move_store_rows(program, slots, export)? {
+        Some(rows) => {
+            for row in rows {
+                let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                out.add(F::MoveStoreObligations, fields, Value::Null)?;
+            }
+        }
+        None => {
+            out.families
+                .get_mut(&F::MoveStoreObligations)
+                .unwrap()
+                .availability = CaptureAvailability::NotRecorded {
+                reason: MOVE_STORE_NOT_RECORDED.into(),
+            };
+        }
+    }
+    match arg_order_rows(program, slots, export)? {
+        Some(rows) => {
+            for row in rows {
+                let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                out.add(F::ArgOrderApplied, fields, Value::Null)?;
+            }
+        }
+        None => {
+            out.families
+                .get_mut(&F::ArgOrderApplied)
+                .unwrap()
+                .availability = CaptureAvailability::NotRecorded {
+                reason: ARG_ORDER_NOT_RECORDED.into(),
+            };
+        }
+    }
+    match range_disjoint_rows(program, slots, export)? {
+        Some(rows) => {
+            for row in rows {
+                let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                out.add(F::RangeDisjoint, fields, Value::Null)?;
+            }
+        }
+        None => {
+            out.families
+                .get_mut(&F::RangeDisjoint)
+                .unwrap()
+                .availability = CaptureAvailability::NotRecorded {
+                reason: RANGE_DISJOINT_NOT_RECORDED.into(),
+            };
+        }
+    }
+    match multi_view_rows(program, slots, export)? {
+        Some(rows) => {
+            for row in rows {
+                let fields = serde_json::to_value(&row).map_err(|e| e.to_string())?;
+                out.add(F::MultiView, fields, Value::Null)?;
+            }
+        }
+        None => {
+            out.families.get_mut(&F::MultiView).unwrap().availability =
+                CaptureAvailability::NotRecorded {
+                    reason: MULTI_VIEW_NOT_RECORDED.into(),
+                };
+        }
+    }
+    for row in &export.realloc_version_sites {
+        out.add(F::ReallocVersions,json!({"function":resolver.function(row.fn_did)?,"event":realloc_key(&row.event),"outcome":tag(row.outcome),"edge":row.edge,"location":mir_location(row.location),"local":row.local.as_u32(),"use_present":row.use_var.is_some()}),json!({"use_var":row.use_var.map(|v|v.as_u32()),"def_var":row.def_var.as_u32()}))?;
+    }
+    for row in &export.realloc_coverage_holds {
+        out.add(F::ReallocCases,json!({"event":realloc_key(&row.site),"kind":"coverage-hold","receipt":"realloc-ssa-coverage:hold-raw","reason":row.reason.label(),"slots":row.slots.iter().map(|slot|resolver.slot(*slot)).collect::<Result<Vec<_>,_>>()?}),Value::Null)?;
+    }
+    for row in &export.realloc_cases {
+        resolver.named_function(&row.event.function)?;
+        out.add(F::ReallocCases,json!({"event":realloc_key(&row.event),"outcome":tag(row.case.outcome),"old":tag(row.case.old),"result":tag(row.case.result),"contents":tag(row.case.contents),"old_before_present":row.old_before.is_some(),"old_after_present":row.old_after.is_some(),"result_claim_present":row.result_claim.is_some()}),json!({"old_before":row.old_before.map(|v|v.as_u32()),"old_after":row.old_after.map(|v|v.as_u32()),"result_claim":row.result_claim.map(|v|v.as_u32())}))?;
+    }
+    for (family, inventory) in [
+        (F::SourceInventory, export.source_events.as_ref().unwrap()),
+        (
+            F::ReplaySourceInventory,
+            export.replay_source_events.as_ref().unwrap(),
+        ),
+    ] {
+        for (key, row) in &inventory.retirements {
+            if key != &row.key {
+                return Err("source inventory event key mismatch".into());
+            }
+            resolver.named_function(&key.function)?;
+            out.add(
+                family,
+                json!({"kind":"retirement","event":source_event(row)}),
+                Value::Null,
+            )?;
+        }
+        for row in &inventory.calls {
+            resolver.named_function(&row.caller)?;
+            resolver.named_function(&row.callee)?;
+            out.add(
+                family,
+                json!({"kind":"route","route":source_route(row)}),
+                Value::Null,
+            )?;
+        }
+        for row in &inventory.reallocations {
+            resolver.named_function(&row.key.function)?;
+            out.add(
+                family,
+                json!({"kind":"realloc","site":realloc_site(row)}),
+                Value::Null,
+            )?;
+        }
+        for (&(function, loc), targets) in &inventory.call_targets {
+            let mut known = targets
+                .known
+                .iter()
+                .map(|did| program.tcx.def_path_str(*did))
+                .collect::<Vec<_>>();
+            known.sort();
+            out.add(family,json!({"kind":"call-targets","function":resolver.function(function)?,"location":location(loc),"known":known,"unknown":targets.unknown}),Value::Null)?;
+        }
+    }
+    let entry = export.entry_protection.as_ref().unwrap();
+    for fact in entry
+        .entries
+        .iter()
+        .cloned()
+        .map(pe::EntryFact::Entry)
+        .chain(
+            entry
+                .observations
+                .iter()
+                .cloned()
+                .map(pe::EntryFact::Observation),
+        )
+        .chain(
+            entry
+                .binding_facts
+                .iter()
+                .cloned()
+                .map(pe::EntryFact::Binding),
+        )
+    {
+        out.add(F::EntryProtection, resolver.fact(&fact)?, Value::Null)?;
+    }
+    for row in &export.entry_accesses {
+        out.add(F::EntryAccesses,json!({"function":resolver.function(row.function)?,"location":location(row.location),"phase":tag(row.phase),"place":place(&row.place),"extent":tag(row.extent),"mode":tag(row.mode),"cause":tag(row.cause)}),Value::Null)?;
+    }
+    for row in &export.entry_fact_witnesses {
+        use pe::evidence::FactRule;
+        let (rule, key) = match row.rule {
+            FactRule::ParameterEntry(k) => ("parameter-entry", k),
+            FactRule::WholeCallReachability(k) => ("whole-call-reachability", k),
+            FactRule::FrameExit(k) => ("frame-exit", k),
+            FactRule::LocatedInputBinding(k) => ("located-input-binding", k),
+        };
+        let predecessors=row.predecessors.iter().map(|p|Ok(json!({"function":resolver.function(p.function)?,"location":location(p.location),"phase":tag(p.phase),"moment":tag(p.moment)}))).collect::<Result<Vec<_>,String>>()?;
+        out.add(F::EntryWitnesses,json!({"fact":resolver.fact(&row.fact)?,"rule":rule,"entry":resolver.entry(key)?,"predecessors":predecessors}),Value::Null)?;
+    }
+    let (mut value, labels) = resolver.review(export.source_retirement.as_ref().unwrap())?;
+    value["stack_entry_acceptance"] = super::licensing::stack_export::collect(export)
+        .map(|accepted| accepted.stamp())
+        .unwrap_or(Value::Null);
+    out.add(F::RetirementFinal, value, labels)?;
+    for (round, review) in export.retirement_rounds.iter().enumerate() {
+        let (mut value, labels) = resolver.review(review)?;
+        value["round"] = json!(round);
+        out.add(F::RetirementRounds, value, labels)?;
+    }
+    let comparison = export.comparisons.as_ref().unwrap();
+    out.add(
+        F::Comparisons,
+        json!({"kind":"disposition","disposition":tag(comparison.disposition)}),
+        Value::Null,
+    )?;
+    for row in &comparison.sites {
+        resolver.named_function(&row.function)?;
+        out.add(F::Comparisons,json!({"kind":"site","function":row.function,"block":row.block,"statement":row.statement,"operator":row.operator,"operands":row.operands.iter().map(|o|json!({"place":o.place.as_ref().map(place),"slot":o.slot})).collect::<Vec<_>>()}),Value::Null)?;
+    }
+    for row in &comparison.guards {
+        if !out.identities.contains(&row.slot) {
+            return Err("unresolved comparison guard slot".into());
+        }
+        out.add(
+            F::Comparisons,
+            json!({"kind":"guard","slot":row.slot,"rule":tag(row.rule)}),
+            Value::Null,
+        )?;
+    }
+    for row in &export.qualifier_facts.as_ref().unwrap().rows {
+        if !out.identities.contains(&row.slot) {
+            return Err("unresolved qualifier slot".into());
+        }
+        out.add(
+            F::QualifierFacts,
+            serde_json::to_value(row).map_err(|e| e.to_string())?,
+            Value::Null,
+        )?;
+    }
+    for row in &export.array_fields.as_ref().unwrap().rows {
+        for key in row
+            .slot_keys
+            .iter()
+            .chain(&row.source_slots)
+            .chain(&row.loaded_slots)
+        {
+            if !out.identities.contains(key) {
+                return Err("unresolved array field slot".into());
+            }
+        }
+        out.add(
+            F::ArrayFields,
+            serde_json::to_value(row).map_err(|e| e.to_string())?,
+            Value::Null,
+        )?;
+    }
+    let demand = export.demand_evidence.as_ref().unwrap().canonical_json()?;
+    out.add(
+        F::DemandEvidence,
+        serde_json::from_str(&demand).map_err(|e| e.to_string())?,
+        Value::Null,
+    )?;
+    let proof = super::proof_evidence::ProofEvidence::from_export(program.tcx, export);
+    let proof = proof.canonical_json()?;
+    out.add(
+        F::ProofEvidence,
+        serde_json::from_str(&proof).map_err(|e| e.to_string())?,
+        Value::Null,
+    )?;
+    out.validate()?;
+    Ok(out)
+}
+
+pub(crate) mod stream;
+#[cfg(test)]
+mod stream_tests;
+
+#[cfg(test)]
+mod tests;

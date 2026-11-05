@@ -1,0 +1,939 @@
+//! **R829-1 / R855-1 (USER; main 184) — the caller-side hold of the pending
+//! sibling-overlap sites, decided on the settled table before anything is
+//! planned.** A source delivered as a borrowed form and handed to a raw formal
+//! beside a risky raw sibling is decided raw (`held:pair-not-shown-disjoint`),
+//! its callers plan their bridges against that raw formal, and the pending table
+//! reads 0. Run through the real round driver (`rewrite_m1_path`).
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+struct Outcome {
+    source: String,
+    reasons: Vec<(String, String)>,
+    /// Each degradation's reason, debug-printed (its detail included).
+    details: Vec<(String, String)>,
+    pending: usize,
+}
+
+fn outcome(text: &str) -> Outcome {
+    outcome_in(text, false)
+}
+
+/// The same, in the ATTESTED census world (wave-5d 149: R898-1 (2)'s reading;
+/// the unattested world answers every pair without a proof, so wave-5d's
+/// peer arm (R833-1) holds there what a proof clears here).
+fn outcome_attested(text: &str) -> Outcome {
+    outcome_in(text, true)
+}
+
+fn outcome_in(text: &str, attested: bool) -> Outcome {
+    let dir = std::env::temp_dir().join(format!(
+        "crat-r855-hold-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("fixture dir");
+    let root = dir.join("lib.rs");
+    std::fs::write(&root, text).expect("fixture root");
+    let result = if attested {
+        super::rewrite_m1_path_a5_injected(
+            &root,
+            super::OverlapMode::PreciseReplay,
+            Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            &|_| {},
+        )
+    } else {
+        super::rewrite_m1_path(&root)
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    match result {
+        super::RewriteOutcome::Emitted {
+            source,
+            degradations,
+            raw_boundary_artifacts,
+            ..
+        } => {
+            println!("SOURCE\n{source}");
+            for d in &degradations {
+                println!("DEGRADED {} {}", d.subject, d.reason.key());
+            }
+            assert!(super::verify::type_checks_str(&source), "{source}");
+            Outcome {
+                source,
+                reasons: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+                    .collect(),
+                details: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), format!("{:?}", d.reason)))
+                    .collect(),
+                pending: raw_boundary_artifacts.pending_sibling_receipts.len(),
+            }
+        }
+        other => panic!("the fixture must emit: {other:?}"),
+    }
+}
+
+fn reason_of<'a>(outcome: &'a Outcome, subject: &str) -> Option<&'a str> {
+    outcome
+        .reasons
+        .iter()
+        .find(|(s, _)| s.starts_with(subject))
+        .map(|(_, r)| r.as_str())
+}
+
+fn signature<'a>(source: &'a str, function: &str) -> &'a str {
+    source
+        .lines()
+        .find(|line| line.contains(&format!("fn {function}(")))
+        .unwrap_or_default()
+}
+
+/// **H1** (re-pinned): `caller::src` (a formal) is handed to `update`'s raw `src`
+/// beside `(*holder).data`, a raw sibling `update` writes through, and `entry`
+/// passes one object to both. Decided raw under its own reason.
+const PARAMETER_CASE: &str = "#![allow(dead_code, unused_unsafe)]\n\
+    pub struct Holder { data: *mut i32 }\n\
+    pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }\n\
+    pub unsafe fn caller(holder: *const Holder, src: *const i32) {\n\
+        update((*holder).data, src);\n\
+    }\n\
+    pub unsafe fn entry() {\n\
+        let mut value = 1;\n\
+        let holder = Holder { data: &mut value };\n\
+        caller(&holder, &value);\n\
+    }\n";
+
+#[test]
+fn r855_1_h1_a_pending_formal_is_decided_raw() {
+    let out = outcome(PARAMETER_CASE);
+    assert_eq!(out.pending, 0, "the pending table reads 0");
+    assert_eq!(
+        reason_of(&out, "caller::src"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+    let caller = signature(&out.source, "caller");
+    assert!(caller.contains("src: *const i32"), "held raw: {caller}");
+    // Only the held source: the caller's other formal keeps its reference.
+    assert!(caller.contains("holder: &Holder"), "untouched: {caller}");
+}
+
+/// **H3** (R857-1, main 184a option (a)): the frame-binding premise is one
+/// predicate in both places. `lstat(name, &mut statBuf)` hands a formal beside the
+/// address of a binding of the caller's own frame, which did not exist when the
+/// frame received `name`, so under the UB-free-input scope the two cannot alias:
+/// the site is neither held at decision time nor pending at the terminal, and the
+/// program emits with `name` delivered (bzip2's three `lstat` / `stat` rows,
+/// R407-14).
+const H3_FRAME_BINDING: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct stat {
+    pub st_dev: u64,
+    pub st_nlink: u64,
+}
+extern "C" {
+    fn lstat(path: *const i8, buf: *mut stat) -> i32;
+}
+pub unsafe fn countHardLinks(mut name: *mut i8) -> i32 {
+    let mut statBuf: stat = stat { st_dev: 0, st_nlink: 0 };
+    let i = lstat(name, &mut statBuf);
+    if i != 0 {
+        return 0;
+    }
+    statBuf.st_nlink as i32 - 1
+}
+"#;
+
+/// H3's control: the written sibling is borrowed THROUGH a dereference
+/// (`&mut (*h).st`), storage the frame did not create, so the premise does not
+/// apply and the formal is held.
+const H3_THROUGH_DEREF: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct stat {
+    pub st_dev: u64,
+    pub st_nlink: u64,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct holder {
+    pub st: stat,
+}
+extern "C" {
+    fn lstat(path: *const i8, buf: *mut stat) -> i32;
+}
+pub unsafe fn countHardLinks(mut name: *mut i8, mut h: *mut holder) -> i32 {
+    let i = lstat(name, &mut (*h).st);
+    if i != 0 {
+        return 0;
+    }
+    (*h).st.st_nlink as i32 - 1
+}
+"#;
+
+#[test]
+fn r857_1_h3_a_frame_binding_sibling_is_neither_held_nor_pending() {
+    let out = outcome(H3_FRAME_BINDING);
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_eq!(
+        reason_of(&out, "countHardLinks::name"),
+        None,
+        "not held: {:?}",
+        out.reasons
+    );
+    let function = signature(&out.source, "countHardLinks");
+    assert!(!function.contains("name: *mut i8"), "delivered: {function}");
+}
+
+#[test]
+fn r857_1_h3_control_a_sibling_through_a_dereference_is_held() {
+    let out = outcome(H3_THROUGH_DEREF);
+    assert_eq!(out.pending, 0, "the pending table reads 0");
+    assert_eq!(
+        reason_of(&out, "countHardLinks::name"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+    let function = signature(&out.source, "countHardLinks");
+    assert!(function.contains("name: *mut i8"), "held raw: {function}");
+}
+
+/// **D1 (main 186): R857-1's premise at a LOCAL callee.** brotli `CopyStat`'s
+/// shape: C2Rust's local `stat` wrapper stands between the formal and `__xstat`,
+/// and the sibling addresses a binding of the caller's own frame. The premise is
+/// about the caller's frame, not the callee's kind: neither held nor pending.
+const H3_LOCAL_CALLEE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct stat_t {
+    pub st_dev: u64,
+    pub st_mode: u32,
+}
+extern "C" {
+    fn __xstat(ver: i32, path: *const i8, buf: *mut stat_t) -> i32;
+}
+unsafe fn stat(mut path: *const i8, mut buf: *mut stat_t) -> i32 {
+    return __xstat(1 as i32, path, buf);
+}
+pub unsafe fn CopyStat(mut name: *const i8) -> u32 {
+    let mut statbuf: stat_t = stat_t { st_dev: 0, st_mode: 0 };
+    if stat(name, &mut statbuf) != 0 {
+        return 0;
+    }
+    statbuf.st_mode
+}
+"#;
+
+#[test]
+fn r857_1_d1_a_frame_binding_sibling_at_a_local_callee_is_neither_held_nor_pending() {
+    let out = match super::rewrite_m1_census_world(H3_LOCAL_CALLEE) {
+        super::RewriteOutcome::Emitted {
+            source,
+            degradations,
+            raw_boundary_artifacts,
+            ..
+        } => {
+            println!("SOURCE\n{source}");
+            assert!(super::verify::type_checks_str(&source), "{source}");
+            Outcome {
+                source,
+                reasons: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+                    .collect(),
+                details: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), format!("{:?}", d.reason)))
+                    .collect(),
+                pending: raw_boundary_artifacts.pending_sibling_receipts.len(),
+            }
+        }
+        other => panic!("the fixture must emit: {other:?}"),
+    };
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_eq!(
+        reason_of(&out, "CopyStat::name"),
+        None,
+        "not held: {:?}",
+        out.reasons
+    );
+}
+
+/// D1 in the open world (`rewrite_m1`, no attestation: no A5 proof is final), as
+/// the suite's fixtures run: the premise alone keeps the site off the pending set
+/// and the formal is not this hold's (in this world `stat::path` takes its own
+/// `held:thin-extent`, and its class carries `CopyStat` with it).
+#[test]
+fn r857_1_d1_open_world_a_frame_binding_sibling_at_a_local_callee_is_not_held() {
+    let out = outcome(H3_LOCAL_CALLEE);
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_ne!(
+        reason_of(&out, "CopyStat::name"),
+        Some("held:pair-not-shown-disjoint"),
+        "not this hold's: {:?}",
+        out.reasons
+    );
+}
+
+/// **R861-1 (D3): a string-literal sibling is not risky.** On a UB-free input a
+/// literal is never written, so a literal beside a formal cannot be the written
+/// side of an overlap (as R608-1 treats a literal SOURCE). `strncmp` has no
+/// contract row, so its literal argument reads `Unknown`; the formal is neither
+/// held nor pending.
+const D3_LITERAL_SIBLING: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn strncmp(a: *const i8, b: *const i8, n: u64) -> i32;
+}
+pub unsafe fn is_flag(mut name: *const i8) -> i32 {
+    let mut first: i8 = *name;
+    if first == 0 {
+        return 0;
+    }
+    return (strncmp(name, b"--\0" as *const u8 as *const i8, 2 as u64) == 0) as i32;
+}
+"#;
+
+#[test]
+fn r861_1_d3_a_string_literal_sibling_is_not_risky() {
+    let out = outcome(D3_LITERAL_SIBLING);
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_ne!(
+        reason_of(&out, "is_flag::name"),
+        Some("held:pair-not-shown-disjoint"),
+        "not held: {:?}",
+        out.reasons
+    );
+}
+
+/// **The probe's json.h collateral (main 186 §5, relay 297).** The callee's
+/// formal is held (`memcpy` writes its sibling), and the caller hands it its own
+/// OPTIONAL formal (a null test makes it `Option<&T>`): the call is planned with
+/// the ordinary bridge into the held raw formal, so no verify round reverts it.
+const JSON_OPTION_INTO_HELD: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct json_value_s {
+    pub payload: i32,
+    pub type_0: i32,
+}
+unsafe extern "C" fn copy_value(mut state: *mut u8, mut value: *const json_value_s) {
+    memcpy(state as *mut core::ffi::c_void, value as *const core::ffi::c_void, 8 as u64);
+}
+pub unsafe extern "C" fn extract(mut value: *const json_value_s) -> i32 {
+    if value.is_null() {
+        return 0;
+    }
+    let mut buf: [u8; 8] = [0; 8];
+    copy_value(buf.as_mut_ptr(), value);
+    return (*value).type_0;
+}
+"#;
+
+#[test]
+fn r857_1_an_optional_formal_into_a_held_raw_formal_is_bridged() {
+    let (source, degradations) = match super::rewrite_m1_census_world(JSON_OPTION_INTO_HELD) {
+        super::RewriteOutcome::Emitted {
+            source,
+            degradations,
+            ..
+        } => (source, degradations),
+        other => panic!("the fixture must emit: {other:?}"),
+    };
+    println!("SOURCE\n{source}");
+    let reverted = degradations
+        .iter()
+        .filter(|d| d.reason.key() == "reverted-after-verify-failure")
+        .map(|d| d.subject.clone())
+        .collect::<Vec<_>>();
+    assert!(reverted.is_empty(), "verify reverts: {reverted:?}");
+}
+
+/// **Relay 297: one held map, one loop.** `Drop2::p` is both copied by `memcpy`
+/// beside the written `out` (the pending hold) and released through
+/// `free_func` (R857-2's backstop): it stays held, and the settled-hold table
+/// carries BOTH predicates' receipts for it.
+const TWO_HOLDS: &str = r#"
+// r861-two-holds
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn free(p: *mut core::ffi::c_void);
+    fn memcpy(d: *mut core::ffi::c_void, s: *const core::ffi::c_void, n: u64) -> *mut core::ffi::c_void;
+}
+pub type free_func_t =
+    Option<unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> ()>;
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct MemoryManager {
+    pub free_func: free_func_t,
+    pub opaque: *mut core::ffi::c_void,
+}
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct Obj {
+    pub k: i32,
+}
+unsafe extern "C" fn DefaultFree(mut opaque: *mut core::ffi::c_void, mut address: *mut core::ffi::c_void) {
+    free(address);
+}
+pub unsafe fn Init(mut m: *mut MemoryManager) {
+    (*m).free_func = Some(DefaultFree as unsafe extern "C" fn(*mut core::ffi::c_void, *mut core::ffi::c_void) -> ());
+}
+pub unsafe fn Drop2(mut m: *mut MemoryManager, mut out: *mut Obj, mut p: *mut Obj) {
+    memcpy(out as *mut core::ffi::c_void, p as *const core::ffi::c_void, 4 as u64);
+    (*m).free_func.expect("non-null function pointer")((*m).opaque, p as *mut core::ffi::c_void);
+}
+"#;
+
+#[test]
+fn r861_a_subject_two_holds_name_stays_held_with_both_receipts() {
+    use crate::analyses::borrow_ownership::SlotKind;
+    let _frame = super::test_model_override::frame_lock();
+    super::test_model_override::set(
+        "r861-two-holds",
+        Vec::new(),
+        vec![("Drop2::p".to_owned(), SlotKind::Ref)],
+    );
+    let result = super::rewrite_m1_census_world(TWO_HOLDS);
+    super::test_model_override::clear();
+    let super::RewriteOutcome::Emitted {
+        source,
+        degradations,
+        raw_boundary_artifacts,
+        ..
+    } = result
+    else {
+        panic!("the fixture must emit: {result:?}");
+    };
+    println!(
+        "SOURCE\n{source}\nRECEIPTS\n{}",
+        raw_boundary_artifacts.settled_hold_receipts
+    );
+    let reason = degradations
+        .iter()
+        .find(|d| d.subject.starts_with("Drop2::p"))
+        .map(|d| d.reason.key());
+    assert!(
+        matches!(
+            reason,
+            Some("held:released-through-indirect-call" | "held:pair-not-shown-disjoint")
+        ),
+        "held: {reason:?}"
+    );
+    let predicates = raw_boundary_artifacts
+        .settled_hold_receipts
+        .lines()
+        .filter(|row| {
+            row.split('\t')
+                .nth(1)
+                .is_some_and(|s| s.contains("Drop2::p"))
+        })
+        .map(|row| row.split('\t').next().unwrap_or_default().to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        predicates,
+        [
+            "held:pair-not-shown-disjoint",
+            "held:released-through-indirect-call"
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+        "{}",
+        raw_boundary_artifacts.settled_hold_receipts
+    );
+}
+
+/// The census's A5 world (`rewrite_m1_census_world`), read as [`outcome`] reads
+/// the open world.
+fn census_outcome(text: &str) -> Outcome {
+    match super::rewrite_m1_census_world(text) {
+        super::RewriteOutcome::Emitted {
+            source,
+            degradations,
+            raw_boundary_artifacts,
+            ..
+        } => {
+            println!("SOURCE\n{source}");
+            assert!(super::verify::type_checks_str(&source), "{source}");
+            Outcome {
+                source,
+                reasons: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), d.reason.key().to_owned()))
+                    .collect(),
+                details: degradations
+                    .iter()
+                    .map(|d| (d.subject.clone(), format!("{:?}", d.reason)))
+                    .collect(),
+                pending: raw_boundary_artifacts.pending_sibling_receipts.len(),
+            }
+        }
+        other => panic!("the fixture must emit: {other:?}"),
+    }
+}
+
+/// **D1 beneath casts** (relay 297; binn `binn_list_int32`'s
+/// `&mut value as *mut i32 as *mut c_void`): the address of the caller's own
+/// binding, cast, is still that binding's address, so the premise reads it as
+/// it reads `&mut statbuf`.
+const H3_LOCAL_CALLEE_CAST: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct stat_t {
+    pub st_dev: u64,
+    pub st_mode: u32,
+}
+extern "C" {
+    fn __xstat(ver: i32, path: *const i8, buf: *mut stat_t) -> i32;
+}
+unsafe fn stat(mut path: *const i8, mut buf: *mut core::ffi::c_void) -> i32 {
+    return __xstat(1 as i32, path, buf as *mut stat_t);
+}
+pub unsafe fn CopyStat(mut name: *const i8) -> u32 {
+    let mut statbuf: stat_t = stat_t { st_dev: 0, st_mode: 0 };
+    if stat(name, &mut statbuf as *mut stat_t as *mut core::ffi::c_void) != 0 {
+        return 0;
+    }
+    statbuf.st_mode
+}
+"#;
+
+#[test]
+fn r861_1_d1_a_frame_binding_sibling_beneath_casts_is_neither_held_nor_pending() {
+    let out = census_outcome(H3_LOCAL_CALLEE_CAST);
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_eq!(
+        reason_of(&out, "CopyStat::name"),
+        None,
+        "not held: {:?}",
+        out.reasons
+    );
+}
+
+/// The same in the open world, where no A5 proof is final: the premise alone
+/// keeps the site off the pending set.
+#[test]
+fn r861_1_d1_open_world_a_frame_binding_sibling_beneath_casts_is_not_held() {
+    let out = outcome(H3_LOCAL_CALLEE_CAST);
+    assert_eq!(out.pending, 0, "not a pending site");
+    assert_ne!(
+        reason_of(&out, "CopyStat::name"),
+        Some("held:pair-not-shown-disjoint"),
+        "not this hold's: {:?}",
+        out.reasons
+    );
+}
+
+/// **The premise's own condition (the stand-in review's M1).** A formal
+/// reassigned before the call (`s = other`) may no longer hold a referent from
+/// before the frame, so the frame-binding exemption reads only a formal holding
+/// its entry value or a pointer stepped from it. (No reduced RED: on this shape
+/// and on the `lstat` one the reassignment trips another hold first — a lifetime
+/// degrade, `held:thin-extent` — so the fixture serves the control below.)
+const H3_REASSIGNED: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, non_camel_case_types, non_snake_case)]
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct rec {
+    pub a: u64,
+    pub b: u64,
+}
+extern "C" {
+    fn fill(src: *const rec, dst: *mut rec) -> i32;
+}
+pub unsafe fn copyRec(mut s: *mut rec, mut other: *mut rec) -> u64 {
+    let mut local: rec = rec { a: 0, b: 0 };
+    if (*other).a != 0 {
+        s = other;
+    }
+    let i = fill(s, &mut local);
+    if i != 0 {
+        return 0;
+    }
+    local.b + (*s).a
+}
+"#;
+
+/// The control: a formal only stepped from itself (`s = s.offset(1)`) still
+/// addresses its entry referent; the premise applies.
+#[test]
+fn r861_1_m1_a_formal_stepped_from_itself_keeps_the_premise() {
+    let input = H3_REASSIGNED.replace("        s = other;\n", "        s = s.offset(1);\n");
+    assert!(input.contains("s.offset(1)"));
+    let out = outcome(&input);
+    assert_ne!(
+        reason_of(&out, "copyRec::s"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// **The ladder's borrowed rule into a held formal (the stand-in review's M4).**
+/// `caller::src` is held beside `(*holder).data` (H1); `outer` hands it
+/// `&mut *r`, a reborrow of its delivered `r`: the raw pointer `update` may keep
+/// would outlive the reborrow, so `r` is held too (`held:into-held-formal`), as
+/// the ladder blocks `borrowed-into-raw-param`.
+const BORROWED_INTO_HELD: &str = "#![allow(dead_code, unused_unsafe)]\n\
+    pub struct Holder { data: *mut i32 }\n\
+    pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }\n\
+    pub unsafe fn caller(holder: *const Holder, src: *const i32) {\n\
+        update((*holder).data, src);\n\
+    }\n\
+    pub unsafe fn outer(holder: *const Holder, r: *mut i32) {\n\
+        *r = 3;\n\
+        caller(holder, &mut *r);\n\
+    }\n\
+    pub unsafe fn entry() {\n\
+        let mut value = 1;\n\
+        let shared: *mut i32 = &mut value;\n\
+        let holder = Holder { data: shared };\n\
+        outer(&holder, shared);\n\
+    }\n";
+
+#[test]
+fn r861_1_m4_a_binding_borrowed_into_a_held_formal_is_held() {
+    // The census's A5 world (the open world's proof-site assertion trips here,
+    // main 186 class C); `entry` hands one object to both sides.
+    let out = census_outcome(BORROWED_INTO_HELD);
+    assert_eq!(
+        reason_of(&out, "caller::src"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+    assert_eq!(
+        reason_of(&out, "outer::r"),
+        Some("held:into-held-formal"),
+        "{:?}",
+        out.reasons
+    );
+}
+
+/// **Within the function (the stand-in review's M4).** `caller::s2` is the held
+/// source; `src` initializes it whole. The model keeps the two in one kind; with
+/// `s2` held raw, a delivered `src` would coerce into it silently, so `src` is
+/// held too (`into-held-binding`).
+const FLOWS_INTO_HELD: &str = "#![allow(dead_code, unused_unsafe)]\n\
+    pub struct Holder { data: *mut i32 }\n\
+    pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }\n\
+    pub unsafe fn caller(holder: *const Holder, src: *const i32) {\n\
+        let s2: *const i32 = src;\n\
+        update((*holder).data, s2);\n\
+    }\n\
+    pub unsafe fn entry() {\n\
+        let mut value = 1;\n\
+        let holder = Holder { data: &mut value };\n\
+        caller(&holder, &value);\n\
+    }\n";
+
+#[test]
+fn r861_1_m4_a_binding_flowing_into_a_held_binding_is_held() {
+    let out = outcome(FLOWS_INTO_HELD);
+    let held = |subject: &str| {
+        matches!(
+            reason_of(&out, subject),
+            Some("held:pair-not-shown-disjoint" | "held:into-held-formal")
+        )
+    };
+    assert!(
+        held("caller::s2") && held("caller::src"),
+        "both held: {:?}",
+        out.reasons
+    );
+    let caller = signature(&out.source, "caller");
+    assert!(caller.contains("src: *const i32"), "raw: {caller}");
+}
+
+/// **The within-function rule through a temporary (the stand-in review round 2,
+/// N1).** `s2` is the held source; `src` reaches it through a C2Rust ternary
+/// (`if flag != 0 { src } else { … }`), a MIR temporary the HIR shapes do not
+/// see. The model keeps the two in one kind, so a delivered `src` would coerce
+/// into the raw `s2` silently: `src` is held too, `into-held-binding`.
+const FLOWS_THROUGH_TERNARY: &str = "#![allow(dead_code, unused_unsafe)]\n\
+    pub struct Holder { data: *mut i32 }\n\
+    pub unsafe fn update(dst: *mut i32, src: *const i32) { *dst = *src + 1; }\n\
+    pub unsafe fn caller(holder: *const Holder, src: *const i32, other: *const i32, flag: i32) {\n\
+        let s2: *const i32 = if flag != 0 { src } else { other };\n\
+        update((*holder).data, s2);\n\
+    }\n\
+    pub unsafe fn entry() {\n\
+        let mut value = 1;\n\
+        let holder = Holder { data: &mut value };\n\
+        caller(&holder, &value, &value, 1);\n\
+    }\n";
+
+#[test]
+fn r861_1_n1_a_binding_flowing_through_a_ternary_into_a_held_binding_is_held() {
+    let out = outcome(FLOWS_THROUGH_TERNARY);
+    assert_eq!(
+        reason_of(&out, "caller::s2"),
+        Some("held:pair-not-shown-disjoint"),
+        "{:?}",
+        out.reasons
+    );
+    for formal in ["caller::src", "caller::other"] {
+        assert_eq!(
+            reason_of(&out, formal),
+            Some("held:into-held-formal"),
+            "{formal}: {:?}",
+            out.reasons
+        );
+    }
+    assert!(
+        detail_of(&out, "caller::src").is_some_and(|d| d.contains("into-held-binding:caller::s2")),
+        "{:?}",
+        out.details
+    );
+    let caller = signature(&out.source, "caller");
+    assert!(
+        caller.contains("src: *const i32") && caller.contains("other: *const i32"),
+        "held raw: {caller}"
+    );
+}
+
+fn detail_of<'a>(outcome: &'a Outcome, subject: &str) -> Option<&'a str> {
+    outcome
+        .details
+        .iter()
+        .find(|(s, _)| s.starts_with(subject))
+        .map(|(_, d)| d.as_str())
+}
+
+/// **The MIR arms, one witness each (the stand-in review round 3, C3).** The
+/// held source `s2` receives `src` through a cast, a pointer step, a reborrow
+/// through a dereference, and a call that returns its argument (F2); each holds
+/// `src` with the `into-held-binding:caller::s2` detail.
+#[test]
+fn r861_1_n1_each_mir_arm_holds_the_flowing_binding() {
+    for (arm, initializer, extra) in [
+        ("cast", "src as *mut i32 as *const i32", ""),
+        ("step", "src.offset(0)", ""),
+        ("reborrow", "&*src as *const i32", ""),
+        (
+            "call",
+            "same(src)",
+            "pub unsafe fn same(p: *const i32) -> *const i32 { p }\n",
+        ),
+    ] {
+        let input = FLOWS_INTO_HELD
+            .replace(
+                "let s2: *const i32 = src;",
+                &format!("let s2: *const i32 = {initializer};"),
+            )
+            .replace(
+                "pub unsafe fn entry() {",
+                &format!("{extra}pub unsafe fn entry() {{"),
+            );
+        assert!(input.contains(initializer), "{arm}: {input}");
+        assert!(extra.is_empty() || input.contains(extra), "{arm}: {input}");
+        let out = outcome(&input);
+        assert_eq!(
+            reason_of(&out, "caller::s2"),
+            Some("held:pair-not-shown-disjoint"),
+            "{arm}: {:?}",
+            out.reasons
+        );
+        assert!(
+            detail_of(&out, "caller::src")
+                .is_some_and(|d| d.contains("into-held-binding:caller::s2")),
+            "{arm}: {:?}",
+            out.details
+        );
+    }
+}
+
+/// **R866-1 (relay 300; fan-out 083) — the containment pair.** brotli's
+/// `ProcessCommandsInternal` (its `s` raw) hands `SafeReadDistance(&mut *s,
+/// &mut *br)` with `br = &mut (*s).br`: both formals delivered as `&mut`, the
+/// second inside the first's object, no pair row at that call; the callee writes
+/// through `br` while the protected `s` covers it. Both formals are held
+/// (`ref-beside-ref`, `contained`).
+const CONTAINED_PAIR: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    #[repr(C)]\n\
+    pub struct Br { pos: u32, val: u32 }\n\
+    #[repr(C)]\n\
+    pub struct S { state: i32, br: Br }\n\
+    pub unsafe fn read_distance(s: *mut S, br: *mut Br) -> i32 {\n\
+        (*br).pos += 1;\n\
+        (*s).state += 1;\n\
+        (*s).state\n\
+    }\n\
+    pub unsafe fn process(mut s: *mut S) -> i32 {\n\
+        let _k = s.offset(0);\n\
+        let mut br: *mut Br = &mut (*s).br;\n\
+        read_distance(s, br)\n\
+    }\n\
+    pub unsafe fn entry() -> i32 {\n\
+        let mut x = S { state: 0, br: Br { pos: 0, val: 0 } };\n\
+        process(&mut x)\n\
+    }\n";
+
+#[test]
+fn r866_1_a_containment_pair_holds_both_formals() {
+    let out = outcome_attested(CONTAINED_PAIR);
+    // wave-5d 149 (the 58 re-cut): wave-5d's R866-1 reading of the reborrow in
+    // F2 holds the pair first (`pair-proven-overlap`), or the model already
+    // decides a side raw; main's hold (`held:pair-not-shown-disjoint`, a
+    // contained `ref-beside-ref`) is the same verdict. Both formals stay raw.
+    for formal in ["read_distance::s", "read_distance::br"] {
+        assert!(
+            matches!(
+                reason_of(&out, formal),
+                Some("held:pair-not-shown-disjoint" | "pair-proven-overlap" | "kind-raw")
+            ),
+            "{formal}: {:?}",
+            out.reasons
+        );
+    }
+    let callee = signature(&out.source, "read_distance");
+    assert!(
+        callee.contains("s: *mut S") && callee.contains("br: *mut Br"),
+        "held raw: {callee}"
+    );
+}
+
+/// **The round-2 review's NEW-1, containment through an outer field:** `&mut
+/// (*s).br` beside `br` with `let br = &mut (*s).br` is one object (both
+/// formals delivered, `&mut Br` and `&Br`); the whole-outer requirement left it
+/// unanswered. The control passes a distinct field (`&mut (*s).other`): distinct
+/// fields of one object are disjoint.
+const CONTAINED_FIELD: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    #[repr(C)]\n\
+    pub struct Br { pos: u32, val: u32 }\n\
+    #[repr(C)]\n\
+    pub struct S { state: i32, br: Br, other: Br }\n\
+    pub unsafe fn read_bits(mut a: *mut Br, b: *mut Br) -> u32 {\n\
+        let _k = a as *mut u8;\n\
+        (*a).pos += 1;\n\
+        (*b).val\n\
+    }\n\
+    pub unsafe fn process(s: *mut S) -> u32 {\n\
+        let mut br: *mut Br = &mut (*s).br;\n\
+        read_bits(&mut (*s).br, br)\n\
+    }\n\
+    pub unsafe fn entry() -> u32 {\n\
+        let mut x = S { state: 0, br: Br { pos: 0, val: 0 }, other: Br { pos: 0, val: 0 } };\n\
+        process(&mut x)\n\
+    }\n";
+
+#[test]
+fn r864_1_round2_containment_through_an_outer_field_is_held() {
+    let out = census_outcome(CONTAINED_FIELD);
+    assert!(
+        detail_of(&out, "read_bits::b").is_some_and(|d| d.contains("ref-beside-")
+            && d.contains("read_bits#2:peer#1")
+            && d.contains(";contained")),
+        "{:?}",
+        out.details
+    );
+    let callee = signature(&out.source, "read_bits");
+    assert!(callee.contains("b: *mut Br"), "held raw: {callee}");
+    let distinct = CONTAINED_FIELD.replace(
+        "read_bits(&mut (*s).br, br)",
+        "read_bits(&mut (*s).other, br)",
+    );
+    assert!(distinct.contains("read_bits(&mut (*s).other, br)"));
+    let out = census_outcome(&distinct);
+    assert_eq!(reason_of(&out, "read_bits::b"), None, "{:?}", out.reasons);
+}
+
+/// **The round-2 review's NEW-2 — a pointer static's value is not the static's
+/// storage.** `G` and `H` are two pointer statics that both hold
+/// `TMP.as_mut_ptr()`: `zsqr(G, H)` hands one object at both positions. Two
+/// distinct statics read as two objects only when the arguments address the
+/// statics' own storage.
+const POINTER_STATICS: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    #[derive(Clone, Copy)]\n\
+    #[repr(C)]\n\
+    pub struct Z { sign: i32, used: usize }\n\
+    pub unsafe fn zsqr(mut a: *mut Z, b: *mut Z) {\n\
+        let _k = a.offset(0);\n\
+        let s = (*b).used;\n\
+        (*a).used = s + 1;\n\
+        (*a).sign = 1;\n\
+    }\n\
+    pub static mut TMP: [Z; 1] = [Z { sign: 0, used: 3 }; 1];\n\
+    pub static mut G: *mut Z = 0 as *mut Z;\n\
+    pub static mut H: *mut Z = 0 as *mut Z;\n\
+    pub unsafe fn entry() -> usize {\n\
+        G = TMP.as_mut_ptr();\n\
+        H = TMP.as_mut_ptr();\n\
+        zsqr(G, H);\n\
+        TMP[0].used\n\
+    }\n";
+
+#[test]
+fn r864_1_round2_two_pointer_statics_are_not_two_objects() {
+    let out = outcome(POINTER_STATICS);
+    assert!(
+        // `ref-beside-ref` where the table still decides `a` a slice (no PAIR
+        // node: the round-3 review's R3-1 (b)), `ref-beside-raw` once it is raw.
+        detail_of(&out, "zsqr::b").is_some_and(|d| d.contains("ref-beside-")
+            && d.contains("zsqr#2:peer#1")
+            && d.contains(";unresolved")),
+        "{:?}",
+        out.details
+    );
+    let zsqr = signature(&out.source, "zsqr");
+    assert!(zsqr.contains("b: *mut Z"), "held raw: {zsqr}");
+}
+
+/// **The round-3 review's R3-1 (b) — two slice formals over one raw binding**,
+/// the control: `shift(buf.offset(1), buf, n - 1)`. `dst` and `src` deliver as
+/// slices, no PAIR nodes, and with no raw position the seam's twin has nothing to
+/// route; the seam's A5 gate reads the two converted positions of one root (pass
+/// 2) and places a raw view where A5 does not clear them. The predicate holds
+/// such a pair only on the classifier's clear (class 2), so here the A5 gate's
+/// raw view stands and nothing is held by it.
+const SHIFT_SLICES: &str = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    pub unsafe fn shift(dst: *mut i32, src: *const i32, n: i32) {\n\
+        let mut i = n - 1;\n\
+        while i >= 0 {\n\
+            *dst.offset(i as isize) = *src.offset(i as isize);\n\
+            i -= 1;\n\
+        }\n\
+    }\n\
+    pub unsafe fn g(buf: *mut i32, n: i32) {\n\
+        let _a = buf as usize;\n\
+        shift(buf.offset(1), buf, n - 1);\n\
+    }\n\
+    pub unsafe fn entry() -> i32 {\n\
+        let mut x = [1i32, 2, 3, 4];\n\
+        g(x.as_mut_ptr(), 4);\n\
+        x[3]\n\
+    }\n";
+
+#[test]
+fn r864_1_round3_one_raw_root_at_two_slices_is_the_a5_gates() {
+    let out = census_outcome(SHIFT_SLICES);
+    for formal in ["shift::dst", "shift::src"] {
+        assert!(
+            detail_of(&out, formal).is_none_or(|d| !d.contains("ref-beside-")),
+            "{formal}: {:?}",
+            out.details
+        );
+    }
+    assert_eq!(
+        reason_of(&out, "shift::src"),
+        Some("pair-raw-view"),
+        "{:?}",
+        out.reasons
+    );
+}

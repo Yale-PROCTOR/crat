@@ -35,9 +35,9 @@ use crate::{
 
 pub(crate) mod array_local_index_rewriter;
 pub(crate) mod array_local_trace;
-pub(crate) mod collector;
+pub mod collector;
 pub(crate) mod decision;
-pub(crate) mod diagnostics;
+pub mod diagnostics;
 mod epoch_split;
 mod lifetimes;
 mod struct_array_field_pre;

@@ -1,0 +1,975 @@
+//! Consuming raw returns of optional locals (parameter returns retain E2
+//! ownership), and optional operands of pointer comparisons, whose view the
+//! raw boundary's address arm supplies.
+
+use rustc_hash::FxHashMap;
+use rustc_hir::{
+    BinOpKind, Expr, ExprKind, HirId, Node,
+    def::Res,
+    def_id::LocalDefId,
+    intravisit::{self, Visitor},
+};
+use rustc_middle::ty::{TyCtxt, TyKind};
+use rustc_span::Span;
+
+use super::{
+    Decision, DecisionTable, Subject, SubjectKind,
+    emitability::{ArgShape, EmitabilityFacts, OptUseSite, OptUses, UseEdit},
+    lifetime::FnSignatureSlot,
+    raw_boundary::{RawMutability, raw_target_type},
+    seam::Form,
+};
+use crate::bo_rewriter::mechanical_receipt::{
+    MechanicalEvidence, MechanicalFamily, MechanicalTerminalReason, OptionPresentationReceiptPlan,
+};
+
+/// **R607-1 leg B (relay 092): a branch self-reassignment.** For
+/// `x = if c { A } else { x };` (either arm), the arm that is the subject itself
+/// keeps its Option value unchanged, and only the OTHER arm's tail needs the
+/// value adapter. Returns that other arm's tail expression when `branch_value`
+/// is the subject `binding` as the bare tail of one arm of an `if` that is the
+/// right-hand side of an assignment to the same `binding`.
+pub(super) fn self_branch_other<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    branch_value: &'tcx Expr<'tcx>,
+    binding: HirId,
+) -> Option<&'tcx Expr<'tcx>> {
+    let is_binding = |expression: &Expr<'_>| {
+        matches!(expression.kind, ExprKind::Path(rustc_hir::QPath::Resolved(_, path))
+            if path.res == Res::Local(binding))
+    };
+    if !is_binding(branch_value) {
+        return None;
+    }
+    let Node::Block(block) = tcx.parent_hir_node(branch_value.hir_id) else { return None };
+    if !block.stmts.is_empty() || block.expr.map(|tail| tail.hir_id) != Some(branch_value.hir_id) {
+        return None;
+    }
+    let Node::Expr(arm) = tcx.parent_hir_node(block.hir_id) else { return None };
+    if !matches!(arm.kind, ExprKind::Block(inner, _) if inner.hir_id == block.hir_id) {
+        return None;
+    }
+    let Node::Expr(branch) = tcx.parent_hir_node(arm.hir_id) else { return None };
+    let ExprKind::If(_, then, Some(otherwise)) = branch.kind else { return None };
+    let other = if then.hir_id == arm.hir_id {
+        otherwise
+    } else if otherwise.hir_id == arm.hir_id {
+        then
+    } else {
+        return None;
+    };
+    let Node::Expr(assign) = tcx.parent_hir_node(branch.hir_id) else { return None };
+    let ExprKind::Assign(lhs, rhs, _) = assign.kind else { return None };
+    if rhs.hir_id != branch.hir_id || !is_binding(lhs) {
+        return None;
+    }
+    let ExprKind::Block(other_block, _) = other.kind else { return None };
+    let tail = other_block.expr?;
+    (!is_binding(tail)).then_some(tail)
+}
+
+/// The same shape read from the assignment's right-hand side: the `if` whose
+/// one arm is `binding` itself. Returns the other arm's tail, the value the
+/// Option value planner renders in place of the whole right-hand side.
+pub(super) fn self_branch_value_of<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    rhs: &'tcx Expr<'tcx>,
+    binding: HirId,
+) -> Option<&'tcx Expr<'tcx>> {
+    let ExprKind::If(_, then, Some(otherwise)) = rhs.kind else { return None };
+    [then, otherwise].into_iter().find_map(|arm| {
+        let ExprKind::Block(block, _) = arm.kind else { return None };
+        self_branch_other(tcx, block.expr?, binding)
+    })
+}
+
+/// Defer only an explicit, bare return of a positively identified local.
+/// Final presentation and permission are checked by `plan_raw_returns`.
+pub(super) fn collect_raw_return(
+    tcx: TyCtxt<'_>,
+    expression: &Expr<'_>,
+    node: (LocalDefId, HirId),
+    uses: &mut FxHashMap<(LocalDefId, HirId), OptUses>,
+) -> bool {
+    if !matches!(tcx.parent_hir_node(node.1), Node::LetStmt(_))
+        || returned_value_route(tcx, expression).is_none()
+        || !matches!(
+            tcx.fn_sig(node.0)
+                .skip_binder()
+                .skip_binder()
+                .output()
+                .kind(),
+            TyKind::RawPtr(..)
+        )
+    {
+        return false;
+    }
+    let entry = uses.entry(node).or_default();
+    entry.non_test_uses += 1;
+    entry.sites.push(OptUseSite {
+        hir_id: expression.hir_id,
+        span: expression.span,
+        operation: "return-raw",
+    });
+    true
+}
+
+/// Is this expression the value an explicit `return` hands out — bare
+/// (`return r`) or as the tail of an `if` / `else if` arm
+/// (`return if !r.is_null() { r } else { .. }`, lil `lil_find_var::r`)?
+/// A returned CAST of the local (`return pvalue as *mut c_void`, binn
+/// `compress_int::pvalue`) is the address arm's `ptr-cast` observation
+/// instead, deferred by [`collect_address_observation`].
+fn returned_value_route(tcx: TyCtxt<'_>, expression: &Expr<'_>) -> Option<()> {
+    let mut current = expression.hir_id;
+    loop {
+        let parent = match tcx.parent_hir_node(current) {
+            Node::Expr(parent) => parent,
+            // A block's tail expression: its parent node is the `Block` itself,
+            // whose own parent is the `ExprKind::Block` expression.
+            Node::Block(block) if block.expr.is_some_and(|tail| tail.hir_id == current) => {
+                current = block.hir_id;
+                continue;
+            }
+            _ => return None,
+        };
+        match parent.kind {
+            ExprKind::Ret(Some(value)) if value.hir_id == current => return Some(()),
+            // A cast of the local is the address arm's observation (`ptr-cast`),
+            // deferred by `collect_address_observation`; the cast stays and
+            // converts the bridged value.
+            ExprKind::Cast(inner, _) if inner.hir_id == current => return None,
+            ExprKind::Block(block, _)
+                if block.hir_id == current
+                    || block.expr.is_some_and(|tail| tail.hir_id == current) => {}
+            ExprKind::If(_, then, otherwise)
+                if then.hir_id == current
+                    || otherwise.is_some_and(|otherwise| otherwise.hir_id == current) => {}
+            ExprKind::DropTemps(inner) if inner.hir_id == current => {}
+            _ => return None,
+        }
+        current = parent.hir_id;
+    }
+}
+
+pub(super) fn plan_raw_returns(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    subject: &Subject,
+    source: Form,
+    uses: &OptUses,
+    receipts: &mut Vec<OptionPresentationReceiptPlan>,
+    edits: &mut Vec<((LocalDefId, HirId), UseEdit)>,
+) {
+    for site in uses
+        .sites
+        .iter()
+        .filter(|site| site.operation == "return-raw")
+    {
+        let planned = raw_return_expression(tcx, table, subject, source, site);
+        let (adapter, reason) = match planned {
+            Ok(replacement) => {
+                edits.push((
+                    (subject.fn_did, subject.hir_id),
+                    UseEdit {
+                        span: site.span,
+                        replacement,
+                        bridge_kind: "subject-use",
+                    },
+                ));
+                ("option-to-raw-consuming-return".to_owned(), None)
+            }
+            Err(reason) => (
+                String::new(),
+                Some(MechanicalTerminalReason::EvidenceMissing(reason.to_owned())),
+            ),
+        };
+        // This is a terminal move, not a callee retaining a view while the
+        // Option is live. No retention verdict or additional waiver is inferred.
+        receipts.push(super::option::receipt(
+            tcx,
+            subject,
+            site.hir_id,
+            MechanicalFamily::OptUseUnsupported,
+            "return-raw",
+            source,
+            Form::Raw,
+            adapter,
+            reason,
+            MechanicalEvidence::default(),
+        ));
+    }
+}
+
+fn raw_return_expression(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    subject: &Subject,
+    source: Form,
+    site: &OptUseSite,
+) -> Result<String, &'static str> {
+    if !matches!(subject.kind, SubjectKind::Local) || subject.ptr_depth != 1 {
+        return Err("option-raw-return:local-thin-pointer-required");
+    }
+    if table
+        .return_interfaces
+        .functions
+        .contains_key(&subject.fn_did)
+        || table
+            .lifetime_plan
+            .function(subject.fn_did)
+            .and_then(|plan| plan.lifetime_for(FnSignatureSlot::RETURN))
+            .is_some()
+    {
+        return Err("option-raw-return:borrowed-interface-owned");
+    }
+    let Form::Opt {
+        mutable,
+        slice: false,
+    } = source
+    else {
+        return Err("option-raw-return:thin-option-required");
+    };
+    let output = tcx
+        .fn_sig(subject.fn_did)
+        .skip_binder()
+        .skip_binder()
+        .output();
+    let expression = tcx.hir_node(site.hir_id).expect_expr();
+    let input = tcx.typeck(subject.fn_did).expr_ty(expression);
+    let (TyKind::RawPtr(input_pointee, _), TyKind::RawPtr(output_pointee, _)) =
+        (input.kind(), output.kind())
+    else {
+        return Err("option-raw-return:raw-signature-required");
+    };
+    if input_pointee != output_pointee {
+        return Err("option-raw-return:pointee-mismatch");
+    }
+    let target = raw_target_type(tcx, output).ok_or("option-raw-return:target-unnameable")?;
+    let name = subject
+        .param_name
+        .as_deref()
+        .ok_or("option-raw-return:binding-unnameable")?;
+    let (null, address) = match (mutable, target.mutability) {
+        (true, RawMutability::Mut) => ("null_mut", "core::ptr::from_mut(value)"),
+        (true, RawMutability::Const) => ("null", "core::ptr::from_mut(value).cast_const()"),
+        (false, RawMutability::Const) => ("null", "core::ptr::from_ref(value)"),
+        (false, RawMutability::Mut) => return Err("option-raw-return:shared-to-mut-held"),
+    };
+    Ok(format!(
+        "{name}.map_or(core::ptr::{null}::<{}>(), |value| {address})",
+        target.pointee
+    ))
+}
+
+/// Defer a direct operand of a pointer comparison (casts peeled upward) to the
+/// raw boundary's address view; `plan_address_observations` then requires that
+/// view to exist. Not a use with no image, so the family is not withdrawn here.
+pub(super) fn collect_address_observation(
+    tcx: TyCtxt<'_>,
+    expression: &Expr<'_>,
+    node: (LocalDefId, HirId),
+    uses: &mut FxHashMap<(LocalDefId, HirId), OptUses>,
+) -> bool {
+    // A RETURNED pointer-to-pointer or pointer-to-integer cast of the local
+    // (`return pvalue as *mut c_void`) is the address arm's `ptr-cast` /
+    // `ptr-to-int` observation (the same predicate as the emitability
+    // collector's); a cast in any other position keeps its own owner (a call
+    // argument is a boundary site, a method receiver a slice-use carrier).
+    if let Node::Expr(cast) = tcx.parent_hir_node(expression.hir_id)
+        && let ExprKind::Cast(inner, _) = cast.kind
+        && inner.hir_id == expression.hir_id
+        && matches!(
+            tcx.typeck(node.0).expr_ty(cast).kind(),
+            TyKind::RawPtr(..) | TyKind::Int(_) | TyKind::Uint(_)
+        )
+        && !cast_owned_by_call_argument(tcx, cast)
+        && returned_value_route(tcx, cast).is_some()
+    {
+        let entry = uses.entry(node).or_default();
+        entry.non_test_uses += 1;
+        entry.sites.push(OptUseSite {
+            hir_id: expression.hir_id,
+            span: expression.span,
+            operation: "address-observation",
+        });
+        return true;
+    }
+    let mut operand = expression;
+    while let Node::Expr(parent) = tcx.parent_hir_node(operand.hir_id)
+        && matches!(parent.kind, ExprKind::Cast(inner, _) if inner.hir_id == operand.hir_id)
+    {
+        operand = parent;
+    }
+    let Node::Expr(parent) = tcx.parent_hir_node(operand.hir_id) else { return false };
+    let ExprKind::Binary(op, lhs, rhs) = parent.kind else { return false };
+    if !matches!(
+        op.node,
+        BinOpKind::Eq
+            | BinOpKind::Ne
+            | BinOpKind::Lt
+            | BinOpKind::Le
+            | BinOpKind::Gt
+            | BinOpKind::Ge
+    ) || (lhs.hir_id != operand.hir_id && rhs.hir_id != operand.hir_id)
+    {
+        return false;
+    }
+    let typeck = tcx.typeck(node.0);
+    if ![lhs, rhs]
+        .into_iter()
+        .all(|side| matches!(typeck.expr_ty(side).kind(), TyKind::RawPtr(..)))
+    {
+        return false;
+    }
+    let entry = uses.entry(node).or_default();
+    entry.non_test_uses += 1;
+    entry.sites.push(OptUseSite {
+        hir_id: expression.hir_id,
+        span: expression.span,
+        operation: "address-observation",
+    });
+    true
+}
+
+/// An `address-observation` site is applied exactly when the seam plan carries
+/// the address view for that operand; otherwise the typed hold.
+pub(super) fn plan_address_observations(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    subject: &Subject,
+    source: Form,
+    uses: &OptUses,
+    receipts: &mut Vec<OptionPresentationReceiptPlan>,
+) {
+    for site in uses
+        .sites
+        .iter()
+        .filter(|site| site.operation == "address-observation")
+    {
+        let view = table.seams.edits.iter().find(|edit| {
+            edit.source_shape == "raw-op-address-observation"
+                && edit.bridge.caller == subject.fn_did
+                && edit.span.source_callsite() == site.span.source_callsite()
+        });
+        // A pointer-to-pointer cast of a SHARED optional to a `*mut` target
+        // is not an observation of the address: the cast value can be written
+        // through by whoever receives it (a return, a store), and a view of a
+        // shared reference must never become writable (`&T -> &mut T`, R395-2).
+        let shared_to_mut_cast = matches!(source, Form::Opt { mutable: false, .. })
+            && matches!(tcx.parent_hir_node(site.hir_id),
+            Node::Expr(cast) if matches!(cast.kind, ExprKind::Cast(inner, _) if inner.hir_id == site.hir_id)
+                && matches!(
+                    tcx.typeck(subject.fn_did).expr_ty(cast).kind(),
+                    TyKind::RawPtr(_, rustc_ast::Mutability::Mut)
+                ));
+        let (adapter, reason) = match view {
+            _ if shared_to_mut_cast => (
+                String::new(),
+                Some(MechanicalTerminalReason::EvidenceMissing(
+                    "option-address-view:shared-to-mut-cast".to_owned(),
+                )),
+            ),
+            Some(view) => (view.spec.template_key().to_owned(), None),
+            None => (
+                String::new(),
+                Some(MechanicalTerminalReason::EvidenceMissing(
+                    "option-address-view:missing".to_owned(),
+                )),
+            ),
+        };
+        // A comparison observes the address only; no callee, no retention.
+        receipts.push(super::option::receipt(
+            tcx,
+            subject,
+            site.hir_id,
+            MechanicalFamily::OptUseUnsupported,
+            "address-observation",
+            source,
+            Form::Raw,
+            adapter,
+            reason,
+            MechanicalEvidence::default(),
+        ));
+    }
+}
+
+/// One reborrow per call: when a MUTABLE thin optional is accessed through
+/// `as_mut()` at two or more places inside one call's argument list — the
+/// disjoint-field views `f(&mut (*value).a, &mut (*value).b)` wave-6p
+/// certifies — each access borrows the Option mutably for the whole call and
+/// the compiler refuses the second (E0499). The call is wrapped in a block
+/// that reborrows the Option ONCE, `let value = value.as_deref_mut().unwrap();`,
+/// under which the original argument text is already right; the call's inner
+/// edits are composed into the block (the same mechanism a composed Option
+/// initializer uses) and the subject's own accessor edits inside it are
+/// retired. The unwrap is the existing required-dereference idiom: the C code
+/// dereferences the pointer at these arguments unconditionally.
+pub(super) fn plan_call_reborrows(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    subject: &Subject,
+    source: Form,
+    receipts: &mut Vec<OptionPresentationReceiptPlan>,
+    edits: &mut Vec<((LocalDefId, HirId), UseEdit)>,
+    composed: &mut Vec<((LocalDefId, HirId), Span)>,
+) {
+    let Form::Opt {
+        mutable: true,
+        slice: false,
+    } = source
+    else {
+        return;
+    };
+    let node = (subject.fn_did, subject.hir_id);
+    let Some(name) = subject.param_name.as_deref() else { return };
+    let Some((_, decision)) = table
+        .entries
+        .iter()
+        .find(|(candidate, _)| (candidate.fn_did, candidate.hir_id) == node)
+    else {
+        return;
+    };
+    let uses = match decision {
+        super::Decision::Opt { uses, .. } => uses,
+        super::Decision::Ref { .. }
+        | super::Decision::InferredRef { .. }
+        | super::Decision::Slice { .. }
+        | super::Decision::NestedSlice { .. }
+        | super::Decision::Cursor { .. }
+        | super::Decision::Box(_)
+        | super::Decision::Degraded(_) => return,
+    };
+    let Some(body_id) = tcx.hir_node_by_def_id(subject.fn_did).body_id() else { return };
+    struct Calls<'a>(Vec<&'a Expr<'a>>);
+    impl<'tcx> Visitor<'tcx> for Calls<'tcx> {
+        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
+            if let ExprKind::Call(..) = expr.kind {
+                self.0.push(expr);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let mut calls = Calls(Vec::new());
+    calls.visit_body(tcx.hir_body(body_id));
+    let sm = tcx.sess.source_map();
+    let unsafe_fn = tcx
+        .fn_sig(subject.fn_did)
+        .skip_binder()
+        .skip_binder()
+        .safety
+        .is_unsafe();
+    for call in calls.0 {
+        let ExprKind::Call(callee, _) = call.kind else { continue };
+        let call_span = call.span.source_callsite();
+        let inside = |span: Span| {
+            let span = span.source_callsite();
+            call_span.lo() <= span.lo() && span.hi() <= call_span.hi()
+        };
+        let own = uses
+            .iter()
+            .filter(|edit| inside(edit.span))
+            .collect::<Vec<_>>();
+        if own.len() < 2 {
+            continue;
+        }
+        let reason = if own.iter().any(|edit| edit.bridge_kind != "subject-use") {
+            Some("option-call-reborrow:non-dereference-use-inside-call")
+        } else if own
+            .iter()
+            .any(|edit| inside(edit.span) && callee.span.contains(edit.span))
+        {
+            Some("option-call-reborrow:subject-in-callee-position")
+        } else if own.iter().any(|edit| {
+            !(edit.replacement.contains(".as_mut().unwrap()")
+                || edit.replacement.contains(".as_deref_mut()"))
+        }) {
+            Some("option-call-reborrow:accessor-not-a-mutable-reborrow")
+        } else {
+            None
+        };
+        let own_spans = own
+            .iter()
+            .map(|edit| edit.span.source_callsite())
+            .collect::<Vec<_>>();
+        let all = super::construction::collect_composable_edits(table, call_span);
+        // Everything inside the call that is not this subject's own accessor:
+        // other subjects' edits, argument bridges, body adapters.
+        let others = all
+            .iter()
+            .filter(|(span, _)| !own_spans.contains(span))
+            .cloned()
+            .collect::<Vec<_>>();
+        let foreign_inside_bridge = others.iter().any(|(outer, _)| {
+            others.iter().any(|(inner, _)| {
+                inner != outer && outer.lo() <= inner.lo() && inner.hi() <= outer.hi()
+            })
+        });
+        let original = sm.span_to_snippet(call_span).unwrap_or_default();
+        let composed_text = if reason.is_some() {
+            Err(String::new())
+        } else if foreign_inside_bridge {
+            Err("option-call-reborrow:nested-foreign-edits".to_owned())
+        } else if original.is_empty() {
+            Err("option-call-reborrow:call-text-unavailable".to_owned())
+        } else {
+            super::construction::compose_initializer(call_span, &original, &others)
+                .map_err(|why| format!("option-call-reborrow:{why}"))
+        };
+        // A call that is not hoisted keeps its pre-existing per-access
+        // rendering: that is not a failure of the Option family (the compiler
+        // decides E0499 per call at verify time), so the skip is recorded on
+        // the receipt's adapter and does not withdraw the owner.
+        let (adapter, terminal) = match (reason, composed_text) {
+            (Some(reason), _) => (format!("skipped:{reason}"), None),
+            (None, Err(why)) => (format!("skipped:{why}"), None),
+            (None, Ok(text)) => {
+                let replacement =
+                    format!("({{ let {name} = {name}.as_deref_mut().unwrap(); {text} }})");
+                edits.push((
+                    node,
+                    UseEdit {
+                        span: call_span,
+                        replacement,
+                        bridge_kind: "option-value-composed",
+                    },
+                ));
+                composed.extend(all.iter().map(|(span, _)| (node, *span)));
+                ("option-call-reborrow".to_owned(), None)
+            }
+        };
+        let _ = unsafe_fn;
+        receipts.push(super::option::receipt(
+            tcx,
+            subject,
+            call.hir_id,
+            MechanicalFamily::OptUseUnsupported,
+            "call-reborrow",
+            source,
+            source,
+            adapter,
+            terminal,
+            MechanicalEvidence::default(),
+        ));
+    }
+}
+
+/// Wave-6o (relay 009). A PARAMETER that some local caller passes the null
+/// literal is nullable by that caller's evidence — the argument is the
+/// parameter's construction site, and a null literal there is the same fact
+/// as `let p = 0 as *mut T` at a local. The optional form follows (null =
+/// `None`, the existing `null-argument` carrier renders the literal); a plain
+/// reference at such a parameter would be `arg-null-literal` at the class
+/// gate, which is what the corpus shows.
+pub(super) fn param_receives_null_literal(facts: &EmitabilityFacts, subject: &Subject) -> bool {
+    let SubjectKind::Param { hir_index } = subject.kind else { return false };
+    facts.call_args.get(&subject.fn_did).is_some_and(|sites| {
+        sites.iter().any(|site| {
+            site.args
+                .iter()
+                .any(|arg| arg.index == hir_index && matches!(arg.shape, ArgShape::NullLit))
+        })
+    })
+}
+
+/// Wave-6o (relay 113, R674-7 (2)): an EXPORTED entry's formal handed on
+/// unchanged (a bare path) to a local callee whose own body null-tests that
+/// formal is nullable by that test — the evidence sits one call down. The
+/// entry's callers outside the program are not seen, and the callee is written
+/// to receive the null they may pass (binn's `binn_list_add(NULL, ..)` →
+/// `binn_list_add_raw`'s `item == NULL`). An unexported function's callers are
+/// all in the program, so their actuals stay the evidence there.
+/// Wave-6o (relay 125, R744-1): forward nullability, actual → formal (§29's
+/// "propagated to the formal"). A formal that some caller passes a binding
+/// carrying its OWN nullability evidence — an `is_null` use, a null literal at
+/// its construction or an assignment, or (for a caller parameter) a
+/// null-literal argument of its own — is nullable by that evidence, unless the
+/// callee dereferences the formal itself: a NULL there is the input's UB (§28),
+/// and the formal keeps its plain form.
+pub(super) fn param_receives_nullable_actual(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    opt_uses: &FxHashMap<(LocalDefId, HirId), OptUses>,
+    null_initialized: &dyn Fn((LocalDefId, HirId)) -> bool,
+    subject: &Subject,
+) -> bool {
+    let SubjectKind::Param { hir_index } = subject.kind else { return false };
+    if entry_dereferences(tcx, subject.fn_did, subject.hir_id)
+        || !hands_on_only_to_pointee_formals(tcx, facts, subject.fn_did, subject.hir_id, 4)
+    {
+        return false;
+    }
+    let caller_param_receives_null = |caller: LocalDefId, binding: HirId| {
+        let Some(body) = tcx.hir_maybe_body_owned_by(caller) else { return false };
+        let Some(index) = body.params.iter().position(|p| p.pat.hir_id == binding) else {
+            return false;
+        };
+        facts.call_args.get(&caller).is_some_and(|sites| {
+            sites.iter().any(|site| {
+                site.args
+                    .iter()
+                    .any(|arg| arg.index == index && matches!(arg.shape, ArgShape::NullLit))
+            })
+        })
+    };
+    facts.call_args.get(&subject.fn_did).is_some_and(|sites| {
+        sites.iter().any(|site| {
+            site.args.iter().any(|arg| {
+                let ArgShape::BareLocal(binding) = arg.shape else { return false };
+                if arg.index != hir_index {
+                    return false;
+                }
+                let node = (site.caller, binding);
+                facts
+                    .raw_only_uses
+                    .get(&node)
+                    .is_some_and(|uses| uses.iter().any(|(op, _)| op == "is_null"))
+                    || opt_uses.get(&node).is_some_and(|uses| uses.null_assigned)
+                    || null_initialized(node)
+                    || caller_param_receives_null(site.caller, binding)
+            })
+        })
+    })
+}
+
+/// Relay 127 (wave-6a 135's cascade): does every BARE hand-on of `binding`,
+/// followed through local callees up to `depth` levels, reach only formals that
+/// access their pointee alone? A reached formal with an extent-leaving raw use
+/// (`offset`, `add`, … — `*x.offset(k)`) wants a slice, and an optional made
+/// above it would meet that slice formal; such a formal is left to the flow rule
+/// that treats it as an array use (main's 55). Foreign callees are not walked:
+/// a thin reference at a foreign C-string position is `thin_extent`'s.
+fn hands_on_only_to_pointee_formals(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    function: LocalDefId,
+    binding: HirId,
+    depth: usize,
+) -> bool {
+    const EXTENT_LEAVING: &[&str] = &[
+        "offset",
+        "wrapping_offset",
+        "add",
+        "sub",
+        "wrapping_add",
+        "wrapping_sub",
+        "offset_from",
+    ];
+    if facts
+        .raw_only_uses
+        .get(&(function, binding))
+        .is_some_and(|uses| {
+            uses.iter()
+                .any(|(op, _)| EXTENT_LEAVING.contains(&op.as_str()))
+        })
+    {
+        return false;
+    }
+    if depth == 0 {
+        return true;
+    }
+    facts.call_args.iter().all(|(callee, sites)| {
+        sites
+            .iter()
+            .filter(|site| site.caller == function)
+            .all(|site| {
+                site.args.iter().all(|arg| {
+                    if !matches!(arg.shape, ArgShape::BareLocal(b) if b == binding) {
+                        return true;
+                    }
+                    let Some(param) = tcx
+                        .hir_maybe_body_owned_by(*callee)
+                        .and_then(|body| body.params.get(arg.index).map(|p| p.pat.hir_id))
+                    else {
+                        return true;
+                    };
+                    hands_on_only_to_pointee_formals(tcx, facts, *callee, param, depth - 1)
+                })
+            })
+    })
+}
+
+/// Does `function`'s own body dereference `binding` (`*x`, `(*x).f`)? An
+/// entry that does is not written to receive NULL: a NULL actual is already
+/// the input's UB there (§28), so a callee's null test is no evidence for it.
+fn entry_dereferences(tcx: TyCtxt<'_>, function: LocalDefId, binding: HirId) -> bool {
+    struct Derefs {
+        binding: HirId,
+        found: bool,
+    }
+    impl<'tcx> Visitor<'tcx> for Derefs {
+        fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+            if let ExprKind::Unary(rustc_hir::UnOp::Deref, mut base) = e.kind {
+                while let ExprKind::DropTemps(inner) | ExprKind::Cast(inner, _) = base.kind {
+                    base = inner;
+                }
+                if matches!(base.kind, ExprKind::Path(rustc_hir::QPath::Resolved(_, path))
+                    if path.res == Res::Local(self.binding))
+                {
+                    self.found = true;
+                }
+            }
+            intravisit::walk_expr(self, e);
+        }
+    }
+    let Some(body) = tcx.hir_maybe_body_owned_by(function) else { return true };
+    let mut v = Derefs {
+        binding,
+        found: false,
+    };
+    v.visit_expr(body.value);
+    v.found
+}
+
+pub(super) fn exported_param_handed_to_null_tested_formal(
+    tcx: TyCtxt<'_>,
+    facts: &EmitabilityFacts,
+    subject: &Subject,
+) -> bool {
+    let SubjectKind::Param { .. } = subject.kind else { return false };
+    if !super::exported_pair::exported(tcx, subject.fn_did)
+        || entry_dereferences(tcx, subject.fn_did, subject.hir_id)
+    {
+        return false;
+    }
+    facts.call_args.iter().any(|(callee, sites)| {
+        sites
+            .iter()
+            .filter(|site| site.caller == subject.fn_did)
+            .any(|site| {
+                site.args.iter().any(|arg| {
+                    matches!(arg.shape, ArgShape::BareLocal(binding) if binding == subject.hir_id)
+                        && tcx
+                            .hir_maybe_body_owned_by(*callee)
+                            .and_then(|body| body.params.get(arg.index))
+                            .and_then(|param| facts.raw_only_uses.get(&(*callee, param.pat.hir_id)))
+                            .is_some_and(|uses| uses.iter().any(|(op, _)| op == "is_null"))
+                })
+            })
+    })
+}
+
+/// `&*e` / `&mut *e` (under casts) where `e` is RAW-typed: the address of one
+/// element of an unknown allocation. A slice built from it by `from_ref` is
+/// one element long; see `plan_values`.
+pub(super) fn address_of_raw_dereference(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    expression: &Expr<'_>,
+) -> bool {
+    let mut expr = expression;
+    while let ExprKind::Cast(inner, _) = expr.kind {
+        expr = inner;
+    }
+    let ExprKind::AddrOf(_, _, place) = expr.kind else { return false };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, base) = place.kind else { return false };
+    matches!(tcx.typeck(owner).expr_ty(base).kind(), TyKind::RawPtr(..))
+}
+
+/// The emitability collector's `owned_by_call_argument`, for a cast: a cast
+/// that is (through `DropTemps`) a call argument is a boundary site, not an
+/// address observation.
+fn cast_owned_by_call_argument(tcx: TyCtxt<'_>, cast: &Expr<'_>) -> bool {
+    let mut child = cast.hir_id;
+    for _ in 0..4 {
+        let Node::Expr(parent) = tcx.parent_hir_node(child) else { return false };
+        match &parent.kind {
+            ExprKind::Call(_, args) if args.iter().any(|arg| arg.hir_id == child) => return true,
+            ExprKind::DropTemps(inner) if inner.hir_id == child => child = parent.hir_id,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// **Relay 024 / R447-5 — the SUFFIX of a delivered slice.**
+///
+/// `s = &*data.offset(l) as *const u8` assigns a computed VIEW of `data`, and
+/// when `data` is delivered as a slice the value is that slice's suffix, not a
+/// one-element carrier: a destination read at `*s.offset(0)` **and**
+/// `*s.offset(1)` indexes past the single element `from_ref` would give, which
+/// is why the planner held such a row (`option-slice-value:one-element-carrier`,
+/// report 009). The sound delivery is `Some(&data[l..])` — bounds-checked, and
+/// forward by the same guard the source side uses (wave-6s2's W6S2-5): the
+/// delta is a non-negative literal or an unsigned-typed expression, the base is
+/// a different local delivered as a slice, and the spine is exactly C2Rust's
+/// `&*…` / `&mut *…` under identity casts.
+pub(super) struct SliceSuffixView {
+    /// The base's emitted name.
+    pub base: String,
+    /// The delta expression, already `usize`-typed for the range.
+    pub delta: String,
+    /// Does the view borrow mutably?
+    pub mutable: bool,
+}
+
+pub(super) fn slice_suffix_view(
+    tcx: TyCtxt<'_>,
+    table: &DecisionTable,
+    owner: LocalDefId,
+    subject_hir: HirId,
+    expression: &Expr<'_>,
+    // **Relay 032 (R455-2) — the DESTINATION's decided mutability is the
+    // authority, not the `&mut` C2Rust writes into every place expression.**
+    // `p = &mut *src.offset(2) as *mut f32` with `p` read only (`*p.offset(0)
+    // + *p.offset(1)`) settles `Opt { mutable: false }`, and a shared base
+    // supplies that view; requiring a mutable base from the spine's syntax
+    // refused the row for a mutability nothing uses.
+    destination_mutable: bool,
+) -> Option<SliceSuffixView> {
+    let typeck = tcx.typeck(owner);
+    let mut expr = expression;
+    // Identity casts only: a cast that changes the pointee is the caller's
+    // `option-value-cast-pointee-unbuilt` refusal, not a suffix.
+    while let ExprKind::Cast(inner, _) = expr.kind {
+        if !matches!(
+            typeck.expr_ty(inner).kind(),
+            TyKind::RawPtr(..) | TyKind::Ref(..)
+        ) {
+            return None;
+        }
+        expr = inner;
+    }
+    let ExprKind::AddrOf(_, _, place) = expr.kind else { return None };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, advanced) = place.kind else { return None };
+    let ExprKind::MethodCall(segment, receiver, [delta], _) = advanced.kind else { return None };
+    if segment.ident.name.as_str() != "offset" {
+        return None;
+    }
+    let mut base = receiver;
+    while let ExprKind::Cast(inner, _) = base.kind {
+        base = inner;
+    }
+    let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = base.kind else { return None };
+    let Res::Local(binding) = path.res else { return None };
+    // A self-advance (`s = &*s.offset(1)`) is the cursor family's, not this arm's.
+    if binding == subject_hir {
+        return None;
+    }
+    let (source, decision) = table
+        .entries
+        .iter()
+        .find(|(source, _)| source.fn_did == owner && source.hir_id == binding)?;
+    let base_mutable = match decision {
+        Decision::Slice { mutable, .. } => *mutable,
+        Decision::Opt {
+            slice: true,
+            mutable,
+            ..
+        } => *mutable,
+        Decision::Ref { .. }
+        | Decision::InferredRef { .. }
+        | Decision::NestedSlice { .. }
+        | Decision::Cursor { .. }
+        | Decision::Opt { .. }
+        | Decision::Box(_)
+        | Decision::Degraded(_) => return None,
+    };
+    // A shared base cannot supply a mutable view — asked of the destination's
+    // own form, which is what the value is used through.
+    if destination_mutable && !base_mutable {
+        return None;
+    }
+    let delta = forward_delta(tcx, owner, delta)?;
+    Some(SliceSuffixView {
+        base: source.param_name.clone()?,
+        delta,
+        mutable: destination_mutable,
+    })
+}
+
+/// The delta text, `usize`-typed, when the offset is provably forward: a
+/// non-negative integer literal under its `as` casts, or an unsigned-typed
+/// expression. Anything else (a signed variable, an arithmetic expression that
+/// may go backwards) stays with the cursor family.
+fn forward_delta(tcx: TyCtxt<'_>, owner: LocalDefId, delta: &Expr<'_>) -> Option<String> {
+    let mut inner = delta;
+    while let ExprKind::Cast(next, _) = inner.kind {
+        inner = next;
+    }
+    if let ExprKind::Lit(literal) = inner.kind
+        && let rustc_ast::LitKind::Int(value, _) = literal.node
+    {
+        return Some(format!("{}", value.get()));
+    }
+    // Read the index from the PEELED expression: C2Rust's `l as isize` is the
+    // cast `offset` wants, and a range wants the unsigned value itself rather
+    // than `(l as isize) as usize` round-tripped back through it.
+    let text = tcx.sess.source_map().span_to_snippet(inner.span).ok()?;
+    match tcx.typeck(owner).expr_ty(inner).kind() {
+        TyKind::Uint(rustc_middle::ty::UintTy::Usize) => Some(text),
+        TyKind::Uint(_) => Some(format!("({text}) as usize")),
+        _ => None,
+    }
+}
+
+/// **Relay 027 / R450-9 — the destination inherits the base's FAT twin.**
+///
+/// `s = &*data.offset(l)` where `data` is an array gives `s` that array's
+/// suffix, so the optional form `s` takes must be the fat one
+/// (`Option<&[T]>`): the assignment IS the extent evidence — the suffix
+/// carries the base's own length — so no `FALLBACK_SLICE_EXTENT` is
+/// fabricated and nothing is widened; `None` stays `None`.
+///
+/// Read at ladder time, where the base's own decision does not exist yet: the
+/// evidence is the fatness verdict for the base (the same authority the
+/// `Slice` arm uses) plus the spine and forward-delta guard of
+/// [`slice_suffix_view`].
+pub(super) fn assigned_forward_view_of_a_fat_base(
+    tcx: TyCtxt<'_>,
+    subject: &Subject,
+    subjects: &[Subject],
+    fat: &crate::bo_rewriter::fat_facts::FatFacts,
+    opt_uses: &FxHashMap<(LocalDefId, HirId), OptUses>,
+) -> bool {
+    let Some(uses) = opt_uses.get(&(subject.fn_did, subject.hir_id)) else {
+        return false;
+    };
+    uses.assignments.iter().any(|assignment| {
+        let Node::Expr(expression) = tcx.hir_node(assignment.rhs) else { return false };
+        forward_view_base(tcx, subject.fn_did, subject.hir_id, expression).is_some_and(|binding| {
+            subjects
+                .iter()
+                .find(|source| source.fn_did == subject.fn_did && source.hir_id == binding)
+                .is_some_and(|source| fat.is_array(source.fn_did, source.local))
+        })
+    })
+}
+
+/// The base binding of `&*BASE.offset(DELTA)` (under identity casts) when the
+/// delta is forward and the base is a different local — the spine
+/// [`slice_suffix_view`] renders, without the decision the ladder cannot see.
+fn forward_view_base(
+    tcx: TyCtxt<'_>,
+    owner: LocalDefId,
+    subject_hir: HirId,
+    expression: &Expr<'_>,
+) -> Option<HirId> {
+    let typeck = tcx.typeck(owner);
+    let mut expr = expression;
+    while let ExprKind::Cast(inner, _) = expr.kind {
+        if !matches!(
+            typeck.expr_ty(inner).kind(),
+            TyKind::RawPtr(..) | TyKind::Ref(..)
+        ) {
+            return None;
+        }
+        expr = inner;
+    }
+    let ExprKind::AddrOf(_, _, place) = expr.kind else { return None };
+    let ExprKind::Unary(rustc_hir::UnOp::Deref, advanced) = place.kind else { return None };
+    let ExprKind::MethodCall(segment, receiver, [delta], _) = advanced.kind else { return None };
+    if segment.ident.name.as_str() != "offset" {
+        return None;
+    }
+    let mut base = receiver;
+    while let ExprKind::Cast(inner, _) = base.kind {
+        base = inner;
+    }
+    let ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = base.kind else { return None };
+    let Res::Local(binding) = path.res else { return None };
+    if binding == subject_hir {
+        return None;
+    }
+    forward_delta(tcx, owner, delta).map(|_| binding)
+}

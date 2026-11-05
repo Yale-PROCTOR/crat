@@ -1,0 +1,480 @@
+//! Offset-derived copy initializers from the frozen heman corpus: unannotated
+//! slice locals delivered with an explicit declaration and item 2's constructor.
+
+use super::decision::Decision;
+
+fn compact(source: &str) -> String {
+    source.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+fn emitted(input: &str, binding: &str) -> (String, Decision) {
+    emitted_reverting(input, binding, false)
+}
+
+fn emitted_reverting(input: &str, binding: &str, withdraw: bool) -> (String, Decision) {
+    let (source, decision) = ::utils::compilation::run_compiler_on_str(input, move |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("original AST");
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::OverlapMode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        for (subject, decision) in &table.entries {
+            println!("DECISION {} {decision:?}", subject.label);
+        }
+        let emission =
+            super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
+                .expect("emission plan");
+        let mut held = emission.plan.held_classes();
+        if withdraw {
+            let owner = table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some(binding))
+                .unwrap()
+                .0
+                .fn_did;
+            held.insert(super::bridge_receipt::SignatureClassId::of(owner));
+        }
+        let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+            &held,
+            &Default::default(),
+            &table,
+        )
+        .expect("held classes");
+        let source = super::ast_transform::ast_emitted_files_from(
+            tcx,
+            &capture,
+            &reverts,
+            emission.plan.root_file.as_ref(),
+            &table,
+            Some(&emission.plan.terminal_call_plans),
+        )
+        .expect("AST emission")
+        .0
+        .into_values()
+        .next()
+        .expect("one source");
+        println!("EMITTED\n{source}");
+        let (subject, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some(binding))
+            .expect("copy subject");
+        assert!(
+            withdraw
+                || !held.contains(&super::bridge_receipt::SignatureClassId::of(subject.fn_did)),
+            "the owner must be placed: {:?}",
+            emission
+                .plan
+                .class_finalization
+                .classes
+                .get(&super::bridge_receipt::SignatureClassId::of(subject.fn_did))
+        );
+        (source, decision.clone())
+    })
+    .expect("input compiles");
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    (source, decision)
+}
+
+/// heman `_match`: a raw-field base offset by a computed pixel index, read at
+/// three constant offsets.
+const MATCH: &str = r#"
+    #[repr(C)]
+    pub struct heman_image { pub width: i32, pub height: i32, pub nbands: i32, pub data: *mut f32 }
+    pub unsafe fn _match(mask: *mut heman_image, mask_color: u32, pixel_index: i32) -> i32 {
+        let mut mcolor = ((*mask).data).offset((pixel_index * 3) as isize);
+        let r1 = (*mcolor.offset(0) * 255.0) as u8;
+        let g1 = (*mcolor.offset(1) * 255.0) as u8;
+        let b1 = (*mcolor.offset(2) * 255.0) as u8;
+        let r2 = (mask_color >> 16) as u8;
+        (r1 == r2 && g1 == b1) as i32
+    }
+"#;
+
+/// heman `heman_ops_emboss`: a per-row destination pointer written through a
+/// counted inner loop.
+const EMBOSS: &str = r#"
+    #[repr(C)]
+    pub struct heman_image { pub width: i32, pub height: i32, pub nbands: i32, pub data: *mut f32 }
+    pub unsafe fn emboss(result: *mut heman_image, width: i32, height: i32) {
+        let mut y = 0;
+        while y < height {
+            let mut dst = ((*result).data).offset((y * width) as isize);
+            let mut x = 0;
+            while x < width {
+                *dst.offset(x as isize) = (x + y) as f32;
+                x += 1;
+            }
+            y += 1;
+        }
+    }
+"#;
+
+#[test]
+fn wave6k_heman_match_offset_copy_is_a_declared_slice() {
+    let (source, decision) = emitted(MATCH, "mcolor");
+    assert!(matches!(decision, Decision::Slice { .. }), "{decision:?}");
+    let compact_source = compact(&source);
+    assert!(compact_source.contains("mcolor:&[f32]="), "{source}");
+    assert!(compact_source.contains("from_raw_parts("), "{source}");
+    assert!(compact_source.contains("mcolor[0"), "{source}");
+}
+
+#[test]
+fn wave6k_heman_emboss_row_offset_copy_is_a_declared_slice() {
+    let (source, decision) = emitted(EMBOSS, "dst");
+    assert!(
+        matches!(decision, Decision::Slice { mutable: true, .. }),
+        "{decision:?}"
+    );
+    let compact_source = compact(&source);
+    assert!(compact_source.contains("dst:&mut[f32]="), "{source}");
+    assert!(compact_source.contains("from_raw_parts_mut("), "{source}");
+    assert!(compact_source.contains("dst[(x)asusize]="), "{source}");
+}
+
+/// genann `load_data`: the base is itself a delivered slice parameter; the
+/// constructor composes the base's own use rewrite.
+#[test]
+fn wave6k_genann_load_data_offset_copy_of_a_slice_parameter() {
+    let (source, decision) = emitted(
+        r#"
+        pub unsafe fn load_data(input: *mut f64, class: *mut f64, n: i32) {
+            let mut i = 0;
+            while i < n {
+                let mut p = input.offset((i * 4) as isize);
+                let mut c = class.offset((i * 3) as isize);
+                *p.offset(0) = 1.0;
+                *c.offset(0) = 0.0;
+                *c.offset(1) = 1.0;
+                i += 1;
+            }
+        }
+    "#,
+        "c",
+    );
+    assert!(
+        matches!(decision, Decision::Slice { mutable: true, .. }),
+        "{decision:?}"
+    );
+    let compact_source = compact(&source);
+    assert!(compact_source.contains("c:&mut[f64]="), "{source}");
+    assert!(compact_source.contains("c[0]=0.0"), "{source}");
+}
+
+/// Owner withdrawal restores the untyped copy and its raw uses.
+#[test]
+fn wave6k_withdrawn_owner_restores_the_untyped_offset_copy() {
+    let (source, _) = emitted_reverting(EMBOSS, "dst", true);
+    assert!(source.contains("result: *mut heman_image"), "{source}");
+    assert!(
+        source.contains("let mut dst = ((*result).data).offset("),
+        "{source}"
+    );
+    assert!(!source.contains("from_raw_parts_mut"), "{source}");
+    assert!(!source.contains("dst: &mut [f32]"), "{source}");
+}
+
+/// heman `transform_to_distance` → `edt`: the caller's offset copies `f` / `z`
+/// are arguments of a LOCAL callee whose own parameters were delivered before.
+/// A candidate on a shared interface must be declined up front (R397-6(b)):
+/// attempting it withdraws the callee's prior delivery (R398-1).
+const TRANSFORM_EDT: &str = r#"
+    pub unsafe fn edt(f: *mut f32, z: *mut f32, n: i32) {
+        *z.offset(0) = -1.0;
+        *z.offset(1) = 1.0;
+        let mut q = 1;
+        while q < n {
+            *z.offset(q as isize) = *f.offset(q as isize) - *z.offset((q - 1) as isize);
+            q += 1;
+        }
+    }
+    pub unsafe fn transform(ff: *mut f32, zz: *mut f32, width: i32, height: i32) {
+        let mut x = 0;
+        while x < width {
+            let mut f = ff.offset((height * x) as isize);
+            let mut z = zz.offset(((height + 1) * x) as isize);
+            let mut y = 0;
+            while y < height {
+                *f.offset(y as isize) = (x + y) as f32;
+                y += 1;
+            }
+            edt(f, z, height);
+            x += 1;
+        }
+    }
+    // wave-5d 150 (R934-1 (i)): a live caller of two separate arrays, so
+    // `transform`'s own pair is certified (R931-1's caller side) at `edt(f, z)`
+    // rather than held as an unknown relation (an uncalled function's
+    // vacuity does not seed (e): R901-2, deferred).
+    #[no_mangle]
+    pub unsafe extern "C" fn __crat_test_live() {
+        let mut a = [0f32; 64];
+        let mut b = [0f32; 72];
+        transform(a.as_mut_ptr(), b.as_mut_ptr(), 8, 8);
+    }
+"#;
+
+#[test]
+fn wave6k_copy_passed_to_a_local_callee_is_declined_and_the_callee_keeps_its_delivery() {
+    ::utils::compilation::run_compiler_on_str(TRANSFORM_EDT, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::OverlapMode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native decisions");
+        for (subject, decision) in &table.entries {
+            println!("DECISION {} {decision:?}", subject.label);
+        }
+        for receipt in &ctx.raw_boundary_artifacts.additive_family_receipts {
+            println!(
+                "WITHDRAWAL {:?}",
+                (
+                    &receipt.family,
+                    &receipt.owner_path,
+                    &receipt.cause,
+                    &receipt.subjects
+                )
+            );
+        }
+        let decision_of = |label: &str| {
+            table
+                .entries
+                .iter()
+                .find(|(s, _)| s.label == label)
+                .map(|(_, d)| d.clone())
+                .unwrap_or_else(|| panic!("no subject {label}"))
+        };
+        assert!(
+            matches!(decision_of("edt::f"), Decision::Slice { .. }),
+            "the callee keeps its delivered slice: {:?}",
+            decision_of("edt::f")
+        );
+        assert!(
+            matches!(decision_of("transform::f"), Decision::Degraded(_)),
+            "a copy on a shared interface is declined up front: {:?}",
+            decision_of("transform::f")
+        );
+        // Re-pinned under R896-1 (2) (wave-5d 146c; 145c, R892-1): at the
+        // Return stage `edt(f, z)` hands two raw locals derived from
+        // `transform`'s two formals, and `edt::z` is a cursor candidate beside
+        // the slice `f`. Nothing shows the pair disjoint (`transform` is dead,
+        // but `f` / `z` are not its formals: R819-2's local-copy control), so
+        // the site gate holds it and withdraws that one candidate. Nothing
+        // else may touch the callee, and `edt::f` keeps its delivery (above).
+        let callee_withdrawals = ctx
+            .raw_boundary_artifacts
+            .additive_family_receipts
+            .iter()
+            .filter(|r| r.owner_path == "edt")
+            .collect::<Vec<_>>();
+        assert!(
+            callee_withdrawals.iter().all(|r| r.cause.contains(":pair:")
+                && r.subjects.iter().all(|subject| subject.0 == "edt::z#2")),
+            "only the pair hold's `edt::z` candidate may be withdrawn: {:?}",
+            callee_withdrawals
+                .iter()
+                .map(|r| (&r.cause, &r.subjects))
+                .collect::<Vec<_>>()
+        );
+    })
+    .expect("input compiles");
+}
+
+/// wave-6s2's pin (relay wave-6k/011 §2): a local initialised by a call to a
+/// LOCAL callee whose return the return family converts is the return
+/// receiver's; this rule must not plan a `from_raw_parts` over it.
+const BARE_RESLICE_RETURN: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ pub unsafe fn chunk_data(mut chunk: *mut u8) -> *mut u8 { return chunk.offset(8); }
+ pub unsafe fn use_it(mut chunk: *mut u8) -> u8 { let a = *chunk.offset(2); let d = chunk_data(chunk); a.wrapping_add(*d.offset(1)) }
+"#;
+
+#[test]
+fn wave6k_call_initialised_slice_local_yields_to_the_return_receiver() {
+    let (source, _) = emitted(BARE_RESLICE_RETURN, "d");
+    let text = compact(&source);
+    assert!(
+        text.contains("fnchunk_data<'a>(mutchunk:&'a[u8])->&'a[u8]{return&chunk[8..];}"),
+        "{source}"
+    );
+    assert!(text.contains("letd:&[u8]=chunk_data(chunk);"), "{source}");
+    assert!(!text.contains("from_raw_parts(chunk_data("), "{source}");
+}
+
+/// R395-2 fix-2 (relay wave-6k/012 §1, wave-6a 005 claim 2(ii)): a copy of a
+/// THIN reference parameter must not become a slice constructed over it —
+/// `from_raw_parts(a, …)` with `a: &i32` widens a one-element claim.
+#[test]
+fn wave6k_thin_reference_root_is_never_widened() {
+    ::utils::compilation::run_compiler_on_str(
+        r#"
+        pub unsafe fn f(a: *const i32) -> i32 { let p = a; *p.offset(1) }
+    "#,
+        |tcx| {
+            let (table, _) = super::decide_table_with_ctx_config(
+                tcx,
+                Some((
+                    super::OverlapMode::PreciseReplay,
+                    Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+                )),
+            )
+            .expect("native decisions");
+            for (subject, decision) in &table.entries {
+                println!("DECISION {} {decision:?}", subject.label);
+            }
+            let (subject, decision) = table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .expect("subject");
+            assert!(
+                matches!(decision, Decision::Degraded(_)),
+                "{} must keep its hold, never a slice over a thin root: {decision:?}",
+                subject.label
+            );
+        },
+    )
+    .expect("input compiles");
+}
+
+/// The mutable spelling of C2Rust's address-of-element idiom (lodepng
+/// `lodepng_compute_color_stats::color`, `&mut *…as *mut u8`). The reference
+/// narrows provenance to one element, so a slice built over it is
+/// Stacked-Borrows UB at its own retag — even at the true length (report 022,
+/// Miri `narrow4`); peeled, it is clean under SB and TB (`peeled`).
+const MUTABLE_ADDRESS_OF: &str = r#"
+    #[repr(C)]
+    pub struct Buf { pub data: *mut u8, pub count: u32 }
+    pub unsafe fn fill(b: *mut Buf, idx: isize) {
+        let mut row = &mut *((*b).data).offset(idx) as *mut u8;
+        *row.offset(0) = 1;
+        *row.offset(1) = 2;
+    }
+"#;
+
+/// brotli `BrotliTransformDictionaryWord::{prefix,suffix}`: the same idiom with
+/// the shared spelling over a raw POINTER field.
+const POINTER_FIELD_ADDRESS_OF: &str = r#"
+    #[repr(C)]
+    pub struct Transforms { pub prefix_suffix: *const u8, pub count: u32 }
+    pub unsafe fn word(t: *const Transforms, idx: isize) -> u32 {
+        let mut prefix = &*((*t).prefix_suffix).offset(idx) as *const u8;
+        (*prefix.offset(0) as u32).wrapping_add(*prefix.offset(1) as u32)
+    }
+"#;
+
+#[test]
+fn wave6k_a_mutable_element_address_is_not_the_slices_root() {
+    let (source, decision) = emitted(MUTABLE_ADDRESS_OF, "row");
+    assert!(matches!(decision, Decision::Slice { .. }), "{decision:?}");
+    assert!(
+        compact(&source).contains(&compact(
+            "core::slice::from_raw_parts_mut(((*b).data).offset(idx)"
+        )),
+        "the root must be the raw pointer, not the one-element reference: {source}"
+    );
+    assert!(
+        !compact(&source).contains(&compact("from_raw_parts_mut(&mut *")),
+        "the address-of wrapper must be peeled: {source}"
+    );
+}
+
+#[test]
+fn wave6k_a_shared_element_address_is_not_the_slices_root() {
+    let (source, decision) = emitted(POINTER_FIELD_ADDRESS_OF, "prefix");
+    assert!(matches!(decision, Decision::Slice { .. }), "{decision:?}");
+    assert!(
+        compact(&source).contains(&compact(
+            "core::slice::from_raw_parts(((*t).prefix_suffix).offset(idx)"
+        )),
+        "the root must be the raw pointer, not the one-element reference: {source}"
+    );
+    assert!(
+        !compact(&source).contains(&compact("from_raw_parts(&*")),
+        "the address-of wrapper must be peeled: {source}"
+    );
+}
+
+/// lodepng `countZeros` (A12, relay 032 / slicecursor 044 §2): a parameter
+/// cursor and a local THIS family types whose initializer is the cursor's
+/// derived chain. With slicecursor's foreign-local rule in, the cursor's view
+/// edit and this construction claimed the same interval — the slice-use adapter
+/// dropped and the owner was withdrawn. The composition is one edit: the
+/// construction's raw source is the cursor's own view.
+///
+/// The gate (`Decision::Cursor` on the base) cannot be exercised end-to-end at
+/// this frame: three reductions of the corpus shape were probed and in each the
+/// base is `SliceCursorUse` / `RawPointerOperation` / not a subject, never a
+/// DELIVERED cursor, exactly as slicecursor 044 reports for the frame without
+/// their rule. What is deterministic, and what this witness pins, is the
+/// rendering the composition contributes.
+#[test]
+fn wave6k_a_cursor_derived_chain_renders_the_cursors_view() {
+    ::utils::compilation::run_compiler_on_str(
+        r#"
+pub unsafe fn count_zeros(mut data: *const u8, size: usize, pos: usize) -> u32 {
+    let mut start = data.offset(pos as isize);
+    let mut copy = data;
+    while data != start && *data == 0 { data = data.offset(1); }
+    let _ = (size, copy);
+    data.offset_from(start) as u32
+}
+"#,
+        |tcx| {
+            let mut rendered: Vec<(String, Option<String>)> = Vec::new();
+            for id in tcx.hir_crate_items(()).free_items() {
+                let did = id.owner_id.def_id;
+                if !matches!(tcx.def_kind(did.to_def_id()), rustc_hir::def::DefKind::Fn) {
+                    continue;
+                }
+                let body = tcx.hir_body_owned_by(did);
+                let rustc_hir::ExprKind::Block(block, _) = body.value.kind else { continue };
+                for statement in block.stmts {
+                    let rustc_hir::StmtKind::Let(local) = statement.kind else { continue };
+                    let Some(initializer) = local.init else { continue };
+                    let name = tcx
+                        .sess
+                        .source_map()
+                        .span_to_snippet(local.pat.span)
+                        .unwrap_or_default();
+                    rendered.push((
+                        name,
+                        super::decision::construction::cursor_view_text_for_tests(
+                            tcx,
+                            did,
+                            initializer,
+                            false,
+                        ),
+                    ));
+                }
+            }
+            let start = rendered
+                .iter()
+                .find(|(name, _)| name.contains("start"))
+                .expect("the derived local");
+            assert_eq!(
+                start.1.as_deref(),
+                Some("data.offset_by(pos as isize).as_ptr()"),
+                "the cursor's derived chain renders the cursor's view"
+            );
+            let copy = rendered
+                .iter()
+                .find(|(name, _)| name.contains("copy"))
+                .expect("the bare copy");
+            assert_eq!(
+                copy.1, None,
+                "a bare copy is the cursor family's own W-CUR-LOCAL view, not this rendering"
+            );
+        },
+    )
+    .expect("the fixture compiles");
+}

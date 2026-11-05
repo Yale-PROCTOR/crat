@@ -10,9 +10,9 @@ use rustc_span::{
 use rustc_type_ir::TyKind::FnDef;
 
 pub struct MirFunctionCall<'call, 'tcx> {
-    pub(crate) func: CallKind,
-    pub(crate) args: &'call [Spanned<Operand<'tcx>>],
-    pub(crate) destination: Place<'tcx>,
+    pub func: CallKind,
+    pub args: &'call [Spanned<Operand<'tcx>>],
+    pub destination: Place<'tcx>,
 }
 
 pub trait TerminatorExt<'tcx> {

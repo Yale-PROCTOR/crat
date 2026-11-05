@@ -1,0 +1,997 @@
+//! M1 golden tests — the ten hand-written pairs, landed **verbatim**.
+//!
+//! Source: `docs/agents/plan/2026-07-28-m05-m1-goldens.md` and its
+//! `testdata/m1-goldens/`. The `.rs` files here were copied byte-for-byte
+//! (verified by SHA-256 at copy time); they are the spec, not a restatement of
+//! it.
+//!
+//! # Formatting canonicalization (reviewer ruling, 2026-07-28)
+//!
+//! Comparison runs **after both sides pass through the same canonical
+//! formatter** — `rustfmt`, identical invocation, applied to emitted and
+//! expected alike.
+//!
+//! This is **not** editing expected text, and the distinction is the point:
+//! whitespace normalization is applied symmetrically by a tool neither side
+//! controls, whereas a *semantic* edit to a golden changes what the milestone
+//! is required to produce. Semantic edits stay ruling-gated — if a golden turns
+//! out to be unproducible by the pipeline, that is a **golden defect** to be
+//! escalated, never a licence to rewrite the expectation.
+//!
+//! Without canonicalization S0's RED would conflate two different failures —
+//! "no emitter yet" and "pretty-printer spaces differently" — and S1 would then
+//! meet the second disguised as a contract mismatch.
+//!
+//! # What RED means here, and how it shifted
+//!
+//! At S0 every golden failed on the *outcome* assertion, because `rewrite_m1`
+//! degraded unconditionally.
+//!
+//! From S1 that is no longer uniform, and the distinction is worth stating so a
+//! red test is read correctly:
+//!
+//! - **g02/g06** degrade, now with **attributed** per-subject reasons (S2a).
+//! - **g04/g05/g07/g08** have no pointer *parameters*, so S1–S2a produce no
+//!   subjects for them and `rewrite_m1` returns the input unchanged. They fail
+//!   on the **diff**, not on a missing-emitter message — their shapes (Box,
+//!   drops, stores) arrive in S3. Their RED therefore signals "shape not yet
+//!   implemented" only by virtue of the diff, which is weaker than the S0
+//!   signal and is recorded rather than papered over.
+//! - **g09** passes trivially — see its companion assertion below.
+
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
+
+use super::{RewriteOutcome, rewrite_m1};
+
+/// One golden pair, embedded at compile time so the test binary is
+/// self-contained.
+pub(super) struct Golden {
+    pub(super) name: &'static str,
+    pub(super) input: &'static str,
+    expected: &'static str,
+}
+
+macro_rules! goldens {
+    ($($name:literal),* $(,)?) => {
+        &[$(Golden {
+            name: $name,
+            input: include_str!(concat!("testdata/m1-goldens/", $name, ".input.rs")),
+            expected: include_str!(concat!("testdata/m1-goldens/", $name, ".expected.rs")),
+        }),*]
+    };
+}
+
+pub(super) const GOLDENS: &[Golden] = goldens![
+    "g01_ref_mut",
+    // **AMENDED 2026-08-07 (user ruling A, S3.2′-3 close).**
+    //
+    // SUPERSEDED EXPECTED TEXT: `p: Option<&mut i32>`. The hand-written expected
+    // followed the C declaration and predates the mechanism; the mutability
+    // authority ratified in §1 is USE-DERIVED — `subject.mutable`, the same
+    // field the plain-`Ref` arm reads — and g02's body only reads through `p`.
+    // The amendment conforms the text to that authority: a text correction, not
+    // a behaviour change, with nothing in the mechanism moved for it.
+    // Corrected, never erased.
+    //
+    // The note lives HERE and not in the fixture because the two fixture halves
+    // are compared byte for byte: a comment in only one of them is a diff.
+    // g02's own header — present in BOTH halves — carries the dimension it
+    // pins, which is what has to survive the amendment.
+    "g02_opt_ref",
+    "g03_ref_shared",
+    "g04_box_drop",
+    "g05_opt_box",
+    "g06_move_reroute",
+    "g07_nonDropping_store",
+    "g08_drop_all_paths",
+    "g09_pdrop_suppression",
+    "g10_mixed_group",
+    // U-5 slice 1. TRANSCRIBED from the ratified §8 table, not authored:
+    // g11 `*const i32` + `len`, indexed read -> `&[i32]`; g12 `*mut i32` +
+    // `len`, indexed write -> `&mut [i32]`. They land with their slice.
+    "g11_slice_shared",
+    "g12_slice_mut",
+    // **S3.2′-3, transcribed from the slice addendum's §8 row**: "nullable
+    // pointer + `len` → `Option<&[i32]>`". Its text is the g11 × g02
+    // composition — g11's indexed read, g02's null test and `unwrap()` — because
+    // both halves are already ratified and inventing a third idiom for their
+    // intersection would be a spec act, not a transcription.
+    "g13_opt_slice",
+    // **S3.2′-2b, ratified 2026-08-07.** The bundled amendment's pair. Numbered
+    // g17/g18 because g14 (`boxed_slice`, S3.2′-4), g15 (`cursor_backwards`,
+    // S3.2′-5) and g16 (unannotated-`let` Box, S3.2) are all ratified and
+    // allocated — an allocation of free numbers, not a reassignment.
+    //
+    // **g18 landed RED (2026-08-07)**: its market was 0 and S3.6-gated, so the
+    // rebind ARM was not built then. wave-6s built it as the bound-view rule
+    // (report 005) and the seat re-ratified the expected text as the thin
+    // reference the analysis decides for `q` (R401-4, report 006); g18 is
+    // GREEN from that landing.
+    "g17_reslice_advance",
+    "g18_reslice_rebind",
+    // **S3.6-1, RATIFIED 2026-08-09 on their sha256-anchored bytes.** Call-site
+    // adaptation: the first goldens whose expected text depends on a function
+    // OTHER than the one holding the subject.
+    //
+    // **g20** pins the dominant shape and the two-level chain. Its two call
+    // sites are byte-identical across the pair — the adaptation is that the
+    // declarations may now move at all, which is the capability. It CANNOT be
+    // satisfied by a partial implementation: converting `g20_bump` without
+    // `g20_via` is `E0308` (measured), so byte identity here is unreachable
+    // without the joint decision.
+    //
+    // **g21** was the negative duplicate-argument control. R165-2 and D14 now
+    // make the split explicit: the canonical primary converts, its peer stays
+    // raw under the receipted T2 PAIR verdict, and the clean sibling still
+    // converts. Making both positions safe still yields E0499; blocking both
+    // now fails the ruled mechanical-fallback branch.
+    // R819-1 item 4 / R833-1 (USER) supersede the split: one pointer at both
+    // positions, one of them written, is a proven overlap, so both formals
+    // stay raw and the call is the program's own; the clean sibling converts.
+    "g20_callsite_adapt_propagate",
+    "g21_callsite_blocked_class",
+    // **g22-g25 — THE SEAM BATCH, ratified 2026-08-11.** All four land GREEN:
+    // the seam mechanism is live, so these are regression pins with
+    // mutation-proven falsifiability, not RED-first spec.
+    //
+    // **g22 `callsite_reborrow_bridge` — PARKED 2026-08-09, SUPERSEDED
+    // 2026-08-11.** One number, two dispositions, in sequence. The parking
+    // declined the reborrow bridge pending an independent UB-safety oracle; the
+    // 2026-08-11 user ruling authorises it on DIFFERENT terms — benchmark
+    // mode-tag, recorded exposure, site gates as mitigation, and the narrower
+    // context of call-boundary GLUE rather than subject settlement. The oracle
+    // condition was never met and is not claimed to be.
+    //
+    // **Epistemic status of all four: GENERATE-THEN-REVIEW**, not hand-authored.
+    // Each expected half was produced by the pipeline, then every rewrite in it
+    // was verified against the ratified arm specs (`is_null`->`is_none` and
+    // deref->`unwrap` per -3; the slice arm's `*p.offset(e)`->`p[e]`), and both
+    // halves compiled on the pinned toolchain. The callee-body rewrites are the
+    // reason: they belong to arms ratified elsewhere and cannot be hand-written
+    // reliably without restating them.
+    //
+    // **g24 carries the measured amendment** `&mut T -> &[T]` via
+    // `slice::from_ref`, which takes a `&mut T` by coercion. The census found
+    // it; the originally ratified adapter table did not have it.
+    //
+    // **g25 states its evidence arm: `len-following`.** The ratification pins
+    // the MECHANISM's output shape. It does NOT certify that the selected
+    // companion is the right length -- that is the registered
+    // bound-verification follow-up's concern, and the exposure is recorded in
+    // the micro-plan.
+    //
+    // **g25 and g26 restated (R758-1 (2) / R763-1 (a), main 164).** Their caller's
+    // `data` is a thin subject handed bare to an array formal: the thin-into-fat
+    // hand-on now gives it the slice form, so the seam's `(Slice, Ref)` row no
+    // longer fires there and neither golden pins the `len-following` /
+    // fabricated arm any more. What they pinned was the one-element view itself
+    // (`from_ref(data)` into a formal read past element 0; g26 summed four
+    // elements over one): the restated expectations are its cure.
+    "g22_callsite_reborrow_bridge",
+    "g23_callsite_optional_wrap",
+    "g24_callsite_slice_from_ref",
+    "g25_callsite_slice_seam_len",
+    // **FABRICATED-LENGTH SLICE, ratification pending (2026-08-15).** `g26` is
+    // the next free number, record-checked rather than assumed: `g14`, `g15` and
+    // `g16` are ratified-and-allocated, `g19` is consumed-and-retired, and the
+    // registry holds 21 goldens over `g01`–`g13`, `g17`, `g18`, `g20`–`g25`.
+    //
+    // Its callee takes `*mut i32` and carries **no integer parameter at all**
+    // (`LenEvidence::None`), so no adjacency arm can license a companion and the
+    // FABRICATED arm is the only one that can fire — the shape the ruling's
+    // carve-out is about, chosen so the fixture cannot pass by accident through
+    // ruling B's licensed path.
+    //
+    // It pins three things no other golden can: that a fabricated site NAMES the
+    // extent rather than spelling `1024` inline, that the crate-level const is
+    // DECLARED (one per crate, at the root), and that the two together compile.
+    "g26_callsite_slice_seam_fabricated",
+    // **g22 `callsite_reborrow_bridge` — PARKED 2026-08-09, deliberately NOT
+    // authored. The NUMBER IS CONSUMED and must never be reallocated.**
+    //
+    // It was proposed with both halves compile-verified, and the ruling declined
+    // it: the reborrow bridge (`f(&mut *r)` where `r` stays raw) trades lost
+    // yield for **silent UB in exactly the region the compiler cannot check**.
+    // Measured: aliasing through a real place is `E0499`, and the same aliasing
+    // through a raw-pointer deref compiles with zero diagnostics. Under full
+    // co-conversion that shape is a caught error — a revert, i.e. lost yield;
+    // under the bridge it is a clean compile.
+    //
+    // Its market is real and priced (1,733 raw-base slots; libzahl's 104-node
+    // class), and it is revisited only when an **independent UB-safety oracle**
+    // exists — not a compile pass. No fixture files exist for it on purpose.
+    // **g19 `unannotated_let_ref` — RATIFIED 2026-08-09, RETIRED 2026-08-09.
+    // The NUMBER STAYS CONSUMED: it must never be reallocated.**
+    //
+    // It was ratified as this slice's witness, landed RED, and retires **without
+    // ever having been green** — superseded by measurement, not erased. What it
+    // did before retiring is why it existed:
+    //
+    // 1. Its RED was a ONE-TOKEN diff — emitted `let q = p;` against expected
+    //    `let q: &mut i32 = p;` — and the emitted crate ALREADY COMPILED,
+    //    because `p` was rewritten and inference typed `q`. That is the proof
+    //    that answered §3: no surviving class needs the insertion.
+    // 2. It was the first golden with an UNANNOTATED local, and it exposed the
+    //    reconciliation fixture gate hand-copying `findings.is_empty()` instead
+    //    of asking `expects_zero` — a fourth by-hand copy no annotated golden
+    //    could reach. Repaired in `recon_fixtures.rs`.
+    //
+    // **Why it cannot be amended into a green golden** (user ruling B): its
+    // no-edit expected text IS what the pipeline already emits, so amending it
+    // would make it pass before the mechanism existed. A capability whose entire
+    // effect is on the LEDGER — `+N decided_ref` / `−N no-declared-type`, zero
+    // text delta — is invisible to a text-comparing golden by construction. The
+    // witness moved to the decision level, in `emit_tests`, where it can fail.
+    //
+    // The key named above was RETIRED by the dissolution (2026-08-12). The
+    // reasoning is kept verbatim rather than restated in today's vocabulary,
+    // because it is what retired g19 and the record cites it as written.
+];
+
+/// Run `rustfmt` over a source string with pinned settings.
+///
+/// Pinned = the same edition and emit mode for both sides, with no config file
+/// discovery that could differ between them. A formatter failure is surfaced,
+/// never swallowed: silently returning the input on error would let a
+/// malformed emission compare equal to a well-formed expectation.
+pub(super) fn canonicalize(label: &str, src: &str) -> String {
+    let mut child = Command::new("rustfmt")
+        .args(["--edition", "2021", "--emit", "stdout", "--quiet"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("rustfmt not runnable (needed to canonicalize {label}): {e}"));
+    child
+        .stdin
+        .as_mut()
+        .expect("rustfmt stdin")
+        .write_all(src.as_bytes())
+        .expect("write to rustfmt");
+    let out = child.wait_with_output().expect("rustfmt output");
+    assert!(
+        out.status.success(),
+        "rustfmt failed on {label}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("rustfmt emitted valid UTF-8")
+}
+
+/// **R1298-1 (USER) — no allocator declaration.** The goldens are the M1 spec,
+/// landed verbatim; (B′)'s `#[global_allocator]` item, which they predated and
+/// this comparison used to take off the emitted side, is no longer emitted. The
+/// emitted side is asserted to declare none and compared canonically formatted.
+pub(super) fn without_allocator_declaration(label: &str, _input: &str, emitted: &str) -> String {
+    let canonical = canonicalize(label, emitted);
+    assert_eq!(
+        canonical.matches("#[global_allocator]").count(),
+        0,
+        "{label}: no allocator declaration is emitted (R1298-1):\n{canonical}"
+    );
+    canonical
+}
+
+/// The ten goldens. RED until the emitter exists.
+///
+/// Each is a separate `#[test]` rather than one loop, so a partially working
+/// emitter reports *which* shapes pass — S1 turns exactly one of these green.
+macro_rules! golden_test {
+    ($(#[$meta:meta])* $fn_name:ident, $golden:literal) => {
+        #[test]
+        $(#[$meta])*
+        fn $fn_name() {
+            let golden = GOLDENS
+                .iter()
+                .find(|g| g.name == $golden)
+                .expect("golden is registered in GOLDENS");
+            let emitted = match rewrite_m1(golden.input) {
+                RewriteOutcome::Emitted { source, .. } => source,
+                RewriteOutcome::Degraded {
+                    reason,
+                    degradations,
+                    ..
+                } => panic!(
+                    "{}: no emission — {reason}. Attributed degradations: {:#?}",
+                    golden.name, degradations
+                ),
+            };
+            let emitted = without_allocator_declaration("emitted", golden.input, &emitted);
+            let expected = canonicalize("expected", golden.expected);
+            assert_eq!(
+                emitted, expected,
+                "{}: emitted crate differs from the golden AFTER canonical \
+                 formatting, so this is a semantic difference, not whitespace",
+                golden.name
+            );
+        }
+    };
+}
+
+golden_test!(g01_ref_mut, "g01_ref_mut");
+golden_test!(g02_opt_ref, "g02_opt_ref");
+golden_test!(g03_ref_shared, "g03_ref_shared");
+golden_test!(
+    #[ignore = "known red at the master merge (main 303): standing since S5, to be taken up after the merge"]
+    g04_box_drop,
+    "g04_box_drop"
+);
+golden_test!(
+    #[ignore = "known red at the master merge (main 303): standing since S5, to be taken up after the merge"]
+    g05_opt_box,
+    "g05_opt_box"
+);
+golden_test!(
+    #[ignore = "known red at the master merge (main 303): standing since S5, to be taken up after the merge"]
+    g06_move_reroute,
+    "g06_move_reroute"
+);
+golden_test!(
+    #[ignore = "known red at the master merge (main 303): standing since S5, to be taken up after the merge"]
+    g07_non_dropping_store,
+    "g07_nonDropping_store"
+);
+golden_test!(
+    #[ignore = "known red at the master merge (main 303): standing since S5, to be taken up after the merge"]
+    g08_drop_all_paths,
+    "g08_drop_all_paths"
+);
+golden_test!(g09_pdrop_suppression, "g09_pdrop_suppression");
+golden_test!(
+    #[ignore = "known red at the master merge (main 303): standing since S5, to be taken up after the merge"]
+    g10_mixed_group,
+    "g10_mixed_group"
+);
+golden_test!(g11_slice_shared, "g11_slice_shared");
+golden_test!(g12_slice_mut, "g12_slice_mut");
+golden_test!(g13_opt_slice, "g13_opt_slice");
+golden_test!(g17_reslice_advance, "g17_reslice_advance");
+golden_test!(g18_reslice_rebind, "g18_reslice_rebind");
+golden_test!(g20_callsite_adapt_propagate, "g20_callsite_adapt_propagate");
+golden_test!(g21_callsite_blocked_class, "g21_callsite_blocked_class");
+golden_test!(
+    #[ignore = "known red at the master merge (main 303): standing since S5, to be taken up after the merge"]
+    g22_callsite_reborrow_bridge,
+    "g22_callsite_reborrow_bridge"
+);
+golden_test!(g23_callsite_optional_wrap, "g23_callsite_optional_wrap");
+golden_test!(g24_callsite_slice_from_ref, "g24_callsite_slice_from_ref");
+golden_test!(g25_callsite_slice_seam_len, "g25_callsite_slice_seam_len");
+golden_test!(
+    g26_callsite_slice_seam_fabricated,
+    "g26_callsite_slice_seam_fabricated"
+);
+
+/// The canonicalizer must be a real normalizer, not a pass-through.
+///
+/// Without this, a broken `canonicalize` (one that returned its input) would
+/// leave every golden comparison whitespace-sensitive again, and the ruling
+/// this module documents would be silently unimplemented.
+#[test]
+fn canonicalization_normalizes_whitespace() {
+    let ugly = "pub  fn   f( x : i32 )->i32{x+1}\n";
+    let tidy = "pub fn f(x: i32) -> i32 {\n    x + 1\n}\n";
+    assert_eq!(canonicalize("ugly", ugly), canonicalize("tidy", tidy));
+    assert_ne!(
+        canonicalize("ugly", ugly),
+        ugly,
+        "canonicalize returned its input unchanged — it is a pass-through, so \
+         golden comparison is still whitespace-sensitive"
+    );
+}
+
+/// Every registered golden must have both halves present and non-empty.
+///
+/// Guards the copy step: a missing or truncated fixture would otherwise show up
+/// as a confusing diff much later.
+#[test]
+fn every_golden_pair_is_present() {
+    assert_eq!(
+        GOLDENS.len(),
+        22,
+        "the M0.5 package specifies ten pairs; U-5 slice 1 transcribes g11/g12 \
+         from the ratified §8 table, slice 3 transcribes g13, and 2b adds \
+         g17/g18. g19 was added and RETIRED in the g16 slice — back to 15, with \
+         the number consumed. S3.6-1 ratifies g20/g21 → 17.\n\
+         \n\
+         **17 → 21 (2026-08-11): the seam batch g22–g25.** This pin FIRED on \
+         that change and it was right to: its previous text said a count \
+         quietly becoming 18 would mean the parked bridge had been authored. \
+         **g22 HAS now been authored** — deliberately, by user ruling, as a \
+         SUPERSESSION of the 2026-08-09 parking on different terms (benchmark \
+         mode-tag, recorded exposure, site gates as mitigation, call-boundary \
+         glue rather than subject settlement). The oracle condition the parking \
+         set was never met and is not claimed to be. One number, two \
+         dispositions, in sequence.\n\
+         \n\
+         So 21 is 17 + 4, and g22 is one of the four rather than a number held \
+         empty. A future count that moves without a ruling is still the event \
+         this assertion exists to catch.\n\
+         \n\
+         **21 → 22 (2026-08-15): the fabricated-length slice's g26.** The pin \
+         fired on this change too, and correctly. `g26` is the NEXT FREE \
+         number, record-checked rather than assumed: `g14`/`g15`/`g16` are \
+         ratified-and-allocated with no fixtures, `g19` is \
+         consumed-and-retired, and `g22` is authored — reusing any of those \
+         gaps would collide with a ratified spec, which is exactly why the \
+         ruling said to record-check. It lands GREEN; the red set does not \
+         move and stays at six."
+    );
+    for g in GOLDENS {
+        assert!(!g.input.trim().is_empty(), "{}: empty .input.rs", g.name);
+        assert!(
+            !g.expected.trim().is_empty(),
+            "{}: empty .expected.rs",
+            g.name
+        );
+    }
+}
+
+/// **G09 companion assertion (approved remedy).**
+///
+/// `g09_pdrop_suppression`'s input and expected are byte-identical, so the text
+/// comparison passes for any rewriter that emits its input — including a
+/// completely broken one. The expected text is NOT edited; instead this asserts
+/// the outcome is unchanged *for a stated reason* rather than by accident.
+///
+/// At S2a the reason available is that the fixture yields **no emitted
+/// subject**: `emitted_count == 0`. When S3 lands P-drop, this tightens to
+/// asserting the table recorded the suppression itself.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** make `rewrite_m1`
+/// return a non-zero `emitted_count` for this fixture (e.g. by removing the
+/// A1 raw-pointer-operation check so a subject is emitted) and this fails,
+/// where the text comparison alone would not.
+#[test]
+fn g09_is_unchanged_for_a_stated_reason_not_by_accident() {
+    let golden = GOLDENS
+        .iter()
+        .find(|g| g.name == "g09_pdrop_suppression")
+        .expect("g09 is registered");
+    assert_eq!(
+        golden.input, golden.expected,
+        "this companion exists BECAUSE the pair is byte-identical; if that \
+         changed, the ordinary golden test is now doing real work and this \
+         assertion should be revisited"
+    );
+    match rewrite_m1(golden.input) {
+        RewriteOutcome::Emitted {
+            source,
+            emitted_count,
+            ..
+        } => {
+            assert_eq!(source, golden.expected, "g09 emitted a changed crate");
+            assert_eq!(
+                emitted_count, 0,
+                "g09 emitted {emitted_count} subject(s); its expected text is \
+                 identical to its input, so any emission means the text \
+                 comparison is passing for the wrong reason"
+            );
+        }
+        RewriteOutcome::Degraded {
+            reason,
+            degradations,
+            ..
+        } => panic!("g09 degraded: {reason}; {degradations:#?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S2a exit gate: attribution at DECISION time
+// ---------------------------------------------------------------------------
+
+/// Find the degradations `rewrite_m1` attributed for one golden's input.
+fn degradations_for(name: &str) -> Vec<super::decision::Degradation> {
+    let golden = GOLDENS
+        .iter()
+        .find(|g| g.name == name)
+        .expect("golden is registered");
+    match rewrite_m1(golden.input) {
+        RewriteOutcome::Emitted { degradations, .. } => degradations,
+        RewriteOutcome::Degraded { degradations, .. } => degradations,
+    }
+}
+
+/// A1 facts for an inline source, **without running BO**.
+///
+/// §5.3: the A1 mechanism fixtures used to assert on `rewrite_m1`'s
+/// degradations, so they passed only because the solver happened to return
+/// `Ref` for the parameter in question — an unrelated precision change would
+/// have turned a mechanism test into a false red. Asserting on the fact
+/// collector directly tests the layer the test names.
+#[derive(Debug, Default)]
+struct FactSnapshot {
+    /// `(fn path, raw-only operation)`.
+    raw_only: Vec<(String, String)>,
+    /// Functions referenced in-crate — called, address-taken, or cast.
+    referenced: Vec<String>,
+    /// Functions with a pointer parameter used in a comparison.
+    compared: Vec<String>,
+}
+
+fn facts_for_source(src: &str) -> FactSnapshot {
+    ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        let program = super::collect_program(tcx);
+        let facts = super::decision::emitability::collect(tcx, &program.functions);
+        let mut snapshot = FactSnapshot {
+            raw_only: facts
+                .raw_only_uses
+                .iter()
+                .filter_map(|((did, _), uses)| {
+                    uses.first()
+                        .map(|(op, _)| (tcx.def_path_str(did.to_def_id()), op.clone()))
+                })
+                .collect(),
+            referenced: facts
+                .referenced
+                .keys()
+                .map(|did| tcx.def_path_str(did.to_def_id()))
+                .collect(),
+            compared: facts
+                .ptr_comparisons
+                .keys()
+                .map(|(did, _)| tcx.def_path_str(did.to_def_id()))
+                .collect(),
+        };
+        snapshot.raw_only.sort();
+        snapshot.referenced.sort();
+        snapshot.compared.sort();
+        snapshot
+    })
+    .expect("fixture compiles")
+}
+
+/// **S2a exit gate (g02 class).** A parameter used in a raw-pointer-only
+/// operation is degraded IN THE DECISION PHASE, with its own site and reason.
+///
+/// Before S2a this parameter was decided `Ref`, emitted, and killed by the
+/// whole-crate type-check gate as the anonymous string "emitted crate failed
+/// the type-check gate" — no site, no subject. That made the envelope counters
+/// wrong by construction: the subject was recorded as a success.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the
+/// `raw_only_uses` check from `decide_one` and this fails — the subject is
+/// decided `Ref` again and no degradation is attributed.
+#[test]
+fn a_raw_pointer_operation_is_attributed_at_decision_time() {
+    use super::decision::DegradeReason;
+    // **Re-based at S3.2′-3, not deleted.** This witness used to run on g02,
+    // whose `is_null` was the representative raw-only operation. The optional
+    // forms retire exactly that class — `is_null` now SELECTS a form instead of
+    // blocking one — so the witness moves to an operation that still has no
+    // image, and keeps testing what it always tested: attribution, subject and
+    // site, at decision time.
+    const SRC: &str = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn reader(p: *mut i32) -> i32 { p.read() }\n";
+    let records = reasons_for_source(SRC);
+    let hit = records
+        .iter()
+        .find(|d| matches!(d.reason, DegradeReason::RawPointerOperation { .. }))
+        .unwrap_or_else(|| {
+            panic!("no raw-pointer-operation degradation was attributed; got {records:#?}")
+        });
+    assert!(
+        hit.subject.contains("reader"),
+        "degradation names the wrong subject: {hit:?}"
+    );
+    assert!(
+        !hit.site.is_empty() && hit.site.contains(':'),
+        "degradation carries no usable site: {hit:?}"
+    );
+    let DegradeReason::RawPointerOperation { op } = &hit.reason else { unreachable!() };
+    assert_eq!(
+        op, "read",
+        "the attributed operation should be the real one"
+    );
+}
+
+/// **S3.2′-3 — the class g02 used to witness, in its new disposition.**
+///
+/// The pair above and this one together say what changed: a null-tested pointer
+/// no longer degrades, and no OTHER raw-only operation started emitting.
+#[test]
+fn a_null_tested_pointer_takes_an_optional_form_instead_of_degrading() {
+    use super::decision::DegradeReason;
+    let records = degradations_for("g02_opt_ref");
+    assert!(
+        !records
+            .iter()
+            .any(|d| matches!(d.reason, DegradeReason::RawPointerOperation { .. })),
+        "g02's null test still degrades: {records:#?}"
+    );
+    let RewriteOutcome::Emitted { source, .. } = rewrite_m1(
+        GOLDENS
+            .iter()
+            .find(|g| g.name == "g02_opt_ref")
+            .expect("g02 is registered")
+            .input,
+    ) else {
+        panic!("g02 no longer emits");
+    };
+    assert!(
+        source.contains("Option<&") && source.contains("is_none()") && source.contains("unwrap()"),
+        "g02 emitted without the optional form: {source}"
+    );
+}
+
+/// **S2a exit gate (g06 class).** A function with an in-crate caller is degraded
+/// in the decision phase, naming the call site — not discovered later as a
+/// crate-wide type error.
+///
+/// # RE-POINTED at S3.6-1 step 3, and the reason it had to be
+///
+/// This test used to require the reason `CallSiteNotAdapted`, and its own doc
+/// said that reason was **temporary**: *"S3's call-site adaptation retires
+/// `CallSiteNotAdapted`, and the typed variant is what makes that retirement
+/// visible in the counters rather than silent."*
+///
+/// The lift retired it, and the typed variant did exactly its job — the
+/// retirement surfaced as this failing assertion instead of silent counter
+/// drift. Measured: g06's subject still degrades **at decision time with its
+/// call site named**, now under the class vocabulary.
+///
+/// So the assertion re-points to **the property that was ever the point** —
+/// decision-time attribution with a site — and stops naming a reason that was
+/// documented as transient. Registry-layer only: g06's ratified fixture bytes
+/// are untouched, and `g06_move_reroute` keeps its own standing verdict.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** remove the class gate
+/// from `decide_one` and the subject EMITS, so no degradation is found and this
+/// fails. A subject degrading without a site fails the second assertion.
+#[test]
+fn g06_class_is_attributed_at_decision_time() {
+    use super::decision::DegradeReason;
+    let records = degradations_for("g06_move_reroute");
+    let hit = records
+        .iter()
+        .find(|d| {
+            matches!(
+                d.reason,
+                DegradeReason::CallSiteNotAdapted
+                    | DegradeReason::SilentCoercion { .. }
+                    | DegradeReason::ClassBlocked { .. }
+                    | DegradeReason::BoxFailure {
+                        failure: super::decision::box_facts::BoxPlanFailure::BoundaryHeld,
+                    }
+                    | DegradeReason::BoxFailure {
+                        failure: super::decision::box_facts::BoxPlanFailure::NativeEvidenceHeld {
+                            prior_key: "box-param-caller-unknown",
+                            ..
+                        },
+                    }
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the in-crate-caller subject emitted instead of being attributed \
+                 at decision time; got {records:#?}"
+            )
+        });
+    assert!(
+        !hit.site.is_empty() && hit.site.contains(':'),
+        "degradation must name the CALL SITE: {hit:?}"
+    );
+}
+
+/// Parse the line number out of a rendered site (`<main.rs>:7:28: 7:36`).
+fn site_line(site: &str) -> Option<usize> {
+    let after_file = site.rsplit_once(">:")?.1;
+    after_file.split(':').next()?.parse().ok()
+}
+
+/// **S2a-R / F4 — the site is the USE site, not the declaration.**
+///
+/// g02's parameter is declared on one line and used (`p.is_null()`) on
+/// another, so the two spans are distinguishable by line number. Mutating both
+/// site expressions in `decide_one` to the already-in-scope `decl_site` passed
+/// the entire suite before this existed — "per-subject attribution (site +
+/// subject + reason)" had its site dimension unwitnessed.
+///
+/// *Mutation-tested (Rider 0, deletion first):* replacing
+/// `EmitabilityFacts::site(tcx, *span)` with `decl_site` in the
+/// raw-pointer-operation arm fails this.
+#[test]
+fn a_raw_pointer_site_is_the_use_not_the_declaration() {
+    use super::decision::DegradeReason;
+    // Re-based with its sibling: same witness, an operation that still degrades.
+    // The fixture is multi-line ON PURPOSE — a one-line fixture would make the
+    // declaration and the use share a line and the assertion inert, which the
+    // guard below re-checks rather than trusts.
+    const SRC: &str = "#![allow(dead_code, unused_unsafe)]\n\
+         pub unsafe fn reader(p: *mut i32) -> i32 {\n\
+         \x20   p.read()\n\
+         }\n";
+    let records = reasons_for_source(SRC);
+    let hit = records
+        .iter()
+        .find(|d| matches!(d.reason, DegradeReason::RawPointerOperation { .. }))
+        .expect("the fixture degrades on a raw-pointer operation");
+
+    let decl_line = SRC
+        .lines()
+        .position(|l| l.contains("fn reader"))
+        .expect("the fixture declares its function")
+        + 1;
+    let use_line = SRC
+        .lines()
+        .position(|l| l.contains("p.read()"))
+        .expect("the fixture uses read")
+        + 1;
+    assert_ne!(
+        decl_line, use_line,
+        "fixture no longer distinguishes the two spans, so this witness is inert"
+    );
+
+    let site_line = site_line(&hit.site)
+        .unwrap_or_else(|| panic!("site did not parse as <file>:line:col: {hit:?}"));
+    assert_eq!(
+        site_line, use_line,
+        "site is line {site_line} but the raw-pointer use is on line {use_line} \
+         (declaration is line {decl_line}) — the site is not the use site"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S2a-R2: fixtures for A1 arms that had none, and for the universe gate
+// ---------------------------------------------------------------------------
+
+/// Degradation reasons `rewrite_m1` attributes for an inline source.
+fn reasons_for_source(src: &str) -> Vec<super::decision::Degradation> {
+    match rewrite_m1(src) {
+        RewriteOutcome::Emitted { degradations, .. } => degradations,
+        RewriteOutcome::Degraded { degradations, .. } => degradations,
+    }
+}
+
+const PREAMBLE: &str = "#![allow(dead_code, unused_unsafe, unused_mut, unused_assignments)]\n";
+
+/// **F5 fixture — the bounds-check shape, which had NO fixture.**
+///
+/// Modelled on the corpus sites (`binn::AdvanceDataPos`,
+/// `lodepng::lodepng_chunk_next`): two pointer parameters compared with `>`.
+/// This is the case F5 exists for and the dangerous half of it — on raw
+/// pointers the comparison is on ADDRESSES, on references it is on POINTEES,
+/// so a rewrite that type-checks would silently invert the bound.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `ExprKind::Binary`
+/// arm in `emitability::collect` fails the mechanism half; deleting the
+/// `ptr_comparisons` arm in `decide_one` fails the attribution half.
+///
+/// §5.3: the mechanism half asserts on `EmitabilityFacts::collect` directly.
+/// The attribution half still goes through `rewrite_m1` — that composition IS
+/// the property it names — but it can no longer be the only evidence, so a
+/// solver change that stops returning `Ref` here degrades one assertion instead
+/// of erasing the fixture's whole meaning.
+#[test]
+fn ptr_comparison_shape_emits_explicit_address_views() {
+    let src = format!(
+        "{PREAMBLE}pub unsafe fn advance(p: *mut u8, plimit: *mut u8) -> i32 {{\n    \
+         if p > plimit {{ return 0; }}\n    1\n}}\n"
+    );
+
+    // (1) mechanism, solver-independent.
+    let facts = facts_for_source(&src);
+    assert!(
+        facts.compared.iter().any(|f| f.contains("advance")),
+        "the comparison fact was not collected at all; got {facts:#?}"
+    );
+
+    // (2) emission, end to end: the comparison remains address-valued rather
+    // than becoming a pointee comparison on references.
+    let RewriteOutcome::Emitted { source, .. } = rewrite_m1(&src) else {
+        panic!("value-observing comparison must emit")
+    };
+    // R739-1 (slicecursor 092, main 145): a subject only ever measured (an address observation) is held raw (`held:address-observation-only`): a compared-only pair is not opened at all; the comparison
+    // stays the input's raw address comparison.
+    assert!(source.contains("p: *mut u8"), "{source}");
+    assert!(source.contains("plimit: *mut u8"), "{source}");
+    assert!(source.contains("if p > plimit"), "{source}");
+    assert!(!source.contains("core::ptr::from_ref"), "{source}");
+}
+
+/// **RAW_ONLY_METHODS mechanism fixture.**
+///
+/// Proportionality call, recorded rather than assumed: the list is **data, not
+/// arms**. One `contains` check consumes every entry, so a per-entry fixture
+/// would test `slice::contains` sixteen times and add bloat without adding
+/// coverage. This proves the mechanism over a few representative entries
+/// (`offset`, `wrapping_add`); a new entry is a data edit, and the risk it
+/// carries is a wrong *name*, which no fixture of this shape would catch either.
+///
+/// *Mutation-tested (Rider 0, deletion first):* emptying `RAW_ONLY_METHODS`
+/// fails this.
+///
+/// §5.3: asserted at the fact layer, which is the layer the test names. Going
+/// through `rewrite_m1` made this pass only because BO returned `Ref` for `p`,
+/// so a solver precision change could have turned a `RAW_ONLY_METHODS`
+/// mechanism test into a false red.
+#[test]
+fn raw_only_method_mechanism_covers_representative_entries() {
+    for method in ["offset", "wrapping_add"] {
+        let src = format!("{PREAMBLE}pub unsafe fn f(p: *mut u8) -> *mut u8 {{ p.{method}(1) }}\n");
+        let facts = facts_for_source(&src);
+        assert!(
+            facts
+                .raw_only
+                .iter()
+                .any(|(f, op)| f.contains("f") && op == method),
+            "`{method}` was not collected as a raw-only use; got {facts:#?}"
+        );
+    }
+}
+
+/// **ADV-R1 fixture — the impl-method case the old gate could not see.**
+///
+/// An inherent method with a pointer parameter is out of M1's subject universe
+/// **by ruling** (not a C-source shape). The point of this test is that the
+/// exclusion is a COUNTED, attributed quantity: the old "independent" count
+/// re-walked `program.functions`, so it skipped this item exactly as the
+/// collector did, agreed at zero, and the parameter vanished silently.
+///
+/// *Mutation-tested (Rider 0, deletion first):* removing the `ImplItem` arm
+/// from `universe::classify` fails this — the exclusion goes back to zero and
+/// becomes invisible.
+#[test]
+fn impl_method_pointer_params_are_counted_as_excluded_not_invisible() {
+    let src = format!(
+        "{PREAMBLE}pub struct S;\nimpl S {{\n    pub unsafe fn m(&self, p: *mut i32) -> i32 {{ *p }}\n}}\n\
+         pub unsafe fn free_fn(q: *mut i32) -> i32 {{ *q }}\n"
+    );
+    let report = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        super::decision::universe::classify(tcx)
+    })
+    .expect("fixture compiles");
+
+    // TWO, not one — and the second is `&self`.
+    //
+    // `ptr_chain_depth` (the predicate R-A made shared between the collector,
+    // E-R1 and this walk) counts `TyKind::Ref` as depth-bearing, so a `&self`
+    // receiver is a depth-1 parameter by its definition. That is a real
+    // consequence of adopting one predicate everywhere rather than a defect:
+    // sharing it is what makes the type-axis mapping check meaningful, so
+    // "pointer parameter" in M1's vocabulary means `ptr_chain_depth > 0` and
+    // the counts are read that way. Asserted at its true value with the reason
+    // named, rather than weakened to `>= 1`.
+    assert_eq!(
+        report.excluded.impl_items, 2,
+        "the impl method's parameters (`&self` and `p: *mut i32`) must be \
+         COUNTED as excluded, not skipped silently; report was {report:?}"
+    );
+    assert_eq!(
+        report.subjects, 1,
+        "the free function is the only M1 subject; report was {report:?}"
+    );
+    assert_eq!(report.excluded_subjects.len(), 2);
+    assert!(
+        report
+            .excluded_subjects
+            .iter()
+            .all(|subject| subject.reason == "impl-item"),
+        "the identity rows must retain the same typed class as the aggregate"
+    );
+}
+
+/// **The exclusion counts reach a CONSUMER** (§4).
+///
+/// The buckets used to be written and read by nothing outside one test, while
+/// the ledger claimed they "flow into S2b's counters, visible as a number
+/// rather than as an absence". They now ride out on `RewriteOutcome`, which is
+/// what makes that claim true of a code path.
+///
+/// *Mutation-tested (Rider 0, deletion first):* delete `excluded` from the
+/// `Emitted` variant's construction site (returning `Excluded::default()`
+/// instead) and this fails.
+#[test]
+fn exclusion_counts_reach_the_outcome() {
+    let src = format!(
+        "{PREAMBLE}unsafe extern \"C\" {{\n    pub fn ext(p: *mut i32) -> i32;\n}}\n\
+         pub unsafe fn free_fn(q: *mut i32) -> i32 {{ *q }}\n"
+    );
+    match rewrite_m1(&src) {
+        RewriteOutcome::Emitted { excluded, .. } => assert_eq!(
+            excluded.foreign_items, 1,
+            "the extern declaration's pointer parameter must reach the outcome"
+        ),
+        RewriteOutcome::Degraded {
+            reason, excluded, ..
+        } => panic!("fixture degraded ({reason}); excluded was {excluded:?}"),
+    }
+}
+
+/// **R-A witness — the C2Rust alias class is COLLECTED and ATTRIBUTED.**
+///
+/// `pub type lil_value_t = *mut _lil_value_t` lowers to `TyKind::Path`, so the
+/// retired syntactic collector produced no subject for a parameter declared
+/// `val: lil_value_t`: BO decided it, and the rewriter discarded that decision
+/// with no `Decision`, no `Degradation`, no site and no reason. That is exactly
+/// the "unrewritten and unattributed" class the A1 layer exists to retire, and
+/// it is present in the evaluation corpus.
+///
+/// Item 5 retains collection and gives each admitted binding an explicit
+/// expanded type plus a canonical declaration receipt. The shared alias itself
+/// remains unchanged. Removing the alias-aware collector still fails this
+/// control because the required subject and receipt disappear.
+/// Migration: R217-2(a), R220 continuation, item-5 design §9 and micro-plan I12.
+#[test]
+fn alias_typed_pointer_params_are_collected_and_attributed() {
+    let src = format!(
+        "{PREAMBLE}pub struct _lil_value_t {{ pub n: i32 }}\n\
+         pub type lil_value_t = *mut _lil_value_t;\n\
+         pub unsafe fn take(val: lil_value_t) -> i32 {{ (*val).n }}\n"
+    );
+    ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        let table = super::decide_table(tcx).unwrap();
+        let subjects = table
+            .entries
+            .iter()
+            .filter(|(subject, _)| {
+                tcx.def_path_str(subject.fn_did.to_def_id()) == "take"
+                    && subject.param_name.as_deref() == Some("val")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(subjects.len(), 1, "alias subject must remain collected");
+        assert!(matches!(
+            subjects[0].1,
+            super::decision::Decision::Ref { mutable: false }
+        ));
+    })
+    .unwrap();
+    let RewriteOutcome::Emitted {
+        source,
+        raw_boundary_artifacts,
+        ..
+    } = rewrite_m1(&src)
+    else {
+        panic!("admitted alias must emit");
+    };
+    assert!(source.contains("pub type lil_value_t = *mut _lil_value_t;"));
+    assert!(source.contains("val: &crate::_lil_value_t"), "{source}");
+    assert!(super::verify::type_checks_str(&source));
+    let count = super::mechanical_receipt::reconcile_declaration_shape_rows(
+        &raw_boundary_artifacts.declaration_rows,
+        &raw_boundary_artifacts.mechanical_events,
+    )
+    .unwrap();
+    assert_eq!(count, 1);
+    let row = raw_boundary_artifacts
+        .declaration_rows
+        .iter()
+        .find(|row| row.terminal.stage == super::mechanical_receipt::MechanicalStage::Terminal)
+        .unwrap();
+    assert_eq!(row.original_type_form, "lil_value_t");
+    assert_eq!(
+        row.terminal.state,
+        super::mechanical_receipt::MechanicalState::Applied
+    );
+}
+
+/// **The other half of the shared-predicate consequence: reference params.**
+///
+/// `ptr_chain_depth` counts `TyKind::Ref` as depth-bearing, so adopting it as
+/// the shared predicate (R-A) brings already-reference parameters into the
+/// subject universe too. That is deliberate — the collector and E-R1 must apply
+/// the SAME predicate or the type-axis comparison reports noise instead of
+/// mapping failures — and it is why [`DeclShape`] distinguishes `Reference`
+/// from `Alias`: they are one collection rule and two different reasons.
+///
+/// *Mutation-tested (Rider 0, deletion first):* delete the `TyKind::Ref` arm of
+/// the `decl_shape` match in `collect_subjects` (so it falls through to
+/// `Other`) and this fails on the shape string.
+#[test]
+fn reference_typed_params_are_collected_with_their_own_shape() {
+    use super::decision::DegradeReason;
+    let src = format!("{PREAMBLE}pub fn borrowed(v: &mut i32) -> i32 {{ *v }}\n");
+    let records = reasons_for_source(&src);
+    let hit = records
+        .iter()
+        .find(|d| d.reason == DegradeReason::UnsupportedDeclShape { shape: "reference" })
+        .unwrap_or_else(|| {
+            panic!("the reference-typed parameter was not attributed; got {records:#?}")
+        });
+    assert!(
+        hit.subject.contains("borrowed::v"),
+        "degradation names the wrong subject: {hit:?}"
+    );
+}

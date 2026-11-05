@@ -1,0 +1,721 @@
+//! wave-6s2 — bare slice pass-ons classified by the callee's parameter
+//! (report 001).
+//!
+//! The pass-on sub-family has no unbuilt emission mechanism: a delivered
+//! slice passed as-is into a local callee takes the callee parameter's own
+//! form — the same-form zero-syntax carrier (W-C1), the thin `&T` first
+//! element, or the raw bridge under the site's T1 / T2 tier when the
+//! parameter settles raw — and a positively-retaining callee holds it. The
+//! pins below fix those five outcomes; the two `#[ignore]`d witnesses
+//! reproduce the two class-level walls the corpus rows wait on, each named
+//! for the lane that owns it.
+//!
+//! Model gate (relay 002 §4): a caller-side form never outruns the model's
+//! kind of the callee it forwards to — every pass-on here takes the callee
+//! parameter's OWN settled form (same-form zero syntax, the thin element, or
+//! the raw bridge exactly because the callee's parameter stays raw); no pin
+//! and no rule of this lane converts a callee on the caller's behalf.
+
+fn emit_with_receipts(input: &str) -> (String, String) {
+    let receipts = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let sink = receipts.clone();
+    let output = ::utils::compilation::run_compiler_on_str(input, move |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("capture original AST");
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::OverlapMode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("native corpus-mode decisions");
+        for (subject, decision) in &table.entries {
+            println!(
+                "DECISION {} arms={:?} {decision:?}",
+                subject.label,
+                table.arm_requirements.get(&(subject.fn_did, subject.hir_id))
+            );
+        }
+        let mut plans = String::new();
+        // A compact, assertable decision line per subject: the emitted form, or
+        // `degraded:<reason>`. A witness of a wall that MOVES (one family's
+        // blocker replaced by another's) needs the reason, not only the text.
+        for (subject, decision) in &table.entries {
+            let state = match decision {
+                super::decision::Decision::Degraded(record) => {
+                    format!("degraded:{}", record.reason.key())
+                }
+                other => super::decision::seam::form_of(other).key().to_owned(),
+            };
+            plans.push_str(&format!("DECISION-KV {} {state}\n", subject.label));
+        }
+        for plan in &table.slice_use_receipts {
+            println!("SLICE-USE-RECEIPT {plan:#?}");
+            plans.push_str(&format!(
+                "PLAN owner={} adapter={} target={} retention={:?} state={:?} reason={:?} evidence={}\n",
+                plan.obligation.planned.owner_path,
+                plan.adapter,
+                plan.target_form,
+                plan.retention,
+                plan.obligation.intended_terminal_state,
+                plan.obligation.intended_terminal_reason,
+                plan.boundary_evidence
+            ));
+        }
+        for edit in &table.seams.edits {
+            println!(
+                "SEAM owner={:?} src={:?} repl={} zero={} shape={} found={:?} expected={:?}",
+                edit.owner_class,
+                edit.source_node,
+                edit.replacement,
+                edit.zero_syntax,
+                edit.source_shape,
+                edit.found,
+                edit.expected
+            );
+        }
+        for block in &table.seams.blocked {
+            println!("SEAM-BLOCK {block:?}");
+        }
+        *sink.lock().unwrap() = format!(
+            "{plans}{:#?}",
+            ctx.raw_boundary_artifacts.additive_family_receipts
+        );
+        let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans)
+            .expect("native emission plan");
+        for (id, class) in &emission.plan.class_finalization.classes {
+            println!(
+                "CLASS {} ready={} holds={:?}",
+                tcx.def_path_str(id.local_def_id().to_def_id()),
+                class.is_ready(),
+                class.hold_reasons()
+            );
+        }
+        for collision in &emission.plan.class_finalization.collisions {
+            println!("COLLISION {collision:?}");
+        }
+        let held = emission.plan.held_classes();
+        let reverts = super::ast_transform::revert_set_from_classes_and_atoms(
+            &held,
+            &Default::default(),
+            &table,
+        )
+        .expect("planned held classes");
+        super::ast_transform::ast_emitted_files_from(
+            tcx,
+            &capture,
+            &reverts,
+            emission.plan.root_file.as_ref(),
+            &table,
+            Some(&emission.plan.terminal_call_plans),
+        )
+        .expect("native AST emission")
+        .0
+        .into_iter()
+        .map(|(path, text)| format!("// FILE {path:?}\n{text}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+    })
+    .expect("input type-checks");
+    let receipts = receipts.lock().unwrap().clone();
+    println!("EMITTED {output}");
+    println!("RECEIPTS {receipts}");
+    (output, receipts)
+}
+
+fn joined(source: &str) -> String {
+    source.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// **Witness A (for wave-5d2).** The callee's READ/WRITE parameter pair is
+/// held `pair-raw-view` by a caller that passes two views of ONE root
+/// (`overlap(x, x.offset(n), n)`). A second caller whose own arguments are
+/// two distinct delivered slices already plans its pass-ons as the raw seams
+/// (`p` same-form, `q.as_mut_ptr()` T2) — and both classes are then held by
+/// a cross-class interval collision: the A5 pair arm renders a
+/// `a5-site-proof-t2-fallback` edit over the WHOLE call, on top of the
+/// caller's own raw-view edit. Measured at `8e84dc6d`; the collision is the
+/// pair-charged partner coupling wave-5d2 owns.
+const CALLEE_PAIR_HELD: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe fn pair(mut a: *const u8, mut b: *mut u8, n: usize) {
+    let mut i: usize = 0;
+    while i < n { *b.offset(i as isize) = *a.offset(i as isize); i = i.wrapping_add(1); }
+ }
+ pub unsafe fn overlap(mut x: *mut u8, n: usize) { pair(x, x.offset(n as isize), n); }
+ pub unsafe fn caller(mut p: *const u8, mut q: *mut u8, n: usize) -> u8 {
+    let a = *p.offset(1);
+    *q.offset(1) = a;
+    pair(p, q, n);
+    a
+ }
+ // A live caller (R898-1: an uncalled function's pairs are disjoint by
+ // vacuity): `overlap` gets an unknown pointer; wave-5d 149g (the 58 re-cut):
+ // `caller` gets two distinct stack arrays, so its own pair is certified
+ // rather than held under R833-1 (two opaque pointers may name one object).
+ extern "C" { fn __crat_test_opaque() -> *mut core::ffi::c_void; }
+ #[no_mangle]
+ pub unsafe extern "C" fn __crat_test_live() { overlap(__crat_test_opaque() as *mut u8, 0); let s = [0u8; 4]; let mut t = [0u8; 4]; caller(s.as_ptr(), t.as_mut_ptr(), 0); }
+"#;
+
+#[test]
+fn wave6s2_pass_on_beside_a_certified_caller_pair_bridges() {
+    let (source, receipts) = emit_with_receipts(CALLEE_PAIR_HELD);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut p: &[u8]"), "{source}");
+    assert!(source.contains("mut q: &mut [u8]"), "{source}");
+    // R217-2(a): the expectation MOVED with wave-5d's exclusion re-derivation
+    // and the A5 pair arm (batch-9 candidate frame). The collision that held
+    // both classes is gone: the callee's READ parameter converts with the
+    // caller's `p` (zero syntax), and only the WRITE parameter stays raw,
+    // taking the caller's `q` through the A5 arm's temporary.
+    assert!(
+        source.contains("mut a: &[u8], mut b: *mut u8"),
+        "the callee's read parameter converts, the write parameter stays raw: {source}"
+    );
+    let text = joined(&source);
+    // wave-5d 149g (the 58 re-cut): the driver hands `caller` two separate
+    // arrays, so R931-1 certifies `caller`'s own pair at `pair(p, q, n)` and
+    // A5 renders no raw view there; the write pass-on is the slice's raw
+    // bridge directly. (An unresolved delivered pair at that call is held by
+    // the pair rule now (R833-1 / R864-1), so the A5 collision this witness
+    // was written for no longer arises: coverage lost, named in 149g.)
+    assert!(
+        text.contains("pair(p, q.as_mut_ptr(), n)"),
+        "the write pass-on is the caller's slice bridged raw, the read pass-on zero syntax: {source}"
+    );
+    assert!(
+        receipts.contains("adapter=slice-mut-to-raw-mut"),
+        "the write bridge's template: {receipts}"
+    );
+}
+
+/// **Pins 1–3.** A callee parameter the analysis itself keeps raw (a
+/// pointer-to-integer observation: `kind-raw`), a thin callee, and a
+/// positively-retaining callee. The first two deliver the caller; the third
+/// must stay held — the site's own disposition blocks it and nothing raises a
+/// tier.
+const PASS_ON_TO_RAW_MODEL: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe fn back(mut p: *const u8, n: usize) -> u8 { let a = p as usize; return *p.offset((a % 2 + n) as isize); }
+ pub unsafe fn caller(mut buf: *const u8, n: usize) -> u8 {
+    let a = *buf.offset(1);
+    let b = back(buf, n);
+    a.wrapping_add(b)
+ }
+"#;
+
+#[test]
+fn wave6s2_pin_pass_on_into_a_model_raw_callee_bridges() {
+    let (source, receipts) = emit_with_receipts(PASS_ON_TO_RAW_MODEL);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut buf: &[u8]"), "{source}");
+    assert!(
+        source.contains("mut p: *const u8"),
+        "the callee keeps its raw parameter: {source}"
+    );
+    assert!(
+        joined(&source).contains("back(buf.as_ptr(), n)"),
+        "{source}"
+    );
+    assert!(
+        receipts.contains("template=SliceToRawConst"),
+        "the site's own boundary template: {receipts}"
+    );
+}
+
+const PASS_ON_TO_THIN: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe fn one(mut p: *const u8) -> u8 { return *p; }
+ pub unsafe fn caller(mut buf: *const u8, n: usize) -> u8 {
+    let a = *buf.offset(n as isize);
+    let b = one(buf);
+    a.wrapping_add(b)
+ }
+"#;
+
+#[test]
+fn wave6s2_pin_pass_on_into_a_thin_callee_takes_the_first_element() {
+    let (source, _) = emit_with_receipts(PASS_ON_TO_THIN);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut p: &u8"), "{source}");
+    assert!(
+        joined(&source).contains("one(buf.first().unwrap())"),
+        "{source}"
+    );
+}
+
+const PASS_ON_TO_RETAINING: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_upper_case_globals)]
+ static mut KEEP: *const u8 = 0 as *const u8;
+ unsafe fn sink(mut p: *const u8, n: usize) -> u8 { KEEP = p; return *p.offset(n as isize); }
+ pub unsafe fn caller(mut buf: *const u8, n: usize) -> u8 {
+    let a = *buf.offset(1);
+    let b = sink(buf, n);
+    a.wrapping_add(b)
+ }
+"#;
+
+#[test]
+fn wave6s2_pin_pass_on_into_a_positively_retaining_callee_stays_held() {
+    // Restated under R878-1 (B) (relay 304; main 194a / 196): `KEEP = p` is `sink`'s own
+    // store into a static, which the retained-access check of record holds (`sink::p`
+    // `held:retained-alias`; `caller::buf` follows it, `held:into-held-formal`). The
+    // tier's positive-retention row is at the site into `sink`'s formal, which says
+    // nothing of what `sink` does with its value. A label: both stay raw, as the tier's
+    // row held them.
+    let (source, receipts) = emit_with_receipts(PASS_ON_TO_RETAINING);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut buf: *const u8"), "{source}");
+    assert!(!source.contains("as_ptr()"), "{source}");
+    assert!(
+        receipts.contains("sink::p degraded:held:retained-alias"),
+        "{receipts}"
+    );
+}
+
+/// **Pin 4.** The callee's parameter is withdrawn in the SAME family
+/// transaction (it hands the pointer to a foreign `*mut` position with no
+/// negative-write evidence); the family loop re-derives the caller with the
+/// callee raw and the pass-on takes the raw bridge under the site's tier.
+const CALLEE_WRITER: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe extern "C" { fn consume(q: *mut u8, n: usize); }
+ unsafe fn sink(mut p: *const u8, n: usize) -> u8 { consume(p as *mut u8, n); return *p.offset(1); }
+ pub unsafe fn caller(mut buf: *const u8, n: usize) -> u8 {
+    let a = *buf.offset(1);
+    let b = sink(buf, n);
+    a.wrapping_add(b)
+ }
+"#;
+
+#[test]
+fn wave6s2_pin_pass_on_into_a_callee_withdrawn_in_the_same_transaction_bridges() {
+    // Restated under R878-1 (B) (relay 304; main 194a / 196): `sink` hands `p` to the
+    // foreign `consume`, which the retained-access check of record reads as keeping it.
+    // The tier's row at that call is a bridge's block (a shared pointer at a `*mut`
+    // position without negative-write evidence), not a retention reading, and its T2
+    // waiver is at the site into `sink`'s formal. `sink::p` is held, and so is
+    // `caller::buf` (the callee it is handed to keeps it, and that formal is held): a
+    // delivery lost, the pass-on stays raw.
+    let (source, receipts) = emit_with_receipts(CALLEE_WRITER);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut buf: *const u8"), "{source}");
+    assert!(
+        source.contains("mut p: *const u8"),
+        "the callee keeps its raw parameter: {source}"
+    );
+    assert!(joined(&source).contains("sink(buf, n)"), "{source}");
+    assert!(
+        receipts.contains("sink::p degraded:held:retained-alias")
+            && receipts.contains("caller::buf degraded:held:retained-alias"),
+        "{receipts}"
+    );
+}
+
+/// **Pin 5.** A callee pinned by a function-pointer reference keeps its raw
+/// signature behind a shim; the caller's pass-on is zero syntax into the shim.
+const CALLEE_PINNED: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ unsafe fn sink(mut p: *const u8, n: usize) -> u8 { return *p.offset(n as isize); }
+ pub unsafe fn table() -> unsafe fn(*const u8, usize) -> u8 { sink as unsafe fn(*const u8, usize) -> u8 }
+ pub unsafe fn caller(mut buf: *const u8, n: usize) -> u8 {
+    let a = *buf.offset(1);
+    let b = sink(buf, n);
+    a.wrapping_add(b)
+ }
+"#;
+
+#[test]
+fn wave6s2_pin_pass_on_into_a_fn_pointer_pinned_callee_goes_through_its_shim() {
+    let (source, _) = emit_with_receipts(CALLEE_PINNED);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut buf: &[u8]"), "{source}");
+    assert!(
+        source.contains("unsafe fn __crat_safe_sink(mut p: &[u8], n: usize)"),
+        "{source}"
+    );
+    assert!(joined(&source).contains("sink(buf, n)"), "{source}");
+}
+
+// ---------------------------------------------------------------------------
+// W6S2-2 — the C2Rust constant-reslice return (`decision/slice_passon.rs`).
+// ---------------------------------------------------------------------------
+
+/// **Witness (lodepng `lodepng_chunk_data` / `lodepng_chunk_data_const`,
+/// batch-6 rows, sole).** C2Rust spells the reslice return as
+/// `&mut *chunk.offset(8 as i32 as isize) as *mut u8`; the return family
+/// already delivers `return chunk.offset(8)` as the tied `&chunk[8..]`, and
+/// the spine is the same value. RED at `8e84dc6d` (`slice-cursor-use` on both
+/// parameters), GREEN with the recogniser.
+const LODEPNG_CHUNK_DATA: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ pub unsafe fn lodepng_chunk_data(mut chunk: *mut u8) -> *mut u8 { return &mut *chunk.offset(8 as i32 as isize) as *mut u8; }
+ pub unsafe fn lodepng_chunk_data_const(mut chunk: *const u8) -> *const u8 { return &*chunk.offset(8 as i32 as isize) as *const u8; }
+ pub unsafe fn use_it(mut chunk: *mut u8) -> u8 { let a = *chunk.offset(2); let d = lodepng_chunk_data(chunk); let c = lodepng_chunk_data_const(chunk); a.wrapping_add(*d.offset(1)).wrapping_add(*c.offset(2)) }
+"#;
+
+#[test]
+fn wave6s2_c2rust_constant_reslice_return_delivers_the_tied_suffix() {
+    let (source, _) = emit_with_receipts(LODEPNG_CHUNK_DATA);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    let text = joined(&source);
+    assert!(
+        text.contains(
+            "fn lodepng_chunk_data<'a>(mut chunk: &'a [u8]) -> &'a [u8] { return &chunk[8..]; }"
+        ),
+        "{source}"
+    );
+    assert!(
+        text.contains("fn lodepng_chunk_data_const<'a>(mut chunk: &'a [u8]) -> &'a [u8] { return &chunk[8..]; }"),
+        "{source}"
+    );
+    assert!(
+        text.contains("let d: &[u8] = lodepng_chunk_data(chunk);"),
+        "{source}"
+    );
+    assert!(
+        text.contains("a.wrapping_add(d[1]).wrapping_add(c[2])"),
+        "{source}"
+    );
+}
+
+/// **Witness (the bare spelling is unchanged).** `return chunk.offset(8)`
+/// delivered before this rule and delivers identically with it.
+const BARE_RESLICE_RETURN: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ pub unsafe fn chunk_data(mut chunk: *mut u8) -> *mut u8 { return chunk.offset(8); }
+ pub unsafe fn use_it(mut chunk: *mut u8) -> u8 { let a = *chunk.offset(2); let d = chunk_data(chunk); a.wrapping_add(*d.offset(1)) }
+"#;
+
+#[test]
+fn wave6s2_pin_bare_constant_reslice_return_still_delivers() {
+    let (source, _) = emit_with_receipts(BARE_RESLICE_RETURN);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        joined(&source)
+            .contains("fn chunk_data<'a>(mut chunk: &'a [u8]) -> &'a [u8] { return &chunk[8..]; }"),
+        "{source}"
+    );
+}
+
+/// **Controls.** A cast that CHANGES the pointee (`… as *const u16` on a
+/// `*const u8` receiver) is a reinterpretation, not a reslice, and stays
+/// held; a NEGATIVE literal is the bidirectional family's (slicecursor) and
+/// stays held. Both functions keep their raw signatures.
+const RESLICE_RETURN_CONTROLS: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ pub unsafe fn reinterpret(mut chunk: *const u8) -> *const u16 { return &*chunk.offset(8 as i32 as isize) as *const u8 as *const u16; }
+ pub unsafe fn backward(mut chunk: *const u8) -> *const u8 { return &*chunk.offset(-8 as i32 as isize) as *const u8; }
+ pub unsafe fn use_it(mut chunk: *mut u8) -> u16 { let a = *chunk.offset(2); let d = reinterpret(chunk); let c = backward(chunk.offset(16)); (a as u16).wrapping_add(*d).wrapping_add(*c as u16) }
+"#;
+
+#[test]
+fn wave6s2_reslice_return_controls_stay_held() {
+    let (source, _) = emit_with_receipts(RESLICE_RETURN_CONTROLS);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("fn reinterpret(mut chunk: *const u8) -> *const u16"),
+        "a pointee-changing cast is not a reslice: {source}"
+    );
+    assert!(
+        source.contains("fn backward(mut chunk: *const u8) -> *const u8"),
+        "a negative literal is the bidirectional family's: {source}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pins of wave-6f's W6F-2 on the Slice family (R407-8): a delivered slice at
+// an argument of a call THROUGH A FUNCTION POINTER is an inventoried
+// `<indirect>` raw-boundary site — the raw view under the T2 waiver, the
+// callee keeping the pointer type its signature names. Model gate: the
+// caller's form never outruns the callee it forwards to — the bridge exists
+// exactly because the indirect callee's parameter stays raw. RED until W6F-2
+// with its return-type refinement is on the head (the lane's own W6S2-3 was
+// withdrawn in its favour, report 004 / relay 002).
+// ---------------------------------------------------------------------------
+
+/// **Witness (tulipindicators `fuzzer::check_output::options#4`, batch-6 row,
+/// sole).** `(*info).start.expect(..)(options)` is a call through a function
+/// pointer, which the boundary planner does not inventory; the bare argument
+/// was refused and the whole subject held. It is the raw view under the T2
+/// waiver: `(..)(options.as_ptr())`, while the counted read `options[k]`
+/// delivers.
+const CHECK_OUTPUT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_camel_case_types)]
+ #[repr(C)] pub struct ti_indicator_info { pub start: Option<unsafe extern "C" fn(*const f64) -> i32>, pub options: i32 }
+ pub unsafe extern "C" fn check_output(mut info: *const ti_indicator_info, mut size: i32, mut options: *const f64) -> i32 {
+    let mut s: i32 = 0;
+    s = (*info).start.expect("non-null function pointer")(options);
+    let mut k: i32 = 0;
+    let mut acc: f64 = 0.0;
+    while k < (*info).options { acc += *options.offset(k as isize); k += 1; }
+    s + acc as i32
+ }
+"#;
+
+#[test]
+fn wave6s2_fn_pointer_call_argument_takes_the_t2_raw_view() {
+    let (source, receipts) = emit_with_receipts(CHECK_OUTPUT);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(source.contains("mut options: &[f64]"), "{source}");
+    let text = joined(&source);
+    assert!(
+        text.contains("(*info).start.expect(\"non-null function pointer\")(options.as_ptr());"),
+        "{source}"
+    );
+    assert!(text.contains("acc += options[(k) as usize];"), "{source}");
+    assert!(receipts.contains("retention=T2"), "{receipts}");
+}
+
+/// **Controls.** A SHARED slice at a `*mut` function-pointer parameter has
+/// no negative-write evidence and holds; a function pointer that returns a
+/// raw pointer may hand a child of the argument back and holds. Both keep the
+/// raw parameter.
+const FN_POINTER_CONTROLS: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables)]
+ pub unsafe fn writer(mut f: unsafe extern "C" fn(*mut u8) -> i32, mut buf: *const u8, n: usize) -> i32 {
+    let a = *buf.offset(n as isize);
+    f(buf as *mut u8) + a as i32
+ }
+ pub unsafe fn child(mut g: unsafe extern "C" fn(*const u8) -> *mut u8, mut buf: *const u8, n: usize) -> u8 {
+    let a = *buf.offset(n as isize);
+    let r = g(buf);
+    a.wrapping_add(*r)
+ }
+"#;
+
+#[test]
+fn wave6s2_fn_pointer_call_controls_stay_held() {
+    let (source, receipts) = emit_with_receipts(FN_POINTER_CONTROLS);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(!source.contains("as_ptr()"), "{source}");
+    assert!(
+        source.contains("mut buf: *const u8, n: usize) -> i32"),
+        "{source}"
+    );
+    assert!(
+        source.contains("mut buf: *const u8, n: usize) -> u8"),
+        "{source}"
+    );
+    assert!(
+        receipts.contains("returned-child") || receipts.contains("negative-write-absent"),
+        "{receipts}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W6S2-4 — a COMPUTED VIEW of a delivered slice at an argument of a call
+// through a function pointer: the composition of wave-6s's computed
+// sub-view spine with wave-6f's `<indirect>` raw-boundary site (relay 005 §1).
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// W6S2-5 — the destination of a computed view copied by ASSIGNMENT
+// (`decision/slice_passon.rs`).
+// ---------------------------------------------------------------------------
+
+/// **Witness (brotli `BrotliFindAllStaticDictionaryMatches::s#61`, `s_0`,
+/// `s_1`, `s_2` — four sole rows ENABLED at the batch-9 frame, and lodepng
+/// `addChunk_IHDR::data#9`).** The source `data` delivers and its edit is the
+/// checked suffix; the DESTINATION saw the assignment as an unsupported use
+/// and stayed raw.
+const ASSIGN_COMPUTED_VIEW_DESTINATION: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe fn FindMatches(mut data: *const u8, max_length: usize, mut out: *mut u32) -> i32 {
+    let mut s = 0 as *const u8;
+    let mut l: usize = 0;
+    let mut found = 0;
+    while l < max_length {
+        if *data.offset(l as isize) as i32 == ' ' as i32 { l = l.wrapping_add(1); continue; }
+        s = &*data.offset(l as isize) as *const u8;
+        if *s.offset(0 as isize) as i32 == 'a' as i32 { *out.offset(found as isize) = l as u32; found += 1; }
+        if *s.offset(1 as isize) as i32 == 'b' as i32 { found += 1; }
+        l = l.wrapping_add(1);
+    }
+    found
+ }
+"#;
+
+#[test]
+fn wave6s2_assignment_destination_of_a_computed_view_is_in_scope() {
+    let (source, receipts) = emit_with_receipts(ASSIGN_COMPUTED_VIEW_DESTINATION);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        source.contains("mut data: &[u8]"),
+        "the source delivers: {source}"
+    );
+    // **Both frames, under R217-2(a)** (wave-6o relay 036 §2; this lane is
+    // closed, so wave-6o restates it rather than letting it read as a red).
+    //
+    // The INVARIANT this control was written for is that the wall leaves THIS
+    // family: the destination is never `slice-use-unsupported` once the
+    // assignment is in scope. What happens next depends on the frame:
+    //
+    // * before wave-6o's `7d7368ec` — the destination stays raw at its
+    //   null-initialised declaration and the source renders the raw view
+    //   `s = (&(data)[l..]).as_ptr()`;
+    // * with it — the Option family takes the destination
+    //   (`Opt { mutable: false, slice: true }`) and the assignment renders
+    //   `s = Some(&data[l..])`, which is the delivery this control's own
+    //   report predicted.
+    assert!(
+        !receipts.contains("DECISION-KV FindMatches::s degraded:slice-use-unsupported"),
+        "the wall must leave this family on either frame: {receipts}"
+    );
+    let raw_destination = receipts.contains("DECISION-KV FindMatches::s degraded:null-init")
+        && joined(&source).contains("s = (&(data)[l..]).as_ptr()");
+    let optional_destination = joined(&source).contains("s = Some(&data[l..])")
+        || joined(&source).contains("s = Some(&(data)[l..])");
+    assert!(
+        raw_destination || optional_destination,
+        "either the raw view for a raw destination, or the suffix for an optional one: {source}"
+    );
+}
+
+/// **Control.** A BACKWARD assignment (`p = q.offset(-k)`) is the
+/// bidirectional family's (R394-2) and stays out of scope; a self-advance
+/// stays the classifier's own arm.
+const ASSIGN_BACKWARD_DESTINATION: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe fn Walk(mut data: *const u8, n: usize) -> u8 {
+    let mut s = 0 as *const u8;
+    let mut acc = 0u8;
+    let mut l: usize = 1;
+    while l < n {
+        acc = acc.wrapping_add(*data.offset(l as isize));
+        s = &*data.offset((l as isize) + (-1 as isize)) as *const u8;
+        acc = acc.wrapping_add(*s.offset(0 as isize));
+        l = l.wrapping_add(1);
+    }
+    acc
+ }
+"#;
+
+#[test]
+fn wave6s2_backward_assignment_destination_stays_out_of_scope() {
+    let (source, receipts) = emit_with_receipts(ASSIGN_BACKWARD_DESTINATION);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    // R217-2(a), measured on batch-10 dry8: what this control fixes is that
+    // W6S2-5 does NOT admit a backward assignment. On this lane's own frame
+    // that shows as the use wall standing; on a composed frame the row is
+    // taken by the BIDIRECTIONAL family instead (R394-2) — the source becomes
+    // a cursor and the destination its element view — which is the routing
+    // this control asserts, not a widening of my rule. Both outcomes are
+    // spelled; no third one passes.
+    if receipts.contains("DECISION-KV Walk::data cursor-shared") {
+        assert!(
+            receipts.contains("DECISION-KV Walk::s opt-slice-shared")
+                || receipts.contains("DECISION-KV Walk::s slice-shared")
+                || receipts.contains("DECISION-KV Walk::s degraded:"),
+            "the bidirectional family owns the row: {receipts}"
+        );
+        assert!(
+            !joined(&source).contains("s = &(data)[l..]"),
+            "never my forward suffix for a backward delta: {source}"
+        );
+    } else {
+        assert!(source.contains("mut s = 0 as *const u8"), "{source}");
+        assert!(
+            receipts.contains("DECISION-KV Walk::s degraded:slice-use-unsupported"),
+            "a backward assignment keeps the use wall: {receipts}"
+        );
+    }
+}
+
+/// **The delivery witness (report 010).** The same destination shape with a
+/// TYPED (non-null) initialiser: both ends deliver and the assignment is the
+/// checked suffix — so W6S2-5 is a delivery rule, and the corpus rows whose
+/// declaration is null-initialised (brotli `static_dict::s*`, lodepng
+/// `addChunk_IHDR::data`) wait on exactly one thing: wave-6o's Option
+/// declaration for that local. Measured without composing the two lines.
+const ASSIGN_DESTINATION_NON_NULL_INIT: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe fn FindMatches(mut data: *const u8, max_length: usize, mut out: *mut u32) -> i32 {
+    let mut s: *const u8 = data;
+    let mut l: usize = 0;
+    let mut found = 0;
+    while l < max_length {
+        if *data.offset(l as isize) as i32 == ' ' as i32 { l = l.wrapping_add(1); continue; }
+        s = &*data.offset(l as isize) as *const u8;
+        if *s.offset(0 as isize) as i32 == 'a' as i32 { *out.offset(found as isize) = l as u32; found += 1; }
+        if *s.offset(1 as isize) as i32 == 'b' as i32 { found += 1; }
+        l = l.wrapping_add(1);
+    }
+    found
+ }
+"#;
+
+#[test]
+fn wave6s2_assignment_destination_delivers_once_its_declaration_is_typed() {
+    let (source, receipts) = emit_with_receipts(ASSIGN_DESTINATION_NON_NULL_INIT);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        receipts.contains("DECISION-KV FindMatches::s slice-shared"),
+        "the destination carries the view: {receipts}"
+    );
+    let text = joined(&source);
+    assert!(text.contains("let mut s: &[u8] = data;"), "{source}");
+    assert!(
+        text.contains("s = &(data)[l..];"),
+        "the assignment is the checked suffix: {source}"
+    );
+    assert!(text.contains("s[0]") && text.contains("s[1]"), "{source}");
+    assert!(
+        !text.contains("as_ptr()"),
+        "neither end needs a raw view: {source}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// W6S2-5b (R451-4) — the same assignment with an ARRAY-LOCAL source.
+// ---------------------------------------------------------------------------
+
+/// **Control 1.** The same array-local source with a TYPED destination stays
+/// out of scope: no family owns the right-hand side for an array source, so
+/// admitting it could only produce an ill-typed assignment.
+const ARRAY_LOCAL_SOURCE_TYPED_DESTINATION: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ pub unsafe fn Typed(mut pIn: *const f32) -> f32 {
+    let mut m4x4: [f32; 16] = [0.; 16];
+    let mut pMatrix: *mut f32 = m4x4.as_mut_ptr();
+    m4x4[5] = *pIn.offset(4);
+    pMatrix = &mut *m4x4.as_mut_ptr().offset(0 as isize) as *mut f32;
+    *pMatrix.offset(0) + *pMatrix.offset(5)
+ }
+"#;
+
+#[test]
+fn wave6s2_array_local_source_with_a_typed_destination_stays_out_of_scope() {
+    let (source, receipts) = emit_with_receipts(ARRAY_LOCAL_SOURCE_TYPED_DESTINATION);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        !receipts.contains("DECISION-KV Typed::pMatrix slice-shared")
+            && !receipts.contains("DECISION-KV Typed::pMatrix slice-mut"),
+        "a typed destination is not admitted by this arm: {receipts}"
+    );
+}
+
+/// **Control 2.** A source whose extent is NOT in its type — a pointer handed
+/// back by a call — is refused by the array arm (and by the pointer arm, whose
+/// receiver must be a local path).
+const CALL_RESULT_SOURCE: &str = r#"
+ #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
+ unsafe extern "C" { fn get_buf() -> *mut f32; }
+ pub unsafe fn FromCall(n: usize) -> f32 {
+    let mut p = 0 as *mut f32;
+    p = &mut *get_buf().offset(1 as isize) as *mut f32;
+    *p.offset(0) + *p.offset(1)
+ }
+"#;
+
+#[test]
+fn wave6s2_call_result_source_is_refused() {
+    let (source, receipts) = emit_with_receipts(CALL_RESULT_SOURCE);
+    assert!(super::verify::type_checks_str(&source), "{source}");
+    assert!(
+        !receipts.contains("DECISION-KV FromCall::p slice-shared")
+            && !receipts.contains("DECISION-KV FromCall::p slice-mut"),
+        "{receipts}"
+    );
+}

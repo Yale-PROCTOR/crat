@@ -1,0 +1,773 @@
+//! Finite source-object flow. Roots name possible objects, not dynamic epochs.
+
+use std::collections::VecDeque;
+
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_middle::{
+    mir::{
+        Body, CastKind, Local, Location, Operand, Place, ProjectionElem, Rvalue, START_BLOCK,
+        StatementKind, TerminatorKind,
+    },
+    ty::adjustment::PointerCoercion,
+};
+use rustc_span::def_id::LocalDefId;
+
+use super::{call_reach::EscapeFacts, field_objects};
+use crate::{
+    analyses::{
+        borrow_ownership::{
+            crate_slots::{CrateSlots, MAX_SLOT_DEPTH},
+            export::{PlaceKey, ProjKey},
+            realloc::ReallocResult,
+            source_events::{self, SourceEvents},
+        },
+        mir::{CallKind, TerminatorExt},
+    },
+    utils::rustc::RustProgram,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ObjectRoot {
+    Input {
+        function: LocalDefId,
+        parameter: Local,
+        depth: u8,
+    },
+    /// Born in this invocation; caller composition must rebase this root.
+    Fresh {
+        frame: LocalDefId,
+        site: Location,
+    },
+    Stack {
+        function: LocalDefId,
+        local: Local,
+    },
+    /// The object pointed to by field `field` of a single known base.
+    /// `FieldBase` has no field variant, so the path is bounded to one step.
+    Field {
+        base: super::field_objects::FieldBase,
+        field: u32,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ObjectSet {
+    pub(crate) roots: FxHashSet<ObjectRoot>,
+    pub(crate) unknown: bool,
+}
+
+impl Default for ObjectSet {
+    fn default() -> Self {
+        Self {
+            roots: FxHashSet::default(),
+            unknown: true,
+        }
+    }
+}
+
+impl ObjectSet {
+    fn null() -> Self {
+        Self {
+            roots: FxHashSet::default(),
+            unknown: false,
+        }
+    }
+
+    pub(super) fn root(root: ObjectRoot) -> Self {
+        Self {
+            roots: FxHashSet::from_iter([root]),
+            unknown: false,
+        }
+    }
+
+    fn union(&mut self, other: &Self) -> bool {
+        let before = self.roots.len();
+        let changed = other.unknown && !self.unknown;
+        self.unknown |= other.unknown;
+        self.roots.extend(other.roots.iter().copied());
+        changed || before != self.roots.len()
+    }
+}
+
+type State = Vec<Vec<ObjectSet>>;
+type Snapshot = FxHashMap<(Local, u8), ObjectSet>;
+
+#[derive(Default)]
+pub(crate) struct ObjectFacts {
+    snapshots: FxHashMap<(LocalDefId, Location), Snapshot>,
+    /// Relay main/388 stage 3 (B) (`field_cells`): the pointers a function stored in fields of its
+    /// known objects, at the points where it holds any, and the points reached with nothing written
+    /// behind a pointer since its entry.
+    cells: FxHashMap<(LocalDefId, Location), super::field_cells::Cells>,
+    pristine: FxHashSet<(LocalDefId, Location)>,
+}
+
+fn snapshot(state: &State) -> Snapshot {
+    state
+        .iter()
+        .enumerate()
+        .flat_map(|(local, row)| {
+            row.iter().enumerate().filter_map(move |(depth, objects)| {
+                // Null and partial roots with Unknown are meaningful. Only the
+                // exact default Unknown cell can be reconstructed by absence.
+                (!objects.unknown || !objects.roots.is_empty())
+                    .then(|| ((Local::from_usize(local), depth as u8), objects.clone()))
+            })
+        })
+        .collect()
+}
+
+fn pointer(state: &State, place: &PlaceKey, extra_depth: u8) -> ObjectSet {
+    if let Some((base_depth, field)) = field_objects::field_step(&place.proj, extra_depth) {
+        let base = state
+            .get(place.local.as_usize())
+            .and_then(|row| row.get(base_depth))
+            .cloned()
+            .unwrap_or_default();
+        return field_objects::mint(&base, field);
+    }
+    if !place
+        .proj
+        .iter()
+        .all(|projection| matches!(projection, ProjKey::Deref))
+    {
+        return ObjectSet::default();
+    }
+    state
+        .get(place.local.as_usize())
+        .and_then(|row| row.get(place.proj.len() + usize::from(extra_depth)))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn storage(function: LocalDefId, state: &State, place: &PlaceKey) -> ObjectSet {
+    let Some(last_deref) = place
+        .proj
+        .iter()
+        .rposition(|projection| matches!(projection, ProjKey::Deref))
+    else {
+        return ObjectSet::root(ObjectRoot::Stack {
+            function,
+            local: place.local,
+        });
+    };
+    // Fields/elements after the dereference stay in its containing object.
+    // A subsequent dereference through a loaded field needs field-memory facts.
+    pointer(
+        state,
+        &PlaceKey {
+            local: place.local,
+            proj: place.proj[..last_deref].to_vec(),
+        },
+        0,
+    )
+}
+
+fn clobber(state: &mut State) {
+    for objects in state.iter_mut().flatten() {
+        objects.unknown = true;
+    }
+}
+
+/// The clobber a non-allocator local call actually needs, and the one a
+/// projected store and a `Drop` need (relay era-5c/264, N).
+///
+/// Every depth >= 1 cell describes memory behind a pointer, which a callee may
+/// write, and is clobbered exactly as before. A depth-0 cell holds the pointer
+/// value in the caller's own MIR local; a callee cannot name it unless the
+/// local's address escaped, so a non-escaping local's depth-0 cell survives.
+/// A store through memory and drop glue are bounded the same way: they change
+/// a MIR local's own value only if that local's address was taken.
+/// Statics are not cells of this state at all, so nothing about them is
+/// preserved here.
+fn clobber_callee_reachable(state: &mut State, escapes: &EscapeFacts) {
+    for (local, row) in state.iter_mut().enumerate() {
+        let reachable = escapes.escapes(Local::from_usize(local));
+        for (depth, objects) in row.iter_mut().enumerate() {
+            // A callee may write the field cell a `Field` root was
+            // loaded from, so field identity does not survive a call even in a
+            // cell the callee cannot name. There is no callee/base
+            // reachability relation, so every field root is killed.
+            if depth > 0 || reachable || field_objects::names_field(objects) {
+                objects.unknown = true;
+            }
+        }
+    }
+}
+
+/// A place with no `Deref` is `place.local`'s own storage (`_5.f`, `_5[i]`, or
+/// `_5` itself when dropped), so a store or a drop there changes that local.
+/// Only raw-pointer and reference locals have cells (`CrateSlots::build`) and
+/// those take no projection but `Deref`, so this row is empty for every
+/// projected store; clobbering it keeps N sound without relying on that.
+fn clobber_own_storage(state: &mut State, place: Place<'_>) {
+    if place
+        .projection
+        .iter()
+        .all(|projection| !matches!(projection, ProjectionElem::Deref))
+    {
+        for objects in &mut state[place.local.as_usize()] {
+            objects.unknown = true;
+        }
+    }
+}
+
+/// A direct write to a local whose address escaped: a depth >= 1 cell may be a
+/// copy of that local's old value (`px = &raw mut x` copies `x`'s cell into
+/// `px`'s depth-1 cell), so every depth >= 1 cell ends here. Other locals'
+/// depth-0 cells hold their own values and stay. The copy went stale before N
+/// too; a projected store or a `Drop` after the stale read used to hide that,
+/// and N keeps the read's local, so the write itself ends the copy (relay
+/// era-5c/264, the review's N6).
+fn clobber_copies(state: &mut State) {
+    for objects in state.iter_mut().flat_map(|row| row.iter_mut().skip(1)) {
+        objects.unknown = true;
+    }
+}
+
+fn write(place: Place<'_>, values: Vec<ObjectSet>, state: &mut State, escapes: &EscapeFacts) {
+    let Some(local) = place.as_local() else {
+        // N: a projected store writes memory behind a pointer -- a depth >= 1
+        // cell, an escaped local or a static -- or the local's own storage.
+        clobber_callee_reachable(state, escapes);
+        clobber_own_storage(state, place);
+        return;
+    };
+    if escapes.escapes(local) {
+        clobber_copies(state);
+    }
+    let row = &mut state[local.as_usize()];
+    row.fill(ObjectSet::default());
+    for (cell, value) in row.iter_mut().zip(values) {
+        *cell = value;
+    }
+}
+
+fn operand_value(
+    operand: &Operand<'_>,
+    depth: u8,
+    state: &State,
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+) -> ObjectSet {
+    match operand {
+        Operand::Copy(place) | Operand::Move(place) => {
+            pointer(state, &PlaceKey::from_place(*place), depth)
+        }
+        Operand::Constant(_) if source_events::operand_is_null(operand, &[], tcx) => {
+            ObjectSet::null()
+        }
+        _ => ObjectSet::default(),
+    }
+}
+
+fn statement_effect(
+    function: LocalDefId,
+    statement: &StatementKind<'_>,
+    state: &mut State,
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    escapes: &EscapeFacts,
+) {
+    match statement {
+        StatementKind::Assign(box (destination, value)) => {
+            let width = destination
+                .as_local()
+                .map(|local| state[local.as_usize()].len())
+                .unwrap_or(0);
+            let values = (0..width)
+                .map(|depth| match value {
+                    // An unsizing coercion (`&mut [T; N]` -> `&mut [T]`) adds the
+                    // length, or a vtable, and keeps the address (relay
+                    // era-5c/265). Its destination's pointee is unsized, so only
+                    // depth 0 is a cell (`ptr_chain_depth` stops at a pointee
+                    // that is not a pointer); a coerced `Box` or `NonNull` has
+                    // no cell at all.
+                    Rvalue::Use(operand)
+                    | Rvalue::Cast(
+                        CastKind::PtrToPtr | CastKind::PointerCoercion(PointerCoercion::Unsize, _),
+                        operand,
+                        _,
+                    ) => operand_value(operand, depth as u8, state, tcx),
+                    Rvalue::Cast(_, operand @ Operand::Constant(_), _)
+                        if source_events::operand_is_null(operand, &[], tcx) =>
+                    {
+                        ObjectSet::null()
+                    }
+                    Rvalue::Ref(_, _, place) | Rvalue::RawPtr(_, place) => {
+                        let place = PlaceKey::from_place(*place);
+                        if depth == 0 {
+                            storage(function, state, &place)
+                        } else {
+                            pointer(state, &place, (depth - 1) as u8)
+                        }
+                    }
+                    _ => ObjectSet::default(),
+                })
+                .collect();
+            write(*destination, values, state, escapes);
+        }
+        StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+            state[local.as_usize()].fill(ObjectSet::default());
+        }
+        StatementKind::Deinit(place) | StatementKind::SetDiscriminant { place, .. } => {
+            write(**place, Vec::new(), state, escapes);
+        }
+        StatementKind::Intrinsic(
+            box rustc_middle::mir::NonDivergingIntrinsic::CopyNonOverlapping(_),
+        ) => {
+            // The copied memory may contain pointer cells. As with a projected
+            // store, existing possible roots are no longer complete evidence.
+            clobber(state);
+        }
+        _ => {}
+    }
+}
+
+// `argument_index` is read only by the test build's transfer receipt.
+#[cfg_attr(not(test), allow(unused_variables, unused_assignments))]
+fn call_effect<'tcx>(
+    program: &RustProgram<'tcx>,
+    function: LocalDefId,
+    body: &Body<'tcx>,
+    location: Location,
+    normal: bool,
+    certificates: &crate::analyses::borrow_ownership::retirement::return_origin::CertificateMap,
+    escapes: &EscapeFacts,
+    state: &mut State,
+) {
+    use crate::analyses::borrow_ownership::retirement::return_origin::{
+        self, ClosedOrigin, Rejection,
+    };
+    let terminator = body.basic_blocks[location.block].terminator();
+    let Some(call) = terminator.as_call(program.tcx) else {
+        match terminator.kind {
+            // N: drop glue reaches what the dropped value reaches and what any
+            // callee could, and changes the dropped place's own storage.
+            TerminatorKind::Drop { place, .. } => {
+                clobber_callee_reachable(state, escapes);
+                clobber_own_storage(state, place);
+            }
+            TerminatorKind::InlineAsm { .. } => clobber(state),
+            _ => {}
+        }
+        return;
+    };
+    let allocator = matches!(call.func, CallKind::LibC(name)
+        if matches!(name.as_str(), "malloc" | "calloc" | "strdup" | "realloc"));
+    let free = matches!(call.func, CallKind::LibC(name) if name.as_str() == "free");
+    let core_pointer = matches!(call.func, CallKind::RustLib(did)
+        if program.tcx.crate_name(did.krate).as_str() == "core"
+            && program.tcx.def_path_str(did).contains("::ptr::")
+            && matches!(program.tcx.item_name(did).as_str(), "null" | "null_mut" | "is_null"));
+    let null = core_pointer
+        && matches!(call.func, CallKind::RustLib(did)
+        if matches!(program.tcx.item_name(did).as_str(), "null" | "null_mut"));
+    // O: an `offset` / `add` / `sub` of `core::ptr` that leaves its allocation
+    // (one past the end allowed) is UB in Rust and in C, so under §28 the result
+    // points into the receiver's objects. Keyed on the `::ptr::` path, never on
+    // the name alone (`core::ops::Add::add` is not arithmetic); `wrapping_*` and
+    // `byte_*` stay Unknown.
+    let arithmetic = matches!(call.func, CallKind::RustLib(did)
+        if program.tcx.crate_name(did.krate).as_str() == "core"
+            && program.tcx.def_path_str(did).contains("::ptr::")
+            && matches!(program.tcx.item_name(did).as_str(), "offset" | "add" | "sub"));
+    // An array's `as_mut_ptr` (relay era-5c/265): core's slice `as_mut_ptr` /
+    // `as_ptr` are `self as *mut [T] as *mut T` (`*const` for `as_ptr`), so by
+    // core's contract and body the result is the slice's own buffer, the
+    // receiver's referent. Not a §28 argument and not a premise. The instance is
+    // resolved first and keyed on core's inherent impls on a slice type (of
+    // those, only `impl<T> [T]` defines `as_ptr` / `as_mut_ptr`), never on the
+    // name: a local function, a user type's method and a user trait's impl for
+    // a slice are bodies of their own.
+    let slice_buffer = match &terminator.kind {
+        TerminatorKind::Call { func, .. } => func.const_fn_def().is_some_and(|(def_id, args)| {
+            rustc_middle::ty::Instance::try_resolve(
+                program.tcx,
+                body.typing_env(program.tcx),
+                def_id,
+                args,
+            )
+            .ok()
+            .flatten()
+            .is_some_and(|instance| {
+                let item = instance.def_id();
+                matches!(instance.def, rustc_middle::ty::InstanceKind::Item(_))
+                    && program.tcx.crate_name(item.krate).as_str() == "core"
+                    && matches!(
+                        program.tcx.item_name(item).as_str(),
+                        "as_mut_ptr" | "as_ptr"
+                    )
+                    && program.tcx.impl_of_method(item).is_some_and(|impl_did| {
+                        program.tcx.trait_id_of_impl(impl_did).is_none()
+                            && matches!(
+                                program.tcx.type_of(impl_did).skip_binder().kind(),
+                                rustc_middle::ty::TyKind::Slice(_)
+                            )
+                    })
+            })
+        }),
+        _ => false,
+    };
+    // Both keep the receiver's depth-0 objects; the destination's depth >= 1
+    // cells stay Unknown. The receiver is read as the call reads it, before any
+    // clobber.
+    let receiver = (arithmetic || slice_buffer)
+        .then(|| {
+            call.args
+                .first()
+                .map(|receiver| operand_value(&receiver.node, 0, state, program.tcx))
+        })
+        .flatten();
+    let local_candidate = !allocator && !free && !core_pointer;
+    let mut certificate = if !normal {
+        Err(Rejection::NoNormalReturn)
+    } else if call.destination.as_local().is_none() {
+        Err(Rejection::UnsupportedProjection)
+    } else if local_candidate {
+        return_origin::for_call(program, certificates, &call)
+    } else {
+        Err(Rejection::ForeignCall)
+    };
+    let mut argument_index = None;
+    let mut input_snapshot = None;
+    if let Ok(proof) = certificate
+        && let ClosedOrigin::Input(parameter) = proof.origin
+    {
+        let snapshot = return_origin::input_argument_index(parameter).and_then(|index| {
+            let actual = call
+                .args
+                .get(index)
+                .ok_or(Rejection::MissingActualArgument)?;
+            let supported = match &actual.node {
+                Operand::Copy(place) | Operand::Move(place) => {
+                    place.projection.iter().all(|projection| {
+                        matches!(projection, rustc_middle::mir::ProjectionElem::Deref)
+                    })
+                }
+                Operand::Constant(_) => {
+                    source_events::operand_is_null(&actual.node, &[], program.tcx)
+                }
+            };
+            if !supported {
+                return Err(Rejection::UnsupportedActual);
+            }
+            Ok((index, operand_value(&actual.node, 0, state, program.tcx)))
+        });
+        match snapshot {
+            Ok((index, objects)) => {
+                argument_index = Some(index);
+                input_snapshot = Some(objects);
+            }
+            Err(reason) => certificate = Err(reason),
+        }
+    }
+    // Return identity is not an effect summary. The clobber keeps its exact
+    // position -- after any admitted actual-value snapshot, before the
+    // destination write -- and `clobber_callee_reachable` narrows only its SCOPE, to the cells a
+    // callee can reach. A projected store and a `Drop` take the same scope (N);
+    // `CopyNonOverlapping` and inline assembly keep the whole-state clobber.
+    if local_candidate {
+        clobber_callee_reachable(state, escapes);
+    }
+    if normal {
+        let mut value = if allocator {
+            ObjectSet::root(ObjectRoot::Fresh {
+                frame: function,
+                site: location,
+            })
+        } else if null {
+            ObjectSet::null()
+        } else if let Some(receiver) = receiver {
+            receiver
+        } else {
+            match certificate {
+                Ok(proof) => match proof.origin {
+                    ClosedOrigin::Fresh => ObjectSet::root(ObjectRoot::Fresh {
+                        frame: function,
+                        site: location,
+                    }),
+                    ClosedOrigin::Input(_) => input_snapshot.unwrap_or_default(),
+                },
+                Err(_) => ObjectSet::default(),
+            }
+        };
+        if certificate.is_ok_and(|proof| proof.nullable) {
+            // Null contributes no object. The explicit alternative lives in the
+            // certificate/receipt; this union never clears an actual's Unknown.
+            value.union(&ObjectSet::null());
+        }
+        write(call.destination, vec![value], state, escapes);
+    }
+    #[cfg(test)]
+    if local_candidate {
+        return_origin::record_transfer(|| return_origin::TransferReceipt {
+            caller: function,
+            callee: return_origin::direct_callee(program, &call).ok(),
+            location,
+            normal,
+            certificate,
+            argument_index,
+            // Observe the actual post-write state. A projected write can discard
+            // a factory value, so that value is never substituted for delivery.
+            destination_objects: pointer(state, &PlaceKey::from_place(call.destination), 0),
+        });
+    }
+}
+
+fn join(entry: &mut Option<State>, incoming: State) -> bool {
+    let Some(previous) = entry else {
+        *entry = Some(incoming);
+        return true;
+    };
+    let mut changed = false;
+    for (old, new) in previous.iter_mut().flatten().zip(incoming.iter().flatten()) {
+        changed |= old.union(new);
+    }
+    changed
+}
+
+impl ObjectFacts {
+    pub(crate) fn analyze(
+        program: &RustProgram<'_>,
+        slots: &CrateSlots,
+        events: &SourceEvents,
+        origin_flows: &crate::analyses::borrow_ownership::origin_flow::OriginFlowResults,
+    ) -> Self {
+        let certificates = crate::analyses::borrow_ownership::retirement::return_origin::derive(
+            program,
+            origin_flows,
+        );
+        let mut facts = Self::default();
+        for &function in &program.functions {
+            let body = program
+                .tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let universe = &slots.fn_local_slots[&function];
+            let initial: State = body
+                .local_decls
+                .indices()
+                .map(|local| {
+                    (0..MAX_SLOT_DEPTH)
+                        .filter_map(|depth| {
+                            universe.slot_for_local_depth(local, depth).map(|_| {
+                                if local.as_usize() > 0 && local.as_usize() <= body.arg_count {
+                                    ObjectSet::root(ObjectRoot::Input {
+                                        function,
+                                        parameter: local,
+                                        depth,
+                                    })
+                                } else {
+                                    ObjectSet::default()
+                                }
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            let escapes = EscapeFacts::of_body(&body);
+            let function_path = program.tcx.def_path_str(function.to_def_id());
+            let reallocations: Vec<_> = events
+                .reallocations
+                .iter()
+                .filter(|site| site.key.function == function_path)
+                .collect();
+            let mut entries = vec![None; body.basic_blocks.len()];
+            entries[START_BLOCK.as_usize()] = Some(initial);
+            let mut queue = VecDeque::from([START_BLOCK]);
+            let mut queued = vec![false; body.basic_blocks.len()];
+            queued[START_BLOCK.as_usize()] = true;
+            while let Some(block) = queue.pop_front() {
+                queued[block.as_usize()] = false;
+                let data = &body.basic_blocks[block];
+                let mut state = entries[block.as_usize()]
+                    .clone()
+                    .expect("reachable object state");
+                for statement in &data.statements {
+                    statement_effect(function, &statement.kind, &mut state, program.tcx, &escapes);
+                }
+                let location = Location {
+                    block,
+                    statement_index: data.statements.len(),
+                };
+                for successor in data.terminator().successors() {
+                    let mut outgoing = state.clone();
+                    let normal = matches!(data.terminator().kind,
+                        TerminatorKind::Call { target: Some(target), .. } if target == successor);
+                    call_effect(
+                        program,
+                        function,
+                        &body,
+                        location,
+                        normal,
+                        &certificates,
+                        &escapes,
+                        &mut outgoing,
+                    );
+                    for site in &reallocations {
+                        let ReallocResult::DirectBranch(branch) = &site.result else { continue };
+                        if branch.test != location
+                            || (successor != branch.success && successor != branch.failure)
+                        {
+                            continue;
+                        }
+                        let failure = successor == branch.failure;
+                        for local in std::iter::once(branch.result).chain(
+                            branch
+                                .transports
+                                .iter()
+                                .map(|transport| transport.destination),
+                        ) {
+                            let row = &mut outgoing[local.as_usize()];
+                            row.fill(if failure {
+                                ObjectSet::null()
+                            } else {
+                                ObjectSet::default()
+                            });
+                            if !failure && let Some(value) = row.first_mut() {
+                                *value = ObjectSet::root(ObjectRoot::Fresh {
+                                    frame: function,
+                                    site: Location {
+                                        block: rustc_middle::mir::BasicBlock::from_u32(
+                                            site.key.block,
+                                        ),
+                                        statement_index: site.key.statement,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    if join(&mut entries[successor.as_usize()], outgoing)
+                        && !queued[successor.as_usize()]
+                    {
+                        queued[successor.as_usize()] = true;
+                        queue.push_back(successor);
+                    }
+                }
+            }
+            // Snapshot only after convergence: joins never retain a first-path
+            // singleton as if it were the complete possible-object set.
+            for (block, data) in body.basic_blocks.iter_enumerated() {
+                let Some(mut state) = entries[block.as_usize()].clone() else { continue };
+                for (statement_index, statement) in data.statements.iter().enumerate() {
+                    facts.snapshots.insert(
+                        (
+                            function,
+                            Location {
+                                block,
+                                statement_index,
+                            },
+                        ),
+                        snapshot(&state),
+                    );
+                    statement_effect(function, &statement.kind, &mut state, program.tcx, &escapes);
+                }
+                facts.snapshots.insert(
+                    (
+                        function,
+                        Location {
+                            block,
+                            statement_index: data.statements.len(),
+                        },
+                    ),
+                    snapshot(&state),
+                );
+            }
+            let (cells, pristine) = super::field_cells::analyze(program, function, &body, &facts);
+            facts.cells.extend(
+                cells
+                    .into_iter()
+                    .map(|(location, cells)| ((function, location), cells)),
+            );
+            facts
+                .pristine
+                .extend(pristine.into_iter().map(|location| (function, location)));
+        }
+        facts
+    }
+
+    /// Stage 3 (B): what `function` stored in the field `key` names, at `location`, if it holds it.
+    pub(crate) fn field_cell(
+        &self,
+        function: LocalDefId,
+        location: Location,
+        key: &super::field_cells::CellKey,
+    ) -> Option<&ObjectSet> {
+        self.cells.get(&(function, location))?.get(key)
+    }
+
+    /// Stage 3 (B): whether nothing has written behind a pointer between `function`'s entry and
+    /// `location`, on every path.
+    pub(crate) fn pristine_at(&self, function: LocalDefId, location: Location) -> bool {
+        self.pristine.contains(&(function, location))
+    }
+
+    pub(crate) fn pointer_at(
+        &self,
+        function: LocalDefId,
+        location: Location,
+        place: &PlaceKey,
+        extra_depth: u8,
+    ) -> ObjectSet {
+        let Some(state) = self.snapshots.get(&(function, location)) else {
+            return ObjectSet::default();
+        };
+        if let Some((base_depth, field)) = field_objects::field_step(&place.proj, extra_depth) {
+            let Ok(base_depth) = u8::try_from(base_depth) else {
+                return ObjectSet::default();
+            };
+            let base = state
+                .get(&(place.local, base_depth))
+                .cloned()
+                .unwrap_or_default();
+            return field_objects::mint(&base, field);
+        }
+        if !place
+            .proj
+            .iter()
+            .all(|projection| matches!(projection, ProjKey::Deref))
+        {
+            return ObjectSet::default();
+        }
+        let Ok(depth) = u8::try_from(place.proj.len() + usize::from(extra_depth)) else {
+            return ObjectSet::default();
+        };
+        state
+            .get(&(place.local, depth))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn storage_at(
+        &self,
+        function: LocalDefId,
+        location: Location,
+        place: &PlaceKey,
+    ) -> ObjectSet {
+        if !self.has_location(function, location) {
+            return ObjectSet::default();
+        }
+        let Some(last_deref) = place
+            .proj
+            .iter()
+            .rposition(|projection| matches!(projection, ProjKey::Deref))
+        else {
+            return ObjectSet::root(ObjectRoot::Stack {
+                function,
+                local: place.local,
+            });
+        };
+        self.pointer_at(
+            function,
+            location,
+            &PlaceKey {
+                local: place.local,
+                proj: place.proj[..last_deref].to_vec(),
+            },
+            0,
+        )
+    }
+
+    pub(crate) fn has_location(&self, function: LocalDefId, location: Location) -> bool {
+        self.snapshots.contains_key(&(function, location))
+    }
+}
