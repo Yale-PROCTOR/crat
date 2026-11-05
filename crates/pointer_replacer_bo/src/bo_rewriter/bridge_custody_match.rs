@@ -1428,7 +1428,6 @@ fn expression_for_test(text: &str) -> MatchResult<ast::ptr::P<ast::Expr>> {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 pub(crate) fn slice_construction_corresponds_for_test(
     original: &str,
     emitted: &str,

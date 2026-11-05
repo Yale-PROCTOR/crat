@@ -246,13 +246,12 @@ fn k19_shared_slice_subject_at_a_mut_position_is_still_held() {
 /// citations with it), never the assertion — the assertion is the ruling.
 #[test]
 fn k19_retaining_callee_does_not_bridge() {
-    let input = format!(
-        "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
+    let input = "#![allow(dead_code, unused_unsafe, unused_mut)]\n\
          static mut SINK: *const core::ffi::c_void = core::ptr::null();\n\
-         unsafe fn keep(q: *const core::ffi::c_void) {{ SINK = q; }}\n\
+         unsafe fn keep(q: *const core::ffi::c_void) { SINK = q; }\n\
          pub unsafe fn target(p: *mut i32) -> i32 \
-         {{ *p.offset(1) += 1; keep(p as *const core::ffi::c_void); *p.offset(0) }}\n"
-    );
+         { *p.offset(1) += 1; keep(p as *const core::ffi::c_void); *p.offset(0) }\n"
+        .to_string();
     // Restated (relay 307, R889-1 on main 198's R4-2): `keep` stores `q` into a static,
     // a known retention; the tier-2 retention waiver at `target`'s site excludes a use
     // while the reference is live only, so filter 2 reads no retention there and the

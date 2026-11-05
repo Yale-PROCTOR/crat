@@ -1549,7 +1549,14 @@ pub unsafe fn transform(dst: *mut u8, idx: i32, mut len: i32, t: i32, param: u8)
 // unmodified except for the harness helpers below, which are this file's.
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code, unused_assignments, unused_mut)]
+// Keep the translated source shape used by the transformation tests.
+#[allow(
+    dead_code,
+    unused_assignments,
+    unused_mut,
+    unsafe_op_in_unsafe_fn,
+    clippy::needless_return
+)]
 #[path = "nested_seam_fixture.rs"]
 mod nested_seam_original;
 

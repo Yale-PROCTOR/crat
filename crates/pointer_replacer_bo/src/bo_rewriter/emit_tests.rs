@@ -10046,7 +10046,7 @@ fn a5_w1_proof_site_absent_from_pair_inventory_uses_t2_raw_view() {
         attempt.emission.plan.terminal_call_plans.a5_raw_calls,
     );
     assert!(source.contains("b: *mut i32"), "{source}");
-    assert!(super::verify::type_checks_str(&source));
+    assert!(super::verify::type_checks_str(source));
     assert!(
         attempt
             .emission
@@ -10099,10 +10099,10 @@ fn a5_w1_ref_and_option_forms_share_the_proof_site_raw_view_renderer() {
         !reference_source.contains("&mut *__crat_a5_raw_")
             && !regex::Regex::new(r"__crat_a5_raw_\w*\.as_mut\(\)\.unwrap\(\)")
                 .unwrap()
-                .is_match(&reference_source)
+                .is_match(reference_source)
     );
     assert!(reference_source.contains("b: *mut i32"));
-    assert!(super::verify::type_checks_str(&reference_source));
+    assert!(super::verify::type_checks_str(reference_source));
 
     let optional = e3_a5_raw_role_attempt(
         A5_OPTION_OVERLAP,
@@ -10129,7 +10129,7 @@ fn a5_w1_ref_and_option_forms_share_the_proof_site_raw_view_renderer() {
         "{optional_source}"
     );
     assert!(optional_source.contains("b: *mut i32"), "{optional_source}");
-    assert!(super::verify::type_checks_str(&optional_source));
+    assert!(super::verify::type_checks_str(optional_source));
 }
 
 #[test]
@@ -12950,7 +12950,8 @@ fn slu_r210_local_copy_to_field_has_a_positive_retention_hold() {
             table.entries
         );
     }
-    for name in ["out"] {
+    {
+        let name = "out";
         assert!(
             table.entries.iter().any(|(subject, decision)| {
                 subject.param_name.as_deref() == Some(name)

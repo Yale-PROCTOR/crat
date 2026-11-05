@@ -2215,7 +2215,6 @@ mod audit_tests {
                 )),
             )
             .unwrap();
-            let original_model = ctx.model.clone();
             let program = bo::collect_program(tcx);
             let callee = *program
                 .functions

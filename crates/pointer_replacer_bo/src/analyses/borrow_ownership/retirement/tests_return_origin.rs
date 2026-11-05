@@ -92,7 +92,7 @@ mod extended {
                 OverlapReason,
                 objects::{ObjectFacts, ObjectRoot},
                 overlap,
-                return_origin::{self, Certificate, ClosedOrigin, Rejection},
+                return_origin::{self, Rejection},
                 tests::accepts,
                 tests_return_origin::{
                     ExpectedCertificate, ExpectedObject, check_certificate_and_receipt,

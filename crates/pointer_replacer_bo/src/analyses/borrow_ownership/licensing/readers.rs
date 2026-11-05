@@ -150,7 +150,7 @@ pub(crate) fn validate_call_roles(facts: &super::facts::Facts) -> Result<(), Str
             .reference_peel
             .as_ref()
             .map(|peel| &peel.original_formal)
-            .or_else(|| match &call.formal {
+            .or(match &call.formal {
                 Present(formal) => Some(formal),
                 _ => None,
             });

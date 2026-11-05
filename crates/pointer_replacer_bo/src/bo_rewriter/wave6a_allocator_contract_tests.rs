@@ -1597,7 +1597,8 @@ fn w6a_r608_a_branch_in_a_loop_or_without_a_release_keeps_its_hold() {
         "both_arms::modes\n{receipts}\n{}",
         out.source
     );
-    for owner in ["branch_frees::modes"] {
+    {
+        let owner = "branch_frees::modes";
         assert!(
             receipts.contains(&format!(
                 "{owner}\theld\tcontract-allocation:implicit-close:block-unbalanced"

@@ -258,6 +258,47 @@ pub(crate) fn collect(
     proofs
 }
 
+/// A raw tail consumer is not bounded by the slice indexing checks. A thin
+/// caller cannot supply its full extent through a one-element from_ref view.
+pub(crate) fn needs_full_base(
+    tcx: TyCtxt<'_>,
+    parameter: &super::Subject,
+    uses: &super::emitability::SliceUses,
+) -> bool {
+    uses.raw_uses
+        .iter()
+        .any(|site| site.boundary_span.is_some())
+        && forward_parameter(tcx, parameter.fn_did, parameter.hir_id)
+}
+
+/// An adjacent prefix count does not cover the remaining string copied by a
+/// fresh-return consumer. Keep that adjacency in LenArm, but fabricate the
+/// actual extent through the existing typed fallback constructor.
+pub(crate) fn companion_for_tail(
+    table: &super::DecisionTable,
+    raw: &super::raw_boundary::RawBoundaryDispositionIndex,
+    callee: LocalDefId,
+    index: usize,
+    companion: Option<String>,
+) -> Option<String> {
+    let node = table.entries.iter().find_map(|(subject, _)| {
+        (subject.fn_did == callee && matches!(subject.kind, super::SubjectKind::Param { hir_index } if hir_index == index))
+            .then_some((subject.fn_did, subject.hir_id))
+    });
+    if raw.inventoried_sites().any(|(key, _, site)| {
+        site.node == node
+            && node.is_some()
+            && matches!(
+                raw.return_independent(key),
+                Some(ReturnIndependence::FreshMalloc(_))
+            )
+    }) {
+        None
+    } else {
+        companion
+    }
+}
+
 #[cfg(test)]
 mod tests {
     fn proves(source: &str) -> bool {
@@ -362,46 +403,5 @@ mod tests {
             }
         "#
         ));
-    }
-}
-
-/// A raw tail consumer is not bounded by the slice indexing checks. A thin
-/// caller cannot supply its full extent through a one-element from_ref view.
-pub(crate) fn needs_full_base(
-    tcx: TyCtxt<'_>,
-    parameter: &super::Subject,
-    uses: &super::emitability::SliceUses,
-) -> bool {
-    uses.raw_uses
-        .iter()
-        .any(|site| site.boundary_span.is_some())
-        && forward_parameter(tcx, parameter.fn_did, parameter.hir_id)
-}
-
-/// An adjacent prefix count does not cover the remaining string copied by a
-/// fresh-return consumer. Keep that adjacency in LenArm, but fabricate the
-/// actual extent through the existing typed fallback constructor.
-pub(crate) fn companion_for_tail(
-    table: &super::DecisionTable,
-    raw: &super::raw_boundary::RawBoundaryDispositionIndex,
-    callee: LocalDefId,
-    index: usize,
-    companion: Option<String>,
-) -> Option<String> {
-    let node = table.entries.iter().find_map(|(subject, _)| {
-        (subject.fn_did == callee && matches!(subject.kind, super::SubjectKind::Param { hir_index } if hir_index == index))
-            .then_some((subject.fn_did, subject.hir_id))
-    });
-    if raw.inventoried_sites().any(|(key, _, site)| {
-        site.node == node
-            && node.is_some()
-            && matches!(
-                raw.return_independent(key),
-                Some(ReturnIndependence::FreshMalloc(_))
-            )
-    }) {
-        None
-    } else {
-        companion
     }
 }

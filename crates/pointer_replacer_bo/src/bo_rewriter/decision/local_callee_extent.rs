@@ -1505,8 +1505,8 @@ pub unsafe fn caller(str: *const i8) -> i32 { is_float(str) }
                     Some(&DecidedForms::default()),
                     Some(&fat),
                 )
-                .into_iter()
-                .map(|(_, access)| access.detail())
+                .into_values()
+                .map(|access| access.detail())
                 .collect::<Vec<_>>()
             })
             .unwrap();

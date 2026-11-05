@@ -3515,9 +3515,11 @@ impl KindSolver {
                 let selector_index = selectors
                     .index_of(&selector)
                     .expect("leaked selector belongs to selector universe");
-                let core = (outcome == SatResult::Unsat)
-                    .then(|| self.solver.get_unsat_core())
-                    .unwrap_or_default();
+                let core = if outcome == SatResult::Unsat {
+                    self.solver.get_unsat_core()
+                } else {
+                    Default::default()
+                };
                 SELECTOR_TRACE_CAPTURE.with(|capture| {
                     let mut capture = capture.borrow_mut();
                     let trace = capture.as_mut().expect("selector trace active");

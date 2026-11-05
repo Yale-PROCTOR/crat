@@ -1157,7 +1157,7 @@ mod native_tests {
     fn native_opaque_and_recursive_calls_hold() {
         let source = r#"extern "C" { fn opaque(p: *mut i32); } pub unsafe fn probe(p: *mut i32) { opaque(p); }"#;
         assert!(matches!(
-            verdict(&source, "probe"),
+            verdict(source, "probe"),
             Err(EffectsHold::Opaque(_))
         ));
         assert!(matches!(

@@ -210,7 +210,10 @@ fn a14_shape_counts_are_over_compiler_rows_not_predicted_corpus_yield() {
             "pub unsafe fn witness(inputs: *const *const f64, i: isize) -> f64 { let p = *inputs.add(1); *p.offset(i) }",
         ),
     ];
-    let counts = admission::counts(&rows);
+    let mut counts = std::collections::BTreeMap::new();
+    for row in rows {
+        *counts.entry((row.shape, row.status)).or_insert(0) += 1;
+    }
     assert_eq!(
         counts.get(&(Shape::LocalArray, Status::DecisionOnly)),
         Some(&1)

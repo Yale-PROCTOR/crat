@@ -270,7 +270,8 @@ fn w6b_a_scalar_formal_read_as_bytes_is_a_byte_region() {
             decision(&rows, function, "pdest")
         );
     }
-    for function in ["copy_be32"] {
+    {
+        let function = "copy_be32";
         assert!(
             is_slice(decision(&rows, function, "pdest"), true),
             "{function}::pdest is a mutable byte region: {:?}",
@@ -292,7 +293,8 @@ fn w6b_a_scalar_formal_read_as_bytes_is_a_byte_region() {
     let (source, _) = emitted(COPY_BE);
     let c = compact(&source);
     // The count names the RESOLVED scalar, as W6B-6's views always have.
-    for (function, width) in [("copy_be32", "u32")] {
+    {
+        let (function, width) = ("copy_be32", "u32");
         assert!(
             c.contains(&format!("fn{function}(mutpdest:&mut[u8],")),
             "{function}: the written formal is a byte region: {source}"

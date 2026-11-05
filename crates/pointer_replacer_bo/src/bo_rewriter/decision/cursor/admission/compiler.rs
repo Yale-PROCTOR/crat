@@ -674,6 +674,7 @@ fn unsigned_delta<'tcx>(
             if matches!(source.ty(&body.local_decls, tcx).kind(), ty::Uint(_)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn derive_array<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,

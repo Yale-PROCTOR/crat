@@ -51,33 +51,12 @@ pub(crate) struct EscRuntimeSite {
     #[cfg(test)]
     pub(crate) lhs: SlotRef,
     #[cfg(test)]
-    pub(crate) rhs: SlotRef,
-    #[cfg(test)]
     pub(crate) loan: SelectedCopyLendLoan,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg(test)]
-pub(crate) enum EscExclusionReason {
-    FieldIssuerOutOfScope,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct EscExcludedSite {
-    #[cfg(test)]
-    pub(crate) key: EscCopySiteKey,
-    #[cfg(test)]
-    pub(crate) lhs: SlotRef,
-    #[cfg(test)]
-    pub(crate) rhs: SlotRef,
-    #[cfg(test)]
-    pub(crate) reason: EscExclusionReason,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct EscMinimalSelection {
     pub(crate) sites: Vec<EscRuntimeSite>,
-    pub(crate) excluded_sites: Vec<EscExcludedSite>,
     pub(crate) loans: SelectedCopyLendLoans,
     demotion_exemptions: FxHashMap<LocalDefId, FxHashSet<(Local, Local)>>,
     presentations: FxHashMap<(LocalDefId, SelectedCopyLendLoan), EscPresentation>,
@@ -267,7 +246,7 @@ pub(crate) fn with_fixture_selection<T>(f: impl FnOnce() -> T) -> T {
 fn fixture_selection_enabled() -> bool {
     #[cfg(test)]
     {
-        return FIXTURE_SELECTION.with(std::cell::Cell::get);
+        FIXTURE_SELECTION.with(std::cell::Cell::get)
     }
     #[cfg(not(test))]
     false
@@ -592,16 +571,6 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
             destination_place: row.destination_place.clone(),
         };
         if matches!(row.rhs, SlotRef::Field(_)) {
-            answer.excluded_sites.push(EscExcludedSite {
-                #[cfg(test)]
-                key,
-                #[cfg(test)]
-                lhs: row.lhs,
-                #[cfg(test)]
-                rhs: row.rhs,
-                #[cfg(test)]
-                reason: EscExclusionReason::FieldIssuerOutOfScope,
-            });
             continue;
         }
         let loan = SelectedCopyLendLoan {
@@ -645,8 +614,6 @@ pub(crate) fn select(program: &RustProgram<'_>, slots: &CrateSlots) -> EscMinima
             key,
             #[cfg(test)]
             lhs: row.lhs,
-            #[cfg(test)]
-            rhs: row.rhs,
             #[cfg(test)]
             loan,
         });

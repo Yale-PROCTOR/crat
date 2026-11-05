@@ -6925,7 +6925,7 @@ pub(crate) fn reconcile_seam_owners<'a>(
 ) -> SeamOwnerRecon {
     let mut r = SeamOwnerRecon::default();
     for (key, carried) in edits {
-        let mut push = |r: &mut SeamOwnerRecon, row: String| {
+        let push = |r: &mut SeamOwnerRecon, row: String| {
             if r.examples.len() < 4 {
                 r.examples.push(row);
             }

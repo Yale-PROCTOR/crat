@@ -227,7 +227,9 @@ fn w6p_the_recovered_prefix_is_visible_in_the_ledger_receipt() {
                 .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
                 .unwrap_or_else(|| panic!("no fn {name}"))
         };
-        index.certify_recorded(function("ReadHuffmanCode"), function("SafeReadBits"), 0, 2);
+        index
+            .certify_recorded(function("ReadHuffmanCode"), function("SafeReadBits"), 0, 2)
+            .expect("the recovered fields are disjoint");
         receipt = Some(
             index
                 .ledger()

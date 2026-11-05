@@ -12,7 +12,7 @@
 //! `from_ref` (shape (i), brotli's `dist_cache`) is left to 55's thin-into-fat
 //! rule, and its witness and fixture leave this file with the thin-caller hold.
 
-use super::wave6a_allocation_tests::{compact, emitted};
+use super::wave6a_allocation_tests::compact;
 
 /// lodepng's `lodepng_read32bitInt` shape: the address of one element of a raw
 /// buffer (`&*in_0.offset(k)`) handed to a reader of four.

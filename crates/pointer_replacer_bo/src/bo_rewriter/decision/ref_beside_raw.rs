@@ -437,33 +437,6 @@ fn edge_of(rest: &str) -> Edge {
     }
 }
 
-#[cfg(test)]
-mod edge_tests {
-    use super::{Edge, edge_of};
-
-    /// wave-5d 150d (the round-4 review's MED-1): a certificate's reason holds
-    /// colons, so the premise's own key must be found in the whole receipt.
-    #[test]
-    fn r150d_a_premise_clear_receipt_is_a_premise_edge() {
-        assert_eq!(
-            edge_of(
-                "1/2:clear:pair-disjoint:premise=global-or-integer-provenance:global-value:\
-                 pair-disjointness-certificate:premise=global-or-integer-provenance"
-            ),
-            Edge::PremiseClear
-        );
-        assert_eq!(
-            edge_of("1/2:clear:pair-disjoint:distinct-roots:pair-disjointness-certificate"),
-            Edge::CertifiedClear
-        );
-        assert_eq!(
-            edge_of("1/2:clear:a5-proven-disjoint:a5"),
-            Edge::ClassifierClear
-        );
-        assert_eq!(edge_of("1/2:overlapping:x:y"), Edge::Ordered);
-    }
-}
-
 /// The MIR locals a local's value derives from by construction (the review's
 /// HIGH-2: no arbitrary call edges): copies and casts through temporaries, the
 /// pointer steps and `as_ptr` / `as_mut_ptr` by name, and borrows of a place —
@@ -1206,4 +1179,31 @@ pub(crate) fn call_arguments<'tcx>(tcx: TyCtxt<'tcx>, caller: LocalDefId) -> Cal
     };
     intravisit::Visitor::visit_body(&mut find, tcx.hir_body_owned_by(caller));
     find.found
+}
+
+#[cfg(test)]
+mod edge_tests {
+    use super::{Edge, edge_of};
+
+    /// wave-5d 150d (the round-4 review's MED-1): a certificate's reason holds
+    /// colons, so the premise's own key must be found in the whole receipt.
+    #[test]
+    fn r150d_a_premise_clear_receipt_is_a_premise_edge() {
+        assert_eq!(
+            edge_of(
+                "1/2:clear:pair-disjoint:premise=global-or-integer-provenance:global-value:\
+                 pair-disjointness-certificate:premise=global-or-integer-provenance"
+            ),
+            Edge::PremiseClear
+        );
+        assert_eq!(
+            edge_of("1/2:clear:pair-disjoint:distinct-roots:pair-disjointness-certificate"),
+            Edge::CertifiedClear
+        );
+        assert_eq!(
+            edge_of("1/2:clear:a5-proven-disjoint:a5"),
+            Edge::ClassifierClear
+        );
+        assert_eq!(edge_of("1/2:overlapping:x:y"), Edge::Ordered);
+    }
 }

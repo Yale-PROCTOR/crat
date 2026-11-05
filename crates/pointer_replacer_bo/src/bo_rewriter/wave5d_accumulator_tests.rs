@@ -1,18 +1,17 @@
 //! Relay006 accumulator checkpoint: actual bodies, native model and emission.
 use std::sync::OnceLock;
 
-use super::{
-    OverlapMode, WholeProgramAttestation,
-    decision::{Decision, nested_slice::Hold},
-};
+use super::{OverlapMode, WholeProgramAttestation, decision::nested_slice::Hold};
 
 const SOURCE: &str = include_str!("wave5d_accumulator_fixture.rs");
+// Keep the translated source shape used by the transformation tests.
 #[allow(
     dead_code,
     unused_assignments,
     unused_variables,
     unused_mut,
-    unsafe_op_in_unsafe_fn
+    unsafe_op_in_unsafe_fn,
+    clippy::needless_return
 )]
 #[path = "wave5d_accumulator_fixture.rs"]
 mod original;
