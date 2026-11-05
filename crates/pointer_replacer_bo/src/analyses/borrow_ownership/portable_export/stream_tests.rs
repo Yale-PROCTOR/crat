@@ -103,14 +103,47 @@ fn history(output: &BoExport, count: usize) -> BoExport {
         .expect("real conflict review");
     result.retirement_rounds = (0..count)
         .map(|round| {
-            let mut row = review.clone();
+            let mut row = (**review).clone();
             row.ordinary_error_points = round;
             row.conflicts.push(row.conflicts[0].clone());
-            row
+            std::sync::Arc::new(row)
         })
         .collect();
     result
 }
+/// R1459-2 (main 315, the user's word "(a)로 하자" on addendum 1407's option (A)): the portable stream
+/// of the real capture (its own retirement rounds, no synthetic history), byte for byte as at
+/// `9603759bd`, the head before the retirement reviews became shared handles: the wire file and the
+/// typed canonical bytes, each by its sha256.
+#[test]
+fn r1459_2_portable_stream_bytes_are_unchanged_by_the_shared_review() {
+    use sha2::{Digest, Sha256};
+    captured(CODE, |program, slots, output| {
+        assert!(
+            !output.retirement_rounds.is_empty(),
+            "the capture's own retirement rounds"
+        );
+        let directory = Directory::new();
+        let spool = crate::analyses::borrow_ownership::portable_export::stream::collect_to_path(
+            program,
+            slots,
+            output,
+            &directory.0,
+        )
+        .unwrap();
+        let wire = std::fs::read(&spool.path).unwrap();
+        let mut typed = Vec::new();
+        spool.write_portable_typed(&mut typed).unwrap();
+        let digest = |bytes: &[u8]| format!("{:x}", Sha256::digest(bytes));
+        assert_eq!(
+            (digest(&wire), digest(&typed)),
+            (PINNED_WIRE.to_owned(), PINNED_TYPED.to_owned()),
+            "the portable bytes at 9603759bd"
+        );
+    });
+}
+const PINNED_WIRE: &str = "82ba896faf8a4de4ecbe7c66da94849c6e1f87abc6f4f1467df44c04163f1d06";
+const PINNED_TYPED: &str = "099ac67ab23aa31527d64b5152be383be07d30a3bd75fe6f56bbad229aa6ac32";
 #[test]
 fn r281_w01_twelve_rounds_full_wire_bytes_match_frozen_oracle() {
     captured(CODE, |program, slots, output| {
@@ -181,7 +214,7 @@ fn r281_w05_resident_json_graph_does_not_scale_with_retained_history() {
 fn r281_w03_history_labels_routes_and_duplicates_keep_full_bytes() {
     captured(CODE, |program, slots, output| {
         let mut output = history(output, 12);
-        let conflict = &mut output.retirement_rounds[0].conflicts[0];
+        let conflict = &mut std::sync::Arc::make_mut(&mut output.retirement_rounds[0]).conflicts[0];
         let first = rt::RouteStep {
             caller: program.functions[0],
             callee: program.functions[1],
@@ -213,7 +246,9 @@ fn r281_w03_history_labels_routes_and_duplicates_keep_full_bytes() {
                 owner: None,
             },
         };
-        output.retirement_rounds[0].unresolved.push(unresolved);
+        std::sync::Arc::make_mut(&mut output.retirement_rounds[0])
+            .unresolved
+            .push(unresolved);
         let directory = Directory::new();
         let oracle = collect(program, slots, &output)
             .unwrap()
@@ -235,7 +270,9 @@ fn r281_w03_history_labels_routes_and_duplicates_keep_full_bytes() {
         spool.write_portable_typed(&mut typed).unwrap();
         assert_eq!(typed, oracle.as_bytes());
         let mut reordered = output.clone();
-        reordered.retirement_rounds[0].conflicts[0].route.reverse();
+        std::sync::Arc::make_mut(&mut reordered.retirement_rounds[0]).conflicts[0]
+            .route
+            .reverse();
         assert_ne!(
             collect(program, slots, &reordered)
                 .unwrap()
@@ -245,7 +282,9 @@ fn r281_w03_history_labels_routes_and_duplicates_keep_full_bytes() {
             "ordered route is not a set"
         );
         let mut dropped = output.clone();
-        dropped.retirement_rounds[0].conflicts.pop();
+        std::sync::Arc::make_mut(&mut dropped.retirement_rounds[0])
+            .conflicts
+            .pop();
         assert_ne!(
             collect(program, slots, &dropped)
                 .unwrap()
@@ -255,7 +294,7 @@ fn r281_w03_history_labels_routes_and_duplicates_keep_full_bytes() {
             "duplicate observations must remain"
         );
         let mut relabeled = output.clone();
-        relabeled.retirement_rounds[0].conflicts[0]
+        std::sync::Arc::make_mut(&mut relabeled.retirement_rounds[0]).conflicts[0]
             .loan
             .as_mut()
             .unwrap()
@@ -274,7 +313,7 @@ fn r281_w03_history_labels_routes_and_duplicates_keep_full_bytes() {
 fn r281_w04_corrupt_target_refuses_and_cleans_unpublished_fragments() {
     captured(CODE, |program, slots, output| {
         let mut output = history(output, 12);
-        output.retirement_rounds[0].conflicts[0]
+        std::sync::Arc::make_mut(&mut output.retirement_rounds[0]).conflicts[0]
             .target_key
             .push_str("-corrupt");
         assert!(

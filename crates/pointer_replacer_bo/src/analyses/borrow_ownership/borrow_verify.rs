@@ -171,7 +171,7 @@ struct WitnessedSlotConflict {
 
 struct Revalidated<T> {
     conflicts: T,
-    retirement: super::retirement::RetirementReview,
+    retirement: std::sync::Arc<super::retirement::RetirementReview>,
     reader_failures: Vec<super::licensing::reader_replay::Failure>,
     /// With the raw-cause ledger on, each conflict's
     /// invalidating slots, in the order of `conflicts`' per-function lists (the
@@ -190,13 +190,17 @@ fn finish_readers(
     result.failures
 }
 
+/// R1459-2 (main 315, addendum 1407's option (A)): the round's review is shared, not cloned --
+/// the capture's round history, its final review and the caller hold one `Arc`.
 fn finish_retirement(
     scope: super::retirement::RetirementScope,
-) -> super::retirement::RetirementReview {
-    let review = scope.finish();
+) -> std::sync::Arc<super::retirement::RetirementReview> {
+    let review = std::sync::Arc::new(scope.finish());
     super::export::record(|export| {
-        export.retirement_rounds.push(review.clone());
-        export.source_retirement = Some(review.clone());
+        export
+            .retirement_rounds
+            .push(std::sync::Arc::clone(&review));
+        export.source_retirement = Some(std::sync::Arc::clone(&review));
     });
     review
 }
@@ -1372,7 +1376,7 @@ fn verify_rounds(
             ),
         );
         if !reviewed.retirement.unresolved.is_empty() {
-            stats.source_retirement_decline = reviewed.retirement.unresolved;
+            stats.source_retirement_decline = reviewed.retirement.unresolved.clone();
             return (None, stats);
         }
         let raw_targets = reviewed.retirement.raw_targets();
@@ -2002,7 +2006,7 @@ pub(super) fn verify_guarded_to_fixpoint_counting_impl(
             None,
         );
         if !reviewed.retirement.unresolved.is_empty() {
-            stats.source_retirement_decline = reviewed.retirement.unresolved;
+            stats.source_retirement_decline = reviewed.retirement.unresolved.clone();
             return (None, stats);
         }
         let raw_targets = reviewed.retirement.raw_targets();

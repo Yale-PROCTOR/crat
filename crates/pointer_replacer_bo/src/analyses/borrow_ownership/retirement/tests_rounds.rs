@@ -27,8 +27,7 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-fn check_rounds(force_ref: bool) {
-    const CODE: &str = r#"
+const CODE: &str = r#"
 unsafe extern "C" { fn free(p: *mut u8); }
 pub unsafe fn f(p: *const u8, alias: *mut u8) -> u8 {
     let v = *p;
@@ -36,6 +35,8 @@ pub unsafe fn f(p: *const u8, alias: *mut u8) -> u8 {
     v
 }
 "#;
+
+fn check_rounds(force_ref: bool) {
     for backend in [
         TestValidationBackend::HardCheckRoundOptimize,
         TestValidationBackend::LegacyOptimize,
@@ -152,4 +153,63 @@ pub unsafe fn f(p: *const u8, alias: *mut u8) -> u8 {
 #[test]
 fn e5_p_forced_unrepaired_entry_declines_without_an_ordinary_loan_conflict() {
     check_rounds(true);
+}
+
+/// R1459-2 (main 315, the user's word "(a)로 하자" on addendum 1407's option (A)): the final
+/// retirement review and the last round's are ONE shared handle, not two deep copies of the round's
+/// review. RED at `9603759bd`, where both fields own their copy.
+#[test]
+fn r1459_2_the_final_retirement_review_is_the_last_round_shared() {
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let mut functions = Vec::new();
+        for owner in tcx.hir_crate(()).owners.iter() {
+            let Some(owner) = owner.as_owner() else { continue };
+            let OwnerNode::Item(item) = owner.node() else { continue };
+            if let ItemKind::Fn { .. } = item.kind {
+                functions.push(item.owner_id.def_id);
+            }
+        }
+        let program = RustProgram {
+            tcx,
+            functions,
+            structs: Vec::new(),
+        };
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let ((), export) = with_bo_export(|| {
+            let solver = KindSolver::new(&slots);
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("production construction");
+            let _ = verify_bo_construction_counting_for_test(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &facts,
+                TestValidationBackend::HardCheckRoundOptimize,
+            );
+        });
+        let last = export
+            .retirement_rounds
+            .last()
+            .expect("at least one retirement round");
+        let final_review = export
+            .source_retirement
+            .as_ref()
+            .expect("final retirement review");
+        assert!(
+            Arc::ptr_eq(final_review, last),
+            "the final review must share the last round's handle"
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
 }
