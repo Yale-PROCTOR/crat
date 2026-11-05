@@ -148,6 +148,7 @@ fn collect_wrappers(
         let ast::ItemKind::Fn(wrapper) = &item.kind else { continue };
         let Some(body) = wrapper.body.as_deref() else { continue };
         let Some(call) = block_expression(body) else { continue };
+        let Some(call) = forwarded_call(call) else { continue };
         let ast::ExprKind::Call(callee, args) = &call.kind else { continue };
         let ast::ExprKind::Path(None, path) = &callee.kind else { continue };
         let [segment] = path.segments.as_slice() else { continue };
@@ -238,6 +239,41 @@ fn block_expression(block: &ast::Block) -> Option<&ast::Expr> {
     }
 }
 
+fn forwarded_call(expression: &ast::Expr) -> Option<&ast::Expr> {
+    let expression = utils::ast::unwrap_paren(expression);
+    let ast::ExprKind::MethodCall(method) = &expression.kind else { return Some(expression) };
+    if method.seg.args.is_some() {
+        return None;
+    }
+    if matches!(method.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr") && method.args.is_empty() {
+        return Some(utils::ast::unwrap_paren(&method.receiver));
+    }
+    if method.seg.ident.name.as_str() != "map_or" {
+        return None;
+    }
+    let [default, projection] = method.args.as_slice() else { return None };
+    let ast::ExprKind::Closure(closure) = &projection.kind else { return None };
+    let [parameter] = closure.fn_decl.inputs.as_slice() else { return None };
+    let ast::PatKind::Ident(_, name, None) = &parameter.pat.kind else { return None };
+    let ast::ExprKind::MethodCall(pointer) = &closure.body.kind else { return None };
+    let null = match pointer.seg.ident.name.as_str() {
+        "as_ptr" => "null",
+        "as_mut_ptr" => "null_mut",
+        _ => return None,
+    };
+    if pointer.seg.args.is_some()
+        || !pointer.args.is_empty()
+        || !is_name(&pointer.receiver, name.name)
+    {
+        return None;
+    }
+    let ast::ExprKind::Call(callee, args) = &default.kind else { return None };
+    if !args.is_empty() || path_parts(callee)?.as_slice() != ["core", "ptr", null] {
+        return None;
+    }
+    Some(utils::ast::unwrap_paren(&method.receiver))
+}
+
 fn is_name(expression: &ast::Expr, name: Symbol) -> bool {
     matches!(&utils::ast::unwrap_paren(expression).kind, ast::ExprKind::Path(None, path)
         if path.segments.len() == 1 && path.segments[0].ident.name == name)
@@ -267,6 +303,15 @@ fn path_parts(expression: &ast::Expr) -> Option<Vec<String>> {
     )
 }
 
+fn option_variant(expression: &ast::Expr, variant: &str) -> bool {
+    path_parts(expression).is_some_and(|parts| {
+        parts.as_slice() == [variant]
+            || matches!(parts.as_slice(), [root, module, option, name]
+                if matches!(root.as_str(), "core" | "std")
+                    && module == "option" && option == "Option" && name == variant)
+    })
+}
+
 fn cursor_call<'a>(
     expression: &'a ast::Expr,
     cursor: &str,
@@ -286,7 +331,17 @@ fn slice_bound<'a>(
 ) -> Option<&'a ast::Expr> {
     let ast::TyKind::Ptr(raw) = &raw.kind else { return None };
     let mutable = raw.mutbl.is_mut();
-    if let ast::ExprKind::AddrOf(ast::BorrowKind::Ref, mutability, value) = &empty.kind {
+    if option_variant(empty, "None") {
+        if !matches!(internal.kind, ast::TyKind::Path(..)) {
+            return None;
+        }
+        let ast::ExprKind::Call(callee, args) = &nonnull.kind else { return None };
+        if !option_variant(callee, "Some") {
+            return None;
+        }
+        let [parts] = args.as_slice() else { return None };
+        nonnull = parts;
+    } else if let ast::ExprKind::AddrOf(ast::BorrowKind::Ref, mutability, value) = &empty.kind {
         let slice_type = match &internal.kind {
             ast::TyKind::Ref(_, inner) => {
                 matches!(inner.ty.kind, ast::TyKind::Slice(_)) && inner.mutbl == raw.mutbl
@@ -411,6 +466,99 @@ unsafe fn cursor_wrapper(p: *const i32) {
 "#;
         let output = process_wrapper_bounds(&request(source)).unwrap();
         assert_eq!(output.wrappers.len(), 2);
+    }
+
+    #[test]
+    fn optional_slices_and_plain_slices_keep_bounds_in_source_order() {
+        let source = r#"
+type Maybe<'a> = Option<&'a [i32]>;
+unsafe fn internal(a: Maybe<'_>, b: Option<&mut [u8]>, c: &[u16], n: usize) {}
+unsafe fn wrapper(a: *const i32, b: *mut u8, c: *const u16, n: usize) {
+    internal(if a.is_null() { None } else { Some(core::slice::from_raw_parts(a, 1_000_000)) },
+        if b.is_null() { ::core::option::Option::None }
+            else { ::core::option::Option::Some(::core::slice::from_raw_parts_mut(b, 1_000_000)) },
+        if c.is_null() { &[] } else { std::slice::from_raw_parts(c, 1_000_000) }, n)
+}
+"#;
+        let output = process_wrapper_bounds(&request(source)).unwrap();
+        let [wrapper] = output.wrappers.as_slice() else { panic!() };
+        assert_eq!(wrapper.sites.len(), 3);
+        assert!(
+            wrapper
+                .sites
+                .windows(2)
+                .all(|pair| pair[0].start < pair[1].start)
+        );
+        let mut request = request(source);
+        request.wrapper = Some("wrapper".to_owned());
+        request.expressions = Some(vec!["n".to_owned(), "n + 1".to_owned(), "n + 2".to_owned()]);
+        let candidate = process_wrapper_bounds(&request).unwrap().candidate.unwrap();
+        let expected = source
+            .replacen("1_000_000", "(n\n)", 1)
+            .replacen("1_000_000", "(n + 1\n)", 1)
+            .replacen("1_000_000", "(n + 2\n)", 1);
+        assert_eq!(candidate, expected);
+        utils::compilation::run_compiler_on_str(&candidate, utils::type_check).expect(&candidate);
+    }
+
+    #[test]
+    fn infers_bounds_in_actual_interface_wrappers_with_slice_returns() {
+        let cases = [
+            ("shared", "&'a [i32]"),
+            ("mutable", "&'a mut [i32]"),
+            ("maybe_shared", "Option<&'a [i32]>"),
+            ("maybe_mutable", "Option<&'a mut [i32]>"),
+        ];
+        let mut source = String::new();
+        for (name, slice) in cases {
+            source.push_str(&format!(
+                "pub unsafe fn {name}<'a>(p: {slice}, n: usize) -> {slice} {{ let _ = n; p }}\n"
+            ));
+        }
+        let config = passes::interface_fixer::Config {
+            c_exposed_fns: cases.iter().map(|(name, _)| (*name).to_owned()).collect(),
+            ..Default::default()
+        };
+        let mut source = utils::compilation::run_compiler_on_str(&source, |tcx| {
+            passes::interface_fixer::fix_interfaces(&config, tcx)
+        })
+        .unwrap();
+        let discovery = process_wrapper_bounds(&request(&source)).unwrap();
+        assert_eq!(discovery.wrappers.len(), cases.len(), "{source}");
+        for (name, _) in cases {
+            let mut request = request(&source);
+            request.wrapper = Some(name.to_owned());
+            request.expressions = Some(vec!["n".to_owned()]);
+            source = process_wrapper_bounds(&request).unwrap().candidate.unwrap();
+        }
+        assert!(!source.contains("1_000_000"));
+        utils::compilation::run_compiler_on_str(&source, utils::type_check).expect(&source);
+    }
+
+    #[test]
+    fn ignores_invalid_optional_slice_and_return_conversion_shapes() {
+        let source = r#"
+unsafe fn internal(p: Option<&[i32]>) -> Option<&[i32]> { p }
+unsafe fn plain_internal(p: &[i32]) -> &[i32] { p }
+"#;
+        for wrapper in [
+            "unsafe fn wrapper(p: *const i32) { internal(if p.is_null() { None } else { other::Some(core::slice::from_raw_parts(p, 1_000_000)) }) }",
+            "unsafe fn wrapper(p: *const i32) { internal(if p.is_null() { None } else { Some(core::slice::from_raw_parts_mut(p, 1_000_000)) }) }",
+            "unsafe fn wrapper(p: *const i32) { internal(if p.is_null() { Some(&[]) } else { Some(core::slice::from_raw_parts(p, 1_000_000)) }) }",
+            "unsafe fn wrapper(p: *const i32) { (internal(if p.is_null() { None } else { Some(core::slice::from_raw_parts(p, 1_000_000)) })).map_or(::core::ptr::null_mut(), |slice| slice.as_ptr()) }",
+            "unsafe fn wrapper(p: *const i32) { (internal(if p.is_null() { None } else { Some(core::slice::from_raw_parts(p, 1_000_000)) })).map_or(::core::ptr::null(), |slice| other.as_ptr()) }",
+            "unsafe fn wrapper(p: *const i32) { (plain_internal(if p.is_null() { &[] } else { core::slice::from_raw_parts(p, 1_000_000) })).as_ptr(1) }",
+            "unsafe fn wrapper(p: *const i32) { (plain_internal(if p.is_null() { &[] } else { core::slice::from_raw_parts(p, 1_000_000) })).as_ptr::<i32>() }",
+        ] {
+            let source = format!("{source}\n{wrapper}");
+            assert!(
+                process_wrapper_bounds(&request(&source))
+                    .unwrap()
+                    .wrappers
+                    .is_empty(),
+                "{source}"
+            );
+        }
     }
 
     #[test]

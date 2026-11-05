@@ -58,10 +58,12 @@ pub fn fix_interfaces(config: &Config, tcx: TyCtxt<'_>) -> String {
     pprust::crate_to_string_for_macros(&expanded_ast)
 }
 
-// one resolved wrapper-generation target: the per-param fixes to apply plus
+// one resolved wrapper-generation target: the parameter/return fixes to apply plus
 // what to do with the fn's identity (see `FixAction`)
 struct FixEntry<'tcx> {
+    signature: ty::FnSig<'tcx>,
     param_fixes: FxHashMap<usize, ParamFix<'tcx>>,
+    return_fix: Option<SliceFix<'tcx>>,
     action: FixAction,
 }
 
@@ -121,16 +123,28 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                             "const"
                         };
                         match pfix.kind {
-                            ParamFixKind::Slice => {
-                                let ty = utils::ir::mir_ty_to_string(pfix.ty, self.tcx);
-                                *param.ty = utils::ty!("*{m} {ty}");
-                                write!(
-                                    call,
-                                    "if {x}.is_null() {{ &{}[] }} else {{ std::slice::from_raw_parts{}({x}, 1_000_000) }}, ",
-                                    if pfix.mutability.is_mut() { "mut " } else { "" },
-                                    if pfix.mutability.is_mut() { "_mut" } else { "" },
-                                )
-                                .unwrap();
+                            ParamFixKind::Slice { option_wrapped } => {
+                                *param.ty = SliceFix {
+                                    ty: pfix.ty,
+                                    mutability: pfix.mutability,
+                                    option_wrapped,
+                                }
+                                .raw_type();
+                                let suffix = if pfix.mutability.is_mut() { "_mut" } else { "" };
+                                if option_wrapped {
+                                    write!(
+                                        call,
+                                        "if {x}.is_null() {{ ::core::option::Option::None }} else {{ ::core::option::Option::Some(::core::slice::from_raw_parts{suffix}({x}, 1_000_000)) }}, ",
+                                    )
+                                    .unwrap();
+                                } else {
+                                    write!(
+                                        call,
+                                        "if {x}.is_null() {{ &{}[] }} else {{ std::slice::from_raw_parts{suffix}({x}, 1_000_000) }}, ",
+                                        if pfix.mutability.is_mut() { "mut " } else { "" },
+                                    )
+                                    .unwrap();
+                                }
                             }
                             ParamFixKind::SliceCursor => {
                                 let ty = utils::ir::mir_ty_to_string(pfix.ty, self.tcx);
@@ -182,7 +196,34 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     }
                 }
                 call.push(')');
+                if let Some(return_fix) = fix.return_fix {
+                    f.sig.decl.output = FnRetTy::Ty(Box::new(return_fix.raw_return_type(
+                        self.tcx,
+                        fix,
+                        &mut f.generics,
+                    )));
+                    let suffix = if return_fix.mutability.is_mut() {
+                        "_mut"
+                    } else {
+                        ""
+                    };
+                    let method = if return_fix.mutability.is_mut() {
+                        "as_mut_ptr"
+                    } else {
+                        "as_ptr"
+                    };
+                    call = if return_fix.option_wrapped {
+                        format!(
+                            "({call}).map_or(::core::ptr::null{suffix}(), |slice| slice.{method}())"
+                        )
+                    } else {
+                        format!("({call}).{method}()")
+                    };
+                }
                 let body = f.body.as_mut().unwrap();
+                if !fix.param_fixes.is_empty() {
+                    f.sig.header.safety = Safety::Unsafe(f.sig.span);
+                }
                 body.stmts.clear();
                 let stmt = utils::stmt!("{call}");
                 body.stmts.push(stmt);
@@ -264,7 +305,9 @@ struct ParamFix<'tcx> {
 
 #[derive(Clone, Copy)]
 enum ParamFixKind {
-    Slice,
+    Slice {
+        option_wrapped: bool,
+    },
     SliceCursor,
     // a struct-pointer param specialized to one field (task 3); `ty` on the
     // enclosing `ParamFix` holds the observed field/pointee type, used for
@@ -276,6 +319,85 @@ enum ParamFixKind {
         // false when it's a raw `*const T`/`*mut T`
         option_wrapped: bool,
     },
+}
+
+#[derive(Clone, Copy)]
+struct SliceFix<'tcx> {
+    ty: ty::Ty<'tcx>,
+    mutability: ty::Mutability,
+    option_wrapped: bool,
+}
+
+impl<'tcx> SliceFix<'tcx> {
+    fn raw_return_type(
+        mut self,
+        tcx: TyCtxt<'tcx>,
+        fix: &FixEntry<'tcx>,
+        generics: &mut Generics,
+    ) -> Ty {
+        let mut names = FxHashMap::default();
+        tcx.for_each_free_region(&self.ty, |region| {
+            let ty::RegionKind::ReLateParam(parameter) = region.kind() else { return };
+            if parameter.kind.is_named()
+                || names.contains_key(&region)
+                || fix
+                    .signature
+                    .inputs()
+                    .iter()
+                    .enumerate()
+                    .any(|(index, input)| {
+                        let input = fix.param_fixes.get(&index).map_or(*input, |fix| fix.ty);
+                        tcx.any_free_region_meets(&input, |input_region| input_region == region)
+                    })
+            {
+                return;
+            }
+            // A converted outer reference can no longer supply an elided return lifetime.
+            let mut index = 0;
+            let name = loop {
+                let name = format!("__crat_return{index}");
+                if !generics
+                    .params
+                    .iter()
+                    .any(|param| param.ident.name.as_str().trim_start_matches('\'') == name)
+                {
+                    break name;
+                }
+                index += 1;
+            };
+            let item = utils::item!("fn __lifetime<'{name}>() {{}}");
+            let ItemKind::Fn(mut function) = item.kind else { unreachable!() };
+            generics
+                .params
+                .insert(0, function.generics.params.remove(0));
+            names.insert(
+                region,
+                ty::Region::new_late_param(
+                    tcx,
+                    parameter.scope,
+                    ty::LateParamRegionKind::Named(
+                        parameter.scope,
+                        Symbol::intern(&format!("'{name}")),
+                    ),
+                ),
+            );
+        });
+        self.ty = ty::fold_regions(tcx, self.ty, |region, _| {
+            names.get(&region).copied().unwrap_or(region)
+        });
+        self.raw_type()
+    }
+
+    fn raw_type(self) -> Ty {
+        let element =
+            ty::print::with_no_trimmed_paths!(ty::print::with_crate_prefix!(self.ty.to_string()));
+        let m = if self.mutability.is_mut() {
+            "mut"
+        } else {
+            "const"
+        };
+        utils::ty!("*{m} {element}")
+    }
 }
 
 struct HirVisitor<'a, 'tcx> {
@@ -304,7 +426,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
                             .is_some_and(|s| self.config.c_exposed_fns.contains(s.as_str()))
                     })
             {
-                self.analyze_rename_target(item, name, body);
+                self.analyze_rename_target(item, name);
             } else if let Some((exported_symbol, entry)) =
                 find_field_spec_entry(self.config, self.tcx, item.owner_id.def_id, name)
             {
@@ -317,16 +439,21 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
 }
 
 impl<'tcx> HirVisitor<'_, 'tcx> {
-    fn analyze_rename_target(&mut self, item: &hir::Item<'tcx>, name: &str, body: hir::BodyId) {
-        let body = self.tcx.hir_body(body);
-        let typeck = self.tcx.typeck(item.owner_id.def_id);
-        let fixes = detect_slice_cursor_fixes(self.tcx, body, typeck);
-        if !fixes.is_empty() {
+    fn analyze_rename_target(&mut self, item: &hir::Item<'tcx>, name: &str) {
+        let signature = self.tcx.liberate_late_bound_regions(
+            item.owner_id.def_id.to_def_id(),
+            self.tcx.fn_sig(item.owner_id).instantiate_identity(),
+        );
+        let fixes = detect_slice_cursor_fixes(self.tcx, signature);
+        let return_fix = detect_slice_fix(self.tcx, signature.output());
+        if !fixes.is_empty() || return_fix.is_some() {
             let new_name = Symbol::intern(&format!("{name}_internal"));
             self.fixes.insert(
                 item.owner_id.def_id,
                 FixEntry {
+                    signature,
                     param_fixes: fixes,
+                    return_fix,
                     action: FixAction::Rename {
                         internal_name: new_name,
                     },
@@ -345,7 +472,11 @@ impl<'tcx> HirVisitor<'_, 'tcx> {
     ) {
         let body = self.tcx.hir_body(body);
         let typeck = self.tcx.typeck(item.owner_id.def_id);
-        let mut fixes = detect_slice_cursor_fixes(self.tcx, body, typeck);
+        let signature = self.tcx.liberate_late_bound_regions(
+            item.owner_id.def_id.to_def_id(),
+            self.tcx.fn_sig(item.owner_id).instantiate_identity(),
+        );
+        let mut fixes = detect_slice_cursor_fixes(self.tcx, signature);
         for p in &entry.params {
             match resolve_struct_field_fix(self.tcx, body, typeck, p, self.struct_fields) {
                 Some(fix) => {
@@ -366,7 +497,9 @@ impl<'tcx> HirVisitor<'_, 'tcx> {
         self.fixes.insert(
             item.owner_id.def_id,
             FixEntry {
+                signature,
                 param_fixes: fixes,
+                return_fix: detect_slice_fix(self.tcx, signature.output()),
                 action: FixAction::FieldSpec {
                     exported_name,
                     attr: entry.attr.clone(),
@@ -376,26 +509,41 @@ impl<'tcx> HirVisitor<'_, 'tcx> {
     }
 }
 
+fn detect_slice_fix<'tcx>(tcx: TyCtxt<'tcx>, mut ty: ty::Ty<'tcx>) -> Option<SliceFix<'tcx>> {
+    let option_wrapped = if let ty::TyKind::Adt(definition, args) = ty.kind()
+        && tcx.is_lang_item(definition.did(), hir::LangItem::Option)
+    {
+        ty = args.type_at(0);
+        true
+    } else {
+        false
+    };
+    let ty::TyKind::Ref(_, inner, mutability) = ty.kind() else { return None };
+    let ty::TyKind::Slice(element) = inner.kind() else { return None };
+    Some(SliceFix {
+        ty: *element,
+        mutability: *mutability,
+        option_wrapped,
+    })
+}
+
 // the existing slice/`SliceCursor`(`Mut`) param-shape detection, shared by
 // both the rename flow and the field-spec flow
 fn detect_slice_cursor_fixes<'tcx>(
     tcx: TyCtxt<'tcx>,
-    body: &hir::Body<'tcx>,
-    typeck: &ty::TypeckResults<'tcx>,
+    signature: ty::FnSig<'tcx>,
 ) -> FxHashMap<usize, ParamFix<'tcx>> {
     let mut fixes = FxHashMap::default();
-    for (i, param) in body.params.iter().enumerate() {
-        let ty = typeck.node_type(param.pat.hir_id);
-
-        if let ty::TyKind::Ref(_, inner_ty, m) = ty.kind()
-            && let ty::TyKind::Slice(inner_ty) = inner_ty.kind()
-        {
+    for (i, ty) in signature.inputs().iter().copied().enumerate() {
+        if let Some(fix) = detect_slice_fix(tcx, ty) {
             fixes.insert(
                 i,
                 ParamFix {
-                    kind: ParamFixKind::Slice,
-                    mutability: *m,
-                    ty: *inner_ty,
+                    kind: ParamFixKind::Slice {
+                        option_wrapped: fix.option_wrapped,
+                    },
+                    mutability: fix.mutability,
+                    ty: fix.ty,
                 },
             );
             continue;
@@ -560,6 +708,224 @@ impl<'tcx> intravisit::Visitor<'tcx> for StructFieldVisitor<'tcx> {
 mod tests {
     use rustc_hash::FxHashSet;
     use utils::field_spec::{FieldSpecAttr, FieldSpecEntry, FieldSpecMap, FieldSpecParam};
+
+    fn transform(code: &str, exposed: &[&str]) -> String {
+        let config = super::Config {
+            c_exposed_fns: exposed.iter().map(|name| (*name).to_owned()).collect(),
+            ..Default::default()
+        };
+        let transformed = utils::compilation::run_compiler_on_str(code, |tcx| {
+            super::fix_interfaces(&config, tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&transformed, utils::type_check)
+            .expect(&transformed);
+        transformed
+    }
+
+    #[test]
+    fn wraps_slice_parameters_and_returns_with_matching_mutability() {
+        for (slice, raw, method, optional) in [
+            ("&'a [i32]", "*const i32", "as_ptr", false),
+            ("&'a mut [i32]", "*mut i32", "as_mut_ptr", false),
+            ("Option<&'a [i32]>", "*const i32", "as_ptr", true),
+            ("Option<&'a mut [i32]>", "*mut i32", "as_mut_ptr", true),
+        ] {
+            let source = format!(
+                "#[export_name = \"exported\"] pub unsafe extern \"C\" fn api<'a>(p: {slice}) -> {slice} {{ p }}
+                 unsafe fn caller<'a>(p: {slice}) -> {slice} {{ api(p) }}"
+            );
+            let transformed = transform(&source, &["exported"]);
+            assert!(
+                transformed.contains(&format!("fn api<'a>(p: {raw}) -> {raw}")),
+                "{transformed}"
+            );
+            assert!(transformed.contains("api_internal(p)"));
+            assert_eq!(transformed.matches("export_name").count(), 1);
+            assert_eq!(transformed.matches("1_000_000").count(), 1);
+            assert!(!transformed.contains("is_empty"));
+            if optional {
+                assert!(transformed.contains("::core::option::Option::None"));
+                assert!(transformed.contains("::core::option::Option::Some"));
+                assert!(transformed.contains(&format!("slice.{method}()")));
+                assert!(transformed.contains(".map_or("));
+                assert!(!transformed.contains("&[]"));
+                assert!(!transformed.contains("&mut []"));
+            } else {
+                assert!(transformed.contains(&format!(").{method}()")));
+                assert!(transformed.contains(if raw.starts_with("*mut") {
+                    "&mut []"
+                } else {
+                    "&[]"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn wraps_return_only_functions_and_preserves_inner_lifetimes_and_types() {
+        let source = r#"
+mod nested {
+    pub struct Item<'a> { pub value: &'a i32 }
+    type Items = Option<&'static [Item<'static>]>;
+    #[no_mangle]
+    pub fn items() -> Items { None }
+}
+pub fn shared() -> &'static [&'static i32] { &[] }
+pub fn mutable() -> &'static mut [*const i32] { &mut [] }
+pub fn optional() -> Option<&'static mut [u8]> { Some(&mut []) }
+pub fn std_elements() -> &'static [std::vec::Vec<u8>] { &[] }
+pub fn raw() -> *const &'static [u8] { core::ptr::null() }
+pub fn scalar() -> Option<&'static i32> { None }
+pub fn owned() -> Box<[u8]> { Box::new([]) }
+"#;
+        let transformed = transform(
+            source,
+            &[
+                "items",
+                "shared",
+                "mutable",
+                "optional",
+                "std_elements",
+                "raw",
+                "scalar",
+                "owned",
+            ],
+        );
+        for signature in [
+            "fn items() -> *const crate::nested::Item<'static>",
+            "fn shared() -> *const &'static i32",
+            "fn mutable() -> *mut *const i32",
+            "fn optional() -> *mut u8",
+        ] {
+            assert!(transformed.contains(signature), "{transformed}");
+        }
+        assert!(transformed.contains("::core::ptr::null()"));
+        assert!(transformed.contains("::core::ptr::null_mut()"));
+        assert_eq!(transformed.matches("#[no_mangle]").count(), 1);
+        for name in ["raw", "scalar", "owned"] {
+            assert!(!transformed.contains(&format!("{name}_internal")));
+        }
+        assert!(!transformed.contains("is_empty"));
+    }
+
+    #[test]
+    fn slice_aliases_keep_nested_reference_lifetimes() {
+        let source = r#"
+type Maybe<'a> = Option<&'a [&'a i32]>;
+pub fn alias<'a>(p: Maybe<'a>) -> Maybe<'a> { p }
+pub fn direct<'a>(p: &'a [&'a i32]) -> &'a [&'a i32] { p }
+pub fn bounded<'a: 'b, 'b>(p: &'a [&'b i32]) -> &'a [&'b i32] { p }
+"#;
+        let transformed = transform(source, &["alias", "direct", "bounded"]);
+        for name in ["alias", "direct"] {
+            assert!(
+                transformed.contains(&format!(
+                    "fn {name}<'a>(p: *const &'a i32) -> *const &'a i32"
+                )),
+                "{transformed}"
+            );
+        }
+        assert!(
+            transformed.contains("p: *const &'b i32) -> *const &'b i32"),
+            "{transformed}"
+        );
+    }
+
+    #[test]
+    fn slice_wrappers_preserve_or_name_elided_inner_lifetimes() {
+        let source = r#"
+pub fn input(p: &[&i32]) -> usize { p.len() }
+pub fn output(p: &i32) -> &[&i32] { &[] }
+pub fn converted(p: &[i32]) -> &[&i32] { &[] }
+pub fn maybe_converted(p: Option<&[i32]>) -> Option<&[&i32]> { Some(&[]) }
+pub fn collision<'__crat_return0>(p: &[i32]) -> &[&i32] { &[] }
+"#;
+        let transformed = transform(
+            source,
+            &[
+                "input",
+                "output",
+                "converted",
+                "maybe_converted",
+                "collision",
+            ],
+        );
+        assert!(
+            transformed.contains("fn input(p: *const &i32) -> usize"),
+            "{transformed}"
+        );
+        assert!(
+            transformed.contains("fn output(p: &i32) -> *const &i32"),
+            "{transformed}"
+        );
+        assert!(
+            transformed.contains("-> *const &'__crat_return0 i32"),
+            "{transformed}"
+        );
+        assert!(
+            transformed.contains("-> *const &'__crat_return1 i32"),
+            "{transformed}"
+        );
+    }
+
+    #[test]
+    fn optional_slices_use_core_variants_and_ignore_option_lookalikes() {
+        let source = r#"
+struct None;
+fn Some(_: &[i32]) -> i32 { 0 }
+pub fn api(p: core::option::Option<&[i32]>) -> core::option::Option<&[i32]> { p }
+mod other {
+    pub enum Option<T> { Present(T), Absent }
+    pub fn untouched(p: Option<&[i32]>) -> Option<&[i32]> { p }
+}
+"#;
+        let transformed = transform(source, &["api", "untouched"]);
+        assert!(transformed.contains("fn api(p: *const i32) -> *const i32"));
+        assert!(!transformed.contains("untouched_internal"));
+    }
+
+    #[test]
+    fn field_specialization_combines_optional_slices_and_return_conversion() {
+        let source = r#"
+pub struct Ctx { pub data: [u8; 4] }
+pub fn read_field<'a>(ctx: Option<&'a [u8; 4]>, p: Option<&'a [u8]>) -> Option<&'a [u8]> {
+    p.or_else(|| ctx.map(|data| &data[..]))
+}
+"#;
+        let config = super::Config {
+            field_spec: FieldSpecMap::from_iter([(
+                "read".to_owned(),
+                FieldSpecEntry {
+                    internal: "read_field".to_owned(),
+                    module: String::new(),
+                    attr: FieldSpecAttr::NoMangle,
+                    params: vec![FieldSpecParam {
+                        index: 0,
+                        struct_name: "Ctx".to_owned(),
+                        field: "data".to_owned(),
+                        mutbl: "const".to_owned(),
+                    }],
+                },
+            )]),
+            ..Default::default()
+        };
+        let transformed = utils::compilation::run_compiler_on_str(source, |tcx| {
+            super::fix_interfaces(&config, tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&transformed, utils::type_check)
+            .expect(&transformed);
+        assert!(
+            transformed.contains("fn read<'a>(ctx: *const Ctx, p: *const u8) -> *const u8"),
+            "{transformed}"
+        );
+        assert!(transformed.contains("Some(&(*ctx).data)"));
+        assert!(transformed.contains("::core::option::Option::Some"));
+        assert!(transformed.contains(".map_or("));
+        assert_eq!(transformed.matches("fn read_field").count(), 1);
+        assert_eq!(transformed.matches("#[no_mangle]").count(), 1);
+    }
 
     #[test]
     fn wraps_exposed_export_name_function() {
