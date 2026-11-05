@@ -2244,16 +2244,7 @@ fn target_type<'tcx>(
                 type_spelling_error(function_path, location, original, reason, type_speller.tcx)
             });
     };
-    let inner = if original.is_raw_ptr()
-        && inner.is_c_void(type_speller.tcx)
-        && !matches!(kind, PtrKind::Raw(_))
-    {
-        type_speller
-            .render_semantic_type(type_speller.tcx.types.u8)
-            .map_err(|reason| {
-                type_spelling_error(function_path, location, original, reason, type_speller.tcx)
-            })?
-    } else if let Some((next, rest)) = nested.split_first() {
+    let inner = if let Some((next, rest)) = nested.split_first() {
         let hint = source_hint.and_then(peel_source_pointer);
         target_type(
             *inner,
@@ -2334,19 +2325,10 @@ fn selected_target_type_tree<'tcx>(
     } else {
         decision
     };
-    let inner =
-        if source.is_raw_ptr() && inner.is_c_void(tcx) && !matches!(decision, PtrKind::Raw(_)) {
-            TypeTree::Primitive {
-                name: "u8".to_owned(),
-            }
-        } else {
-            match nested.split_first() {
-                Some((next, rest)) => {
-                    selected_target_type_tree(*inner, next.kind, rest, ast_to_hir, tcx)?
-                }
-                None => semantic_type_tree(*inner, ast_to_hir, tcx)?,
-            }
-        };
+    let inner = match nested.split_first() {
+        Some((next, rest)) => selected_target_type_tree(*inner, next.kind, rest, ast_to_hir, tcx)?,
+        None => semantic_type_tree(*inner, ast_to_hir, tcx)?,
+    };
     let reference = |mutable, pointee| TypeTree::Reference {
         mutability: if mutable {
             RefMutability::Mutable
