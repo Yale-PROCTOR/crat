@@ -482,7 +482,7 @@ pub mod wrapped {
     }
 
     pub unsafe fn owned_id(mut p: *mut i32) -> *mut i32 {
-        p
+        if p.is_null() { core::ptr::null_mut() } else { p }
     }
 
     pub unsafe fn foo() -> *mut i32 {
@@ -561,7 +561,7 @@ pub mod consumer {
     }
 
     pub unsafe fn owned_id(mut p: *mut P) -> *mut ReturnP {
-        p
+        if p.is_null() { core::ptr::null_mut() } else { p }
     }
 
     pub unsafe fn foo() -> *mut ReturnP {
@@ -665,7 +665,7 @@ pub mod wrapped {
     }
 
     pub unsafe fn owned_id(mut p: *mut i32) -> *mut i32 {
-        p
+        if p.is_null() { core::ptr::null_mut() } else { p }
     }
 
     pub unsafe fn foo() -> *mut i32 {

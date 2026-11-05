@@ -75,6 +75,7 @@ pub mod analyses {
     pub mod borrow_ownership;
     pub use pointer_replacer::analyses::*;
 }
+mod accepted_analysis;
 mod analysis_budget;
 mod bo_pipeline;
 mod bo_rewriter;
@@ -82,6 +83,9 @@ mod bo_rewriter;
 mod coverage_recon;
 mod phase_log;
 mod raw_boundary_census_schema;
+pub use accepted_analysis::{
+    AcceptedPointerAnalysis, OriginSummary, SignatureRoot, SignatureSlot, analyze_pointers,
+};
 pub use bo_pipeline::{BoReceipt, Config, query_timeout_env_value, rewrite_bo};
 pub use pointer_replacer::{rewriter, utils};
 

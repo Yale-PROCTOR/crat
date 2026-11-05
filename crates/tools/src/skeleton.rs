@@ -3,9 +3,6 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
 };
 
-use pointer_replacer::{
-    InitialPointerDecisions, PointerDecisionOptions, PtrKind, initial_pointer_decisions,
-};
 use rustc_ast::{
     AttrKind, BindingMode, ByRef, Crate, Expr, ExprKind, Extern, FnRetTy, GenericParamKind, Item,
     ItemKind, LocalKind, Mutability, NodeId, Pat, PatKind, Safety, Stmt, StmtKind, Ty, TyKind,
@@ -39,6 +36,9 @@ use crate::{
     observation::{
         local_c_foreign_function_symbol, printf_rule_argument, select_rule_regions,
         semantic_type_tree,
+    },
+    pointer_decisions::{
+        InitialPointerDecisions, PointerLayer, PointerTarget, PtrKind, initial_pointer_decisions,
     },
     preservation::{make_disposition_forest, validate_skeleton_views},
     printf::{eligible_printf_statement, supported_printf_call},
@@ -146,6 +146,7 @@ pub enum GenerationErrorKind {
     AstHirMismatch,
     TypeSpelling,
     UnsupportedGeneric,
+    PointerAnalysis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,13 +221,11 @@ fn make_skeletons_with_preservation_overrides(
         .iter()
         .map(|item| (item.def_id.to_def_id(), item.id))
         .collect();
-    let mut decisions = initial_pointer_decisions(
-        &pointer_replacer::Config::default(),
-        PointerDecisionOptions {
-            assume_nonnegative_offsets: true,
-        },
-        tcx,
-    );
+    let mut decisions = initial_pointer_decisions(tcx).map_err(|message| GenerationError {
+        kind: GenerationErrorKind::PointerAnalysis,
+        function_path: String::new(),
+        message,
+    })?;
     for item in &raw_items {
         let ItemKind::Fn(function) = &item.item.kind else { continue };
         if !function.sig.decl.c_variadic() {
@@ -237,8 +236,8 @@ fn make_skeletons_with_preservation_overrides(
             signature.input_lifetimes.fill(None);
             signature.output_dec = None;
             signature.output_lifetime = None;
-            signature.signature_locked = true;
         }
+        decisions.clear_signature(item.def_id);
         for parameter in &function.sig.decl.inputs {
             if let Some(pattern) = ast_to_hir.get_pat(parameter.pat.id, tcx)
                 && let hir::PatKind::Binding(_, binding, _, _) = pattern.kind
@@ -1382,17 +1381,65 @@ fn apply_target_signature<'a, 'tcx>(
         .copied()
         .flatten()
         .chain(decision.output_lifetime)
+        .chain((0..function.sig.decl.inputs.len()).flat_map(|index| {
+            decisions
+                .nested(PointerTarget::Input(def_id, index))
+                .iter()
+                .filter_map(|layer| layer.lifetime)
+        }))
+        .chain(
+            decisions
+                .nested(PointerTarget::Output(def_id))
+                .iter()
+                .filter_map(|layer| layer.lifetime),
+        )
     {
         if !lifetimes.contains(&lifetime) {
             lifetimes.push(lifetime);
         }
     }
     add_lifetime_params(&mut function.generics, &lifetimes);
+    let bound_lifetimes = decisions
+        .bounds
+        .get(&def_id)
+        .into_iter()
+        .flatten()
+        .flat_map(|&(longer, shorter)| [longer, shorter])
+        .collect::<Vec<_>>();
+    add_lifetime_params(&mut function.generics, &bound_lifetimes);
+    for &(longer, shorter) in decisions.bounds.get(&def_id).into_iter().flatten() {
+        if let Some(parameter) = function.generics.params.iter_mut().find(|parameter| {
+            parameter.ident.name.as_str().trim_start_matches('\'') == longer.as_str()
+        }) {
+            let parsed = utils::item!("fn f<'{}: '{}>() {{}}", longer.as_str(), shorter.as_str());
+            let ItemKind::Fn(box parsed) = parsed.kind else { unreachable!() };
+            parameter
+                .bounds
+                .extend(parsed.generics.params[0].bounds.iter().cloned());
+        }
+    }
     for (index, param) in function.sig.decl.inputs.iter_mut().enumerate() {
         if force_main_argv && index == 1 {
             continue;
         }
         let original = body.local_decls[rustc_middle::mir::Local::from_usize(index + 1)].ty;
+        let nested = decisions.nested(PointerTarget::Input(def_id, index));
+        if original.is_ref() && !nested.is_empty() {
+            if let Some(kind) = decision.input_decs.get(index).copied().flatten() {
+                let source_hint = param.ty.clone();
+                *param.ty = target_type(
+                    original,
+                    kind,
+                    decision.input_lifetimes[index],
+                    nested,
+                    Some(&source_hint),
+                    type_speller,
+                    function_path,
+                    &format!("parameter `{}`", parameter_name(param, index)),
+                )?;
+            }
+            continue;
+        }
         if !original.is_raw_ptr() {
             if let ty::TyKind::Ref(_, _, mutability) = original.kind()
                 && let Some(lifetime) = decision.input_lifetimes.get(index).copied().flatten()
@@ -1444,6 +1491,7 @@ fn apply_target_signature<'a, 'tcx>(
                     original,
                     PtrKind::Ref(mutability.is_mut()),
                     Some(lifetime),
+                    &[],
                     Some(&source_hint),
                     type_speller,
                     function_path,
@@ -1455,7 +1503,8 @@ fn apply_target_signature<'a, 'tcx>(
         let Some(kind) = decision.input_decs.get(index).copied().flatten() else {
             continue;
         };
-        if raw_decision_matches_ast_type(kind, &param.ty) {
+        if raw_decision_matches_ast_type(kind, &param.ty) && !nested_changes_type(nested, original)
+        {
             continue;
         }
         let lifetime = decision.input_lifetimes.get(index).copied().flatten();
@@ -1464,6 +1513,7 @@ fn apply_target_signature<'a, 'tcx>(
             original,
             kind,
             lifetime,
+            nested,
             Some(&source_hint),
             type_speller,
             function_path,
@@ -1471,11 +1521,23 @@ fn apply_target_signature<'a, 'tcx>(
         )?;
     }
     if let Some(kind) = decision.output_dec
-        && body.local_decls[rustc_middle::mir::RETURN_PLACE]
-            .ty
-            .is_raw_ptr()
+        && matches!(
+            body.local_decls[rustc_middle::mir::RETURN_PLACE].ty.kind(),
+            ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..)
+        )
         && let FnRetTy::Ty(output) = &mut function.sig.decl.output
-        && !raw_decision_matches_ast_type(kind, output)
+        && (!body.local_decls[rustc_middle::mir::RETURN_PLACE]
+            .ty
+            .is_ref()
+            || nested_changes_type(
+                decisions.nested(PointerTarget::Output(def_id)),
+                body.local_decls[rustc_middle::mir::RETURN_PLACE].ty,
+            ))
+        && (!raw_decision_matches_ast_type(kind, output)
+            || nested_changes_type(
+                decisions.nested(PointerTarget::Output(def_id)),
+                body.local_decls[rustc_middle::mir::RETURN_PLACE].ty,
+            ))
     {
         let original = body.local_decls[rustc_middle::mir::RETURN_PLACE].ty;
         let source_hint = output.clone();
@@ -1483,6 +1545,7 @@ fn apply_target_signature<'a, 'tcx>(
             original,
             kind,
             decision.output_lifetime,
+            decisions.nested(PointerTarget::Output(def_id)),
             Some(&source_hint),
             type_speller,
             function_path,
@@ -1596,7 +1659,7 @@ fn constructor_requirements(kind: PtrKind) -> ConstructorRequirements {
             option: false,
             boxed: false,
         },
-        PtrKind::OptRef(_) => ConstructorRequirements {
+        PtrKind::OptRef(_) | PtrKind::OptSlice(_) => ConstructorRequirements {
             option: true,
             boxed: false,
         },
@@ -1621,10 +1684,6 @@ fn constructor_requirements(kind: PtrKind) -> ConstructorRequirements {
             boxed: true,
         },
         PtrKind::Slice(_) => ConstructorRequirements {
-            option: false,
-            boxed: false,
-        },
-        PtrKind::SliceCursor(_) => ConstructorRequirements {
             option: false,
             boxed: false,
         },
@@ -2164,10 +2223,12 @@ impl MutVisitor for SemanticIdentRestorer<'_, '_, '_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn target_type<'tcx>(
     original: ty::Ty<'tcx>,
     kind: PtrKind,
     lifetime: Option<Symbol>,
+    nested: &[PointerLayer],
     source_hint: Option<&Ty>,
     type_speller: &TypeSpeller<'_, 'tcx>,
     function_path: &str,
@@ -2183,24 +2244,61 @@ fn target_type<'tcx>(
                 type_spelling_error(function_path, location, original, reason, type_speller.tcx)
             });
     };
-    let inner = source_hint
-        .and_then(peel_source_pointer)
-        .map(|mut ty| {
-            type_speller.shorten_source_type(&mut ty);
-            Ok(ty)
-        })
-        .unwrap_or_else(|| type_speller.render_semantic_type(*inner))
-        .map_err(|reason| {
-            type_spelling_error(function_path, location, original, reason, type_speller.tcx)
-        })?;
+    let inner = if original.is_raw_ptr()
+        && inner.is_c_void(type_speller.tcx)
+        && !matches!(kind, PtrKind::Raw(_))
+    {
+        type_speller
+            .render_semantic_type(type_speller.tcx.types.u8)
+            .map_err(|reason| {
+                type_spelling_error(function_path, location, original, reason, type_speller.tcx)
+            })?
+    } else if let Some((next, rest)) = nested.split_first() {
+        let hint = source_hint.and_then(peel_source_pointer);
+        target_type(
+            *inner,
+            next.kind,
+            next.lifetime,
+            rest,
+            hint.as_ref(),
+            type_speller,
+            function_path,
+            location,
+        )?
+    } else {
+        source_hint
+            .and_then(peel_source_pointer)
+            .map(|mut ty| {
+                type_speller.shorten_source_type(&mut ty);
+                Ok(ty)
+            })
+            .unwrap_or_else(|| type_speller.render_semantic_type(*inner))
+            .map_err(|reason| {
+                type_spelling_error(function_path, location, original, reason, type_speller.tcx)
+            })?
+    };
     let inner = pprust::ty_to_string(&inner);
-    let lifetime = lifetime
+    let source_lifetime = source_hint.and_then(|hint| match &hint.kind {
+        TyKind::Ref(Some(lifetime), _) => Some(
+            lifetime
+                .ident
+                .name
+                .as_str()
+                .trim_start_matches('\'')
+                .to_owned(),
+        ),
+        _ => None,
+    });
+    let lifetime = source_lifetime
+        .filter(|name| name != "_")
+        .or_else(|| lifetime.map(|name| name.as_str().to_owned()))
         .map(|lifetime| format!("'{} ", lifetime.as_str()))
         .unwrap_or_default();
     let mutable = if kind.is_mut() { "mut " } else { "" };
     let rendered = match kind {
         PtrKind::Ref(_) => format!("&{lifetime}{mutable}{inner}"),
         PtrKind::OptRef(_) => format!("Option<&{lifetime}{mutable}{inner}>"),
+        PtrKind::OptSlice(_) => format!("Option<&{lifetime}{mutable}[{inner}]>"),
         PtrKind::Box => format!("Box<{inner}>"),
         PtrKind::OptBox => format!("Option<Box<{inner}>>"),
         PtrKind::Raw(mutable) => {
@@ -2209,16 +2307,6 @@ fn target_type<'tcx>(
         PtrKind::BoxedSlice => format!("Box<[{inner}]>"),
         PtrKind::OptBoxedSlice => format!("Option<Box<[{inner}]>>"),
         PtrKind::Slice(_) => format!("&{lifetime}{mutable}[{inner}]"),
-        PtrKind::SliceCursor(mutable) => {
-            let cursor = if mutable {
-                "SliceCursorMut"
-            } else {
-                "SliceCursor"
-            };
-            let lifetime = lifetime.trim_end();
-            let lifetime = if lifetime.is_empty() { "'_" } else { lifetime };
-            format!("crate::slice_cursor::{cursor}<{lifetime}, {inner}>")
-        }
     };
     utils::ast::try_parse_ty(rendered.clone()).map_err(|reason| {
         type_spelling_error(
@@ -2234,13 +2322,31 @@ fn target_type<'tcx>(
 fn selected_target_type_tree<'tcx>(
     source: ty::Ty<'tcx>,
     decision: PtrKind,
+    nested: &[PointerLayer],
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'tcx>,
 ) -> Option<TypeTree> {
-    let ty::TyKind::RawPtr(inner, _) = source.kind() else {
+    let (ty::TyKind::RawPtr(inner, _) | ty::TyKind::Ref(_, inner, _)) = source.kind() else {
         return semantic_type_tree(source, ast_to_hir, tcx);
     };
-    let inner = semantic_type_tree(*inner, ast_to_hir, tcx)?;
+    let decision = if let ty::TyKind::Ref(_, _, mutability) = source.kind() {
+        PtrKind::Ref(mutability.is_mut())
+    } else {
+        decision
+    };
+    let inner =
+        if source.is_raw_ptr() && inner.is_c_void(tcx) && !matches!(decision, PtrKind::Raw(_)) {
+            TypeTree::Primitive {
+                name: "u8".to_owned(),
+            }
+        } else {
+            match nested.split_first() {
+                Some((next, rest)) => {
+                    selected_target_type_tree(*inner, next.kind, rest, ast_to_hir, tcx)?
+                }
+                None => semantic_type_tree(*inner, ast_to_hir, tcx)?,
+            }
+        };
     let reference = |mutable, pointee| TypeTree::Reference {
         mutability: if mutable {
             RefMutability::Mutable
@@ -2293,7 +2399,12 @@ fn selected_target_type_tree<'tcx>(
                 element: Box::new(inner),
             },
         ),
-        PtrKind::SliceCursor(_) => return None,
+        PtrKind::OptSlice(mutable) => option(reference(
+            mutable,
+            TypeTree::Slice {
+                element: Box::new(inner),
+            },
+        )),
     })
 }
 
@@ -2320,10 +2431,16 @@ fn rule_binding_catalog(
                 continue;
             };
             let source_type = tcx.typeck(pattern.hir_id.owner).node_type(pattern.hir_id);
-            if source_type.is_raw_ptr()
-                && let Some(target) =
-                    selected_target_type_tree(source_type, decision, ast_to_hir, tcx)
-            {
+            if matches!(
+                source_type.kind(),
+                ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..)
+            ) && let Some(target) = selected_target_type_tree(
+                source_type,
+                decision,
+                decisions.nested(PointerTarget::Input(function, index)),
+                ast_to_hir,
+                tcx,
+            ) {
                 result.insert(binding, target);
             }
         }
@@ -2346,10 +2463,16 @@ fn rule_binding_catalog(
                     .tcx
                     .typeck(hir_pattern.hir_id.owner)
                     .node_type(hir_pattern.hir_id);
-                if source_type.is_raw_ptr()
-                    && let Some(target) =
-                        selected_target_type_tree(source_type, decision, self.ast_to_hir, self.tcx)
-                {
+                if matches!(
+                    source_type.kind(),
+                    ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..)
+                ) && let Some(target) = selected_target_type_tree(
+                    source_type,
+                    decision,
+                    self.decisions.nested(PointerTarget::Binding(binding)),
+                    self.ast_to_hir,
+                    self.tcx,
+                ) {
                     self.result.insert(binding, target);
                 }
             }
@@ -3100,7 +3223,14 @@ fn selected_signature_type<'tcx>(
             }
         });
     match decision {
-        Some(decision) => selected_target_type_tree(source, decision, ast_to_hir, tcx),
+        Some(decision) => {
+            let local = definition.as_local()?;
+            let target = match index {
+                Some(index) => PointerTarget::Input(local, index),
+                None => PointerTarget::Output(local),
+            };
+            selected_target_type_tree(source, decision, decisions.nested(target), ast_to_hir, tcx)
+        }
         None => semantic_type_tree(source, ast_to_hir, tcx),
     }
 }
@@ -4193,6 +4323,10 @@ impl<'tcx> HirPreservationCheck<'tcx, '_> {
         };
         let source = self.tcx.typeck(hir_id.owner).node_type(hir_id);
         decision_changes_type(decision, source)
+            || nested_changes_type(
+                self.decisions.nested(PointerTarget::Binding(hir_id)),
+                source,
+            )
     }
 
     fn local_signature_changes(&self, def_id: LocalDefId) -> bool {
@@ -4216,12 +4350,23 @@ impl<'tcx> HirPreservationCheck<'tcx, '_> {
             .input_decs
             .iter()
             .zip(signature.inputs())
-            .any(|(decision, source)| {
-                decision.is_some_and(|decision| decision_changes_type(decision, *source))
+            .enumerate()
+            .any(|(index, (decision, source))| {
+                decision.is_some_and(|decision| {
+                    decision_changes_type(decision, *source)
+                        || nested_changes_type(
+                            self.decisions.nested(PointerTarget::Input(def_id, index)),
+                            *source,
+                        )
+                })
             })
-            || decision
-                .output_dec
-                .is_some_and(|decision| decision_changes_type(decision, signature.output()))
+            || decision.output_dec.is_some_and(|decision| {
+                decision_changes_type(decision, signature.output())
+                    || nested_changes_type(
+                        self.decisions.nested(PointerTarget::Output(def_id)),
+                        signature.output(),
+                    )
+            })
     }
 
     fn check_callable(&mut self, def_id: DefId, arguments: ty::GenericArgsRef<'tcx>) {
@@ -4376,6 +4521,15 @@ fn decision_changes_type(decision: PtrKind, source: ty::Ty<'_>) -> bool {
     }
 }
 
+fn nested_changes_type(nested: &[PointerLayer], source: ty::Ty<'_>) -> bool {
+    let (ty::TyKind::RawPtr(inner, _) | ty::TyKind::Ref(_, inner, _)) = source.kind() else {
+        return false;
+    };
+    nested.split_first().is_some_and(|(next, rest)| {
+        decision_changes_type(next.kind, *inner) || nested_changes_type(rest, *inner)
+    })
+}
+
 struct Skeletonizer<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     decisions: &'a InitialPointerDecisions,
@@ -4407,18 +4561,36 @@ impl MutVisitor for Skeletonizer<'_, '_> {
             && let Some(hir_id) = self.ast_to_hir.local_map.get(&local.pat.id).copied()
         {
             let inferred = self.tcx.typeck(hir_id.owner).node_type(hir_id);
-            let decision = inferred
-                .is_raw_ptr()
-                .then(|| self.decisions.bindings.get(&hir_id).copied())
-                .flatten();
+            let decision = matches!(
+                inferred.kind(),
+                ty::TyKind::RawPtr(..) | ty::TyKind::Ref(..)
+            )
+            .then(|| self.decisions.bindings.get(&hir_id).copied())
+            .flatten();
             let ty = match (decision, local.ty.as_deref()) {
-                (Some(kind), Some(ty)) if raw_decision_matches_inferred_type(kind, inferred) => {
+                (Some(_), Some(ty))
+                    if inferred.is_ref()
+                        && !nested_changes_type(
+                            self.decisions.nested(PointerTarget::Binding(hir_id)),
+                            inferred,
+                        ) =>
+                {
+                    Ok(Some(ty.clone()))
+                }
+                (Some(kind), Some(ty))
+                    if raw_decision_matches_inferred_type(kind, inferred)
+                        && !nested_changes_type(
+                            self.decisions.nested(PointerTarget::Binding(hir_id)),
+                            inferred,
+                        ) =>
+                {
                     Ok(Some(ty.clone()))
                 }
                 (Some(kind), source_hint) => target_type(
                     inferred,
                     kind,
                     None,
+                    self.decisions.nested(PointerTarget::Binding(hir_id)),
                     source_hint,
                     self.type_speller,
                     self.function_path,

@@ -1607,6 +1607,7 @@ version = "0.1.0"
 dependencies = [
  "passes",
  "pointer_replacer",
+ "pointer_replacer_bo",
  "serde",
  "serde_json",
  "unicode-ident",

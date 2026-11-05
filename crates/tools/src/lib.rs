@@ -16,6 +16,7 @@ extern crate thin_vec;
 
 mod item_replacer;
 mod observation;
+mod pointer_decisions;
 mod preservation;
 mod printf;
 mod rule;

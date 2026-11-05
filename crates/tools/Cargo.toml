@@ -4,13 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-pointer_replacer = { path = "../pointer_replacer" }
+pointer_replacer_bo = { path = "../pointer_replacer_bo" }
 utils = { path = "../utils" }
 serde.workspace = true
 serde_json.workspace = true
 unicode-ident = "1"
 
 [dev-dependencies]
+pointer_replacer = { path = "../pointer_replacer" }
 passes = { path = "../passes" }
 
 [package.metadata.rust-analyzer]
