@@ -1,0 +1,4682 @@
+//! R231/R233 shared, parser-only bridge custody comparison.
+//! The caller verifies source hashes before supplying these inventories.
+
+use std::collections::BTreeSet;
+
+use rustc_ast::{self as ast, mut_visit::MutVisitor};
+use rustc_ast_pretty::pprust;
+use rustc_session::parse::ParseSess;
+use rustc_span::edition::Edition;
+use serde::{Deserialize, Serialize};
+
+use super::bridge_custody_syntax::{
+    ArgumentForm, Binding, ByteSpan, Call, GeneratedKind, Inventory, TypeBinding,
+};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum BridgeKind {
+    PairT2RawView,
+    A5SiteProofT2Fallback,
+    PairCopySnapshot,
+    SiblingOverlapPending,
+}
+
+/// File-relative original bytes and zero-based argument indices. An empty
+/// whole-call argument list is permitted only for a C9 receipt whose position
+/// must be established uniquely by its exact snapshot stamp and actual use.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum SiteAnchor {
+    Call {
+        span: ByteSpan,
+        argument_indices: Vec<usize>,
+    },
+    Argument {
+        span: ByteSpan,
+        argument_index: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct C9Stamp {
+    pub(crate) basic_block: u32,
+    pub(crate) statement_index: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PendingSourceShape {
+    WholeSubject,
+    ProjectedReferent,
+    NativeReturnExpression {
+        argument_span: ByteSpan,
+        source_call_span: ByteSpan,
+        source_owner: u32,
+        source_function: String,
+        source_form: String,
+        source_type: String,
+        temporary: String,
+        template: String,
+    },
+    /// **R424-3 — a typed pointer view of the protected source.**
+    /// `binding.offset(e)` / `.add` / `.cast()` …: the decision layer licenses
+    /// exactly a core pointer method whose receiver IS the binding
+    /// (`sibling_overlap::SourceBridgeEvidence::TypedView`), so the descriptor
+    /// carries that method's name and the comparator re-reads the original
+    /// argument for that exact method over that exact binding — nothing wider.
+    TypedPointerView {
+        method: String,
+    },
+    /// **R424-3 — the raw pointer VALUE loaded out of the subject's field.**
+    /// `(*binding).field`: a load, not a borrow, so it has its own shape; the
+    /// comparator requires the same depth-one field walk over the same binding
+    /// that `ProjectedReferent` requires of a borrow — a load rooted anywhere
+    /// else is a mismatch, not a pass.
+    RawFieldValue,
+    /// **R424-3 — a borrow of the pointer binding's own STORAGE**, `&binding` /
+    /// `&mut binding`: depth zero, distinct from the depth-one projection of
+    /// its referent (`ProjectedReferent`).
+    BindingStorage,
+    /// The same carrier placed at a call the argument CONTAINS rather than IS.
+    /// Its own arm, so the shape above keeps its exact rule: there the edit
+    /// interval and the argument are the same span, here the edit is strictly
+    /// inside the argument and the enclosing text must survive verbatim.
+    NativeReturnExpressionNested {
+        argument_span: ByteSpan,
+        source_call_span: ByteSpan,
+        source_owner: u32,
+        source_function: String,
+        source_form: String,
+        source_type: String,
+        temporary: String,
+        template: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingSource {
+    pub(crate) binding: Option<String>,
+    /// Original compiler binding-pattern span, not a guessed expression root.
+    pub(crate) binding_span: Option<ByteSpan>,
+    pub(crate) shape: PendingSourceShape,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BridgeExpectation {
+    /// Exact ledger identity, retained separately for whole-call and argument rows.
+    pub(crate) identity: String,
+    pub(crate) kind: BridgeKind,
+    /// Qualified original function identities from the compiler/receipt join.
+    pub(crate) caller: String,
+    pub(crate) callee: String,
+    pub(crate) anchor: SiteAnchor,
+    pub(crate) c9_stamp: Option<C9Stamp>,
+    #[serde(default)]
+    pub(crate) pending_source: Option<PendingSource>,
+    pub(crate) tier: String,
+    pub(crate) waiver_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OwnerRename {
+    pub(crate) original_owner: String,
+    pub(crate) emitted_owner: String,
+    /// Explicit exposure-mapping receipt; an inferred basename is insufficient.
+    pub(crate) evidence: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CalleeRename {
+    pub(crate) original_caller: String,
+    /// Exact callee expression spellings, checked through parsed expressions.
+    pub(crate) original_callee_text: String,
+    pub(crate) emitted_callee_text: String,
+    pub(crate) evidence: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BridgeCustodyContext {
+    /// rustc SourceFile.start_pos, explicitly supplied rather than inferred
+    /// from the first generated name. Parser spans remain file-relative bytes.
+    pub(crate) source_global_start: u32,
+    pub(crate) owner_renames: Vec<OwnerRename>,
+    pub(crate) callee_renames: Vec<CalleeRename>,
+    /// **R304-3 — the producer's stated render of each pending call**, keyed by
+    /// the ORIGINAL call's file-relative interval.
+    ///
+    /// R287-1 replaced this arm's *uniqueness* requirement with an *equality*
+    /// one, and R299-2 gave that equality a real text. Where a render is
+    /// stated, the structural search below is retired for that call: the
+    /// matcher asks whether the tree reads what the producer says it emitted,
+    /// which is stricter than re-deriving correspondence from a hand-listed
+    /// set of argument equivalences — the set that did not know the K19′ void
+    /// carrier and reported 85 absences over correct emissions.
+    pub(crate) pending_call_renders: std::collections::BTreeMap<(u32, u32), String>,
+}
+
+pub(crate) struct BridgeCustodyInput<'a> {
+    pub(crate) original: &'a Inventory,
+    pub(crate) emitted: &'a Inventory,
+    pub(crate) original_source: &'a str,
+    pub(crate) emitted_source: &'a str,
+    pub(crate) expectations: &'a [BridgeExpectation],
+    pub(crate) context: &'a BridgeCustodyContext,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReceiptStatus {
+    MatchedRaw,
+    MatchedC9,
+    WaivedPending,
+    InvalidRenderedRole,
+    Missing,
+    Unresolved,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BindingWitness {
+    pub(crate) owner: String,
+    pub(crate) binding_id: usize,
+    pub(crate) name: String,
+    pub(crate) declaration_span: ByteSpan,
+    pub(crate) argument_index: usize,
+    pub(crate) generated_kind: GeneratedKind,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ReceiptResult {
+    pub(crate) identity: String,
+    pub(crate) status: ReceiptStatus,
+    pub(crate) reason: String,
+    pub(crate) original_call: Option<ByteSpan>,
+    pub(crate) emitted_call: Option<ByteSpan>,
+    pub(crate) argument_indices: Vec<usize>,
+    pub(crate) bindings: Vec<BindingWitness>,
+    /// R460-1(b): which evidence paired this row's source bindings.
+    #[serde(default)]
+    pub(crate) correspondence: Correspondence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TreeOnlyWitness {
+    pub(crate) owner: String,
+    pub(crate) binding_id: usize,
+    pub(crate) name: String,
+    pub(crate) declaration_span: ByteSpan,
+    /// None records an unclaimed declaration without an identified call use.
+    pub(crate) call_span: Option<ByteSpan>,
+    pub(crate) argument_index: Option<usize>,
+    pub(crate) reason: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BridgeCustodyReport {
+    pub(crate) data: bool,
+    pub(crate) rows: Vec<ReceiptResult>,
+    pub(crate) tree_only: Vec<TreeOnlyWitness>,
+    pub(crate) issues: Vec<String>,
+}
+
+type MatchResult<T> = Result<T, String>;
+
+fn expression(text: &str) -> MatchResult<ast::ptr::P<ast::Expr>> {
+    let source = format!("fn __custody() {{ let __value = {text}; }}");
+    let session = ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
+    let krate =
+        super::slice_use_inventory_tests::parse_crate(&session, "custody-expression.rs", &source)?;
+    let [item] = krate.items.as_slice() else { return Err("expression-fragment-items".into()) };
+    let ast::ItemKind::Fn(function) = &item.kind else {
+        return Err("expression-fragment-function".into());
+    };
+    let body = function.body.as_ref().ok_or("expression-fragment-body")?;
+    let [statement] = body.stmts.as_slice() else {
+        return Err("expression-fragment-statements".into());
+    };
+    let ast::StmtKind::Let(local) = &statement.kind else {
+        return Err("expression-fragment-local".into());
+    };
+    let ast::LocalKind::Init(initializer) = &local.kind else {
+        return Err("expression-fragment-initializer".into());
+    };
+    Ok(initializer.clone())
+}
+
+fn unparen(mut expression: &ast::Expr) -> &ast::Expr {
+    while let ast::ExprKind::Paren(inner) = &expression.kind {
+        expression = inner;
+    }
+    expression
+}
+
+fn expression_key(expression: &ast::Expr) -> String {
+    struct Parens;
+    impl MutVisitor for Parens {
+        fn visit_expr(&mut self, expression: &mut ast::Expr) {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            while let ast::ExprKind::Paren(inner) = &expression.kind {
+                *expression = (**inner).clone();
+            }
+        }
+    }
+    let mut normalized = expression.clone();
+    Parens.visit_expr(&mut normalized);
+    pprust::expr_to_string(&normalized)
+}
+
+fn same_expression(left: &str, right: &str) -> MatchResult<bool> {
+    Ok(expression_key(&*expression(left)?) == expression_key(&*expression(right)?))
+}
+
+fn path(expression: &ast::Expr) -> Option<String> {
+    let ast::ExprKind::Path(None, path) = &unparen(expression).kind else { return None };
+    Some(
+        path.segments
+            .iter()
+            .filter(|segment| segment.ident.name != rustc_span::kw::PathRoot)
+            .map(|segment| segment.ident.name.to_string())
+            .collect::<Vec<_>>()
+            .join("::"),
+    )
+}
+
+/// Only the reborrow surrounding a selected view is stripped. An arbitrary
+/// dereference, cast, call, or arithmetic in the source operand is preserved.
+fn view_operand(mut expression: &ast::Expr) -> &ast::Expr {
+    loop {
+        expression = unparen(expression);
+        let ast::ExprKind::AddrOf(ast::BorrowKind::Ref, _, inner) = &expression.kind else { break };
+        let ast::ExprKind::Unary(ast::UnOp::Deref, base) = &unparen(inner).kind else { break };
+        expression = base;
+    }
+    expression
+}
+
+/// **R1128-1 (main 230) — the respelled reborrow.** Under
+/// `CRAT_BRIDGE_SPELLING=as-ref-unwrap` the bridge `&*e` / `&mut *e` is spelled
+/// `e.as_ref().unwrap()` / `e.as_mut().unwrap()`: the operand `e` of exactly that
+/// two-call chain (no arguments, no turbofish), or `None` for any other shape.
+/// lodepng's `let mut bpp = lodepng_get_bpp(color.as_ref().unwrap());` — R328-4's
+/// own line — took its ten `filterScanline` stamps with it on `batch61`.
+fn respelled_reborrow_operand(expression: &ast::Expr) -> Option<&ast::Expr> {
+    let ast::ExprKind::MethodCall(unwrap) = &unparen(expression).kind else { return None };
+    let ast::ExprKind::MethodCall(view) = &unparen(&unwrap.receiver).kind else { return None };
+    (unwrap.seg.ident.name.as_str() == "unwrap"
+        && unwrap.args.is_empty()
+        && unwrap.seg.args.is_none()
+        && matches!(view.seg.ident.name.as_str(), "as_ref" | "as_mut")
+        && view.args.is_empty()
+        && view.seg.args.is_none())
+    .then_some(&*view.receiver)
+}
+
+/// **R328-4 — the emitted initializer is the original with the emission's own
+/// call adapters applied.**
+///
+/// lodepng's `filter` has `let bpp = lodepng_get_bpp(color);`. `lodepng_get_bpp`
+/// converted its parameter, so the emitted call site reads
+/// `lodepng_get_bpp(&*color)` — a correct adapted call to the same function with
+/// the same argument. `same_expression` compared the two texts and said no, and
+/// because `linebytes`'s initializer uses `bpp` and `inindex`'s uses
+/// `linebytes`, one unmatched binding took ten custody rows with it. That is
+/// comparator lag, not a divergence: the frame produced a shape the predicate
+/// had never been shown.
+///
+/// **Strict, and additive.** Only a reborrow — `&*e` or `&mut *e`, the form
+/// `view_operand` already peels — is accepted, and only at an argument
+/// position of a call whose callee path and arity match exactly. Any other
+/// difference still refuses. It is tried *after* the plain comparison, so it
+/// can turn a refusal into a match and never the reverse.
+fn initializer_matches_modulo_adapters(original: &ast::Expr, emitted: &ast::Expr) -> bool {
+    let original = unparen(original);
+    let emitted = unparen(emitted);
+    let reborrowed = matches!(
+        &emitted.kind,
+        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, _, inner)
+            if matches!(&unparen(inner).kind, ast::ExprKind::Unary(ast::UnOp::Deref, _))
+    );
+    if reborrowed && initializer_matches_modulo_adapters(original, view_operand(emitted)) {
+        return true;
+    }
+    // **R1128-1 (main 230)** -- the same reborrow under `CRAT_BRIDGE_SPELLING=as-ref-unwrap`.
+    if let Some(operand) = respelled_reborrow_operand(emitted)
+        && initializer_matches_modulo_adapters(original, operand)
+    {
+        return true;
+    }
+    // **R494-1(b)** -- the outbound native-result block is the call it binds.
+    if let Some(call) = native_result_block_call(emitted) {
+        return initializer_matches_modulo_adapters(original, call);
+    }
+    match (&original.kind, &emitted.kind) {
+        // **R494-1(b)** -- and the block sits under the original's own cast, so the
+        // cast has to be peeled on BOTH sides to reach it. Exact: the two casts must
+        // print the same type, which is the case that matters here (the block's tail
+        // re-renders precisely the raw type the original wrote) and refuses a cast
+        // that changed.
+        (ast::ExprKind::Cast(left, left_type), ast::ExprKind::Cast(right, right_type)) => {
+            pprust::ty_to_string(left_type) == pprust::ty_to_string(right_type)
+                && initializer_matches_modulo_adapters(left, right)
+        }
+        (ast::ExprKind::Call(left, left_args), ast::ExprKind::Call(right, right_args)) => {
+            expression_key(left) == expression_key(right)
+                && left_args.len() == right_args.len()
+                && left_args
+                    .iter()
+                    .zip(right_args.iter())
+                    .all(|(l, r)| initializer_matches_modulo_adapters(l, r))
+        }
+        (ast::ExprKind::MethodCall(left), ast::ExprKind::MethodCall(right)) => {
+            left.seg.ident.name == right.seg.ident.name
+                && initializer_matches_modulo_adapters(&left.receiver, &right.receiver)
+                && left.args.len() == right.args.len()
+                && left
+                    .args
+                    .iter()
+                    .zip(right.args.iter())
+                    .all(|(l, r)| initializer_matches_modulo_adapters(l, r))
+        }
+        // **R494-1(b) -- `*p.offset(i)` and `p[i as usize]` are the same element.**
+        //
+        // A delivered container parameter is INDEXED in the emitted program where the
+        // input walked it with `offset`. heman's `heman_ops_stitch_horizontal` takes
+        // `images: *mut *mut heman_image` and is delivered `&mut [*mut heman_image]`,
+        // so `let mut width = (**images.offset(0)).width;` is emitted
+        // `let mut width = (*images[(0) as usize]).width;`. Every binding downstream of
+        // `width` then failed to correspond, and with it the `pair-t2-raw-view` stamp at
+        // the `copy_row` call -- which the tree carries, bound and correct.
+        //
+        // The same relation already exists, rigorously, in the pending-sibling matcher
+        // (`equivalent`), which can also check that the two bases are the same PARAMETER
+        // with corresponding element types because it holds the inventories. Here it does
+        // not need to: this predicate is one conjunct of `same_source_binding`, and the
+        // other is `span_bindings_correspond`, which pairs every binding the two spans
+        // use -- including the base -- by the full rules. What is left to this arm is the
+        // SHAPE, and it is exact: the receiver must correspond, the method must be
+        // `offset` with one argument and no turbofish, and the two indices must be the
+        // same expression once their casts are off (`as isize` against `as usize`).
+        (ast::ExprKind::Unary(ast::UnOp::Deref, pointer), ast::ExprKind::Index(base, index, _)) => {
+            let ast::ExprKind::MethodCall(offset) = &unparen(pointer).kind else {
+                return false;
+            };
+            offset.seg.ident.name.as_str() == "offset"
+                && offset.seg.args.is_none()
+                && offset.args.len() == 1
+                && initializer_matches_modulo_adapters(&offset.receiver, base)
+                && expression_key(peel_casts(&offset.args[0])) == expression_key(peel_casts(index))
+        }
+        // The congruences that carry the relation above up to the binding: the same
+        // field of corresponding values, and the same dereference of them.
+        (ast::ExprKind::Field(left, left_name), ast::ExprKind::Field(right, right_name)) => {
+            left_name.name == right_name.name && initializer_matches_modulo_adapters(left, right)
+        }
+        (
+            ast::ExprKind::Unary(ast::UnOp::Deref, left),
+            ast::ExprKind::Unary(ast::UnOp::Deref, right),
+        ) => initializer_matches_modulo_adapters(left, right),
+        // **R568-1 (a) -- a struct literal whose delivered field starts as `None`.**
+        //
+        // brotli's `let mut literal_enc = BlockEncoder { .., block_types_: 0 as *const
+        // uint8_t, .. };` is emitted with `block_types_: None` once the field
+        // transaction delivers `block_types_` as an optional slice: the null the input
+        // wrote, spelled as the `Option`'s `None` (R29), in a tree the census has
+        // already type-checked, so the field IS an `Option` there. Additive: a literal
+        // that already printed the same still corresponds through the key.
+        (ast::ExprKind::Struct(left), ast::ExprKind::Struct(right)) => {
+            struct_literals_correspond(left, right)
+                || expression_key(original) == expression_key(emitted)
+        }
+        _ => expression_key(original) == expression_key(emitted),
+    }
+}
+
+/// Field by field, in the input's order: the same path, the same field names, the
+/// same functional-update base, and each value either corresponding by
+/// [`initializer_matches_modulo_adapters`] or a zero literal the emitted side
+/// spells `None`. A field added, dropped, renamed or reordered refuses, and so
+/// does any other value that moved.
+fn struct_literals_correspond(original: &ast::StructExpr, emitted: &ast::StructExpr) -> bool {
+    let same_rest = match (&original.rest, &emitted.rest) {
+        (ast::StructRest::None, ast::StructRest::None) => true,
+        (ast::StructRest::Base(left), ast::StructRest::Base(right)) => {
+            expression_key(left) == expression_key(right)
+        }
+        _ => false,
+    };
+    original.qself.is_none()
+        && emitted.qself.is_none()
+        && pprust::path_to_string(&original.path) == pprust::path_to_string(&emitted.path)
+        && same_rest
+        && original.fields.len() == emitted.fields.len()
+        && original
+            .fields
+            .iter()
+            .zip(emitted.fields.iter())
+            .all(|(left, right)| {
+                left.ident.name == right.ident.name
+                    && (initializer_matches_modulo_adapters(&left.expr, &right.expr)
+                        || null_literal_starts_as_none(&left.expr, &right.expr))
+            })
+}
+
+/// The zero literal under any casts, against the path `None`.
+fn null_literal_starts_as_none(original: &ast::Expr, emitted: &ast::Expr) -> bool {
+    if path(emitted).as_deref() != Some("None") {
+        return false;
+    }
+    let mut view = unparen(original);
+    while let ast::ExprKind::Cast(inner, _) = &view.kind {
+        view = unparen(inner);
+    }
+    matches!(&view.kind, ast::ExprKind::Lit(literal)
+        if literal.kind == ast::token::LitKind::Integer && literal.symbol.as_str() == "0")
+}
+
+/// Parse both sides and apply [`initializer_matches_modulo_adapters`].
+fn initializer_adapter_correspondence(original: &str, emitted: &str) -> bool {
+    let (Ok(original), Ok(emitted)) = (expression(original), expression(emitted)) else {
+        return false;
+    };
+    initializer_matches_modulo_adapters(&original, &emitted)
+}
+
+/// Test seam for the arm above.
+/// **R466-1, RULED — the view relations apply INSIDE call arguments, recursively.**
+///
+/// `BrotliAllocate`'s memory-manager receiver is delivered as `&mut MemoryManager`,
+/// so every call site bridges it back: `BrotliAllocate(m, ..)` becomes
+/// `BrotliAllocate(core::ptr::from_mut(&mut *m), ..)`. `core::ptr::from_mut` was
+/// already a relation the comparator knew — but only at the TOP LEVEL of an
+/// initializer, never nested in an argument, so brotli's `clusters` and `pairs`
+/// refused. The replay found them before a census did.
+///
+/// Two calls correspond when the callee is the SAME and each argument corresponds,
+/// recursively and through raw casts. It is a congruence over the relations that
+/// already exist, not a new licence: an argument still has to be a view of the
+/// original's own operand, so a different callee, a different arity, or a
+/// different expression at any one position all refuse.
+fn expressions_correspond(original: &ast::Expr, emitted: &ast::Expr) -> bool {
+    let original = peel_raw_pointer_casts(unparen(original));
+    let emitted = peel_raw_pointer_casts(unparen(emitted));
+    if expression_key(original) == expression_key(emitted) {
+        return true;
+    }
+    // The emitted side may be any view of the original's operand that the
+    // comparator already recognises -- `from_mut(&mut *m)`, `from_ref`, `as_ptr`,
+    // a `cast`, the optional `map_or` spelling.
+    if raw_initializer_matches(emitted, original) {
+        return true;
+    }
+    let (
+        ast::ExprKind::Call(left_callee, left_args),
+        ast::ExprKind::Call(right_callee, right_args),
+    ) = (&original.kind, &emitted.kind)
+    else {
+        return false;
+    };
+    if left_args.len() != right_args.len()
+        || path(left_callee).is_none()
+        || path(left_callee) != path(right_callee)
+    {
+        return false;
+    }
+    left_args
+        .iter()
+        .zip(right_args.iter())
+        .all(|(left, right)| expressions_correspond(left, right))
+}
+
+/// **R494-1(b) -- the outbound native-result block is the call it binds.**
+///
+/// Where a callee's delivered REFERENCE result has to be handed back as the raw
+/// pointer the caller's own initializer wrote, `native_result_expression::render`
+/// emits
+///
+/// ```text
+/// { let [mut] __crat_native_result_<caller>_<hir>: T = (<the adapted call>);
+///   (<a view of that temporary>) as <the original raw type> }
+/// ```
+///
+/// -- one `let`, which binds the call exactly once so the original's evaluation
+/// order survives, and a tail that is a view of precisely what it bound. The
+/// SOURCE the bridge reads is therefore the call, and the comparison continues
+/// there under the relations already in force (R466-1's congruence relates the
+/// call's own adapted arguments).
+///
+/// heman's `heman_image_texel(normals, x, y) as *mut kmVec3` is the corpus row:
+/// with `heman_image_texel` returning `&'static mut f32` under W6L-1, the
+/// initializer of `N` becomes this block, `N`'s correspondence fails, and the A5
+/// stamp the tree does carry at the `kmVec3Lerp` call below it reads
+/// `initializer-original-binding-correspondence-unresolved`.
+///
+/// Exact, and it peels a rename with a view on it -- never a computation. The
+/// generated prefix is required, so an ordinary block cannot enter; there must be
+/// exactly one statement plus the tail; and the tail must be a view of THAT
+/// binding, by `raw_initializer_matches`, not of anything else. A second
+/// statement, a tail naming another value, or a block with a label all refuse and
+/// keep their own key.
+fn native_result_block_call(emitted: &ast::Expr) -> Option<&ast::Expr> {
+    let ast::ExprKind::Block(block, None) = &unparen(emitted).kind else {
+        return None;
+    };
+    let [statement, tail] = block.stmts.as_slice() else {
+        return None;
+    };
+    let ast::StmtKind::Let(local) = &statement.kind else {
+        return None;
+    };
+    let ast::StmtKind::Expr(value) = &tail.kind else {
+        return None;
+    };
+    let ast::PatKind::Ident(_, name, None) = &local.pat.kind else {
+        return None;
+    };
+    let name = name.name.as_str();
+    if !name.starts_with("__crat_native_result_") {
+        return None;
+    }
+    let init = local.kind.init()?;
+    let binding = expression(name).ok()?;
+    raw_initializer_matches(unparen(value), &binding).then_some(init)
+}
+
+#[cfg(test)]
+pub(crate) fn expressions_correspond_for_test(original: &str, emitted: &str) -> bool {
+    let (Ok(original), Ok(emitted)) = (expression(original), expression(emitted)) else {
+        return false;
+    };
+    expressions_correspond(&original, &emitted)
+}
+
+/// **R465-1, RULED — a CONDITIONAL allocation corresponds branch by branch.**
+///
+/// C2Rust guards an allocation with its own size test and the delivery wraps the
+/// allocated pointer without moving the guard:
+///
+/// ```text
+/// original  if length > 0 { BrotliAllocate(..) as *mut uint8_t } else { 0 as *mut uint8_t }
+/// emitted   if length > 0 { Some(Box::from_raw(slice_from_raw_parts_mut(<E>, <len>))) } else { None }
+/// ```
+///
+/// No arm beside this one recognises it — `same_expression` sees two different
+/// texts, `null_initializer_corresponds` wants the WHOLE initializer to be a null
+/// literal, and the slice/adapter arms read a single expression. All 31 of
+/// brotli's `FindBlocks*` rows refused here, through three censuses.
+///
+/// The relation is branch-wise and nothing else: the SAME condition on both
+/// sides, a then-branch whose owning wrapper is over the same allocation
+/// expression, and an else-branch that is `None` against the original's null
+/// literal. `<len>` is the delivered extent and deliberately no part of the source
+/// relation — the custody question is which allocation the bridge reads, not how
+/// long the emitted view says it is. Any other branch shape refuses.
+fn conditional_allocation_corresponds(original: &str, emitted: &str) -> bool {
+    let (Ok(original), Ok(emitted)) = (expression(original), expression(emitted)) else {
+        return false;
+    };
+    let (
+        ast::ExprKind::If(left_cond, left_then, Some(left_else)),
+        ast::ExprKind::If(right_cond, right_then, Some(right_else)),
+    ) = (&unparen(&original).kind, &unparen(&emitted).kind)
+    else {
+        return false;
+    };
+    if expression_key(unparen(left_cond)) != expression_key(unparen(right_cond)) {
+        return false;
+    }
+    let tail = |block: &ast::Block| -> Option<ast::ptr::P<ast::Expr>> {
+        let [statement] = block.stmts.as_slice() else { return None };
+        match &statement.kind {
+            ast::StmtKind::Expr(value) => Some(value.clone()),
+            _ => None,
+        }
+    };
+    let (Some(left_value), Some(right_value)) = (tail(left_then), tail(right_then)) else {
+        return false;
+    };
+    let (Some(left_null), Some(right_null)) = (tail_of_else(left_else), tail_of_else(right_else))
+    else {
+        return false;
+    };
+    // The then-branch either gains an owning wrapper over the same allocation, or
+    // keeps its form and differs only inside the call (R466-1).
+    let then_corresponds = owning_wrapper_over(&right_value, &left_value)
+        || expressions_correspond(&left_value, &right_value);
+    // The else-branch is `None` against the original's null, or -- where the local
+    // stayed raw -- the same null on both sides.
+    let else_corresponds = (expression_key(unparen(&right_null)) == "None"
+        && is_null_pointer_literal(&left_null))
+        || expressions_correspond(&left_null, &right_null);
+    then_corresponds && else_corresponds
+}
+
+fn tail_of_else(expression: &ast::Expr) -> Option<ast::ptr::P<ast::Expr>> {
+    let ast::ExprKind::Block(block, None) = &unparen(expression).kind else {
+        return None;
+    };
+    let [statement] = block.stmts.as_slice() else { return None };
+    match &statement.kind {
+        ast::StmtKind::Expr(value) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// `Some(Box::from_raw(slice_from_raw_parts_mut(<E>, <len>)))`, or the thin
+/// `Box::from_raw(<E>)`, over the ORIGINAL's allocation expression `<E>`.
+fn owning_wrapper_over(emitted: &ast::Expr, original: &ast::Expr) -> bool {
+    let mut view = unparen(emitted);
+    // `Some(..)` is optional: a non-nullable delivery wraps the Box directly.
+    if let ast::ExprKind::Call(callee, arguments) = &view.kind
+        && arguments.len() == 1
+        && path(callee).as_deref() == Some("Some")
+    {
+        view = unparen(&arguments[0]);
+    }
+    let ast::ExprKind::Call(callee, arguments) = &view.kind else {
+        return false;
+    };
+    if arguments.len() != 1
+        || !matches!(
+            path(callee).as_deref(),
+            Some("Box::from_raw" | "std::boxed::Box::from_raw" | "alloc::boxed::Box::from_raw")
+        )
+    {
+        return false;
+    }
+    let mut inner = unparen(&arguments[0]);
+    // The fat form carries the delivered extent; it is not part of the relation.
+    if let ast::ExprKind::Call(constructor, parts) = &inner.kind
+        && parts.len() == 2
+        && matches!(
+            path(constructor).as_deref(),
+            Some(
+                "core::ptr::slice_from_raw_parts_mut"
+                    | "core::ptr::slice_from_raw_parts"
+                    | "std::ptr::slice_from_raw_parts_mut"
+                    | "std::ptr::slice_from_raw_parts"
+            )
+        )
+    {
+        inner = unparen(&parts[0]);
+    }
+    expression_key(inner) == expression_key(original)
+}
+
+fn is_null_pointer_literal(expression: &ast::Expr) -> bool {
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, _) = &view.kind {
+        view = unparen(inner);
+    }
+    // `core::ptr::null_mut()` is a CALL, not a path.
+    if let ast::ExprKind::Call(callee, arguments) = &view.kind
+        && arguments.is_empty()
+        && matches!(
+            path(callee).as_deref(),
+            Some(
+                "core::ptr::null" | "core::ptr::null_mut" | "std::ptr::null" | "std::ptr::null_mut"
+            )
+        )
+    {
+        return true;
+    }
+    matches!(&view.kind, ast::ExprKind::Lit(literal)
+        if literal.kind == ast::token::LitKind::Integer && literal.symbol.as_str() == "0")
+}
+
+#[cfg(test)]
+pub(crate) fn conditional_allocation_corresponds_for_test(original: &str, emitted: &str) -> bool {
+    conditional_allocation_corresponds(original, emitted)
+}
+
+pub(crate) fn initializer_adapter_correspondence_for_test(original: &str, emitted: &str) -> bool {
+    initializer_adapter_correspondence(original, emitted)
+}
+
+/// **R306-1(ii) — the K19′ carrier replaced the original's raw cast, so the
+/// comparison peels that cast on BOTH sides.**
+///
+/// `raw_initializer_matches` already peels a raw-pointer cast off the emitted
+/// initializer; the original kept its own, so `ann` was compared against
+/// `ann as *const libc::c_void` and ten correct void carriers over four
+/// programs read as `pending-source-view-correspondence-unbuilt`.
+///
+/// Strict, and for the same reason as the arm above: **only** raw-pointer
+/// casts are peeled. A cast to any other type is a different value and still
+/// refuses.
+fn peel_raw_pointer_casts(mut expression: &ast::Expr) -> &ast::Expr {
+    loop {
+        expression = unparen(expression);
+        let ast::ExprKind::Cast(inner, ty) = &expression.kind else {
+            break;
+        };
+        if !matches!(ty.kind, ast::TyKind::Ptr(_)) {
+            break;
+        }
+        expression = inner;
+    }
+    expression
+}
+
+fn same_view_operand(expression: &ast::Expr, original: &ast::Expr) -> bool {
+    expression_key(view_operand(peel_raw_pointer_casts(expression)))
+        == expression_key(view_operand(peel_raw_pointer_casts(original)))
+}
+
+/// **R430-2 — the place key of a borrow, with a delivered `Option`'s access
+/// peeled.** A protected source delivered as `Option<&mut T>` spells the same
+/// projected referent as `&mut (**value.as_mut().unwrap()).f` where the
+/// original wrote `&mut (*value).f`: `*<opt>.as_mut().unwrap()` IS `<opt>`.
+/// Only that exact chain is peeled — an access with arguments, a different
+/// method, or any other receiver keeps its own key and still refuses.
+fn optional_place_key(expression: &ast::Expr) -> Option<String> {
+    let expression = unparen(expression);
+    match &expression.kind {
+        ast::ExprKind::Path(..) => path(expression),
+        ast::ExprKind::Field(base, field) => {
+            Some(format!("{}.{}", optional_place_key(base)?, field.name))
+        }
+        ast::ExprKind::Cast(inner, _) => optional_place_key(inner),
+        ast::ExprKind::Index(base, index, _) => Some(format!(
+            "{}[{}]",
+            optional_place_key(base)?,
+            expression_key(index)
+        )),
+        ast::ExprKind::Unary(ast::UnOp::Deref, inner) => {
+            if let ast::ExprKind::MethodCall(unwrap) = &unparen(inner).kind
+                && matches!(unwrap.seg.ident.name.as_str(), "unwrap" | "expect")
+                && let ast::ExprKind::MethodCall(access) = &unparen(&unwrap.receiver).kind
+                && access.args.is_empty()
+                && matches!(
+                    access.seg.ident.name.as_str(),
+                    "as_mut" | "as_ref" | "as_deref" | "as_deref_mut"
+                )
+            {
+                return optional_place_key(&access.receiver);
+            }
+            Some(format!("*{}", optional_place_key(inner)?))
+        }
+        _ => None,
+    }
+}
+
+fn borrows_the_same_place(initializer: &ast::Expr, original: &ast::Expr) -> bool {
+    let (
+        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, emitted_mutability, emitted_place),
+        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, original_mutability, original_place),
+    ) = (&unparen(initializer).kind, &unparen(original).kind)
+    else {
+        return false;
+    };
+    if emitted_mutability != original_mutability {
+        return false;
+    }
+    match (
+        optional_place_key(emitted_place),
+        optional_place_key(original_place),
+    ) {
+        (Some(emitted), Some(original)) => emitted == original,
+        _ => false,
+    }
+}
+
+/// **R568-1 (b) -- an element address through the owner's view is the original
+/// element.** joint (c) passes a Box owner's element at a raw formal through the
+/// owner's raw view at its base: brotli's `BrotliHistogramCombine*` calls read
+/// `&mut *clusters.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())
+/// .offset(num_clusters as isize)` where the input wrote
+/// `&mut *clusters.offset(num_clusters as isize)`. Exact: both sides borrow a
+/// dereferenced one-argument `offset` with the same mutability, the index is the
+/// same expression, and the emitted receiver is a raw view of the original
+/// receiver by the relations already in force. `add`, another index, another owner
+/// or another borrow all refuse.
+fn element_address_through_view(initializer: &ast::Expr, original: &ast::Expr) -> bool {
+    let (
+        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, emitted_mutability, emitted_place),
+        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, original_mutability, original_place),
+    ) = (&unparen(initializer).kind, &unparen(original).kind)
+    else {
+        return false;
+    };
+    let (
+        ast::ExprKind::Unary(ast::UnOp::Deref, emitted_pointer),
+        ast::ExprKind::Unary(ast::UnOp::Deref, original_pointer),
+    ) = (&unparen(emitted_place).kind, &unparen(original_place).kind)
+    else {
+        return false;
+    };
+    let (ast::ExprKind::MethodCall(emitted_offset), ast::ExprKind::MethodCall(original_offset)) = (
+        &unparen(emitted_pointer).kind,
+        &unparen(original_pointer).kind,
+    ) else {
+        return false;
+    };
+    let one_offset = |offset: &ast::MethodCall| {
+        offset.seg.ident.name.as_str() == "offset"
+            && offset.seg.args.is_none()
+            && offset.args.len() == 1
+    };
+    emitted_mutability == original_mutability
+        && one_offset(emitted_offset)
+        && one_offset(original_offset)
+        && expression_key(&emitted_offset.args[0]) == expression_key(&original_offset.args[0])
+        && raw_initializer_matches(&emitted_offset.receiver, &original_offset.receiver)
+}
+
+fn raw_initializer_matches(initializer: &ast::Expr, original: &ast::Expr) -> bool {
+    let initializer = unparen(initializer);
+    if expression_key(initializer) == expression_key(original) {
+        return true;
+    }
+    if borrows_the_same_place(initializer, original) {
+        return true;
+    }
+    if element_address_through_view(initializer, original) {
+        return true;
+    }
+    match &initializer.kind {
+        // **R460-1(a) — a block with ONE named intermediate is that intermediate.**
+        //
+        // The AST layer renders some A5 raw views as `{ let __crat_raw: T = <e>;
+        // __crat_raw }` — the same expression as `<e>` with a name attached. Six
+        // of brotli's `BrotliClusterHistograms*` arguments are spelled that way,
+        // and with no arm here they failed `raw-initializer-source-relation-unbuilt`
+        // and ended batch 13 `data=false`.
+        //
+        // A named intermediate and NOTHING else: exactly one statement, which is
+        // a `let` binding one name to one initializer, and a tail that is exactly
+        // that name. A second statement, a tail that is any other expression, or
+        // a block without a binding all keep their own key and still refuse —
+        // this peels a rename, never a computation.
+        ast::ExprKind::Block(block, None) => {
+            let [statement, tail] = block.stmts.as_slice() else {
+                return false;
+            };
+            let ast::StmtKind::Let(local) = &statement.kind else {
+                return false;
+            };
+            let ast::StmtKind::Expr(value) = &tail.kind else {
+                return false;
+            };
+            let ast::PatKind::Ident(_, name, None) = &local.pat.kind else {
+                return false;
+            };
+            let Some(init) = local.kind.init() else {
+                return false;
+            };
+            path(unparen(value)).is_some_and(|tail| tail == name.name.as_str())
+                && raw_initializer_matches(init, original)
+        }
+        ast::ExprKind::Cast(inner, ty) if matches!(ty.kind, ast::TyKind::Ptr(_)) => {
+            raw_initializer_matches(inner, original)
+        }
+        ast::ExprKind::Call(callee, arguments)
+            if arguments.len() == 1
+                && matches!(
+                    path(callee).as_deref(),
+                    Some(
+                        "core::ptr::from_ref"
+                            | "core::ptr::from_mut"
+                            | "std::ptr::from_ref"
+                            | "std::ptr::from_mut"
+                    )
+                ) =>
+        {
+            same_view_operand(&arguments[0], original)
+        }
+        ast::ExprKind::MethodCall(method) => {
+            let receiver = &method.receiver;
+            let arguments = &method.args;
+            match method.seg.ident.name.as_str() {
+                "as_ptr" | "as_mut_ptr" if arguments.is_empty() => {
+                    same_view_operand(receiver, original)
+                }
+                "cast" | "cast_mut" | "cast_const" if arguments.is_empty() => {
+                    raw_initializer_matches(receiver, original)
+                }
+                "map_or" if arguments.len() == 2 => {
+                    let ast::ExprKind::MethodCall(access) = &unparen(receiver).kind else {
+                        return false;
+                    };
+                    if !access.args.is_empty()
+                        || !matches!(
+                            access.seg.ident.name.as_str(),
+                            "as_deref" | "as_deref_mut" | "as_ref" | "as_mut"
+                        )
+                        || !same_view_operand(&access.receiver, original)
+                    {
+                        return false;
+                    }
+                    let ast::ExprKind::Call(null, null_args) = &unparen(&arguments[0]).kind else {
+                        return false;
+                    };
+                    if !null_args.is_empty()
+                        || !matches!(
+                            path(null).as_deref(),
+                            Some(
+                                "core::ptr::null"
+                                    | "core::ptr::null_mut"
+                                    | "std::ptr::null"
+                                    | "std::ptr::null_mut"
+                            )
+                        )
+                    {
+                        return false;
+                    }
+                    if matches!(
+                        path(&arguments[1]).as_deref(),
+                        Some(
+                            "core::ptr::from_ref"
+                                | "core::ptr::from_mut"
+                                | "std::ptr::from_ref"
+                                | "std::ptr::from_mut"
+                        )
+                    ) {
+                        return true;
+                    }
+                    let ast::ExprKind::Closure(closure) = &unparen(&arguments[1]).kind else {
+                        return false;
+                    };
+                    let [parameter] = closure.fn_decl.inputs.as_slice() else { return false };
+                    let ast::PatKind::Ident(_, name, None) = &parameter.pat.kind else {
+                        return false;
+                    };
+                    // **R430-2 — the view may be cast to the callee's pointee.**
+                    // `|slice| slice.as_ptr().cast::<c_void>()` is the same view
+                    // as `|slice| slice.as_ptr()`; only the zero-argument
+                    // pointer casts are peeled, exactly as elsewhere here.
+                    let mut body = unparen(&closure.body);
+                    while let ast::ExprKind::MethodCall(cast) = &body.kind {
+                        if !cast.args.is_empty()
+                            || !matches!(
+                                cast.seg.ident.name.as_str(),
+                                "cast" | "cast_mut" | "cast_const"
+                            )
+                        {
+                            break;
+                        }
+                        body = unparen(&cast.receiver);
+                    }
+                    // **R636-1 — an optional REFERENCE's view, in closure form.**
+                    // `|value| core::ptr::from_mut(value)` is the same view as the
+                    // `map_or(null, core::ptr::from_mut)` accepted above; the Option
+                    // bridge spells it this way (binn's `pint`, batch 50). Exactly one
+                    // argument, and it is the closure's own parameter.
+                    if let ast::ExprKind::Call(project, projected) = &body.kind {
+                        let [projected] = projected.as_slice() else { return false };
+                        return matches!(
+                            path(project).as_deref(),
+                            Some(
+                                "core::ptr::from_ref"
+                                    | "core::ptr::from_mut"
+                                    | "std::ptr::from_ref"
+                                    | "std::ptr::from_mut"
+                            )
+                        ) && path(projected).as_deref() == Some(name.name.as_str());
+                    }
+                    let ast::ExprKind::MethodCall(project) = &body.kind else {
+                        return false;
+                    };
+                    project.args.is_empty()
+                        && matches!(project.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr")
+                        && path(&project.receiver).as_deref() == Some(name.name.as_str())
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn optional_raw_view_matches(initializer: &ast::Expr, original: &ast::Expr) -> bool {
+    match &unparen(initializer).kind {
+        ast::ExprKind::Cast(inner, ty) if matches!(ty.kind, ast::TyKind::Ptr(_)) => {
+            optional_raw_view_matches(inner, original)
+        }
+        ast::ExprKind::MethodCall(method)
+            if method.args.is_empty()
+                && matches!(
+                    method.seg.ident.name.as_str(),
+                    "cast" | "cast_mut" | "cast_const"
+                ) =>
+        {
+            optional_raw_view_matches(&method.receiver, original)
+        }
+        ast::ExprKind::MethodCall(method) if method.seg.ident.name.as_str() == "map_or" => {
+            raw_initializer_matches(initializer, original)
+        }
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PointerType {
+    Raw(bool),
+    Reference(bool),
+    OptionalReference,
+    Other,
+}
+
+fn parsed_type(text: &str) -> MatchResult<ast::ptr::P<ast::Ty>> {
+    let source = format!("fn __custody(__value: {text}) {{}}");
+    let session = ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
+    let krate =
+        super::slice_use_inventory_tests::parse_crate(&session, "custody-type.rs", &source)?;
+    let [item] = krate.items.as_slice() else { return Err("type-fragment-items".into()) };
+    let ast::ItemKind::Fn(function) = &item.kind else {
+        return Err("type-fragment-function".into());
+    };
+    let [parameter] = function.sig.decl.inputs.as_slice() else {
+        return Err("type-fragment-parameters".into());
+    };
+    Ok(parameter.ty.clone())
+}
+
+fn pointer_type(text: &str) -> MatchResult<PointerType> {
+    let parsed = parsed_type(text)?;
+    let mut ty = &*parsed;
+    while let ast::TyKind::Paren(inner) = &ty.kind {
+        ty = inner;
+    }
+    Ok(match &ty.kind {
+        ast::TyKind::Ptr(pointer) => PointerType::Raw(pointer.mutbl.is_mut()),
+        ast::TyKind::Ref(_, reference) => PointerType::Reference(reference.mutbl.is_mut()),
+        ast::TyKind::Path(None, path) => {
+            let name = path
+                .segments
+                .iter()
+                .filter(|segment| segment.ident.name != rustc_span::kw::PathRoot)
+                .map(|segment| segment.ident.name.to_string())
+                .collect::<Vec<_>>()
+                .join("::");
+            let arguments = path
+                .segments
+                .last()
+                .and_then(|segment| segment.args.as_deref());
+            if matches!(
+                name.as_str(),
+                "Option" | "core::option::Option" | "std::option::Option"
+            ) && let Some(ast::GenericArgs::AngleBracketed(arguments)) = arguments
+                && let [ast::AngleBracketedArg::Arg(ast::GenericArg::Type(payload))] =
+                    arguments.args.as_slice()
+            {
+                let mut payload = &**payload;
+                while let ast::TyKind::Paren(inner) = &payload.kind {
+                    payload = inner;
+                }
+                if matches!(payload.kind, ast::TyKind::Ref(..)) {
+                    PointerType::OptionalReference
+                } else {
+                    PointerType::Other
+                }
+            } else {
+                PointerType::Other
+            }
+        }
+        _ => PointerType::Other,
+    })
+}
+
+fn mapped_owner<'a>(owner: &'a str, context: &'a BridgeCustodyContext) -> MatchResult<&'a str> {
+    let rows = context
+        .owner_renames
+        .iter()
+        .filter(|row| row.original_owner == owner)
+        .collect::<Vec<_>>();
+    match rows.as_slice() {
+        [] => Ok(owner),
+        [row] if !row.evidence.is_empty() && !row.emitted_owner.is_empty() => {
+            Ok(&row.emitted_owner)
+        }
+        _ => Err(format!("ambiguous-or-unreceipted-owner-mapping:{owner}")),
+    }
+}
+
+fn target_owner<'a>(
+    input: &'a BridgeCustodyInput<'_>,
+    expected: &'a BridgeExpectation,
+) -> MatchResult<&'a super::bridge_custody_syntax::Function> {
+    let owner = mapped_owner(&expected.callee, input.context)?;
+    let functions = input
+        .emitted
+        .functions
+        .iter()
+        .filter(|function| function.owner == owner)
+        .collect::<Vec<_>>();
+    match functions.as_slice() {
+        [function] => Ok(function),
+        _ => Err(format!("callee-declaration-not-unique:{owner}")),
+    }
+}
+
+fn original_call<'a>(
+    input: &'a BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+) -> MatchResult<(&'a Call, Vec<usize>)> {
+    let candidates = input
+        .original
+        .calls
+        .iter()
+        .filter(|call| call.owner == expected.caller)
+        .filter(|call| match &expected.anchor {
+            SiteAnchor::Call { span, .. } => call.span == *span,
+            SiteAnchor::Argument {
+                span,
+                argument_index,
+            } => call
+                .arguments
+                .get(*argument_index)
+                .is_some_and(|argument| argument.span == *span),
+        })
+        .collect::<Vec<_>>();
+    let [call] = candidates.as_slice() else {
+        return Err("original-call-anchor-not-unique".into());
+    };
+    let indices = match &expected.anchor {
+        SiteAnchor::Call {
+            argument_indices, ..
+        } => argument_indices.clone(),
+        SiteAnchor::Argument { argument_index, .. } => vec![*argument_index],
+    };
+    if indices.iter().any(|index| *index >= call.arguments.len())
+        || indices.iter().copied().collect::<BTreeSet<_>>().len() != indices.len()
+    {
+        return Err("invalid-or-duplicate-argument-indices".into());
+    }
+    if indices.is_empty() && expected.kind != BridgeKind::PairCopySnapshot {
+        return Err("missing-argument-indices".into());
+    }
+    for argument in &call.arguments {
+        if input
+            .original_source
+            .get(argument.span.lo as usize..argument.span.hi as usize)
+            != Some(argument.text.as_str())
+        {
+            return Err("original-inventory-source-mismatch".into());
+        }
+    }
+    Ok((call, indices))
+}
+
+/// R447-1. The key of this callee's raw twin, when the emitted tree declares
+/// one. `None` when the callee text is not a plain path (a twin is inserted
+/// beside a named function, never beside a computed callee) or when no such
+/// function exists in the emitted tree — in both cases there is no rename to
+/// follow and the caller's candidate set is unchanged.
+fn twin_callee_key(
+    input: &BridgeCustodyInput<'_>,
+    callee_text: &str,
+) -> MatchResult<Option<String>> {
+    let Some(name) = callee_text.rsplit("::").next().map(str::trim) else {
+        return Ok(None);
+    };
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        return Ok(None);
+    }
+    let twin = super::decision::counted_void::raw_twin_name(name);
+    if !input
+        .emitted
+        .functions
+        .iter()
+        .any(|function| function.owner == twin || function.owner.ends_with(&format!("::{twin}")))
+    {
+        return Ok(None);
+    }
+    let text = match callee_text.rsplit_once("::") {
+        Some((prefix, _)) => format!("{prefix}::{twin}"),
+        None => twin,
+    };
+    Ok(Some(expression_key(&*expression(&text)?)))
+}
+
+/// **R695-2 (a) — follow the callee's EXPOSURE rename.** An exposure-shimmed
+/// callee keeps its original name as the raw `extern "C"` shim, and the
+/// in-program callers call its safe inner `__crat_safe_<callee>` instead. The
+/// export already receipts that as the callee's typed-exposure `OwnerRename` (the
+/// one `target_owner` reads), so the call binding the stamped raw temporaries is
+/// the call to that inner. Like R447-1's twin, the alias is derived from the
+/// receipt, not guessed: only a `typed-exposure:` row for this very callee is
+/// followed, only when the original call names the callee by its own item name,
+/// and only when the emitted tree declares exactly that inner.
+fn exposure_callee_key(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    callee_text: &str,
+) -> MatchResult<Option<String>> {
+    let [row] = input
+        .context
+        .owner_renames
+        .iter()
+        .filter(|row| row.original_owner == expected.callee)
+        .collect::<Vec<_>>()[..]
+    else {
+        return Ok(None);
+    };
+    if !row.evidence.starts_with("typed-exposure:") {
+        return Ok(None);
+    }
+    let item = |path: &str| path.rsplit("::").next().map(str::trim).map(str::to_owned);
+    let (Some(named), Some(original), Some(inner)) = (
+        item(callee_text),
+        item(&expected.callee),
+        item(&row.emitted_owner),
+    ) else {
+        return Ok(None);
+    };
+    if named != original
+        || inner.is_empty()
+        || !inner.chars().all(|c| c.is_alphanumeric() || c == '_')
+        || input
+            .emitted
+            .functions
+            .iter()
+            .filter(|function| function.owner == row.emitted_owner)
+            .count()
+            != 1
+    {
+        return Ok(None);
+    }
+    let text = match callee_text.rsplit_once("::") {
+        Some((prefix, _)) => format!("{prefix}::{inner}"),
+        None => inner,
+    };
+    Ok(Some(expression_key(&*expression(&text)?)))
+}
+
+fn emitted_candidates<'a>(
+    input: &'a BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+) -> MatchResult<Vec<&'a Call>> {
+    let owner = mapped_owner(&expected.caller, input.context)?;
+    if input
+        .original
+        .functions
+        .iter()
+        .filter(|function| function.owner == expected.caller)
+        .count()
+        != 1
+        || input
+            .emitted
+            .functions
+            .iter()
+            .filter(|function| function.owner == owner)
+            .count()
+            != 1
+    {
+        return Err("caller-declaration-not-unique".into());
+    }
+    let renames = input
+        .context
+        .callee_renames
+        .iter()
+        .filter(|row| {
+            row.original_caller == expected.caller
+                && row.original_callee_text == original.callee_text
+        })
+        .collect::<Vec<_>>();
+    let callee_text = match renames.as_slice() {
+        [] => original.callee_text.as_str(),
+        [row] if !row.evidence.is_empty() => row.emitted_callee_text.as_str(),
+        _ => return Err("ambiguous-or-unreceipted-callee-mapping".into()),
+    };
+    let key = expression_key(&*expression(callee_text)?);
+    // **R447-1 — follow the RAW TWIN.** A counted-void callee that could not be
+    // split keeps its original body under `__crat_raw_<callee>`, and the sites
+    // that could not be split call the twin instead
+    // (`decision::counted_void::raw_twin_name`, `insert_raw_twin`). The
+    // expectation still names the original callee, so without this the call
+    // that binds the stamped raw temporaries is simply not in the candidate set
+    // and the receipt fails `stamped-raw-temporary-has-no-exact-bound-call-use`
+    // on an emission that is perfectly correct — wave-6v2 017 measured exactly
+    // that on binn (`copy_int_value`, callers `binn_get_int32`/`int64`), which
+    // is what keeps wave-5d's `4001c0a64` (+12) out of a landable frame.
+    //
+    // The alias is DERIVED, not guessed: the twin's name is a function of this
+    // callee's own text, and it is followed only when the emitted tree actually
+    // declares that function, so a call to an unrelated `__crat_raw_*` cannot
+    // be mistaken for this callee's.
+    let twin_key = twin_callee_key(input, callee_text)?;
+    let twin_crate_key = twin_crate_callee_key(input, expected);
+    let exposure_key = exposure_callee_key(input, expected, callee_text)?;
+    let mut candidates = Vec::new();
+    for call in input
+        .emitted
+        .calls
+        .iter()
+        .filter(|call| call.owner == owner && call.arguments.len() == original.arguments.len())
+    {
+        let call_key = expression_key(&*expression(&call.callee_text)?);
+        if call_key == key
+            || twin_key.as_ref() == Some(&call_key)
+            || twin_crate_key.as_ref() == Some(&call_key)
+            || exposure_key.as_ref() == Some(&call_key)
+        {
+            candidates.push(call);
+        }
+    }
+    Ok(candidates)
+}
+
+fn binding_at<'a>(
+    input: &'a BridgeCustodyInput<'_>,
+    call: &'a Call,
+    index: usize,
+) -> MatchResult<&'a Binding> {
+    let argument = call.arguments.get(index).ok_or("emitted-argument-absent")?;
+    let binding = argument
+        .binding
+        .as_ref()
+        .ok_or("emitted-argument-binding-unresolved")?;
+    if binding.owner != call.owner
+        || input.emitted.bindings.get(binding.id) != Some(binding)
+        || binding.init_span.is_none()
+        || binding.declaration_span.hi > call.span.lo
+    {
+        return Err("binding-identity-or-before-call-placement-invalid".into());
+    }
+    if input
+        .emitted_source
+        .get(argument.span.lo as usize..argument.span.hi as usize)
+        != Some(argument.text.as_str())
+        || binding
+            .init_span
+            .and_then(|span| input.emitted_source.get(span.lo as usize..span.hi as usize))
+            != binding.init_text.as_deref()
+    {
+        return Err("emitted-binding-inventory-source-mismatch".into());
+    }
+    Ok(binding)
+}
+
+/// Test seam for R304's correspondence witnesses; the predicate itself stays
+/// private to this module.
+/// Test seams for R310-4(iii)'s branch-specific killers: these go through the
+/// real dispatch and the real initializer comparison, not the helpers.
+#[cfg(test)]
+pub(crate) fn pending_whole_subject_for_test(expression: &str, binding: &str) -> bool {
+    let Ok(parsed) = expression_for_test(expression) else {
+        return false;
+    };
+    whole_subject_uses(&parsed, binding)
+}
+
+#[cfg(test)]
+pub(crate) fn raw_initializer_matches_for_test(emitted: &str, original: &str) -> bool {
+    let (Ok(emitted), Ok(original)) = (expression_for_test(emitted), expression_for_test(original))
+    else {
+        return false;
+    };
+    raw_initializer_matches(&emitted, &original)
+}
+
+#[cfg(test)]
+pub(crate) fn normalised_tokens_of_call_for_test(text: &str) -> String {
+    super::bridge_custody_export::normalised_tokens(text)
+}
+
+/// Test seam for R306's void-carrier witness.
+#[cfg(test)]
+pub(crate) fn whole_subject_uses_for_test(expression: &str, binding: &str) -> bool {
+    let Ok(parsed) = expression_for_test(expression) else {
+        return false;
+    };
+    whole_subject_uses(&parsed, binding)
+}
+
+#[cfg(test)]
+fn expression_for_test(text: &str) -> MatchResult<ast::ptr::P<ast::Expr>> {
+    expression(text)
+}
+
+#[cfg(test)]
+#[cfg(test)]
+pub(crate) fn slice_construction_corresponds_for_test(
+    original: &str,
+    emitted: &str,
+    emitted_type: Option<&str>,
+) -> bool {
+    slice_construction_corresponds(original, emitted, emitted_type)
+}
+
+#[cfg(test)]
+pub(crate) fn typed_view_slice_correspondence_for_test(
+    emitted: &str,
+    binding: &str,
+    method: &str,
+    original: &str,
+) -> bool {
+    let (Ok(emitted), Ok(original)) = (expression_for_test(emitted), expression_for_test(original))
+    else {
+        return false;
+    };
+    typed_view_slice_correspondence(&emitted, binding, method, &original)
+}
+
+pub(crate) fn local_types_correspond_for_test(
+    original: Option<&str>,
+    emitted: Option<&str>,
+) -> MatchResult<bool> {
+    local_types_correspond(original, emitted)
+}
+
+fn local_types_correspond(original: Option<&str>, emitted: Option<&str>) -> MatchResult<bool> {
+    if original == emitted {
+        return Ok(true);
+    }
+    let (Some(original), Some(emitted)) = (original, emitted) else { return Ok(false) };
+    let original = parsed_type(original)?;
+    let emitted = parsed_type(emitted)?;
+    let mut original = &*original;
+    let mut emitted = &*emitted;
+    while let ast::TyKind::Paren(inner) = &original.kind {
+        original = inner;
+    }
+    while let ast::TyKind::Paren(inner) = &emitted.kind {
+        emitted = inner;
+    }
+    if pprust::ty_to_string(original) == pprust::ty_to_string(emitted) {
+        return Ok(true);
+    }
+    let ast::TyKind::Ptr(raw) = &original.kind else {
+        return Ok(false);
+    };
+    // **The emitted side has more than one safe form, and this predicate knew
+    // one of them.** The protected-form check two arms down already accepts
+    // `Option<&…>`; this one accepted only `&T`, so a correctly emitted
+    // nullable or fat form read as a binding mismatch — measured on
+    // tulipindicators' `line`, `*mut c_char` against
+    // `Option<&mut [c_char]>`, the single refusal that failed that program.
+    //
+    // The identity requirement is unchanged: same pointee text, and the
+    // reference may not be mutable where the raw pointer was const. Only the
+    // two shapes the emitter actually produces are peeled — an `Option`
+    // wrapper, which is how null is represented, and a slice pointee, which
+    // carries an extent over the same element type.
+    let emitted = match option_inner(emitted) {
+        Some(inner) => inner,
+        None => emitted,
+    };
+    let ast::TyKind::Ref(_, reference) = &emitted.kind else {
+        return Ok(false);
+    };
+    if reference.mutbl.is_mut() && !raw.mutbl.is_mut() {
+        return Ok(false);
+    }
+    let mut pointee = &*reference.ty;
+    while let ast::TyKind::Paren(inner) = &pointee.kind {
+        pointee = inner;
+    }
+    if let ast::TyKind::Slice(element) = &pointee.kind {
+        pointee = element;
+    }
+    Ok(pprust::ty_to_string(&raw.ty) == pprust::ty_to_string(pointee))
+}
+
+/// `Option<T>` → `T`, for the one wrapper the emitter uses to represent null.
+fn option_inner(ty: &ast::Ty) -> Option<&ast::Ty> {
+    let ast::TyKind::Path(None, path) = &ty.kind else {
+        return None;
+    };
+    let segment = path.segments.last()?;
+    if segment.ident.name.as_str() != "Option" {
+        return None;
+    }
+    let ast::GenericArgs::AngleBracketed(arguments) = &**segment.args.as_ref()? else {
+        return None;
+    };
+    let [ast::AngleBracketedArg::Arg(ast::GenericArg::Type(inner))] = arguments.args.as_slice()
+    else {
+        return None;
+    };
+    Some(inner)
+}
+
+fn span_bindings_correspond(
+    input: &BridgeCustodyInput<'_>,
+    original_owner: &str,
+    original_span: ByteSpan,
+    emitted_owner: &str,
+    emitted_span: ByteSpan,
+    visiting: &mut BTreeSet<(usize, usize)>,
+) -> bool {
+    let ids = |inventory: &Inventory, owner: &str, span: ByteSpan| {
+        inventory
+            .uses
+            .iter()
+            .filter(|usage| {
+                usage.owner == owner && span.lo <= usage.span.lo && usage.span.hi <= span.hi
+            })
+            .map(|usage| usage.binding_id)
+            .collect::<BTreeSet<_>>()
+    };
+    let original_ids = ids(input.original, original_owner, original_span);
+    let emitted_ids = ids(input.emitted, emitted_owner, emitted_span);
+    for &id in &original_ids {
+        let Some(original) = input.original.bindings.get(id) else { return false };
+        if emitted_ids
+            .iter()
+            .filter_map(|id| input.emitted.bindings.get(*id))
+            .filter(|emitted| same_source_binding_inner(input, original, emitted, visiting))
+            .count()
+            != 1
+        {
+            return false;
+        }
+    }
+    for &id in &emitted_ids {
+        let Some(emitted) = input.emitted.bindings.get(id) else { return false };
+        // **R494-1(b) -- a temporary the emission introduced INSIDE this very
+        // initializer is not a source the original wrote.**
+        //
+        // `native_result_expression::render` binds the call once, so the original's
+        // evaluation order survives, and the name it binds exists only in the emitted
+        // program. Asking the input for a counterpart to it is asking for something the
+        // input could not have. This is the same exemption `block_intermediate_of` makes
+        // for R460-1(a)'s plain `{ let __crat_raw: T = e; __crat_raw }`, at the other
+        // place the question is asked.
+        //
+        // Exact on both counts: the generated prefix, so no ordinary local can enter,
+        // and the declaration INSIDE the span under comparison, so a binding that merely
+        // happens to be local to the function is still required to correspond. That the
+        // block RETURNS a view of this binding -- rather than computing something else
+        // with it -- is checked by `native_result_block_call`, which is the conjoined
+        // initializer relation, not this one.
+        if emitted.name.starts_with("__crat_native_result_")
+            && emitted_span.lo <= emitted.declaration_span.lo
+            && emitted.declaration_span.hi <= emitted_span.hi
+        {
+            continue;
+        }
+        if original_ids
+            .iter()
+            .filter_map(|id| input.original.bindings.get(*id))
+            .filter(|original| same_source_binding_inner(input, original, emitted, visiting))
+            .count()
+            != 1
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn same_source_binding_inner(
+    input: &BridgeCustodyInput<'_>,
+    original: &Binding,
+    emitted: &Binding,
+    visiting: &mut BTreeSet<(usize, usize)>,
+) -> bool {
+    if original.name != emitted.name
+        || mapped_owner(&original.owner, input.context).ok() != Some(emitted.owner.as_str())
+    {
+        return false;
+    }
+    let original_parameter = input
+        .original
+        .functions
+        .iter()
+        .filter(|function| function.owner == original.owner)
+        .flat_map(|function| &function.parameters)
+        .find(|parameter| {
+            parameter.span == original.declaration_span && parameter.binding == original.name
+        });
+    if let Some(parameter) = original_parameter {
+        return input
+            .emitted
+            .functions
+            .iter()
+            .filter(|function| function.owner == emitted.owner)
+            .flat_map(|function| &function.parameters)
+            .any(|candidate| {
+                candidate.index == parameter.index
+                    && candidate.span == emitted.declaration_span
+                    && candidate.binding == emitted.name
+            });
+    }
+    // A local counterpart needs its actual declaration, a compatible type where
+    // both sides HAVE one, and initializer dependencies. Equal names alone never
+    // establish it.
+    //
+    // **R460-1(b), RULED.** Where the ORIGINAL local carries no annotation, the
+    // type test is not asked and correspondence is decided by binding identity:
+    // the unique declaration in each owner, reached through the initializer chain
+    // below. C2Rust writes `let mut block_ids = BrotliAllocate(..) as *mut u8;`
+    // with no annotation, the delivery ledger transforms that local on purpose to
+    // `Option<Box<[u8]>>`, and `local_types_correspond` then had a `None` on one
+    // side and refused — 31 of brotli's rows, and batch 13's `data=false`.
+    // Custody checks fidelity of the SOURCE the bridge reads, and identity is
+    // stronger evidence of that than comparing a type the input never wrote.
+    // Annotated-vs-annotated still goes through the type test and an annotated
+    // mismatch still refuses.
+    //
+    // **R833-4 (main 175a §5), RULED — an annotation that is a raw pointer only by
+    // name.** brotli's `let mut literal_context_lut: ContextLut = ..` (`pub type
+    // ContextLut = *const uint8_t;`) is delivered as `&u8`; the alias's pointee chain
+    // ends in `libc::c_uchar`, so no text comparison can pair it. A bare alias that
+    // R605-2's binding resolves to a raw pointer is matched as an unannotated local is:
+    // by identity, with the emitted form a reference whose mutability is not above the
+    // raw pointer's. The pointee is not compared.
+    // It never takes away a match the type test already makes (the Codex review of
+    // R833-4): an undelivered local keeps the alias on both sides and pairs by type.
+    let type_ok = original.type_text.is_none()
+        || local_types_correspond(original.type_text.as_deref(), emitted.type_text.as_deref())
+            .unwrap_or(false);
+    let alias_identity = !type_ok
+        && original
+            .type_text
+            .as_deref()
+            .and_then(|text| raw_alias_mutability(input, &original.owner, text))
+            .is_some_and(|raw_mutable| {
+                matches!(
+                    emitted.type_text.as_deref().map(pointer_type),
+                    Some(Ok(PointerType::Reference(mutable))) if raw_mutable || !mutable
+                )
+            });
+    if input
+        .original
+        .bindings
+        .iter()
+        .filter(|binding| binding.owner == original.owner && binding.name == original.name)
+        .count()
+        != 1
+        || input
+            .emitted
+            .bindings
+            .iter()
+            .filter(|binding| binding.owner == emitted.owner && binding.name == emitted.name)
+            .count()
+            != 1
+        || !(type_ok || alias_identity)
+    {
+        return false;
+    }
+    let by_identity = original.type_text.is_none() || alias_identity;
+    let pair = (original.id, emitted.id);
+    if !visiting.insert(pair) {
+        return false;
+    }
+    let result = match (
+        original.init_text.as_deref(),
+        emitted.init_text.as_deref(),
+        original.init_span,
+        emitted.init_span,
+    ) {
+        (Some(left), Some(right), Some(left_span), Some(right_span)) => {
+            (same_expression(left, right).unwrap_or(false)
+                || null_initializer_corresponds(left, right, emitted.type_text.as_deref())
+                || slice_construction_corresponds(left, right, emitted.type_text.as_deref())
+                || initializer_adapter_correspondence(left, right)
+                || conditional_allocation_corresponds(left, right))
+                && span_bindings_correspond(
+                    input,
+                    &original.owner,
+                    left_span,
+                    &emitted.owner,
+                    right_span,
+                    visiting,
+                )
+        }
+        (None, None, None, None) => original.type_text == emitted.type_text,
+        _ => false,
+    };
+    visiting.remove(&pair);
+    // The widening is countable, and it counts rows that RESTED on it. Recording
+    // before the initializer relation ran marked rows whose pairing then failed —
+    // measured at batch 13d, where all 31 of brotli's refusing rows carried
+    // `by-identity` while none of them paired.
+    if result && by_identity {
+        record_correspondence(Correspondence::ByIdentity);
+    }
+    result
+}
+
+/// `None` is how an optional reference spells the null a raw local was
+/// initialized with.
+///
+/// The comparator already knows this two arms away — `PointerType::
+/// OptionalReference` and `optional_raw_view_matches` are built on it — and
+/// this predicate did not, so a correctly emitted nullable local read as an
+/// initializer mismatch. The emitted type must actually be an `Option`, and
+/// the original initializer must actually be a null pointer literal; nothing
+/// else corresponds.
+fn null_initializer_corresponds(original: &str, emitted: &str, emitted_type: Option<&str>) -> bool {
+    if emitted.trim() != "None" {
+        return false;
+    }
+    if !emitted_type
+        .and_then(|text| parsed_type(text).ok())
+        .is_some_and(|ty| option_inner(&ty).is_some())
+    {
+        return false;
+    }
+    let Ok(parsed) = expression(original) else {
+        return false;
+    };
+    let mut view = unparen(&parsed);
+    while let ast::ExprKind::Cast(inner, _) = &view.kind {
+        view = unparen(inner);
+    }
+    matches!(&view.kind, ast::ExprKind::Lit(literal)
+        if literal.kind == ast::token::LitKind::Integer && literal.symbol.as_str() == "0")
+}
+
+/// **R424-3 — the slice form of a raw local's own initializer.** A delivered
+/// slice local is declared `&[T]` / `&mut [T]` and initialized
+/// `core::slice::from_raw_parts[_mut](<the original initializer>, <extent>)`:
+/// the same value, viewed as a slice. The arm is exact — the emitted type must
+/// really be a slice reference, the call must really be that constructor, and
+/// its pointer operand must correspond to the original initializer by the rules
+/// already in force. The extent is the slice family's own receipt (evidence or
+/// the named fallback of addendum 77) and is not a source-correspondence fact.
+fn slice_construction_corresponds(
+    original: &str,
+    emitted: &str,
+    emitted_type: Option<&str>,
+) -> bool {
+    let is_slice_reference = emitted_type
+        .and_then(|text| parsed_type(text).ok())
+        .is_some_and(|ty| match &ty.kind {
+            ast::TyKind::Ref(_, reference) => matches!(reference.ty.kind, ast::TyKind::Slice(_)),
+            _ => false,
+        });
+    if !is_slice_reference {
+        return false;
+    }
+    let (Ok(original), Ok(emitted)) = (expression(original), expression(emitted)) else {
+        return false;
+    };
+    let ast::ExprKind::Call(callee, arguments) = &unparen(&emitted).kind else {
+        return false;
+    };
+    if arguments.len() != 2
+        || !matches!(
+            path(callee).as_deref(),
+            Some(
+                "core::slice::from_raw_parts"
+                    | "core::slice::from_raw_parts_mut"
+                    | "std::slice::from_raw_parts"
+                    | "std::slice::from_raw_parts_mut"
+            )
+        )
+    {
+        return false;
+    }
+    let pointer = &arguments[0];
+    expression_key(unparen(pointer)) == expression_key(unparen(&original))
+        || initializer_matches_modulo_adapters(&original, pointer)
+}
+
+/// **R295-3, applied to a predicate rather than an arm.** `same_source_binding`
+/// answers a bare `bool`, and one refusal in tulipindicators reported two
+/// identically named bindings as a mismatch with nothing to read. This names
+/// the FIRST condition that refuses; it re-derives nothing the predicate does
+/// not itself check, and is only ever called on the failing path.
+fn source_binding_divergence(
+    input: &BridgeCustodyInput<'_>,
+    original: &Binding,
+    emitted: &Binding,
+) -> String {
+    if original.name != emitted.name {
+        return format!("name:{}!={}", original.name, emitted.name);
+    }
+    if mapped_owner(&original.owner, input.context).ok() != Some(emitted.owner.as_str()) {
+        return format!("owner:{}!={}", original.owner, emitted.owner);
+    }
+    let count = |inventory: &Inventory, owner: &str, name: &str| {
+        inventory
+            .bindings
+            .iter()
+            .filter(|binding| binding.owner == owner && binding.name == name)
+            .count()
+    };
+    let originals = count(input.original, &original.owner, &original.name);
+    let emitteds = count(input.emitted, &emitted.owner, &emitted.name);
+    if originals != 1 {
+        return format!("original-name-not-unique:{originals}");
+    }
+    if emitteds != 1 {
+        return format!("emitted-name-not-unique:{emitteds}");
+    }
+    if !local_types_correspond(original.type_text.as_deref(), emitted.type_text.as_deref())
+        .unwrap_or(false)
+    {
+        return format!(
+            "type:{}!={}",
+            original.type_text.as_deref().unwrap_or("-"),
+            emitted.type_text.as_deref().unwrap_or("-")
+        );
+    }
+    match (
+        original.init_text.as_deref(),
+        emitted.init_text.as_deref(),
+        original.init_span,
+        emitted.init_span,
+    ) {
+        (Some(left), Some(right), Some(_), Some(_)) => {
+            if !same_expression(left, right).unwrap_or(false)
+                && !null_initializer_corresponds(left, right, emitted.type_text.as_deref())
+                && !slice_construction_corresponds(left, right, emitted.type_text.as_deref())
+            {
+                format!("initializer:{left}!={right}")
+            } else {
+                "initializer-dependencies".to_owned()
+            }
+        }
+        (None, None, None, None) => "declared-type".to_owned(),
+        _ => "initializer-presence".to_owned(),
+    }
+}
+
+/// **R460-1(b) — which evidence paired a row's source bindings.**
+///
+/// `ByType` is the standing test: both sides carry an annotation and the types
+/// correspond. `ByIdentity` is the ruled widening: the ORIGINAL local carries no
+/// annotation, so the type test is not asked and the unique declaration in each
+/// owner, reached through the initializer chain, is the evidence instead.
+///
+/// It is an INSTRUMENT, not a gate — it changes no verdict, it records which
+/// evidence a verdict rested on so the widening is countable in the census
+/// (R450-9: a new fact gets a new column).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Correspondence {
+    #[default]
+    ByType,
+    ByIdentity,
+}
+
+impl Correspondence {
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            Self::ByType => "by-type",
+            Self::ByIdentity => "by-identity",
+        }
+    }
+}
+
+thread_local! {
+    /// Set while ONE receipt row is being matched; `compare` clears it before
+    /// each row and reads it after, so the flag can never leak between rows.
+    static ROW_CORRESPONDENCE: std::cell::Cell<Correspondence> =
+        const { std::cell::Cell::new(Correspondence::ByType) };
+}
+
+fn record_correspondence(mode: Correspondence) {
+    if mode == Correspondence::ByIdentity {
+        ROW_CORRESPONDENCE.with(|cell| cell.set(mode));
+    }
+}
+
+fn reset_correspondence() {
+    ROW_CORRESPONDENCE.with(|cell| cell.set(Correspondence::ByType));
+}
+
+fn taken_correspondence() -> Correspondence {
+    ROW_CORRESPONDENCE.with(std::cell::Cell::get)
+}
+
+fn same_source_binding(
+    input: &BridgeCustodyInput<'_>,
+    original: &Binding,
+    emitted: &Binding,
+) -> bool {
+    same_source_binding_inner(input, original, emitted, &mut BTreeSet::new())
+}
+
+fn validate_initializer_bindings(
+    input: &BridgeCustodyInput<'_>,
+    original: &Call,
+    index: usize,
+    temporary: &Binding,
+) -> MatchResult<()> {
+    let original_span = original.arguments[index].span;
+    let init_span = temporary.init_span.ok_or("initializer-span-absent")?;
+    let original_ids = input
+        .original
+        .uses
+        .iter()
+        .filter(|usage| {
+            usage.owner == original.owner
+                && original_span.lo <= usage.span.lo
+                && usage.span.hi <= original_span.hi
+        })
+        .map(|usage| usage.binding_id)
+        .collect::<BTreeSet<_>>();
+    let emitted_ids = input
+        .emitted
+        .uses
+        .iter()
+        .filter(|usage| {
+            usage.owner == temporary.owner
+                && init_span.lo <= usage.span.lo
+                && usage.span.hi <= init_span.hi
+        })
+        .map(|usage| usage.binding_id)
+        .collect::<BTreeSet<_>>();
+    for &original_id in &original_ids {
+        let original = input
+            .original
+            .bindings
+            .get(original_id)
+            .ok_or("original-source-binding-absent")?;
+        if emitted_ids
+            .iter()
+            .filter_map(|id| input.emitted.bindings.get(*id))
+            .filter(|emitted| same_source_binding(input, original, emitted))
+            .count()
+            != 1
+        {
+            return Err("initializer-original-binding-correspondence-unresolved".into());
+        }
+    }
+    for emitted_id in emitted_ids {
+        let emitted = input
+            .emitted
+            .bindings
+            .get(emitted_id)
+            .ok_or("emitted-source-binding-absent")?;
+        // **R460-1(a), completed.** The block form the arm above peels declares
+        // its own intermediate — `{ let __crat_raw: T = <e>; __crat_raw }` — and
+        // that name is the BRIDGE's, not a source binding the original could
+        // have a counterpart for. Peeling the expression without exempting the
+        // binding moved brotli's six rows from
+        // `raw-initializer-source-relation-unbuilt` to
+        // `initializer-uses-an-unmatched-or-shadowing-binding`, which is the same
+        // six sites refusing one step later. The exemption is exact: the binding
+        // must be declared INSIDE this initializer and be the one the block's
+        // tail names, so an emitted binding that merely happens to be local is
+        // still unmatched.
+        if block_intermediate_of(input, temporary, emitted) {
+            continue;
+        }
+        if original_ids
+            .iter()
+            .filter_map(|id| input.original.bindings.get(*id))
+            .filter(|original| same_source_binding(input, original, emitted))
+            .count()
+            != 1
+        {
+            return Err("initializer-uses-an-unmatched-or-shadowing-binding".into());
+        }
+    }
+    Ok(())
+}
+
+/// Whether `candidate` is the named intermediate that `temporary`'s own block
+/// initializer declares — `{ let <n>: T = <e>; <n> }`, the form R460-1(a) peels.
+fn block_intermediate_of(
+    input: &BridgeCustodyInput<'_>,
+    temporary: &Binding,
+    candidate: &Binding,
+) -> bool {
+    let (Some(init_text), Some(init_span)) = (temporary.init_text.as_deref(), temporary.init_span)
+    else {
+        return false;
+    };
+    if candidate.owner != temporary.owner
+        || candidate.declaration_span.lo < init_span.lo
+        || candidate.declaration_span.hi > init_span.hi
+    {
+        return false;
+    }
+    let Ok(initializer) = expression(init_text) else {
+        return false;
+    };
+    let ast::ExprKind::Block(block, None) = &unparen(&initializer).kind else {
+        return false;
+    };
+    let [statement, tail] = block.stmts.as_slice() else {
+        return false;
+    };
+    let (ast::StmtKind::Let(local), ast::StmtKind::Expr(value)) = (&statement.kind, &tail.kind)
+    else {
+        return false;
+    };
+    let ast::PatKind::Ident(_, name, None) = &local.pat.kind else {
+        return false;
+    };
+    let _ = input;
+    name.name.as_str() == candidate.name
+        && path(unparen(value)).is_some_and(|tail| tail == candidate.name)
+}
+
+fn witness(binding: &Binding, index: usize, kind: GeneratedKind) -> BindingWitness {
+    BindingWitness {
+        owner: binding.owner.clone(),
+        binding_id: binding.id,
+        name: binding.name.clone(),
+        declaration_span: binding.declaration_span,
+        argument_index: index,
+        generated_kind: kind,
+    }
+}
+
+/// **R690-5 (main 134b §3) — the original's own pointer cast, re-applied by the
+/// annotation.** brotli's `compress_fragment` passes `cmd_bits as *const uint16_t`,
+/// and the PAIR arm binds it as `let __crat_a5_raw_N_2: *const u16 = cmd_bits;`: the
+/// same pointer, the `*mut -> *const` re-applied by the temporary's type. Only
+/// `validate_raw` asks this, where the temporary and the target formal are both
+/// already checked raw, so the peeled operand reaches the same formal as the same
+/// address. Pointer-to-pointer casts only; any other cast keeps its own key.
+fn peeled_pointer_casts(original: &ast::Expr) -> &ast::Expr {
+    let mut expression = unparen(original);
+    while let ast::ExprKind::Cast(inner, ty) = &expression.kind
+        && matches!(ty.kind, ast::TyKind::Ptr(_))
+    {
+        expression = unparen(inner);
+    }
+    expression
+}
+
+/// R833-4: the mutability of the raw pointer a bare type alias names, where R605-2's
+/// module binding resolves it (in both inventories) to a raw pointer; `None` otherwise.
+fn raw_alias_mutability(input: &BridgeCustodyInput<'_>, owner: &str, text: &str) -> Option<bool> {
+    let parsed = parsed_type(text).ok()?;
+    let ast::TyKind::Path(None, path) = &parsed.kind else {
+        return None;
+    };
+    if !matches!(path.segments.as_slice(), [segment] if segment.args.is_none()) {
+        return None;
+    }
+    match formal_pointer_type(&[input.original, input.emitted], owner, text).ok()? {
+        PointerType::Raw(mutable) => Some(mutable),
+        _ => None,
+    }
+}
+
+/// The A5 raw temporary's target formal, classified as the raw-view check reads it:
+/// through its module's own alias binding (R605-2), as the pending check reads it.
+fn raw_view_target_type(
+    scopes: &[&Inventory],
+    target: &super::bridge_custody_syntax::Function,
+    index: usize,
+) -> MatchResult<PointerType> {
+    formal_pointer_type(
+        scopes,
+        &target.owner,
+        &target
+            .parameters
+            .get(index)
+            .ok_or("raw-target-parameter-absent")?
+            .type_text,
+    )
+}
+
+fn validate_raw(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    call: &Call,
+    indices: &[usize],
+) -> MatchResult<Vec<BindingWitness>> {
+    let target = target_owner(input, expected)?;
+    indices
+        .iter()
+        .map(|&index| {
+            let argument = &call.arguments[index];
+            let binding = binding_at(input, call, index)?;
+            if argument.form != ArgumentForm::Path
+                || binding.generated != Some(GeneratedKind::RawTemporary)
+            {
+                return Err("raw-view-argument-is-not-its-typed-bound-temporary".into());
+            }
+            let temporary_type = pointer_type(
+                binding
+                    .type_text
+                    .as_deref()
+                    .ok_or("raw-temporary-type-absent")?,
+            )?;
+            let target_type =
+                raw_view_target_type(&[input.emitted, input.original], target, index)?;
+            if !matches!(
+                (temporary_type, target_type),
+                (PointerType::Raw(_), PointerType::Raw(false))
+                    | (PointerType::Raw(true), PointerType::Raw(true))
+            ) {
+                return Err("raw-view-target-or-temporary-is-not-raw".into());
+            }
+            let init = expression(
+                binding
+                    .init_text
+                    .as_deref()
+                    .ok_or("raw-temporary-initializer-absent")?,
+            )?;
+            let source = expression(&original.arguments[index].text)?;
+            if !raw_initializer_matches(&init, &source)
+                && !raw_initializer_matches(&init, peeled_pointer_casts(&source))
+            {
+                return Err("raw-initializer-source-relation-unbuilt".into());
+            }
+            validate_initializer_bindings(input, original, index, binding)?;
+            Ok(witness(binding, index, GeneratedKind::RawTemporary))
+        })
+        .collect()
+}
+
+fn validate_c9(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    call: &Call,
+    indices: &[usize],
+    name: &str,
+) -> MatchResult<Vec<BindingWitness>> {
+    let target = target_owner(input, expected)?;
+    indices
+        .iter()
+        .map(|&index| {
+            let argument = &call.arguments[index];
+            let binding = binding_at(input, call, index)?;
+            if binding.name != name
+                || binding.generated != Some(GeneratedKind::C9Temporary)
+                || argument.form != ArgumentForm::AddrOfPath
+                || argument.address_kind.as_deref() != Some("ref")
+                || argument.address_mutable != Some(false)
+            {
+                return Err("c9-argument-is-not-the-exact-shared-snapshot-borrow".into());
+            }
+            let target_type = pointer_type(
+                &target
+                    .parameters
+                    .get(index)
+                    .ok_or("c9-target-parameter-absent")?
+                    .type_text,
+            )?;
+            if !matches!(
+                target_type,
+                PointerType::Reference(false) | PointerType::Raw(false)
+            ) {
+                return Err("c9-target-is-not-a-shared-or-const-raw-parameter".into());
+            }
+            let init = expression(
+                binding
+                    .init_text
+                    .as_deref()
+                    .ok_or("c9-initializer-absent")?,
+            )?;
+            let ast::ExprKind::Unary(ast::UnOp::Deref, operand) = &unparen(&init).kind else {
+                return Err("c9-initializer-is-not-a-private-read".into());
+            };
+            let source = expression(&original.arguments[index].text)?;
+            if !same_view_operand(operand, &source) {
+                return Err("c9-initializer-source-mismatch".into());
+            }
+            validate_initializer_bindings(input, original, index, binding)?;
+            Ok(witness(binding, index, GeneratedKind::C9Temporary))
+        })
+        .collect()
+}
+
+/// This correspondence rule is confined to pending-waiver call matching. It
+/// recognizes the existing native slice read, without changing raw/C9 view
+/// validation or treating a changed scalar argument as an interchangeable site.
+struct PendingScalarRead<'a, 'source> {
+    input: &'a BridgeCustodyInput<'source>,
+    original_owner: &'a str,
+    emitted_owner: &'a str,
+    visiting: BTreeSet<(usize, usize)>,
+}
+
+fn pending_parameter_index(inventory: &Inventory, binding: &Binding) -> Option<usize> {
+    let parameters = inventory
+        .functions
+        .iter()
+        .filter(|function| function.owner == binding.owner)
+        .flat_map(|function| &function.parameters)
+        .filter(|parameter| {
+            parameter.binding == binding.name && parameter.span == binding.declaration_span
+        })
+        .collect::<Vec<_>>();
+    match parameters.as_slice() {
+        [parameter] => Some(parameter.index),
+        _ => None,
+    }
+}
+
+fn pending_parameter_element(text: &str, original_raw: bool) -> MatchResult<Option<String>> {
+    let source = format!("fn __custody(__value: {text}) {{}}");
+    let session = ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
+    let krate =
+        super::slice_use_inventory_tests::parse_crate(&session, "pending-base-type.rs", &source)?;
+    let [item] = krate.items.as_slice() else { return Err("pending-base-type-items".into()) };
+    let ast::ItemKind::Fn(function) = &item.kind else {
+        return Err("pending-base-type-function".into());
+    };
+    let [parameter] = function.sig.decl.inputs.as_slice() else {
+        return Err("pending-base-type-parameters".into());
+    };
+    let mut ty = &*parameter.ty;
+    while let ast::TyKind::Paren(inner) = &ty.kind {
+        ty = inner;
+    }
+    let element = if original_raw {
+        let ast::TyKind::Ptr(pointer) = &ty.kind else { return Ok(None) };
+        &*pointer.ty
+    } else {
+        let ast::TyKind::Ref(_, reference) = &ty.kind else { return Ok(None) };
+        let mut payload = &*reference.ty;
+        while let ast::TyKind::Paren(inner) = &payload.kind {
+            payload = inner;
+        }
+        let ast::TyKind::Slice(element) = &payload.kind else { return Ok(None) };
+        &**element
+    };
+    Ok(Some(pprust::ty_to_string(element)))
+}
+
+fn pending_local_names(expression: &ast::Expr) -> BTreeSet<String> {
+    struct Names(BTreeSet<String>);
+    impl<'ast> rustc_ast::visit::Visitor<'ast> for Names {
+        fn visit_expr(&mut self, expression: &'ast ast::Expr) {
+            if let Some(name) = path(expression)
+                && !name.contains("::")
+            {
+                self.0.insert(name);
+            }
+            rustc_ast::visit::walk_expr(self, expression);
+        }
+    }
+    let mut names = Names(BTreeSet::new());
+    rustc_ast::visit::Visitor::visit_expr(&mut names, expression);
+    names.0
+}
+
+impl PendingScalarRead<'_, '_> {
+    fn binding(inventory: &Inventory, owner: &str, span: ByteSpan, name: &str) -> Option<Binding> {
+        let ids = inventory
+            .uses
+            .iter()
+            .filter(|usage| {
+                usage.owner == owner && span.lo <= usage.span.lo && usage.span.hi <= span.hi
+            })
+            .filter_map(|usage| inventory.bindings.get(usage.binding_id))
+            .filter(|binding| binding.name == name && binding.owner == owner)
+            .map(|binding| binding.id)
+            .collect::<BTreeSet<_>>();
+        if ids.len() != 1 {
+            return None;
+        }
+        inventory.bindings.get(*ids.first()?).cloned()
+    }
+
+    fn corresponding_bindings(
+        &self,
+        name: &str,
+        original_span: ByteSpan,
+        emitted_span: ByteSpan,
+    ) -> Option<(Binding, Binding)> {
+        Some((
+            Self::binding(
+                self.input.original,
+                self.original_owner,
+                original_span,
+                name,
+            )?,
+            Self::binding(self.input.emitted, self.emitted_owner, emitted_span, name)?,
+        ))
+    }
+
+    fn index_binding(&mut self, original: &Binding, emitted: &Binding) -> MatchResult<bool> {
+        if original.name != emitted.name
+            || original.type_text != emitted.type_text
+            || mapped_owner(&original.owner, self.input.context)? != emitted.owner
+        {
+            return Ok(false);
+        }
+        let original_parameter = pending_parameter_index(self.input.original, original);
+        let emitted_parameter = pending_parameter_index(self.input.emitted, emitted);
+        if original_parameter.is_some() || emitted_parameter.is_some() {
+            return Ok(original_parameter.is_some() && original_parameter == emitted_parameter);
+        }
+        if self
+            .input
+            .original
+            .bindings
+            .iter()
+            .filter(|binding| binding.owner == original.owner && binding.name == original.name)
+            .count()
+            != 1
+            || self
+                .input
+                .emitted
+                .bindings
+                .iter()
+                .filter(|binding| binding.owner == emitted.owner && binding.name == emitted.name)
+                .count()
+                != 1
+        {
+            return Ok(false);
+        }
+        let (Some(original_text), Some(emitted_text), Some(original_span), Some(emitted_span)) = (
+            original.init_text.as_deref(),
+            emitted.init_text.as_deref(),
+            original.init_span,
+            emitted.init_span,
+        ) else {
+            return Ok(false);
+        };
+        let pair = (original.id, emitted.id);
+        if !self.visiting.insert(pair) {
+            return Err("pending-index-initializer-cycle".into());
+        }
+        let result = (|| {
+            let original_expression = expression(original_text)?;
+            let emitted_expression = expression(emitted_text)?;
+            self.equivalent(
+                &original_expression,
+                &emitted_expression,
+                original_span,
+                emitted_span,
+            )
+        })();
+        self.visiting.remove(&pair);
+        result
+    }
+
+    fn index_bindings(
+        &mut self,
+        original: &ast::Expr,
+        emitted: &ast::Expr,
+        original_span: ByteSpan,
+        emitted_span: ByteSpan,
+    ) -> MatchResult<bool> {
+        if expression_key(original) != expression_key(emitted) {
+            return Ok(false);
+        }
+        let names = pending_local_names(original);
+        if names != pending_local_names(emitted) {
+            return Ok(false);
+        }
+        for name in names {
+            let Some((original, emitted)) =
+                self.corresponding_bindings(&name, original_span, emitted_span)
+            else {
+                return Ok(false);
+            };
+            if !self.index_binding(&original, &emitted)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn equivalent(
+        &mut self,
+        original: &ast::Expr,
+        emitted: &ast::Expr,
+        original_span: ByteSpan,
+        emitted_span: ByteSpan,
+    ) -> MatchResult<bool> {
+        let original = unparen(original);
+        let emitted = unparen(emitted);
+        if expression_key(original) == expression_key(emitted) {
+            return self.index_bindings(original, emitted, original_span, emitted_span);
+        }
+        if let (
+            ast::ExprKind::Cast(original, original_type),
+            ast::ExprKind::Cast(emitted, emitted_type),
+        ) = (&original.kind, &emitted.kind)
+        {
+            if pprust::ty_to_string(original_type) != pprust::ty_to_string(emitted_type) {
+                return Ok(false);
+            }
+            return self.equivalent(original, emitted, original_span, emitted_span);
+        }
+        let ast::ExprKind::Unary(ast::UnOp::Deref, pointer) = &original.kind else {
+            return Ok(false);
+        };
+        let ast::ExprKind::MethodCall(offset) = &unparen(pointer).kind else { return Ok(false) };
+        let ast::ExprKind::Index(emitted_base, emitted_index, _) = &emitted.kind else {
+            return Ok(false);
+        };
+        if offset.seg.ident.name.as_str() != "offset"
+            || offset.seg.args.is_some()
+            || offset.args.len() != 1
+        {
+            return Ok(false);
+        }
+        let Some(base) = path(&offset.receiver).filter(|name| !name.contains("::")) else {
+            return Ok(false);
+        };
+        if path(emitted_base).as_deref() != Some(base.as_str()) {
+            return Ok(false);
+        }
+        let Some((original_binding, emitted_binding)) =
+            self.corresponding_bindings(&base, original_span, emitted_span)
+        else {
+            return Ok(false);
+        };
+        let Some(original_parameter) =
+            pending_parameter_index(self.input.original, &original_binding)
+        else {
+            return Ok(false);
+        };
+        if pending_parameter_index(self.input.emitted, &emitted_binding) != Some(original_parameter)
+        {
+            return Ok(false);
+        }
+        let (Some(original_type), Some(emitted_type)) = (
+            original_binding.type_text.as_deref(),
+            emitted_binding.type_text.as_deref(),
+        ) else {
+            return Ok(false);
+        };
+        let original_element = pending_parameter_element(original_type, true)?;
+        if original_element.is_none()
+            || original_element != pending_parameter_element(emitted_type, false)?
+        {
+            return Ok(false);
+        }
+        let ast::ExprKind::Cast(original_index, original_index_type) =
+            &unparen(&offset.args[0]).kind
+        else {
+            return Ok(false);
+        };
+        let ast::ExprKind::Cast(emitted_index, emitted_index_type) = &unparen(emitted_index).kind
+        else {
+            return Ok(false);
+        };
+        if pprust::ty_to_string(original_index_type) != "isize"
+            || pprust::ty_to_string(emitted_index_type) != "usize"
+        {
+            return Ok(false);
+        }
+        self.index_bindings(original_index, emitted_index, original_span, emitted_span)
+    }
+}
+
+fn pending_carrier_witnesses(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    call: &Call,
+    index: usize,
+    binding: &Binding,
+) -> MatchResult<Vec<BindingWitness>> {
+    let mut witnesses = Vec::new();
+    for companion in input.expectations.iter().filter(|row| {
+        row.kind != BridgeKind::SiblingOverlapPending
+            && row.caller == expected.caller
+            && row.callee == expected.callee
+    }) {
+        if companion.kind == BridgeKind::PairCopySnapshot
+            && expected.c9_stamp.is_some()
+            && companion.c9_stamp != expected.c9_stamp
+        {
+            continue;
+        }
+        let mut row = ReceiptResult {
+            identity: companion.identity.clone(),
+            status: ReceiptStatus::Unresolved,
+            reason: String::new(),
+            original_call: None,
+            emitted_call: None,
+            argument_indices: Vec::new(),
+            bindings: Vec::new(),
+            // A companion probe, never published as a row of its own.
+            correspondence: Correspondence::ByType,
+        };
+        if match_receipt(input, companion, &mut row).is_err()
+            || row.original_call != Some(original.span)
+            || row.emitted_call != Some(call.span)
+            || !matches!(
+                row.status,
+                ReceiptStatus::MatchedRaw | ReceiptStatus::MatchedC9
+            )
+        {
+            continue;
+        }
+        for witness in row.bindings.into_iter().filter(|witness| {
+            witness.binding_id == binding.id
+                && witness.owner == binding.owner
+                && witness.argument_index == index
+        }) {
+            if !witnesses.contains(&witness) {
+                witnesses.push(witness);
+            }
+        }
+    }
+    if witnesses.len() != 1 {
+        return Err("pending-generated-carrier-lacks-exact-ordinary-receipt".into());
+    }
+    Ok(witnesses)
+}
+
+/// **R306-1(ii) — the K19′ void carrier is the whole subject, cast.**
+///
+/// `p as *const libc::c_void` reaches a void position as a cast OF the subject,
+/// not as a different source, and the ledger's `WholeSubject` claim is right
+/// about it. The comparator compared the whole expression to the binding's path
+/// and so refused ten correct emissions over four programs.
+///
+/// Strict: only **raw-pointer** casts are peeled — a cast to any other type is
+/// a different value — and what remains must be the binding's own path.
+fn whole_subject_uses(expression: &ast::Expr, binding: &str) -> bool {
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, ty) = &view.kind {
+        if !matches!(ty.kind, ast::TyKind::Ptr(_)) {
+            return false;
+        }
+        view = unparen(inner);
+    }
+    path(view).as_deref() == Some(binding)
+}
+
+fn projected_referent_uses(expression: &ast::Expr, binding: &str) -> bool {
+    // **R304-2's seal has a SECOND SPELLING, and the comparator knows it as
+    // strictly as the decision layer does.** `((*binding).field).as_ptr()` is
+    // the same depth-1 projection of the protected referent, viewed as a
+    // pointer by an array or slice method instead of borrowed with `&`. The
+    // arm is exact: the receiver must be a place, the walk must reach the
+    // binding, and the depth must be one — a loaded raw field value still
+    // cannot pass, because its walk sees no dereference of the binding.
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, _) = &view.kind {
+        view = unparen(inner);
+    }
+    if let ast::ExprKind::MethodCall(method) = &view.kind
+        && method.args.is_empty()
+        && matches!(method.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr")
+    {
+        let mut place = unparen(&method.receiver);
+        let mut dereferences = 0;
+        loop {
+            match &place.kind {
+                ast::ExprKind::Field(base, _) => place = unparen(base),
+                ast::ExprKind::Unary(ast::UnOp::Deref, base) => {
+                    dereferences += 1;
+                    place = unparen(base);
+                }
+                _ => break,
+            }
+        }
+        return dereferences == 1 && path(place).as_deref() == Some(binding);
+    }
+    let ast::ExprKind::AddrOf(ast::BorrowKind::Ref, _, place) = &unparen(expression).kind else {
+        return false;
+    };
+    let mut place = unparen(place);
+    let mut dereferences = 0;
+    loop {
+        match &place.kind {
+            ast::ExprKind::Field(base, _) => place = unparen(base),
+            ast::ExprKind::Unary(ast::UnOp::Deref, base) => {
+                dereferences += 1;
+                place = unparen(base);
+            }
+            _ => break,
+        }
+    }
+    // This is a borrow of the protected referent or its fields. A loaded raw
+    // field value has no surrounding reference borrow and cannot pass here.
+    dereferences == 1 && path(place).as_deref() == Some(binding)
+}
+
+/// **R424-3.** The original argument is the typed view the descriptor names:
+/// the SAME core pointer method over the SAME binding, under pointer casts.
+/// Nothing else passes — a different method, a receiver that is not the
+/// binding, or a place walk of any depth is a mismatch.
+fn typed_pointer_view_uses(expression: &ast::Expr, binding: &str, method: &str) -> bool {
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, ty) = &view.kind {
+        if !matches!(ty.kind, ast::TyKind::Ptr(_)) {
+            return false;
+        }
+        view = unparen(inner);
+    }
+    let ast::ExprKind::MethodCall(call) = &view.kind else {
+        return false;
+    };
+    call.seg.ident.name.as_str() == method
+        && path(unparen(&call.receiver)).as_deref() == Some(binding)
+}
+
+/// **R424-3.** The original argument LOADS a raw pointer out of the subject's
+/// field: a field chain whose place walk reaches the binding at exactly the
+/// recorded dereference depth, with no surrounding borrow.
+fn raw_field_value_uses(expression: &ast::Expr, binding: &str) -> bool {
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, _) = &view.kind {
+        view = unparen(inner);
+    }
+    if !matches!(view.kind, ast::ExprKind::Field(..)) {
+        return false;
+    }
+    let mut place = view;
+    let mut depth = 0;
+    loop {
+        match &place.kind {
+            ast::ExprKind::Field(base, _) => place = unparen(base),
+            ast::ExprKind::Unary(ast::UnOp::Deref, base) => {
+                depth += 1;
+                place = unparen(base);
+            }
+            _ => break,
+        }
+    }
+    depth == 1 && path(place).as_deref() == Some(binding)
+}
+
+/// **R424-3.** The original argument borrows the binding's own storage:
+/// `&binding` or `&mut binding`, no projection, no dereference.
+fn binding_storage_uses(expression: &ast::Expr, binding: &str) -> bool {
+    let mut view = unparen(expression);
+    while let ast::ExprKind::Cast(inner, ty) = &view.kind {
+        if !matches!(ty.kind, ast::TyKind::Ptr(_)) {
+            return false;
+        }
+        view = unparen(inner);
+    }
+    let ast::ExprKind::AddrOf(ast::BorrowKind::Ref, _, place) = &view.kind else {
+        return false;
+    };
+    path(unparen(place)).as_deref() == Some(binding)
+}
+
+fn pending_original_source(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    index: usize,
+    expression: &ast::Expr,
+) -> MatchResult<Binding> {
+    let span = original.arguments[index].span;
+    let Some(metadata) = &expected.pending_source else {
+        let name = path(expression)
+            .filter(|name| !name.contains("::"))
+            .ok_or("pending-original-source-is-not-a-binding")?;
+        return PendingScalarRead::binding(input.original, &original.owner, span, &name)
+            .ok_or_else(|| "pending-original-source-binding-unresolved".into());
+    };
+    if matches!(
+        &metadata.shape,
+        PendingSourceShape::NativeReturnExpression { .. }
+            | PendingSourceShape::NativeReturnExpressionNested { .. }
+    ) {
+        return Err("pending-native-expression-carrier-unbuilt".into());
+    }
+    let name = metadata
+        .binding
+        .as_deref()
+        .ok_or("pending-source-binding-name-absent")?;
+    let binding_span = metadata
+        .binding_span
+        .ok_or("pending-source-binding-span-absent")?;
+    let candidates = input
+        .original
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding.owner == original.owner
+                && binding.name == name
+                && binding_span.lo <= binding.binding_span.lo
+                && binding.binding_span.hi <= binding_span.hi
+        })
+        .collect::<Vec<_>>();
+    let [binding] = candidates.as_slice() else {
+        return Err("pending-protected-binding-metadata-not-unique".into());
+    };
+    let used = PendingScalarRead::binding(input.original, &original.owner, span, name)
+        .is_some_and(|used| used.id == binding.id && used == **binding);
+    let shape_matches = match &metadata.shape {
+        PendingSourceShape::WholeSubject => whole_subject_uses(expression, name),
+        PendingSourceShape::ProjectedReferent => projected_referent_uses(expression, name),
+        PendingSourceShape::TypedPointerView { method } => {
+            typed_pointer_view_uses(expression, name, method)
+        }
+        PendingSourceShape::RawFieldValue => raw_field_value_uses(expression, name),
+        PendingSourceShape::BindingStorage => binding_storage_uses(expression, name),
+        PendingSourceShape::NativeReturnExpression { .. }
+        | PendingSourceShape::NativeReturnExpressionNested { .. } => {
+            return Err("pending-native-expression-carrier-unbuilt".into());
+        }
+    };
+    // R295-3's rule: two independent conditions, two names.
+    if !used {
+        return Err(format!(
+            "pending-source-operand-binding-not-the-declared-one:{name}"
+        ));
+    }
+    if !shape_matches {
+        return Err(format!(
+            "pending-source-operand-shape-mismatch:{name}:{:?}",
+            metadata.shape
+        ));
+    }
+    Ok((**binding).clone())
+}
+
+/// **R424-3 — the delivered slice's suffix view of a typed pointer view.**
+///
+/// The protected source reaches the pending site as `binding.offset(e)` in the
+/// ORIGINAL; once the subject is delivered as a slice the same value is spelled
+/// `(&[mut] (binding)[e..]).as_[mut_]ptr()` (wave-6s's computed suffix view).
+/// The correspondence is exact and narrow: the same binding, the offset-family
+/// method the descriptor recorded, and the SAME index expression modulo casts —
+/// a different binding, a different offset, a bounded range (`e..n`) or any
+/// other method is not this view and still refuses.
+fn typed_view_slice_correspondence(
+    emitted: &ast::Expr,
+    binding: &str,
+    method: &str,
+    original: &ast::Expr,
+) -> bool {
+    if !matches!(
+        method,
+        "offset"
+            | "add"
+            | "wrapping_offset"
+            | "wrapping_add"
+            | "byte_offset"
+            | "wrapping_byte_offset"
+    ) {
+        return false;
+    }
+    let ast::ExprKind::MethodCall(original_call) = &unparen(peel_raw_pointer_casts(original)).kind
+    else {
+        return false;
+    };
+    if original_call.seg.ident.name.as_str() != method
+        || original_call.args.len() != 1
+        || path(unparen(&original_call.receiver)).as_deref() != Some(binding)
+    {
+        return false;
+    }
+    // **R431-2 — the view may be cast to the callee's pointee**, by `as` or by
+    // the pointer method: brotli's `memcpy` takes
+    // `(&(data)[(from_pos) as usize..]).as_ptr().cast::<c_void>()` where the
+    // original wrote `data.offset(from_pos as isize) as *const c_void`. Only
+    // the zero-argument pointer casts are peeled, as everywhere else here.
+    let mut emitted = unparen(peel_raw_pointer_casts(emitted));
+    while let ast::ExprKind::MethodCall(cast) = &emitted.kind {
+        if !cast.args.is_empty()
+            || !matches!(
+                cast.seg.ident.name.as_str(),
+                "cast" | "cast_mut" | "cast_const"
+            )
+        {
+            break;
+        }
+        emitted = unparen(peel_raw_pointer_casts(&cast.receiver));
+    }
+    let ast::ExprKind::MethodCall(view) = &emitted.kind else {
+        return false;
+    };
+    if !view.args.is_empty() || !matches!(view.seg.ident.name.as_str(), "as_ptr" | "as_mut_ptr") {
+        return false;
+    }
+    let ast::ExprKind::AddrOf(ast::BorrowKind::Ref, _, place) = &unparen(&view.receiver).kind
+    else {
+        return false;
+    };
+    let ast::ExprKind::Index(base, index, _) = &unparen(place).kind else {
+        return false;
+    };
+    if path(unparen(base)).as_deref() != Some(binding) {
+        return false;
+    }
+    let ast::ExprKind::Range(Some(start), None, ast::RangeLimits::HalfOpen) = &unparen(index).kind
+    else {
+        return false;
+    };
+    expression_key(peel_casts(start)) == expression_key(peel_casts(&original_call.args[0]))
+}
+
+/// Every `as` cast, of any target type: the two sides spell the same index with
+/// different integer types (`(1 as c_int) as usize` vs `1 as c_int as isize`).
+fn peel_casts(mut expression: &ast::Expr) -> &ast::Expr {
+    loop {
+        expression = unparen(expression);
+        match &expression.kind {
+            ast::ExprKind::Cast(inner, _) => expression = inner,
+            _ => return expression,
+        }
+    }
+}
+
+/// **R455-1 — an UNANNOTATED re-binding of an optional formal's referent.**
+///
+/// binn's `binn_load` delivers `value: Option<&mut binn>`, and the emitted
+/// pending call reads the referent through a block-scoped re-binding that
+/// carries no type annotation — `{ let value = value.as_deref_mut().unwrap();
+/// binn_is_valid(data, &mut (*value).type_0, ..) }`. The declared form the
+/// pending law asks for is not in the emitted bytes, so the site was
+/// `unresolved` with `pending-reference-type-absent` and the census ended
+/// `data=false`.
+///
+/// The form is DERIVABLE exactly, and only here: the initializer is one
+/// whole-optional access of one binding, and `Option<&mut T>` accessed by
+/// `as_deref_mut().unwrap()` is `&mut T`, by `as_deref().unwrap()` `&T`. No
+/// other access is followed — `as_mut()` on the same optional is `&mut &mut T`,
+/// a different form, and nothing in the emitted vocabulary spells the referent
+/// that way.
+///
+/// The correspondence obligation moves WITH the derivation: the caller
+/// discharges it against the ACCESSED OPTIONAL, never against the re-binding,
+/// so a re-binding of a namesake or of any other optional still fails closed.
+fn pending_optional_access_rebinding(
+    input: &BridgeCustodyInput<'_>,
+    owner: &str,
+    binding: &Binding,
+) -> MatchResult<(Binding, String)> {
+    let (Some(init_text), Some(init_span)) = (binding.init_text.as_deref(), binding.init_span)
+    else {
+        return Err("pending-reference-type-absent".into());
+    };
+    let initializer = expression(init_text)?;
+    let Some((source_name, mutable)) = optional_whole_access(&initializer) else {
+        return Err("pending-reference-type-absent".into());
+    };
+    let source = PendingScalarRead::binding(input.emitted, owner, init_span, &source_name)
+        .ok_or("pending-optional-rebinding-source-binding-unresolved")?;
+    let text = source
+        .type_text
+        .as_deref()
+        .ok_or("pending-optional-rebinding-source-type-absent")?;
+    let Some((payload_mutable, pointee)) = optional_reference_payload(text)? else {
+        return Err(format!(
+            "pending-optional-rebinding-source-is-not-an-optional-reference:{source_name}:{text}"
+        ));
+    };
+    // R295-3: this is its own condition. `as_deref_mut` of `Option<&T>` is not
+    // a form the referent has; refusing it is not the same as refusing a
+    // non-optional source.
+    if mutable && !payload_mutable {
+        return Err(format!(
+            "pending-optional-rebinding-access-exceeds-the-optional:{source_name}:{text}"
+        ));
+    }
+    let form = if mutable {
+        format!("&mut {pointee}")
+    } else {
+        format!("&{pointee}")
+    };
+    Ok((source, form))
+}
+
+/// `<binding>.as_deref().unwrap()` / `<binding>.as_deref_mut().unwrap()` — the
+/// whole optional, accessed once, with no other operand. Returns the accessed
+/// binding's name and whether the access is the mutable one.
+fn optional_whole_access(expression: &ast::Expr) -> Option<(String, bool)> {
+    let ast::ExprKind::MethodCall(unwrap) = &unparen(expression).kind else {
+        return None;
+    };
+    if unwrap.seg.ident.name.as_str() != "unwrap" || !unwrap.args.is_empty() {
+        return None;
+    }
+    let ast::ExprKind::MethodCall(access) = &unparen(&unwrap.receiver).kind else {
+        return None;
+    };
+    if !access.args.is_empty() {
+        return None;
+    }
+    let mutable = match access.seg.ident.name.as_str() {
+        "as_deref" => false,
+        "as_deref_mut" => true,
+        _ => return None,
+    };
+    let name = path(unparen(&access.receiver)).filter(|name| !name.contains("::"))?;
+    Some((name, mutable))
+}
+
+/// The payload of `Option<&T>` / `Option<&mut T>` as (mutable, pointee text).
+/// Any other type — including an `Option` of a non-reference — is `None`.
+fn optional_reference_payload(text: &str) -> MatchResult<Option<(bool, String)>> {
+    let parsed = parsed_type(text)?;
+    let mut ty = &*parsed;
+    while let ast::TyKind::Paren(inner) = &ty.kind {
+        ty = inner;
+    }
+    let ast::TyKind::Path(None, path) = &ty.kind else {
+        return Ok(None);
+    };
+    let name = path
+        .segments
+        .iter()
+        .filter(|segment| segment.ident.name != rustc_span::kw::PathRoot)
+        .map(|segment| segment.ident.name.to_string())
+        .collect::<Vec<_>>()
+        .join("::");
+    if !matches!(
+        name.as_str(),
+        "Option" | "core::option::Option" | "std::option::Option"
+    ) {
+        return Ok(None);
+    }
+    let Some(ast::GenericArgs::AngleBracketed(arguments)) = path
+        .segments
+        .last()
+        .and_then(|segment| segment.args.as_deref())
+    else {
+        return Ok(None);
+    };
+    let [ast::AngleBracketedArg::Arg(ast::GenericArg::Type(payload))] = arguments.args.as_slice()
+    else {
+        return Ok(None);
+    };
+    let mut payload = &**payload;
+    while let ast::TyKind::Paren(inner) = &payload.kind {
+        payload = inner;
+    }
+    let ast::TyKind::Ref(_, reference) = &payload.kind else {
+        return Ok(None);
+    };
+    Ok(Some((
+        reference.mutbl.is_mut(),
+        pprust::ty_to_string(&reference.ty),
+    )))
+}
+
+/// A pending bridge hands its value to the callee's formal as a raw pointer, so
+/// that formal must be raw in the emitted tree.
+fn pending_target_raw(
+    scopes: &[&Inventory],
+    target: &super::bridge_custody_syntax::Function,
+    index: usize,
+) -> MatchResult<()> {
+    let parameter = target
+        .parameters
+        .get(index)
+        .ok_or("pending-target-absent")?;
+    if !matches!(
+        formal_pointer_type(scopes, &target.owner, &parameter.type_text)?,
+        PointerType::Raw(_)
+    ) {
+        return Err("pending-target-is-not-raw".into());
+    }
+    Ok(())
+}
+
+/// **R695-2 (b) — a C-variadic position has no formal to be raw.** A foreign
+/// `sprintf(_: *mut c_char, _: *const c_char, _: ...)` hands the value at
+/// position 2 onward with the argument's own type, so there the ARGUMENT must be
+/// raw by construction: `x.as_ptr()`, `x.as_mut_ptr()`, or a cast to a raw
+/// pointer. Anything else -- a bare reference among them -- fails closed. A fixed
+/// formal is checked by `pending_target_raw`, unchanged.
+fn pending_target_accepts(
+    scopes: &[&Inventory],
+    target: &super::bridge_custody_syntax::Function,
+    index: usize,
+    argument_text: &str,
+) -> MatchResult<()> {
+    let variadic_from = target
+        .parameters
+        .last()
+        .filter(|parameter| parameter.type_text.trim() == "...")
+        .map(|_| target.parameters.len() - 1);
+    match variadic_from {
+        Some(first) if index >= first => {
+            let argument = expression(argument_text)?;
+            if raw_by_construction(&argument) {
+                Ok(())
+            } else {
+                Err("pending-variadic-argument-not-raw".into())
+            }
+        }
+        _ => pending_target_raw(scopes, target, index),
+    }
+}
+
+/// Is this argument expression a raw pointer by its own spelling? `x.as_ptr()` /
+/// `x.as_mut_ptr()`, a cast to a raw pointer, and (relay 303) the bridges that end in
+/// a raw-pointer method or a raw-pointer constructor: `cast` / `cast_mut` /
+/// `cast_const` exist only on raw pointers, `core::ptr::from_ref` / `from_mut` /
+/// `null` / `null_mut` return one, and an Option's `map_or(null…(), ..)` has its
+/// default's type.
+fn raw_by_construction(argument: &ast::Expr) -> bool {
+    let raw_constructor = |expr: &ast::Expr| match &unparen(expr).kind {
+        ast::ExprKind::Call(callee, _) => match &unparen(callee).kind {
+            ast::ExprKind::Path(_, path) => path.segments.last().is_some_and(|segment| {
+                matches!(
+                    segment.ident.name.as_str(),
+                    "from_ref" | "from_mut" | "null" | "null_mut"
+                )
+            }),
+            _ => false,
+        },
+        _ => false,
+    };
+    match &unparen(argument).kind {
+        ast::ExprKind::MethodCall(call) => match call.seg.ident.name.as_str() {
+            "as_ptr" | "as_mut_ptr" | "cast_mut" | "cast_const" => call.args.is_empty(),
+            "cast" => true,
+            "map_or" | "map_or_else" => call
+                .args
+                .first()
+                .is_some_and(|default| raw_constructor(default)),
+            _ => false,
+        },
+        ast::ExprKind::Cast(_, ty) => matches!(ty.kind, ast::TyKind::Ptr(_)),
+        _ => raw_constructor(argument),
+    }
+}
+
+/// R695-2 (b): the pending-target check with its argument, on one emitted source.
+#[cfg(test)]
+pub(crate) fn pending_target_accepts_for_test(
+    emitted: &str,
+    owner: &str,
+    index: usize,
+    argument: &str,
+) -> Result<(), String> {
+    let inventory = super::bridge_custody_syntax::inventory_source("emitted.rs", emitted)?;
+    let target = inventory
+        .functions
+        .iter()
+        .find(|function| function.owner == owner)
+        .ok_or("owner-absent")?;
+    rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
+        pending_target_accepts(&[&inventory], target, index, argument)
+    })
+}
+
+/// R605-2: a callee formal written as the bare name of a type alias its module
+/// binds -- by its own `type` item, or by an un-renamed crate-path import of one --
+/// is classified by the alias's type, one level: brotli's `literal_context_lut:
+/// ContextLut` (`= *const uint8_t`) is raw. Only that explicit binding, the same in
+/// every inventory (emitted and original), resolves, and only for the one function of
+/// that owner, declared directly in a module chain with no `cfg` (Codex's reviews: a
+/// crate-wide name
+/// map certified homonyms; an owner path can name a sibling module; a disabled alias
+/// is not a binding). Anything else -- a primitive, a glob, a generic, a renamed or
+/// external import, a nested function, a name the module does not bind -- is
+/// classified as written, so it fails closed as not raw.
+fn formal_pointer_type(scopes: &[&Inventory], owner: &str, text: &str) -> MatchResult<PointerType> {
+    let parsed = parsed_type(text)?;
+    if let ast::TyKind::Path(None, path) = &parsed.kind
+        && let [segment] = path.segments.as_slice()
+        && segment.args.is_none()
+    {
+        let name = segment.ident.name.as_str();
+        let module = owner.rsplit_once("::").map_or("", |(module, _)| module);
+        let mut resolved = scopes.iter().map(|scope| {
+            let declarations = scope
+                .functions
+                .iter()
+                .filter(|function| function.owner == owner)
+                .count();
+            if scope.crate_opaque
+                || scope.opaque_modules.contains("")
+                || module_prefixes(module).any(|prefix| {
+                    scope.item_paths.contains(prefix) || scope.opaque_modules.contains(prefix)
+                })
+                || scope.type_parameters.contains(name)
+                || declarations != 1
+                || !scope.module_functions.contains(owner)
+            {
+                None
+            } else {
+                bound_alias(scope, module, name, 4)
+            }
+        });
+        if let Some(Some(first)) = resolved.next()
+            && resolved.all(|text| text.as_ref() == Some(&first))
+        {
+            return pointer_type(&first);
+        }
+    }
+    pointer_type(text)
+}
+
+/// Every segment-aligned prefix of a module path (`a`, `a::b`, `a::b::c`): a
+/// non-module item at any of them, or a macro invoked in any of them or at the root,
+/// can hide a nested callee of the same owner string (Codex: `fn host` whose body
+/// macro makes `mod inner`, beside `mod host::inner`; a root macro making `fn host`).
+fn module_prefixes(module: &str) -> impl Iterator<Item = &str> {
+    module
+        .match_indices("::")
+        .map(|(at, _)| &module[..at])
+        .chain((!module.is_empty()).then_some(module))
+}
+
+/// The alias a module binds `name` to, following crate-path imports.
+fn bound_alias(scope: &Inventory, module: &str, name: &str, depth: usize) -> Option<String> {
+    if (!module.is_empty() && !scope.modules.contains(module))
+        || scope.opaque_modules.contains(module)
+    {
+        return None;
+    }
+    match scope.type_bindings.get(module)?.get(name)? {
+        TypeBinding::Alias(text) => Some(text.clone()),
+        TypeBinding::Import(path) if depth > 0 => {
+            let (item, module) = path.split_last()?;
+            bound_alias(scope, &module.join("::"), item, depth - 1)
+        }
+        _ => None,
+    }
+}
+
+/// R819-3 (main 174a): the raw-view target check on one emitted source, for the witness.
+#[cfg(test)]
+pub(crate) fn raw_view_target_check_for_test(
+    emitted: &str,
+    owner: &str,
+    index: usize,
+) -> Result<(), String> {
+    let inventory = super::bridge_custody_syntax::inventory_source("emitted.rs", emitted)?;
+    let target = inventory
+        .functions
+        .iter()
+        .find(|function| function.owner == owner)
+        .ok_or("owner-absent")?;
+    rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
+        match raw_view_target_type(&[&inventory], target, index)? {
+            PointerType::Raw(_) => Ok(()),
+            _ => Err("raw-view-target-or-temporary-is-not-raw".into()),
+        }
+    })
+}
+
+/// R605-2: the pending-target check on one emitted source, for the witness.
+#[cfg(test)]
+pub(crate) fn pending_target_check_for_test(
+    emitted: &str,
+    owner: &str,
+    index: usize,
+) -> Result<(), String> {
+    let inventory = super::bridge_custody_syntax::inventory_source("emitted.rs", emitted)?;
+    let target = inventory
+        .functions
+        .iter()
+        .find(|function| function.owner == owner)
+        .ok_or("owner-absent")?;
+    rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
+        pending_target_raw(&[&inventory], target, index)
+    })
+}
+
+fn pending_selected_argument(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    call: &Call,
+    index: usize,
+) -> MatchResult<Vec<BindingWitness>> {
+    let target = target_owner(input, expected)?;
+    let argument_text = &call
+        .arguments
+        .get(index)
+        .ok_or("emitted-argument-absent")?
+        .text;
+    pending_target_accepts(
+        &[input.emitted, input.original],
+        target,
+        index,
+        argument_text,
+    )?;
+    if expected.pending_source.as_ref().is_some_and(|source| {
+        matches!(
+            &source.shape,
+            PendingSourceShape::NativeReturnExpression { .. }
+                | PendingSourceShape::NativeReturnExpressionNested { .. }
+        )
+    }) {
+        return pending_native_expression(input, expected, original, call, index);
+    }
+    let original_argument = &original.arguments[index];
+    let original_expression = expression(&original_argument.text)?;
+    let original_binding =
+        pending_original_source(input, expected, original, index, &original_expression)?;
+    let name = original_binding.name.as_str();
+    let argument = &call.arguments[index];
+    let mut witnesses = Vec::new();
+    let source_span = if argument
+        .binding
+        .as_ref()
+        .is_some_and(|binding| binding.generated.is_some())
+    {
+        let placed = binding_at(input, call, index)?;
+        witnesses = pending_carrier_witnesses(input, expected, original, call, index, placed)?;
+        placed
+            .init_span
+            .ok_or("pending-carrier-initializer-absent")?
+    } else {
+        let emitted_expression = expression(&argument.text)?;
+        let typed_view_method =
+            expected
+                .pending_source
+                .as_ref()
+                .and_then(|source| match &source.shape {
+                    PendingSourceShape::TypedPointerView { method } => Some(method.as_str()),
+                    _ => None,
+                });
+        if !raw_initializer_matches(&emitted_expression, &original_expression)
+            && !typed_view_method.is_some_and(|method| {
+                typed_view_slice_correspondence(
+                    &emitted_expression,
+                    name,
+                    method,
+                    &original_expression,
+                )
+            })
+        {
+            return Err("pending-source-view-correspondence-unbuilt".into());
+        }
+        argument.span
+    };
+    let emitted_binding = PendingScalarRead::binding(input.emitted, &call.owner, source_span, name)
+        .ok_or("pending-protected-source-binding-unresolved")?;
+    // **R455-1.** An unannotated re-binding of an optional formal's referent
+    // carries its form in the optional, not in its own bytes.
+    let rebinding = match emitted_binding.type_text {
+        Some(_) => None,
+        None => Some(pending_optional_access_rebinding(
+            input,
+            &call.owner,
+            &emitted_binding,
+        )?),
+    };
+    let (source_binding, form_text) = match (&rebinding, emitted_binding.type_text.as_deref()) {
+        (Some((source, form)), _) => (source, form.as_str()),
+        (None, Some(declared)) => (&emitted_binding, declared),
+        (None, None) => return Err("pending-reference-type-absent".into()),
+    };
+    let protected_form = match pointer_type(form_text)? {
+        PointerType::Reference(_) => true,
+        PointerType::OptionalReference => {
+            let source_text = input
+                .emitted_source
+                .get(source_span.lo as usize..source_span.hi as usize)
+                .ok_or("pending-nullable-source-span-invalid")?;
+            let emitted_source_expression = expression(source_text)?;
+            // **R430-2 — a PROJECTED borrow of an optional source's referent.**
+            // The nullable view (`as_deref().map_or(null(), ..)`) is one
+            // spelling; binn's `binn_is_valid(data, &mut (*value).type_0, ..)`
+            // over `value: Option<&mut binn>` is the other — the argument
+            // borrows the same place through the optional's access. The place
+            // keys must be equal (R430-2's arm), so nothing wider passes.
+            optional_raw_view_matches(&emitted_source_expression, &original_expression)
+                || borrows_the_same_place(&emitted_source_expression, &original_expression)
+        }
+        PointerType::Raw(_) | PointerType::Other => false,
+    };
+    // **R295-3's rule, applied here too.** One name covered two independent
+    // conditions — the emitted binding is not the original's, and the emitted
+    // binding's declared form is not a protected one — and a reader could not
+    // tell which had fired.
+    if !same_source_binding(input, &original_binding, source_binding) {
+        return Err(format!(
+            "pending-protected-source-binding-mismatch:{name}:{}",
+            source_binding_divergence(input, &original_binding, source_binding)
+        ));
+    }
+    if !protected_form {
+        return Err(format!(
+            "pending-protected-source-not-a-reference:{name}:{form_text}"
+        ));
+    }
+    Ok(witnesses)
+}
+
+fn pending_native_view(
+    template: &str,
+    form: &str,
+    temporary: &str,
+    target: &ast::Ty,
+) -> MatchResult<String> {
+    let ast::TyKind::Ptr(pointer) = &target.kind else {
+        return Err("pending-native-expression-view-target-not-raw".into());
+    };
+    let mutable = pointer.mutbl.is_mut();
+    let pointee = pprust::ty_to_string(&pointer.ty);
+    let text = match (template, form, mutable) {
+        ("ref-shared-to-raw-const", "ref-shared", false) => {
+            format!("core::ptr::from_ref({temporary})")
+        }
+        ("ref-mut-to-raw-const", "ref-mut", false) => format!("core::ptr::from_ref(&*{temporary})"),
+        ("ref-mut-to-raw-mut", "ref-mut", true) => {
+            format!("core::ptr::from_mut(&mut *{temporary})")
+        }
+        ("shared-ref-to-mut-raw", "ref-shared", true) => {
+            format!("core::ptr::from_ref({temporary}).cast_mut()")
+        }
+        ("slice-mut-to-raw-mut", "slice-mut", true) => format!("{temporary}.as_mut_ptr()"),
+        ("slice-to-raw-const", "slice-shared" | "slice-mut", false) => {
+            format!("{temporary}.as_ptr()")
+        }
+        ("slice-to-raw-mut", "slice-shared", true) => format!("{temporary}.as_ptr().cast_mut()"),
+        ("option-to-raw-null-map", "opt-ref-mut", true) => format!(
+            "{temporary}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), core::ptr::from_mut)"
+        ),
+        ("option-to-raw-null-map", "opt-ref-shared" | "opt-ref-mut", false) => format!(
+            "{temporary}.as_deref().map_or(core::ptr::null::<{pointee}>(), core::ptr::from_ref)"
+        ),
+        ("option-to-raw-null-map", "opt-ref-shared", true) => format!(
+            "{temporary}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |value| core::ptr::from_ref(value).cast_mut())"
+        ),
+        ("option-to-raw-null-map", "opt-slice-mut", true) => format!(
+            "{temporary}.as_deref_mut().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_mut_ptr())"
+        ),
+        ("option-to-raw-null-map", "opt-slice-shared" | "opt-slice-mut", false) => format!(
+            "{temporary}.as_deref().map_or(core::ptr::null::<{pointee}>(), |slice| slice.as_ptr())"
+        ),
+        ("option-to-raw-null-map", "opt-slice-shared", true) => format!(
+            "{temporary}.as_deref().map_or(core::ptr::null_mut::<{pointee}>(), |slice| slice.as_ptr().cast_mut())"
+        ),
+        _ => return Err("pending-native-expression-view-template-unbuilt".into()),
+    };
+    Ok(text)
+}
+
+/// Correspondence for the existing raw-to-slice source-call adapter. The
+/// named fallback extent remains owned by its adapter receipt and waiver;
+/// recognizing this syntax creates no slice-length evidence.
+fn pending_native_slice_argument(
+    input: &BridgeCustodyInput<'_>,
+    source_function: &str,
+    original: &Call,
+    emitted: &Call,
+    position: usize,
+    target: &super::bridge_custody_syntax::Function,
+) -> MatchResult<bool> {
+    let before = &original.arguments[position];
+    let after = &emitted.arguments[position];
+    let after_expression = expression(&after.text)?;
+    let ast::ExprKind::Call(callee, arguments) = &unparen(&after_expression).kind else {
+        return Ok(false);
+    };
+    let constructor_mutable = match path(callee).as_deref() {
+        Some("core::slice::from_raw_parts") => false,
+        Some("core::slice::from_raw_parts_mut") => true,
+        _ => return Ok(false),
+    };
+    let [operand, extent] = arguments.as_slice() else { return Ok(false) };
+    if path(extent).as_deref() != Some("crate::FALLBACK_SLICE_EXTENT")
+        || expression_key(operand) != expression_key(&*expression(&before.text)?)
+    {
+        return Ok(false);
+    }
+    let original_targets = input
+        .original
+        .functions
+        .iter()
+        .filter(|function| function.owner == source_function)
+        .collect::<Vec<_>>();
+    let [original_target] = original_targets.as_slice() else { return Ok(false) };
+    let (Some(before_parameter), Some(after_parameter)) = (
+        original_target.parameters.get(position),
+        target.parameters.get(position),
+    ) else {
+        return Ok(false);
+    };
+    let before_type = parsed_type(&before_parameter.type_text)?;
+    let after_type = parsed_type(&after_parameter.type_text)?;
+    let (ast::TyKind::Ptr(pointer), ast::TyKind::Ref(_, reference)) =
+        (&before_type.kind, &after_type.kind)
+    else {
+        return Ok(false);
+    };
+    let ast::TyKind::Slice(element) = &reference.ty.kind else { return Ok(false) };
+    if reference.mutbl.is_mut() != constructor_mutable
+        || (constructor_mutable && !pointer.mutbl.is_mut())
+        || pprust::ty_to_string(&pointer.ty) != pprust::ty_to_string(element)
+    {
+        return Ok(false);
+    }
+    // Use the pinned inventory's actual operand span for scope correspondence,
+    // never the fresh fragment parser's offsets or a guessed binding name.
+    let constructors = input
+        .emitted
+        .calls
+        .iter()
+        .filter(|call| {
+            call.owner == emitted.owner
+                && after.span.lo <= call.span.lo
+                && call.span.hi <= after.span.hi
+                && call.callee_path.as_deref() == path(callee).as_deref()
+                && call.arguments.len() == 2
+        })
+        .collect::<Vec<_>>();
+    let [constructor] = constructors.as_slice() else { return Ok(false) };
+    let text = input
+        .emitted_source
+        .get(constructor.span.lo as usize..constructor.span.hi as usize)
+        .ok_or("pending-native-slice-constructor-span-invalid")?;
+    if !same_expression(text, &after.text)?
+        || !same_expression(&constructor.arguments[0].text, &before.text)?
+    {
+        return Ok(false);
+    }
+    Ok(span_bindings_correspond(
+        input,
+        &original.owner,
+        before.span,
+        &emitted.owner,
+        constructor.arguments[0].span,
+        &mut BTreeSet::new(),
+    ))
+}
+
+/// The one rule that separates the two native-expression carriers.
+///
+/// The bare carrier edits the argument itself, so its edit interval must BE the
+/// argument. The nested carrier edits a call the argument contains, so its
+/// interval must sit **strictly** inside: equality would mean it had claimed
+/// the whole argument, and anything outside means the receipt does not describe
+/// the edit that was made. Neither arm may accept what the other describes --
+/// that is what keeps custody catching carrier drift after the shape was added.
+pub(crate) fn native_expression_interval_ok(
+    argument_span: &ByteSpan,
+    source_call_span: &ByteSpan,
+    nested: bool,
+) -> bool {
+    if nested {
+        argument_span.lo <= source_call_span.lo
+            && source_call_span.hi <= argument_span.hi
+            && source_call_span != argument_span
+    } else {
+        source_call_span == argument_span
+    }
+}
+
+fn pending_native_expression(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    call: &Call,
+    index: usize,
+) -> MatchResult<Vec<BindingWitness>> {
+    let metadata = expected
+        .pending_source
+        .as_ref()
+        .ok_or("pending-native-expression-source-missing")?;
+    let (
+        argument_span,
+        source_call_span,
+        source_function,
+        source_form,
+        source_type,
+        temporary,
+        template,
+        nested,
+    ) = match &metadata.shape {
+        PendingSourceShape::NativeReturnExpression {
+            argument_span,
+            source_call_span,
+            source_function,
+            source_form,
+            source_type,
+            temporary,
+            template,
+            ..
+        } => (
+            argument_span,
+            source_call_span,
+            source_function,
+            source_form,
+            source_type,
+            temporary,
+            template,
+            false,
+        ),
+        PendingSourceShape::NativeReturnExpressionNested {
+            argument_span,
+            source_call_span,
+            source_function,
+            source_form,
+            source_type,
+            temporary,
+            template,
+            ..
+        } => (
+            argument_span,
+            source_call_span,
+            source_function,
+            source_form,
+            source_type,
+            temporary,
+            template,
+            true,
+        ),
+        _ => return Err("pending-native-expression-source-kind".into()),
+    };
+    // The two shapes differ in exactly one rule and share every other. The
+    // bare carrier requires the edit interval to BE the argument; the nested
+    // one requires it to sit strictly inside, which is what keeps the
+    // enclosing cast, projection or arithmetic in the caller's hands.
+    let interval_ok = native_expression_interval_ok(argument_span, source_call_span, nested);
+    if metadata.binding.is_some()
+        || metadata.binding_span.is_some()
+        || *argument_span != original.arguments[index].span
+        || !interval_ok
+        || !temporary.starts_with("__crat_outbound_return_")
+    {
+        return Err("pending-native-expression-source-identity-mismatch".into());
+    }
+    let sources = input
+        .original
+        .calls
+        .iter()
+        .filter(|source| source.owner == original.owner && source.span == *source_call_span)
+        .collect::<Vec<_>>();
+    let [source] = sources.as_slice() else {
+        return Err("pending-native-expression-source-call-not-unique".into());
+    };
+    let source_path = path(&*expression(&source.callee_text)?)
+        .ok_or("pending-native-expression-source-not-direct")?;
+    let relative = original
+        .owner
+        .rsplit_once("::")
+        .map(|(module, _)| format!("{module}::{source_path}"));
+    if source_path != *source_function && relative.as_ref() != Some(source_function)
+        || input
+            .original
+            .functions
+            .iter()
+            .filter(|function| function.owner == *source_function)
+            .count()
+            != 1
+    {
+        return Err("pending-native-expression-source-callee-mismatch".into());
+    }
+    let argument = &call.arguments[index];
+    if input
+        .emitted_source
+        .get(argument.span.lo as usize..argument.span.hi as usize)
+        != Some(argument.text.as_str())
+    {
+        return Err("pending-native-expression-argument-source-mismatch".into());
+    }
+    let parsed = expression(&argument.text)?;
+    let ast::ExprKind::Block(block, None) = &unparen(&parsed).kind else {
+        return Err("pending-native-expression-argument-block-missing".into());
+    };
+    let [declaration, tail] = block.stmts.as_slice() else {
+        return Err("pending-native-expression-carrier-statements".into());
+    };
+    let (ast::StmtKind::Let(local), ast::StmtKind::Expr(tail)) = (&declaration.kind, &tail.kind)
+    else {
+        return Err("pending-native-expression-carrier-shape".into());
+    };
+    let ast::PatKind::Ident(_, name, None) = &local.pat.kind else {
+        return Err("pending-native-expression-temporary-pattern".into());
+    };
+    let (Some(local_type), ast::LocalKind::Init(initializer)) = (&local.ty, &local.kind) else {
+        return Err("pending-native-expression-typed-initializer-missing".into());
+    };
+    let native_type = parsed_type(source_type)?;
+    if name.name.as_str() != temporary
+        || pprust::ty_to_string(local_type) != pprust::ty_to_string(&native_type)
+        || !matches!(
+            pointer_type(source_type)?,
+            PointerType::Reference(_) | PointerType::OptionalReference
+        )
+    {
+        return Err("pending-native-expression-temporary-type-or-name".into());
+    }
+    let bindings = input
+        .emitted
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding.owner == call.owner
+                && binding.name == *temporary
+                && argument.span.lo <= binding.declaration_span.lo
+                && binding.declaration_span.hi <= argument.span.hi
+        })
+        .collect::<Vec<_>>();
+    let [binding] = bindings.as_slice() else {
+        return Err("pending-native-expression-temporary-not-unique".into());
+    };
+    let init_span = binding
+        .init_span
+        .ok_or("pending-native-expression-initializer-span-missing")?;
+    let init_text = binding
+        .init_text
+        .as_deref()
+        .ok_or("pending-native-expression-initializer-missing")?;
+    if input
+        .emitted_source
+        .get(init_span.lo as usize..init_span.hi as usize)
+        != Some(init_text)
+        || !same_expression(init_text, &pprust::expr_to_string(initializer))?
+        || binding
+            .type_text
+            .as_deref()
+            .map(parsed_type)
+            .transpose()?
+            .as_ref()
+            .is_none_or(|ty| pprust::ty_to_string(ty) != pprust::ty_to_string(&native_type))
+    {
+        return Err("pending-native-expression-binding-source-mismatch".into());
+    }
+    let mut source_expected = expected.clone();
+    source_expected.callee = source_function.clone();
+    let emitted_sources = emitted_candidates(input, &source_expected, source)?;
+    let emitted_sources = emitted_sources
+        .into_iter()
+        .filter(|source| init_span.lo <= source.span.lo && source.span.hi <= init_span.hi)
+        .collect::<Vec<_>>();
+    let [emitted_source] = emitted_sources.as_slice() else {
+        return Err("pending-native-expression-initializer-call-not-unique".into());
+    };
+    let call_text = input
+        .emitted_source
+        .get(emitted_source.span.lo as usize..emitted_source.span.hi as usize)
+        .ok_or("pending-native-expression-initializer-call-span-invalid")?;
+    if !same_expression(init_text, call_text)? {
+        return Err("pending-native-expression-initializer-is-not-source-call".into());
+    }
+    let source_target = target_owner(input, &source_expected)?;
+    for (position, (before, after)) in source
+        .arguments
+        .iter()
+        .zip(&emitted_source.arguments)
+        .enumerate()
+    {
+        if !same_expression(&before.text, &after.text)? {
+            let before = expression(&before.text)?;
+            let after = expression(&after.text)?;
+            let borrowed = source_target
+                .parameters
+                .get(position)
+                .map(|parameter| pointer_type(&parameter.type_text))
+                .transpose()?
+                .is_some_and(|ty| matches!(ty, PointerType::Reference(_)));
+            if (!borrowed || !same_view_operand(&after, &before))
+                && !pending_native_slice_argument(
+                    input,
+                    source_function,
+                    source,
+                    emitted_source,
+                    position,
+                    source_target,
+                )?
+            {
+                return Err(
+                    "pending-native-expression-source-argument-correspondence-unbuilt".into(),
+                );
+            }
+        }
+    }
+    validate_initializer_bindings(input, original, index, binding)?;
+    let ast::ExprKind::Cast(view, raw_type) = &unparen(tail).kind else {
+        return Err("pending-native-expression-raw-view-missing".into());
+    };
+    let target = target_owner(input, expected)?;
+    if pointer_type(&pprust::ty_to_string(raw_type))?
+        != pointer_type(&target.parameters[index].type_text)?
+    {
+        return Err("pending-native-expression-raw-target-mismatch".into());
+    }
+    let expected_view = pending_native_view(template, source_form, temporary, raw_type)?;
+    if !same_expression(&pprust::expr_to_string(view), &expected_view)? {
+        return Err("pending-native-expression-raw-view-template-mismatch".into());
+    }
+    let uses = input
+        .emitted
+        .uses
+        .iter()
+        .filter(|usage| {
+            usage.owner == call.owner
+                && argument.span.lo <= usage.span.lo
+                && usage.span.hi <= argument.span.hi
+                && input
+                    .emitted
+                    .bindings
+                    .get(usage.binding_id)
+                    .is_some_and(|binding| binding.name == *temporary)
+        })
+        .collect::<Vec<_>>();
+    let [usage] = uses.as_slice() else {
+        return Err("pending-native-expression-view-use-not-unique".into());
+    };
+    if usage.binding_id != binding.id
+        || usage.span.lo < binding.declaration_span.hi
+        || usage.context == super::bridge_custody_syntax::UseContext::AssignmentTarget
+    {
+        return Err("pending-native-expression-view-binding-mismatch".into());
+    }
+    // Inline pending views already carry their exact argument in the receipt.
+    // This safe native temporary is neither a raw nor a C9 temporary.
+    Ok(Vec::new())
+}
+
+fn pending(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    candidates: &[&Call],
+    indices: &[usize],
+) -> MatchResult<(ByteSpan, Vec<BindingWitness>, ReceiptStatus)> {
+    if expected.tier != "T2-pending"
+        || expected.waiver_id.as_deref()
+            != Some("c-aliasing-semantics-at-unsafe-bridges/v2-pending")
+    {
+        return Err("pending-tier-or-waiver-mismatch".into());
+    }
+    let target = target_owner(input, expected)?;
+    // **R304-3 — the stated render is the claim.**
+    if let Some(rendered) = input
+        .context
+        .pending_call_renders
+        .get(&(original.span.lo, original.span.hi))
+    {
+        let want = super::bridge_custody_export::normalised_tokens(rendered);
+        let mut stated = Vec::new();
+        for call in candidates {
+            let text = input
+                .emitted_source
+                .get(call.span.lo as usize..call.span.hi as usize)
+                .ok_or("pending-call-span-outside-emitted-source")?;
+            // **R306-1(ii) — the A5/PAIR composite is stated as ONE unit.**
+            //
+            // The producer renders the whole hoisting construct the AST layer
+            // emitted at this original span — `{ let __crat_a5_raw_N: T = …;
+            // callee(…, __crat_a5_raw_N) }` — bound to its stamp. The
+            // candidate here is the CALL, which lives inside that block, so an
+            // equality against the call's own span can never hold for these
+            // sites. The strict arm: the tree must carry the stated composite,
+            // and this candidate must be the call within it.
+            let have = super::bridge_custody_export::normalised_tokens(text);
+            if have != want
+                && !(want.contains(&have)
+                    && super::bridge_custody_export::normalised_tokens(input.emitted_source)
+                        .contains(&want))
+            {
+                continue;
+            }
+            let mut witnesses = Vec::new();
+            for &index in indices {
+                witnesses.extend(pending_selected_argument(
+                    input, expected, original, call, index,
+                )?);
+            }
+            stated.push((*call, witnesses));
+        }
+        // **Duplicates settle by text equality.** Two calls reading what the
+        // producer stated both satisfy an equality claim; that is exactly the
+        // property R287-1 chose over uniqueness.
+        let Some((call, witnesses)) = stated.into_iter().next() else {
+            // R295-3: say WHICH absence. A render the file carries somewhere
+            // but no candidate does is a candidate-selection question; a
+            // render the file does not carry at all means the AST layer never
+            // emitted that call, and R306-1(i) deletes such a row rather than
+            // keeping a claim the tree cannot answer.
+            let in_file = super::bridge_custody_export::normalised_tokens(input.emitted_source)
+                .contains(&want);
+            return Err(format!(
+                "pending-call-render-absent:candidates={}:in-file={in_file}",
+                candidates.len()
+            ));
+        };
+        return Ok((call.span, witnesses, ReceiptStatus::WaivedPending));
+    }
+    let mut matching = Vec::new();
+    for call in candidates {
+        let mut same = true;
+        let mut witnesses = Vec::new();
+        let mut scalar_read = PendingScalarRead {
+            input,
+            original_owner: &original.owner,
+            emitted_owner: &call.owner,
+            visiting: BTreeSet::new(),
+        };
+        for (index, (argument, original_argument)) in
+            call.arguments.iter().zip(&original.arguments).enumerate()
+        {
+            if indices.contains(&index) {
+                match pending_selected_argument(input, expected, original, call, index) {
+                    Ok(selected) => witnesses.extend(selected),
+                    Err(_) => same = false,
+                }
+                continue;
+            }
+            if !same_expression(&argument.text, &original_argument.text)? {
+                let original_expression = expression(&original_argument.text)?;
+                let emitted_expression = expression(&argument.text)?;
+                let native_read = scalar_read.equivalent(
+                    &original_expression,
+                    &emitted_expression,
+                    original_argument.span,
+                    argument.span,
+                )?;
+                let primary_reborrow = match (
+                    &unparen(&emitted_expression).kind,
+                    target
+                        .parameters
+                        .get(index)
+                        .map(|parameter| pointer_type(&parameter.type_text))
+                        .transpose()?,
+                ) {
+                    (
+                        ast::ExprKind::AddrOf(ast::BorrowKind::Ref, mutable, _),
+                        Some(PointerType::Reference(target_mutable)),
+                    ) => {
+                        (!target_mutable || mutable.is_mut())
+                            && same_view_operand(&emitted_expression, &original_expression)
+                            && span_bindings_correspond(
+                                input,
+                                &original.owner,
+                                original_argument.span,
+                                &call.owner,
+                                argument.span,
+                                &mut BTreeSet::new(),
+                            )
+                    }
+                    _ => false,
+                };
+                same &= native_read || primary_reborrow;
+            }
+        }
+        if same {
+            matching.push((*call, witnesses));
+        }
+    }
+    // **R295-3 — the two failures this arm can have are not the same failure.**
+    //
+    // One message covered both an EMPTY match set — no corresponding call in
+    // the tree, a real custody failure — and a set of two or more, which is
+    // the uniqueness requirement R287-1 ruled custody never needed. A reader
+    // of `pending-call-correspondence-not-unique` could not tell which had
+    // happened, and the two want opposite dispositions.
+    let [(call, witnesses)] = matching.as_slice() else {
+        return Err(if matching.is_empty() {
+            "pending-call-correspondence-absent".into()
+        } else {
+            format!("pending-call-correspondence-not-unique:{}", matching.len())
+        });
+    };
+    Ok((call.span, witnesses.clone(), ReceiptStatus::WaivedPending))
+}
+
+/// A raw temporary is evidence of a raw intermediate, not of the callee's
+/// terminal role. Nested AST uses can establish the exact binding even when
+/// the whole argument is a reborrow, slice construction, or Option view.
+fn invalid_rendered_role(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    candidates: &[&Call],
+    indices: &[usize],
+    stamp: u32,
+) -> MatchResult<Option<(ByteSpan, Vec<BindingWitness>, String)>> {
+    let target = target_owner(input, expected)?;
+    let mut invalid_calls = Vec::new();
+    for call in candidates {
+        let mut witnesses = Vec::new();
+        let mut reasons = Vec::new();
+        for &index in indices {
+            let argument = &call.arguments[index];
+            let parameter = target
+                .parameters
+                .get(index)
+                .ok_or("role-target-parameter-absent")?;
+            if !matches!(
+                pointer_type(&parameter.type_text)?,
+                PointerType::Reference(_) | PointerType::OptionalReference
+            ) {
+                continue;
+            }
+            let pair_name = format!("__crat_pair_raw_{stamp}_{index}");
+            let a5_name = format!("__crat_a5_raw_{stamp}_{index}");
+            let ids = input
+                .emitted
+                .uses
+                .iter()
+                .filter(|usage| {
+                    usage.owner == call.owner
+                        && argument.span.lo <= usage.span.lo
+                        && usage.span.hi <= argument.span.hi
+                        && usage.context
+                            != super::bridge_custody_syntax::UseContext::AssignmentTarget
+                })
+                .filter_map(|usage| input.emitted.bindings.get(usage.binding_id))
+                .filter(|binding| {
+                    binding.owner == call.owner
+                        && (binding.name == pair_name || binding.name == a5_name)
+                })
+                .map(|binding| binding.id)
+                .collect::<BTreeSet<_>>();
+            if ids.len() > 1 {
+                return Err("multiple-stamped-bindings-inside-safe-argument".into());
+            }
+            let Some(&id) = ids.first() else { continue };
+            let binding = &input.emitted.bindings[id];
+            if binding.generated != Some(GeneratedKind::RawTemporary)
+                || binding.declaration_span.hi > call.span.lo
+                || !matches!(
+                    pointer_type(
+                        binding
+                            .type_text
+                            .as_deref()
+                            .ok_or("role-temporary-type-absent")?
+                    )?,
+                    PointerType::Raw(_)
+                )
+            {
+                return Err("safe-argument-stamped-binding-is-not-a-placed-raw-temporary".into());
+            }
+            if input
+                .emitted_source
+                .get(argument.span.lo as usize..argument.span.hi as usize)
+                != Some(argument.text.as_str())
+                || binding
+                    .init_span
+                    .and_then(|span| input.emitted_source.get(span.lo as usize..span.hi as usize))
+                    != binding.init_text.as_deref()
+            {
+                return Err("role-binding-inventory-source-mismatch".into());
+            }
+            let initializer = expression(
+                binding
+                    .init_text
+                    .as_deref()
+                    .ok_or("role-temporary-initializer-absent")?,
+            )?;
+            let source = expression(&original.arguments[index].text)?;
+            if !raw_initializer_matches(&initializer, &source) {
+                return Err("role-initializer-source-relation-unbuilt".into());
+            }
+            validate_initializer_bindings(input, original, index, binding)?;
+            witnesses.push(witness(binding, index, GeneratedKind::RawTemporary));
+            reasons.push(format!(
+                "arg={index};binding-id={id};temporary={};target={};argument={}",
+                binding.name, parameter.type_text, argument.text
+            ));
+        }
+        if !witnesses.is_empty() {
+            invalid_calls.push((call.span, witnesses, reasons.join(" | ")));
+        }
+    }
+    if invalid_calls.len() > 1 {
+        return Err("invalid-role-call-correspondence-not-unique".into());
+    }
+    Ok(invalid_calls.pop())
+}
+
+fn match_receipt(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    row: &mut ReceiptResult,
+) -> MatchResult<()> {
+    let (original, indices) = original_call(input, expected)?;
+    row.original_call = Some(original.span);
+    row.argument_indices = indices.clone();
+    let candidates = emitted_candidates(input, expected, original)?;
+    if expected.kind == BridgeKind::SiblingOverlapPending {
+        let (span, bindings, status) = pending(input, expected, original, &candidates, &indices)?;
+        row.emitted_call = Some(span);
+        row.bindings = bindings;
+        row.status = status;
+        row.reason = "licensed-pending-site-present;waived-not-sound".into();
+        return Ok(());
+    }
+    if expected.kind == BridgeKind::PairCopySnapshot {
+        if expected.tier != "T1" || expected.waiver_id.is_some() {
+            return Err("c9-tier-or-waiver-mismatch".into());
+        }
+    } else if expected.tier != "T2"
+        || expected.waiver_id.as_deref() != Some(super::bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID)
+    {
+        return Err("raw-view-tier-or-waiver-mismatch".into());
+    }
+    let stamp = input
+        .context
+        .source_global_start
+        .checked_add(original.span.lo)
+        .ok_or("source-global-offset-overflow")?;
+    let raw_name = |index: usize, a5: bool| {
+        format!(
+            "__crat_{}_raw_{stamp}_{index}",
+            if a5 { "a5" } else { "pair" }
+        )
+    };
+    if expected.kind != BridgeKind::PairCopySnapshot {
+        if let Some((call, witnesses, reason)) =
+            invalid_rendered_role(input, expected, original, &candidates, &indices, stamp)?
+        {
+            row.emitted_call = Some(call);
+            row.bindings = witnesses;
+            row.status = ReceiptStatus::InvalidRenderedRole;
+            row.reason = format!(
+                "receipt-linked-invalid-rendered-role:raw-temporary-to-safe-parameter;{reason}"
+            );
+            return Ok(());
+        }
+        let raw_calls = candidates
+            .iter()
+            .filter(|call| {
+                indices.iter().all(|&index| {
+                    call.arguments[index]
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| {
+                            binding.name == raw_name(index, false)
+                                || binding.name == raw_name(index, true)
+                        })
+                })
+            })
+            .copied()
+            .collect::<Vec<_>>();
+        if raw_calls.len() > 1 {
+            return Err("multiple-calls-use-the-stamped-raw-view".into());
+        }
+        if let [call] = raw_calls.as_slice() {
+            row.bindings = validate_raw(input, expected, original, call, &indices)?;
+            row.emitted_call = Some(call.span);
+            row.status = ReceiptStatus::MatchedRaw;
+            row.reason = "exact-original-stamp-bound-raw-temporary-and-call".into();
+            return Ok(());
+        }
+    }
+    if let Some(c9) = expected.c9_stamp {
+        let name = format!("__crat_c9_{}_{}", c9.basic_block, c9.statement_index);
+        let mut c9_calls = Vec::new();
+        for call in &candidates {
+            let selected = if indices.is_empty() {
+                call.arguments
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, argument)| {
+                        argument
+                            .binding
+                            .as_ref()
+                            .is_some_and(|binding| binding.name == name)
+                            .then_some(index)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                indices.clone()
+            };
+            if !selected.is_empty()
+                && selected.iter().all(|&index| {
+                    call.arguments[index]
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.name == name)
+                })
+            {
+                c9_calls.push((*call, selected));
+            }
+        }
+        if c9_calls.len() > 1 {
+            return Err("c9-stamp-call-correspondence-not-unique".into());
+        }
+        if let [(call, selected)] = c9_calls.as_slice() {
+            if indices.is_empty() && selected.len() != 1 {
+                return Err("c9-argument-position-not-unique".into());
+            }
+            row.bindings = validate_c9(input, expected, original, call, selected, &name)?;
+            row.argument_indices = selected.clone();
+            row.emitted_call = Some(call.span);
+            row.status = ReceiptStatus::MatchedC9;
+            row.reason = "exact-c9-stamp-private-read-and-call-borrow".into();
+            return Ok(());
+        }
+    } else if candidates.iter().any(|call| {
+        call.arguments.iter().enumerate().any(|(index, argument)| {
+            (indices.is_empty() || indices.contains(&index))
+                && argument
+                    .binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.generated == Some(GeneratedKind::C9Temporary))
+        })
+    }) {
+        return Err("c9-alternative-present-without-exact-proof-stamp".into());
+    }
+    let owner = mapped_owner(&expected.caller, input.context)?;
+    if input.emitted.bindings.iter().any(|binding| {
+        binding.owner == owner
+            && indices.iter().any(|&index| {
+                binding.name == raw_name(index, false) || binding.name == raw_name(index, true)
+            })
+    }) {
+        return Err("stamped-raw-temporary-has-no-exact-bound-call-use".into());
+    }
+    if expected.kind == BridgeKind::A5SiteProofT2Fallback
+        && let SiteAnchor::Argument { argument_index, .. } = expected.anchor
+        && let Some((call, reason)) =
+            twin_inline_raw_view(input, expected, original, argument_index)
+    {
+        row.emitted_call = Some(call.span);
+        row.status = ReceiptStatus::MatchedRaw;
+        row.reason = reason;
+        return Ok(());
+    }
+    if let (BridgeKind::A5SiteProofT2Fallback, SiteAnchor::Argument { argument_index, .. }) =
+        (&expected.kind, &expected.anchor)
+    {
+        if let Some((call, reason)) =
+            twin_call_input_argument(input, expected, original, *argument_index)
+        {
+            row.emitted_call = Some(call.span);
+            row.status = ReceiptStatus::MatchedRaw;
+            row.reason = reason;
+            return Ok(());
+        }
+    }
+    row.status = ReceiptStatus::Missing;
+    row.reason = "no-stamped-raw-view-or-matched-c9-at-original-site".into();
+    Ok(())
+}
+
+/// **R636-1 — at a raw-twin call the A5 view is the argument itself.**
+///
+/// A counted-void call routed `RawTwin` renames the callee and keeps its arguments, so the
+/// A5 fallback plans no stamped temporary there (R496-1): the stamps would be dead lets.
+/// When a caller's safe value sits at such an argument, the caller's own bridge renders
+/// its raw view INLINE — binn's `pint` (batch 50: `Option<&mut c_int>`), passed as
+/// `pint.as_deref_mut().map_or(null_mut(), |value| from_mut(value).cast())` to
+/// `crate::src::binn::__crat_raw_copy_int_value` — and that expression is the T2 view the
+/// per-argument receipt claims. Before this arm the receipt read `Missing`.
+///
+/// Narrow, and only ever turning a `Missing` into a match (every refusal above still
+/// fires first): an A5 per-argument receipt; a call, in the caller, to the callee's twin
+/// as the emitted tree declares it in the callee's own module, spelled crate-rooted as
+/// the counted-void rename writes it; the twin's formal at the position is raw; the
+/// argument reads exactly its source bytes, is a raw view of the original argument by
+/// the relations in force and is not the original text (a zero-syntax twin site is
+/// R499-1's, not this arm's); its bindings are the original argument's, one to one; and
+/// exactly one call qualifies.
+/// **R757-1 (main 146) — the crate-qualified spelling of this callee's raw twin.** The
+/// emission names a twin by its crate path (`crate::src::kazmath::vec3::__crat_raw_kmVec3Add`),
+/// which R447-1's key (built from the original call's own spelling) does not read. Only a
+/// twin the emitted tree declares under this very callee's module is followed.
+fn twin_crate_callee_key(
+    input: &BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+) -> Option<String> {
+    let twin_owner = twin_owner_of(expected);
+    input
+        .emitted
+        .functions
+        .iter()
+        .any(|function| function.owner == twin_owner)
+        .then(|| expression(&format!("crate::{twin_owner}")).ok())
+        .flatten()
+        .map(|callee| expression_key(&callee))
+}
+
+fn twin_owner_of(expected: &BridgeExpectation) -> String {
+    match expected.callee.rsplit_once("::") {
+        Some((module, name)) => {
+            format!(
+                "{module}::{}",
+                super::decision::counted_void::raw_twin_name(name)
+            )
+        }
+        None => super::decision::counted_void::raw_twin_name(&expected.callee),
+    }
+}
+
+/// **R757-1 (main 146) — a raw-twin call handed the input's own argument.** wave-5d's
+/// `eefb63fa9` (R738-1 (i)) sends a call it cannot adapt to the callee's raw twin with the
+/// INPUT's arguments (`__crat_raw_kmVec3Add(pOut, pOut, &mut uuv)`, brotli's
+/// `__crat_raw_ProcessSingleCodeLength(code_len, &mut (*h).symbol, ..)`). The argument is
+/// then the input's own expression at the input's own raw formal: no safe value crosses,
+/// so no raw view is owed. Matched only when (1) the call is to the declared twin by its
+/// crate-qualified spelling (the redirect's; a bare or relative name is not proven to resolve
+/// to it), exactly one such call carries this argument, and exactly one input invocation in
+/// the caller carries it; (2) the twin's formal
+/// is raw; (3) the argument's expression equals the original's (or is R460-1(a)'s named
+/// intermediate of it); (4) every binding it reads pairs one to one with the original's;
+/// and (5) the argument is not a BARE path (casts peeled) naming a binding whose
+/// declaration the emission changed: a delivered binding handed bare is a raw view of the
+/// subject and owes its stamp. A borrow of a place through a delivered binding
+/// (`&mut (*h).repeat`, `h: &mut _`) is the same pointer the stamped view
+/// `from_mut(&mut (*h).repeat)` would bind, and a field read through it (`(*h).symbol_lists`)
+/// is the field's own raw value.
+fn twin_call_input_argument<'a>(
+    input: &'a BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    index: usize,
+) -> Option<(&'a Call, String)> {
+    let owner = mapped_owner(&expected.caller, input.context).ok()?;
+    let twin_owner = twin_owner_of(expected);
+    let [declared] = input
+        .emitted
+        .functions
+        .iter()
+        .filter(|function| function.owner == twin_owner)
+        .collect::<Vec<_>>()[..]
+    else {
+        return None;
+    };
+    if !matches!(
+        pointer_type(&declared.parameters.get(index)?.type_text).ok()?,
+        PointerType::Raw(_)
+    ) {
+        return None;
+    }
+    let spelling = expression_key(&*expression(&format!("crate::{twin_owner}")).ok()?);
+    let source = expression(&original.arguments.get(index)?.text).ok()?;
+    // (2) The receipt pairs with ONE input invocation: no other call to this callee in
+    // the original caller carries the same argument at this index.
+    let original_callee = expression_key(&*expression(&original.callee_text).ok()?);
+    let invocations = input
+        .original
+        .calls
+        .iter()
+        .filter(|call| {
+            call.owner == original.owner
+                && call.arguments.len() == original.arguments.len()
+                && expression(&call.callee_text)
+                    .is_ok_and(|callee| expression_key(&callee) == original_callee)
+                && expression(&call.arguments[index].text)
+                    .is_ok_and(|argument| expression_key(&argument) == expression_key(&source))
+        })
+        .count();
+    if invocations != 1 {
+        return None;
+    }
+    let mut matched = Vec::new();
+    for call in input
+        .emitted
+        .calls
+        .iter()
+        .filter(|call| call.owner == owner && call.arguments.len() == original.arguments.len())
+    {
+        let Ok(callee) = expression(&call.callee_text) else { continue };
+        let argument = &call.arguments[index];
+        if expression_key(&callee) != spelling
+            || input
+                .emitted_source
+                .get(argument.span.lo as usize..argument.span.hi as usize)
+                != Some(argument.text.as_str())
+        {
+            continue;
+        }
+        let Ok(emitted) = expression(&argument.text) else { continue };
+        let mut bare = unparen(&emitted);
+        while let ast::ExprKind::Cast(inner, _) = &bare.kind {
+            bare = unparen(inner);
+        }
+        let mut changed = BTreeSet::new();
+        let mut unresolved = false;
+        for usage in input.emitted.uses.iter().filter(|usage| {
+            usage.owner == call.owner
+                && argument.span.lo <= usage.span.lo
+                && usage.span.hi <= argument.span.hi
+        }) {
+            match input.emitted.bindings.get(usage.binding_id) {
+                Some(binding)
+                    if original_binding(input, binding)
+                        || (argument.span.lo <= binding.declaration_span.lo
+                            && binding.declaration_span.hi <= argument.span.hi) => {}
+                Some(binding) => {
+                    changed.insert(binding.name.clone());
+                }
+                None => unresolved = true,
+            }
+        }
+        let bare_changed = path(bare).is_some_and(|name| changed.contains(&name));
+        if (expression_key(&emitted) == expression_key(&source)
+            || named_intermediate_of(&emitted, &source))
+            && !unresolved
+            && !bare_changed
+            && argument_bindings_correspond_beside(input, original, call, index, true)
+        {
+            matched.push((call, changed));
+        }
+    }
+    let [(call, changed)] = &matched[..] else { return None };
+    let through = if changed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            ";through-delivered={}",
+            changed.iter().cloned().collect::<Vec<_>>().join(",")
+        )
+    };
+    Some((
+        call,
+        format!(
+            "twin-call-input-argument:arg={index};twin={twin_owner}{through};argument={}",
+            call.arguments[index].text
+        ),
+    ))
+}
+
+/// R460-1(a)'s rename and nothing else: `{ let __crat_raw: *mut T = <e> as *mut T; __crat_raw }`,
+/// a BY-VALUE binding annotated with a raw pointer type, whose initializer is the original
+/// argument's expression with raw-pointer casts only peeled, cast (if at all) to exactly the
+/// annotation. A `ref` binding, an integer annotation or a cast through an integer refuses.
+fn named_intermediate_of(emitted: &ast::Expr, source: &ast::Expr) -> bool {
+    let ast::ExprKind::Block(block, None) = &unparen(emitted).kind else {
+        return false;
+    };
+    let [statement, tail] = block.stmts.as_slice() else {
+        return false;
+    };
+    let (ast::StmtKind::Let(local), ast::StmtKind::Expr(tail)) = (&statement.kind, &tail.kind)
+    else {
+        return false;
+    };
+    let (ast::PatKind::Ident(mode, name, None), Some(annotation), Some(initializer)) =
+        (&local.pat.kind, &local.ty, local.kind.init())
+    else {
+        return false;
+    };
+    if !matches!(mode.0, ast::ByRef::No) || !matches!(annotation.kind, ast::TyKind::Ptr(_)) {
+        return false;
+    }
+    if let ast::ExprKind::Cast(_, target) = &unparen(initializer).kind
+        && pprust::ty_to_string(target) != pprust::ty_to_string(annotation)
+    {
+        return false;
+    }
+    path(unparen(tail)).is_some_and(|tail| tail == name.name.as_str())
+        && expression_key(peel_raw_pointer_casts(initializer))
+            == expression_key(peel_raw_pointer_casts(source))
+}
+
+fn twin_inline_raw_view<'a>(
+    input: &'a BridgeCustodyInput<'_>,
+    expected: &BridgeExpectation,
+    original: &Call,
+    index: usize,
+) -> Option<(&'a Call, String)> {
+    let owner = mapped_owner(&expected.caller, input.context).ok()?;
+    let (module, name) = match expected.callee.rsplit_once("::") {
+        Some((module, name)) => (Some(module), name),
+        None => (None, expected.callee.as_str()),
+    };
+    let twin = super::decision::counted_void::raw_twin_name(name);
+    let twin_owner = match module {
+        Some(module) => format!("{module}::{twin}"),
+        None => twin.clone(),
+    };
+    let [declared] = input
+        .emitted
+        .functions
+        .iter()
+        .filter(|function| function.owner == twin_owner)
+        .collect::<Vec<_>>()[..]
+    else {
+        return None;
+    };
+    if !matches!(
+        pointer_type(&declared.parameters.get(index)?.type_text).ok()?,
+        PointerType::Raw(_)
+    ) {
+        return None;
+    }
+    let spelling = expression_key(&*expression(&format!("crate::{twin_owner}")).ok()?);
+    let source = expression(&original.arguments.get(index)?.text).ok()?;
+    let mut matched = Vec::new();
+    for call in input
+        .emitted
+        .calls
+        .iter()
+        .filter(|call| call.owner == owner && call.arguments.len() == original.arguments.len())
+    {
+        let Ok(callee) = expression(&call.callee_text) else { continue };
+        let argument = &call.arguments[index];
+        if expression_key(&callee) != spelling
+            || input
+                .emitted_source
+                .get(argument.span.lo as usize..argument.span.hi as usize)
+                != Some(argument.text.as_str())
+        {
+            continue;
+        }
+        let Ok(view) = expression(&argument.text) else { continue };
+        if expression_key(&view) != expression_key(&source)
+            && raw_initializer_matches(&view, &source)
+            && argument_bindings_correspond(input, original, call, index)
+        {
+            matched.push(call);
+        }
+    }
+    let [call] = matched[..] else { return None };
+    Some((
+        call,
+        format!(
+            "twin-call-inline-raw-view:arg={index};twin={twin_owner};argument={}",
+            call.arguments[index].text
+        ),
+    ))
+}
+
+/// The caller's bindings read inside the emitted argument are the original argument's,
+/// one to one (closure-internal names belong to the closure's own owner and are not
+/// counted).
+fn argument_bindings_correspond(
+    input: &BridgeCustodyInput<'_>,
+    original: &Call,
+    call: &Call,
+    index: usize,
+) -> bool {
+    argument_bindings_correspond_beside(input, original, call, index, false)
+}
+
+/// As [`argument_bindings_correspond`]; with `skip_inner`, a binding the emitted argument
+/// itself declares (R460-1(a)'s `__crat_raw`) is the argument's own name, not a caller's.
+fn argument_bindings_correspond_beside(
+    input: &BridgeCustodyInput<'_>,
+    original: &Call,
+    call: &Call,
+    index: usize,
+    skip_inner: bool,
+) -> bool {
+    let within = |owner: &str, span: ByteSpan, usage: &super::bridge_custody_syntax::BindingUse| {
+        usage.owner == owner && span.lo <= usage.span.lo && usage.span.hi <= span.hi
+    };
+    let original_ids = input
+        .original
+        .uses
+        .iter()
+        .filter(|usage| within(&original.owner, original.arguments[index].span, usage))
+        .map(|usage| usage.binding_id)
+        .collect::<BTreeSet<_>>();
+    let span = call.arguments[index].span;
+    let emitted_ids = input
+        .emitted
+        .uses
+        .iter()
+        .filter(|usage| within(&call.owner, span, usage))
+        .map(|usage| usage.binding_id)
+        .filter(|id| {
+            !skip_inner
+                || input.emitted.bindings.get(*id).is_none_or(|binding| {
+                    !(span.lo <= binding.declaration_span.lo
+                        && binding.declaration_span.hi <= span.hi)
+                })
+        })
+        .collect::<BTreeSet<_>>();
+    let pairs =
+        |original: &Binding, emitted: &Binding| same_source_binding(input, original, emitted);
+    let (Some(originals), Some(emitted)) = (
+        original_ids
+            .iter()
+            .map(|id| input.original.bindings.get(*id))
+            .collect::<Option<Vec<_>>>(),
+        emitted_ids
+            .iter()
+            .map(|id| input.emitted.bindings.get(*id))
+            .collect::<Option<Vec<_>>>(),
+    ) else {
+        return false;
+    };
+    originals
+        .iter()
+        .all(|o| emitted.iter().filter(|e| pairs(o, e)).count() == 1)
+        && emitted
+            .iter()
+            .all(|e| originals.iter().filter(|o| pairs(o, e)).count() == 1)
+}
+
+fn generated_name(name: &str) -> bool {
+    name.starts_with("__crat_pair_raw_")
+        || name.starts_with("__crat_a5_raw_")
+        || name.starts_with("__crat_c9_")
+}
+
+fn original_binding(input: &BridgeCustodyInput<'_>, binding: &Binding) -> bool {
+    let same = |candidate: &Binding| {
+        candidate.name == binding.name
+            && candidate.type_text == binding.type_text
+            && candidate.init_text == binding.init_text
+    };
+    let originals = input
+        .original
+        .bindings
+        .iter()
+        .filter(|candidate| {
+            same(candidate)
+                && mapped_owner(&candidate.owner, input.context).ok()
+                    == Some(binding.owner.as_str())
+        })
+        .count();
+    originals == 1
+        && input
+            .emitted
+            .bindings
+            .iter()
+            .filter(|candidate| candidate.owner == binding.owner && same(candidate))
+            .count()
+            == 1
+}
+
+fn reverse_census(input: &BridgeCustodyInput<'_>, rows: &[ReceiptResult]) -> Vec<TreeOnlyWitness> {
+    let mut extras = Vec::new();
+    for binding in input
+        .emitted
+        .bindings
+        .iter()
+        .filter(|binding| generated_name(&binding.name) && !original_binding(input, binding))
+    {
+        let owned = rows
+            .iter()
+            .flat_map(|row| row.bindings.iter().map(move |witness| (row, witness)))
+            .filter(|(_, witness)| {
+                witness.binding_id == binding.id && witness.owner == binding.owner
+            })
+            .collect::<Vec<_>>();
+        let uses = input
+            .emitted
+            .uses
+            .iter()
+            .filter(|usage| usage.binding_id == binding.id && usage.owner == binding.owner)
+            .collect::<Vec<_>>();
+        if owned.is_empty() || uses.is_empty() {
+            extras.push(TreeOnlyWitness {
+                owner: binding.owner.clone(),
+                binding_id: binding.id,
+                name: binding.name.clone(),
+                declaration_span: binding.declaration_span,
+                call_span: None,
+                argument_index: None,
+                reason: "unclaimed-generated-declaration".into(),
+            });
+        }
+        for usage in uses {
+            let claimed = owned.iter().any(|(row, witness)| {
+                row.emitted_call.is_some_and(|span| {
+                    input
+                        .emitted
+                        .calls
+                        .iter()
+                        .find(|call| call.owner == binding.owner && call.span == span)
+                        .and_then(|call| call.arguments.get(witness.argument_index))
+                        .is_some_and(|argument| {
+                            argument.span.lo <= usage.span.lo && usage.span.hi <= argument.span.hi
+                        })
+                })
+            });
+            if claimed {
+                continue;
+            }
+            let calls = input
+                .emitted
+                .calls
+                .iter()
+                .filter(|call| call.owner == binding.owner)
+                .flat_map(|call| {
+                    call.arguments
+                        .iter()
+                        .enumerate()
+                        .filter(move |(_, argument)| {
+                            argument.span.lo <= usage.span.lo && usage.span.hi <= argument.span.hi
+                        })
+                        .map(move |(index, _)| (call.span, index))
+                })
+                .collect::<Vec<_>>();
+            let location = match calls.as_slice() {
+                [location] => Some(*location),
+                _ => None,
+            };
+            extras.push(TreeOnlyWitness {
+                owner: binding.owner.clone(),
+                binding_id: binding.id,
+                name: binding.name.clone(),
+                declaration_span: binding.declaration_span,
+                call_span: location.map(|(span, _)| span),
+                argument_index: location.map(|(_, index)| index),
+                reason: format!(
+                    "unclaimed-generated-use:{}..{}",
+                    usage.span.lo, usage.span.hi
+                ),
+            });
+        }
+    }
+    extras
+}
+
+/// One complete file inventory, including files with no expected ledger rows.
+/// Parser scope barriers matter at the exact binding lookup; ordinary unrelated
+/// source assignments do not turn into a program-wide custody failure.
+pub(crate) fn compare(input: BridgeCustodyInput<'_>) -> BridgeCustodyReport {
+    rustc_span::create_session_globals_then(Edition::Edition2018, &[], None, || {
+        let mut report = BridgeCustodyReport::default();
+        let mut identities = BTreeSet::new();
+        let mut duplicates = BTreeSet::new();
+        for expected in input.expectations {
+            if !identities.insert(expected.identity.as_str()) {
+                duplicates.insert(expected.identity.as_str());
+            }
+        }
+        for identity in &duplicates {
+            report
+                .issues
+                .push(format!("duplicate-ledger-identity:{identity}"));
+        }
+        let normalized_offsets = !input.original_source.starts_with('\u{feff}')
+            && !input.original_source.contains("\r\n");
+        if !normalized_offsets {
+            report
+                .issues
+                .push("producer-stamp-requires-explicit-LF-no-BOM-source".into());
+        }
+        for expected in input.expectations {
+            let mut row = ReceiptResult {
+                identity: expected.identity.clone(),
+                status: ReceiptStatus::Unresolved,
+                reason: String::new(),
+                original_call: None,
+                emitted_call: None,
+                argument_indices: Vec::new(),
+                bindings: Vec::new(),
+                correspondence: Correspondence::ByType,
+            };
+            reset_correspondence();
+            let result = if duplicates.contains(expected.identity.as_str()) {
+                Err("duplicate-ledger-identity".into())
+            } else if !normalized_offsets {
+                Err("original-source-offset-normalization-unresolved".into())
+            } else {
+                match_receipt(&input, expected, &mut row)
+            };
+            if let Err(reason) = result {
+                row.status = ReceiptStatus::Unresolved;
+                row.reason = reason;
+                row.bindings.clear();
+            }
+            row.correspondence = taken_correspondence();
+            report.rows.push(row);
+        }
+        report.tree_only = reverse_census(&input, &report.rows);
+        report.data = report.issues.is_empty()
+            && report.tree_only.is_empty()
+            && report.rows.iter().all(|row| {
+                matches!(
+                    row.status,
+                    ReceiptStatus::MatchedRaw
+                        | ReceiptStatus::MatchedC9
+                        | ReceiptStatus::WaivedPending
+                )
+            });
+        report
+    })
+}

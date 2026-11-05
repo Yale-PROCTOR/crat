@@ -1,0 +1,363 @@
+// R436/N1 fixtures — the corpus shape the pair rule cannot reach. Both bodies
+// are `indicators::ema::ti_ema` from rs-crown-derived (its assert dropped): a
+// lookback indicator whose body is NOT the elementwise pattern, so the pair
+// rule holds it at `IntervalChanged` even though both tables are delivered
+// flat slices with an inner Ref level.
+//
+//   ti_ema           — both tables' row loads lead the block, so BOTH deliver
+//                      in one plan (R445-3 dropped the lane boundary).
+//   ti_ema_late_out  — the output table's row load sits AFTER an early return,
+//                      so it is not a leading load: only the input table
+//                      delivers and the output table keeps its frame form.
+//   ti_ema_late_in   — the mirror image: the mutable output table delivers.
+//   ti_ema_extra_use — the output table is read a second time after the loop,
+//                      so not every use of it is an admitted row load.
+//   ti_sma_mixed     — R500-6 (b)'s shape: both row loads lead the block, but
+//                      the INPUT row is read at `i - period`, which offset-sign
+//                      reads as possibly negative, so that row belongs to the
+//                      CURSOR family while the output row is an ordinary slice
+//                      write. The corpus rows it stands for are ti_crossany,
+//                      ti_crossover, ti_decay, ti_edecay and ti_tr.
+//   ti_sma_cursor_only — R501-4 (iv)'s shape: the same body with the output
+//                      row's load moved below the guard, so the ONLY admissible
+//                      row is the cursor's and no sibling needs protecting.
+//                      Clause (g) is the only thing keeping it tree-neutral.
+pub mod indicators {
+    pub mod ema {
+        // Safety: callers supply one initialized, readable pointer-table cell
+        // per table. For positive size the inner input pointer covers size live
+        // doubles and the output row is writable for size doubles.
+        pub unsafe extern "C" fn ti_ema(
+            mut size: std::os::raw::c_int,
+            mut inputs: *const *const std::os::raw::c_double,
+            mut options: *const std::os::raw::c_double,
+            mut outputs: *const *mut std::os::raw::c_double,
+        ) -> std::os::raw::c_int {
+            let mut input: *const std::os::raw::c_double =
+                *inputs.offset(0 as std::os::raw::c_int as isize);
+            let period: std::os::raw::c_int =
+                *options.offset(0 as std::os::raw::c_int as isize) as std::os::raw::c_int;
+            let mut output: *mut std::os::raw::c_double =
+                *outputs.offset(0 as std::os::raw::c_int as isize);
+            if period < 1 as std::os::raw::c_int {
+                return 1 as std::os::raw::c_int;
+            }
+            let per: std::os::raw::c_double = 2 as std::os::raw::c_int as std::os::raw::c_double
+                / (period as std::os::raw::c_double
+                    + 1 as std::os::raw::c_int as std::os::raw::c_double);
+            let mut val: std::os::raw::c_double = *input.offset(0 as std::os::raw::c_int as isize);
+            *output.offset(0 as std::os::raw::c_int as isize) = val;
+            let mut i: std::os::raw::c_int = 0;
+            i = 1 as std::os::raw::c_int;
+            while i < size {
+                val = (*input.offset(i as isize) - val) * per + val;
+                *output.offset(i as isize) = val;
+                i += 1
+            }
+            return 0 as std::os::raw::c_int;
+        }
+    }
+    pub mod ema_late_out {
+        // Safety: as above. The output table cell is read only after the
+        // period guard, so its load is not one of the block's leading loads.
+        pub unsafe extern "C" fn ti_ema_late_out(
+            mut size: std::os::raw::c_int,
+            mut inputs: *const *const std::os::raw::c_double,
+            mut options: *const std::os::raw::c_double,
+            mut outputs: *const *mut std::os::raw::c_double,
+        ) -> std::os::raw::c_int {
+            let mut input: *const std::os::raw::c_double =
+                *inputs.offset(0 as std::os::raw::c_int as isize);
+            let period: std::os::raw::c_int =
+                *options.offset(0 as std::os::raw::c_int as isize) as std::os::raw::c_int;
+            if period < 1 as std::os::raw::c_int {
+                return 1 as std::os::raw::c_int;
+            }
+            let mut output: *mut std::os::raw::c_double =
+                *outputs.offset(0 as std::os::raw::c_int as isize);
+            let per: std::os::raw::c_double = 2 as std::os::raw::c_int as std::os::raw::c_double
+                / (period as std::os::raw::c_double
+                    + 1 as std::os::raw::c_int as std::os::raw::c_double);
+            let mut val: std::os::raw::c_double = *input.offset(0 as std::os::raw::c_int as isize);
+            *output.offset(0 as std::os::raw::c_int as isize) = val;
+            let mut i: std::os::raw::c_int = 0;
+            i = 1 as std::os::raw::c_int;
+            while i < size {
+                val = (*input.offset(i as isize) - val) * per + val;
+                *output.offset(i as isize) = val;
+                i += 1
+            }
+            return 0 as std::os::raw::c_int;
+        }
+    }
+    pub mod ema_late_in {
+        // Safety: as above. Here it is the INPUT table cell that is read only
+        // after the period guard, so the MUTABLE output table is the one this
+        // arm delivers.
+        pub unsafe extern "C" fn ti_ema_late_in(
+            mut size: std::os::raw::c_int,
+            mut inputs: *const *const std::os::raw::c_double,
+            mut options: *const std::os::raw::c_double,
+            mut outputs: *const *mut std::os::raw::c_double,
+        ) -> std::os::raw::c_int {
+            let mut output: *mut std::os::raw::c_double =
+                *outputs.offset(0 as std::os::raw::c_int as isize);
+            let period: std::os::raw::c_int =
+                *options.offset(0 as std::os::raw::c_int as isize) as std::os::raw::c_int;
+            if period < 1 as std::os::raw::c_int {
+                return 1 as std::os::raw::c_int;
+            }
+            let mut input: *const std::os::raw::c_double =
+                *inputs.offset(0 as std::os::raw::c_int as isize);
+            let per: std::os::raw::c_double = 2 as std::os::raw::c_int as std::os::raw::c_double
+                / (period as std::os::raw::c_double
+                    + 1 as std::os::raw::c_int as std::os::raw::c_double);
+            let mut val: std::os::raw::c_double = *input.offset(0 as std::os::raw::c_int as isize);
+            *output.offset(0 as std::os::raw::c_int as isize) = val;
+            let mut i: std::os::raw::c_int = 0;
+            i = 1 as std::os::raw::c_int;
+            while i < size {
+                val = (*input.offset(i as isize) - val) * per + val;
+                *output.offset(i as isize) = val;
+                i += 1
+            }
+            return 0 as std::os::raw::c_int;
+        }
+    }
+    pub mod ema_extra_use {
+        // Safety: as above. The output table is read a SECOND time after the
+        // loop, so not every use of it is an admitted row load.
+        pub unsafe extern "C" fn ti_ema_extra_use(
+            mut size: std::os::raw::c_int,
+            mut inputs: *const *const std::os::raw::c_double,
+            mut options: *const std::os::raw::c_double,
+            mut outputs: *const *mut std::os::raw::c_double,
+        ) -> std::os::raw::c_int {
+            let mut input: *const std::os::raw::c_double =
+                *inputs.offset(0 as std::os::raw::c_int as isize);
+            let period: std::os::raw::c_int =
+                *options.offset(0 as std::os::raw::c_int as isize) as std::os::raw::c_int;
+            let mut output: *mut std::os::raw::c_double =
+                *outputs.offset(0 as std::os::raw::c_int as isize);
+            if period < 1 as std::os::raw::c_int {
+                return 1 as std::os::raw::c_int;
+            }
+            let mut val: std::os::raw::c_double = *input.offset(0 as std::os::raw::c_int as isize);
+            let mut i: std::os::raw::c_int = 0;
+            i = 0 as std::os::raw::c_int;
+            while i < size {
+                val = *input.offset(i as isize) + val;
+                *output.offset(i as isize) = val;
+                i += 1
+            }
+            let last: *mut std::os::raw::c_double =
+                *outputs.offset(0 as std::os::raw::c_int as isize);
+            *last.offset(0 as std::os::raw::c_int as isize) = val;
+            return 0 as std::os::raw::c_int;
+        }
+    }
+    pub mod sma_mixed {
+        // Safety: as above. The input row is read at `i - period`, so the
+        // cursor family takes it; the output row is written at `i` only, so it
+        // stays an ordinary slice write and N1 delivers it on its own.
+        pub unsafe extern "C" fn ti_sma_mixed(
+            mut size: std::os::raw::c_int,
+            mut inputs: *const *const std::os::raw::c_double,
+            mut options: *const std::os::raw::c_double,
+            mut outputs: *const *mut std::os::raw::c_double,
+        ) -> std::os::raw::c_int {
+            let mut input: *const std::os::raw::c_double =
+                *inputs.offset(0 as std::os::raw::c_int as isize);
+            let period: std::os::raw::c_int =
+                *options.offset(0 as std::os::raw::c_int as isize) as std::os::raw::c_int;
+            let mut output: *mut std::os::raw::c_double =
+                *outputs.offset(0 as std::os::raw::c_int as isize);
+            if period < 1 as std::os::raw::c_int {
+                return 1 as std::os::raw::c_int;
+            }
+            let mut sum: std::os::raw::c_double =
+                0 as std::os::raw::c_int as std::os::raw::c_double;
+            let mut i: std::os::raw::c_int = 0;
+            i = 0 as std::os::raw::c_int;
+            while i < period {
+                sum += *input.offset(i as isize);
+                *output.offset(i as isize) = sum;
+                i += 1
+            }
+            i = period;
+            while i < size {
+                sum += *input.offset(i as isize);
+                sum -= *input.offset((i - period) as isize);
+                *output.offset(i as isize) = sum;
+                i += 1
+            }
+            return 0 as std::os::raw::c_int;
+        }
+    }
+    pub mod sma_cursor_only {
+        // Safety: as above. `ti_sma_mixed` with the OUTPUT row's load moved
+        // below the period guard, so that table is not a leading load and the
+        // only admissible row left is the CURSOR's. This owner has no
+        // slice-only table, so clause (f) leaves the arm free and clause (g) is
+        // the only thing standing between it and a flip it cannot type.
+        pub unsafe extern "C" fn ti_sma_cursor_only(
+            mut size: std::os::raw::c_int,
+            mut inputs: *const *const std::os::raw::c_double,
+            mut options: *const std::os::raw::c_double,
+            mut outputs: *const *mut std::os::raw::c_double,
+        ) -> std::os::raw::c_int {
+            let mut input: *const std::os::raw::c_double =
+                *inputs.offset(0 as std::os::raw::c_int as isize);
+            let period: std::os::raw::c_int =
+                *options.offset(0 as std::os::raw::c_int as isize) as std::os::raw::c_int;
+            if period < 1 as std::os::raw::c_int {
+                return 1 as std::os::raw::c_int;
+            }
+            let mut output: *mut std::os::raw::c_double =
+                *outputs.offset(0 as std::os::raw::c_int as isize);
+            let mut sum: std::os::raw::c_double =
+                0 as std::os::raw::c_int as std::os::raw::c_double;
+            let mut i: std::os::raw::c_int = 0;
+            i = 0 as std::os::raw::c_int;
+            while i < period {
+                sum += *input.offset(i as isize);
+                *output.offset(i as isize) = sum;
+                i += 1
+            }
+            i = period;
+            while i < size {
+                sum += *input.offset(i as isize);
+                sum -= *input.offset((i - period) as isize);
+                *output.offset(i as isize) = sum;
+                i += 1
+            }
+            return 0 as std::os::raw::c_int;
+        }
+    }
+    pub mod sma_twice {
+        // Safety: as above, with TWO output cells. R519-2's W3 shape: the output
+        // table is named twice, so `table_named_once` refuses an exclusive
+        // cursor row over its element and the transaction rolls that parameter
+        // back — while the input table, whose row is an ordinary slice read,
+        // keeps the delivery it earned.
+        pub unsafe extern "C" fn ti_sma_twice(
+            mut size: std::os::raw::c_int,
+            mut inputs: *const *const std::os::raw::c_double,
+            mut options: *const std::os::raw::c_double,
+            mut outputs: *const *mut std::os::raw::c_double,
+        ) -> std::os::raw::c_int {
+            let mut input: *const std::os::raw::c_double =
+                *inputs.offset(0 as std::os::raw::c_int as isize);
+            let period: std::os::raw::c_int =
+                *options.offset(0 as std::os::raw::c_int as isize) as std::os::raw::c_int;
+            let mut lo: *mut std::os::raw::c_double =
+                *outputs.offset(0 as std::os::raw::c_int as isize);
+            let mut hi: *mut std::os::raw::c_double =
+                *outputs.offset(1 as std::os::raw::c_int as isize);
+            if period < 1 as std::os::raw::c_int {
+                return 1 as std::os::raw::c_int;
+            }
+            let mut i: std::os::raw::c_int = 0;
+            i = 0 as std::os::raw::c_int;
+            while i < size {
+                *lo.offset(i as isize) = *input.offset(i as isize);
+                i += 1
+            }
+            i = period;
+            while i < size {
+                *hi.offset((i - period) as isize) = *input.offset(i as isize);
+                i += 1
+            }
+            return 0 as std::os::raw::c_int;
+        }
+    }
+}
+pub struct IndicatorInfo {
+    pub indicator: Option<
+        unsafe extern "C" fn(
+            std::os::raw::c_int,
+            *const *const std::os::raw::c_double,
+            *const std::os::raw::c_double,
+            *const *mut std::os::raw::c_double,
+        ) -> std::os::raw::c_int,
+    >,
+}
+pub static INDICATORS: [IndicatorInfo; 7] = [
+    IndicatorInfo {
+        indicator: Some(
+            indicators::ema::ti_ema
+                as unsafe extern "C" fn(
+                    std::os::raw::c_int,
+                    *const *const std::os::raw::c_double,
+                    *const std::os::raw::c_double,
+                    *const *mut std::os::raw::c_double,
+                ) -> std::os::raw::c_int,
+        ),
+    },
+    IndicatorInfo {
+        indicator: Some(
+            indicators::ema_late_out::ti_ema_late_out
+                as unsafe extern "C" fn(
+                    std::os::raw::c_int,
+                    *const *const std::os::raw::c_double,
+                    *const std::os::raw::c_double,
+                    *const *mut std::os::raw::c_double,
+                ) -> std::os::raw::c_int,
+        ),
+    },
+    IndicatorInfo {
+        indicator: Some(
+            indicators::ema_late_in::ti_ema_late_in
+                as unsafe extern "C" fn(
+                    std::os::raw::c_int,
+                    *const *const std::os::raw::c_double,
+                    *const std::os::raw::c_double,
+                    *const *mut std::os::raw::c_double,
+                ) -> std::os::raw::c_int,
+        ),
+    },
+    IndicatorInfo {
+        indicator: Some(
+            indicators::ema_extra_use::ti_ema_extra_use
+                as unsafe extern "C" fn(
+                    std::os::raw::c_int,
+                    *const *const std::os::raw::c_double,
+                    *const std::os::raw::c_double,
+                    *const *mut std::os::raw::c_double,
+                ) -> std::os::raw::c_int,
+        ),
+    },
+    IndicatorInfo {
+        indicator: Some(
+            indicators::sma_mixed::ti_sma_mixed
+                as unsafe extern "C" fn(
+                    std::os::raw::c_int,
+                    *const *const std::os::raw::c_double,
+                    *const std::os::raw::c_double,
+                    *const *mut std::os::raw::c_double,
+                ) -> std::os::raw::c_int,
+        ),
+    },
+    IndicatorInfo {
+        indicator: Some(
+            indicators::sma_cursor_only::ti_sma_cursor_only
+                as unsafe extern "C" fn(
+                    std::os::raw::c_int,
+                    *const *const std::os::raw::c_double,
+                    *const std::os::raw::c_double,
+                    *const *mut std::os::raw::c_double,
+                ) -> std::os::raw::c_int,
+        ),
+    },
+    IndicatorInfo {
+        indicator: Some(
+            indicators::sma_twice::ti_sma_twice
+                as unsafe extern "C" fn(
+                    std::os::raw::c_int,
+                    *const *const std::os::raw::c_double,
+                    *const std::os::raw::c_double,
+                    *const *mut std::os::raw::c_double,
+                ) -> std::os::raw::c_int,
+        ),
+    },
+];

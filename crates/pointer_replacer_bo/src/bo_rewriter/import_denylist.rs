@@ -1,0 +1,2255 @@
+//! Mechanical enforcement of the greenfield isolation rule (design §6.3).
+//!
+//! The 2026-07-27 ruling makes `bo_rewriter/` a top-level module rather than a
+//! separate crate, because a crate would have forced `mod analyses` public. The
+//! cost of that choice is losing compile-time isolation from
+//! [`crate::rewriter`]: sibling modules can see each other's `pub(crate)` items
+//! freely, so nothing in the type system stops an import.
+//!
+//! This test buys that isolation back.
+//!
+//! # Why a filesystem walk rather than `include_str!`
+//!
+//! The in-tree precedent (`analyses/borrow_ownership/borrow_engine/mod.rs`'s
+//! `fork_sync` tripwire) uses `include_str!`, which requires naming every file
+//! by hand — so a newly added file silently escapes the scan. Walking the
+//! directory at test time catches new files automatically, which is the
+//! property that matters for a module expected to grow through M1–M4.
+
+use std::{fs, path::Path};
+
+/// Path fragments that would breach the isolation rule. Matching is textual and
+/// deliberately over-broad: a false positive is a rename away, a false negative
+/// is a silent architectural regression.
+const FORBIDDEN: &[&str] = &[
+    "crate::rewriter",
+    "super::rewriter",
+    "use rewriter",
+    "::rewriter::",
+];
+
+fn module_root() -> &'static Path {
+    // `CARGO_MANIFEST_DIR` is the crate root, so this resolves inside whichever
+    // checkout/worktree is running the test.
+    Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bo_rewriter"))
+}
+
+fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("bo_rewriter module directory unreadable at {dir:?}: {e}"));
+    for entry in entries {
+        let entry = entry.expect("readable directory entry");
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Scan every `.rs` file under `root`, reporting one entry per offending line.
+///
+/// # The F3 repair, applied once for every scan in this file
+///
+/// A scan whose accumulation is exercised **only** by the production call has
+/// no witness for its own wiring: on clean sources it returns empty, so
+/// deleting the accumulation is invisible — the suite stays green and the rule
+/// silently stops being enforced. That defect was found in the R-C `if let`
+/// scan, then reproduced by its author in the `coverage_recon` rule one slice
+/// later, and the audit found it in two more. Four instances is a pattern, not
+/// four mistakes.
+///
+/// The repair is structural: **the production checks and their
+/// synthetic-corpus witnesses call this same function.** A synthetic corpus
+/// containing a real violation drives the same accumulate path the production
+/// call uses, so deleting that path fails a standing test.
+///
+/// Comments are skipped here, uniformly: a comment cannot import, and
+/// documentation has to be able to name what a rule forbids in order to
+/// explain it.
+fn scan_root(
+    root: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+    offense: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no .rs files found under {root:?} — the scan would pass vacuously"
+    );
+    let mut hits = Vec::new();
+    let mut scanned = 0usize;
+    for file in &files {
+        if skip(file) {
+            continue;
+        }
+        scanned += 1;
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
+        for (index, line) in text.lines().enumerate() {
+            if is_comment(line) {
+                continue;
+            }
+            if let Some(detail) = offense(line) {
+                hits.push(format!(
+                    "{}:{}: {detail}",
+                    file.strip_prefix(root).unwrap_or(file).display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    // The `files.is_empty()` assert above runs BEFORE `skip`, so an over-broad
+    // skip predicate left every production scan examining nothing and reporting
+    // clean — permanently. Measured 2026-07-31: making
+    // `is_denylist_self_reference` match every file kept all 20 tests in this
+    // module green. Asserting SURVIVORS converts every caller at one site.
+    assert!(
+        scanned > 0,
+        "every file under {root:?} was skipped — the scan examined nothing and \
+         would report clean regardless of what the sources contain"
+    );
+    hits
+}
+
+/// Write a throwaway source tree and return its root.
+///
+/// This is what makes the scans' accumulation witnessable: a corpus that
+/// genuinely violates the rule, fed to the production scan function.
+///
+/// Callers clean up with [`drop_corpus`] **after** their assertions, so a
+/// FAILING test leaves its corpus on disk to be inspected. The pid in the path
+/// keeps concurrent `cargo test` processes from colliding on a shared tag.
+#[cfg(test)]
+fn temp_corpus(tag: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("crat-denylist-{}-{tag}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create temp corpus");
+    for (name, body) in files {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create temp corpus subdir");
+        }
+        fs::write(&path, body).expect("write temp source");
+    }
+    dir
+}
+
+/// A line referencing the frozen `rewriter` tree, or `None`.
+fn frozen_rewriter_offense(line: &str) -> Option<String> {
+    FORBIDDEN
+        .iter()
+        .find(|needle| line.contains(**needle))
+        .map(|needle| format!("matched {needle:?} in: {}", line.trim()))
+}
+
+/// Every `.rs` file under `bo_rewriter/` must be free of any reference to the
+/// frozen `rewriter` tree.
+#[test]
+fn bo_rewriter_never_references_the_frozen_rewriter() {
+    let root = module_root();
+    // This file necessarily *spells* the forbidden fragments — in `FORBIDDEN`
+    // and in its fixtures — so it cannot scan itself without indicting its own
+    // implementation.
+    let breaches = scan_root(
+        root,
+        &|file| is_denylist_self_reference(file, root),
+        &frozen_rewriter_offense,
+    );
+
+    assert!(
+        breaches.is_empty(),
+        "bo_rewriter/ must never reference the frozen `rewriter` tree \
+         (greenfield ruling 2026-07-27). Offending lines:\n{}",
+        breaches.join("\n")
+    );
+}
+
+/// This module is the one file allowed to contain the forbidden fragments,
+/// because it has to spell them to search for them.
+fn is_denylist_self_reference(file: &Path, root: &Path) -> bool {
+    file == root.join("import_denylist.rs")
+}
+
+/// Line comments and doc comments, which cannot import anything.
+///
+/// Deliberately does **not** handle block comments: `/* … */` spanning an
+/// import would be dead code that still reads as a breach, and flagging it is
+/// the safer error.
+fn is_comment(line: &str) -> bool {
+    line.trim_start().starts_with("//")
+}
+
+/// The scan must actually reach files — guards against a path typo silently
+/// turning the real test into a no-op.
+#[test]
+fn denylist_scan_reaches_the_module_sources() {
+    let root = module_root();
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    let names: Vec<_> = files
+        .iter()
+        .filter_map(|p| p.file_name().and_then(|n| n.to_str()))
+        .collect();
+    assert!(
+        names.contains(&"mod.rs"),
+        "expected bo_rewriter/mod.rs in the scan, found {names:?}"
+    );
+}
+
+/// The denylist itself must be able to catch a breach. Without this, a broken
+/// matcher would let every real test pass.
+#[test]
+fn denylist_matches_a_synthetic_breach() {
+    let sample = "use crate::rewriter::decision::PtrKind;";
+    assert!(
+        FORBIDDEN.iter().any(|needle| sample.contains(needle)),
+        "denylist failed to match a known-bad import line"
+    );
+}
+
+const WAVE3_DOC_INPUTS: &[&str] = &[
+    "adapter-overlap-153.tsv",
+    "2026-08-30-item-e-adapter-overlap-audit",
+    "0c6be335bd5412700e40497fd64e57525e0018d02be7bc229cdd386b7cd627a5",
+    "88558cfb668aae13c4c9362eb4389927fa493c8306ee59a24c9f983208e457c8",
+    // Raw-boundary wave-1's external controls use the same no-docs boundary.
+    "two-strategy-reads.tsv",
+    "60869d0e423f4e0fd65a74ca55df025e3fbd4968cc76ecaa0f1490f0e924cdca",
+    "arm-b-62.tsv",
+];
+
+fn wave3_docs_input_offense(line: &str) -> Option<String> {
+    WAVE3_DOC_INPUTS
+        .iter()
+        .find(|needle| line.contains(**needle))
+        .map(|needle| format!("production names wave-3 control input {needle:?}"))
+        .or_else(|| {
+            (line.contains("docs/agents/") && (line.contains("read") || line.contains("open")))
+                .then(|| "production appears to read a docs artifact path".to_owned())
+        })
+}
+
+/// Addendum 96: the TSV is an external differential oracle, never a production
+/// input or an embedded 41-key allowlist.
+#[test]
+fn wave3_production_never_reads_or_embeds_the_docs_control() {
+    let root = module_root();
+    let breaches = scan_root(
+        root,
+        &|file| is_test_only_file(file),
+        &wave3_docs_input_offense,
+    );
+    assert!(
+        breaches.is_empty(),
+        "wave-3 production must derive site proofs from frozen facts:\n{}",
+        breaches.join("\n")
+    );
+}
+
+#[test]
+fn wave3_docs_input_ratchet_matches_a_synthetic_breach() {
+    assert!(
+        wave3_docs_input_offense("std::fs::read_to_string(\"adapter-overlap-153.tsv\")").is_some()
+    );
+    assert!(
+        wave3_docs_input_offense(
+            "let keys = \"88558cfb668aae13c4c9362eb4389927fa493c8306ee59a24c9f983208e457c8\";"
+        )
+        .is_some()
+    );
+}
+
+fn e2_docs_or_legacy_input_offense(line: &str) -> Option<String> {
+    const E2_INPUTS: &[&str] = &[
+        "e2-subjects.tsv",
+        "e2-functions.tsv",
+        "2026-08-30-e2-lifetime-emission-design",
+        "rewriter::lifetimes",
+    ];
+    E2_INPUTS
+        .iter()
+        .find(|needle| line.contains(**needle))
+        .map(|needle| format!("E2 production names forbidden input {needle:?}"))
+        .or_else(|| {
+            (line.contains("docs/agents/")
+                && (line.contains("read") || line.contains("include_bytes")))
+            .then(|| "E2 production appears to consume a docs artifact".to_owned())
+        })
+}
+
+/// E2-FN derives from the carried analysis facts. Design/census files and the
+/// legacy lifetime emitter remain external controls/precedent only.
+#[test]
+fn dependency_ratchet_e2_has_no_docs_or_legacy_runtime_input() {
+    let breaches = scan_root(
+        module_root(),
+        &|file| is_test_only_file(file),
+        &e2_docs_or_legacy_input_offense,
+    );
+    assert!(
+        breaches.is_empty(),
+        "E2 runtime-input breach:\n{}",
+        breaches.join("\n")
+    );
+}
+
+#[test]
+fn e2_runtime_input_ratchet_matches_synthetic_breaches() {
+    assert!(
+        e2_docs_or_legacy_input_offense(
+            "let rows = std::fs::read_to_string(\"docs/agents/e2-subjects.tsv\");"
+        )
+        .is_some()
+    );
+    assert!(
+        e2_docs_or_legacy_input_offense("use crate::rewriter::lifetimes::LifetimePlans;").is_some()
+    );
+}
+
+fn raw_boundary_wave2_runtime_input_offense(line: &str) -> Option<String> {
+    const FORBIDDEN_INPUTS: &[&str] = &[
+        "is_c_exposed_fn",
+        "unified-market-control.tsv",
+        "masked-reason-reconciliation.tsv",
+        "diagnostic-arm-clusters.tsv",
+        "adapter-overlap-153.tsv",
+        "category-a-not-placed-identities.tsv",
+        "a5-member-subjects.tsv",
+        "formal-comparators.tsv",
+        "json-h-formal-identities.tsv",
+        "2026-09-04-raw-boundary-wave3b-remaining-mechanical-classes-design",
+    ];
+    FORBIDDEN_INPUTS
+        .iter()
+        .find(|needle| line.contains(**needle))
+        .map(|needle| format!("raw-boundary wave 2 production names forbidden input {needle:?}"))
+        .or_else(|| {
+            (line.contains("docs/agents/")
+                && (line.contains("read") || line.contains("include_bytes")))
+            .then(|| "raw-boundary wave 2 production appears to consume docs".to_owned())
+        })
+}
+
+#[test]
+fn dependency_ratchet_raw_boundary_wave2_has_no_docs_or_legacy_helper_input() {
+    let breaches = scan_root(
+        module_root(),
+        &|file| is_test_only_file(file),
+        &raw_boundary_wave2_runtime_input_offense,
+    );
+    assert!(
+        breaches.is_empty(),
+        "raw-boundary wave 2 runtime-input breach:\n{}",
+        breaches.join("\n")
+    );
+}
+
+#[test]
+fn raw_boundary_wave2_runtime_input_ratchet_matches_synthetic_breaches() {
+    assert!(
+        raw_boundary_wave2_runtime_input_offense(
+            "let rows = std::fs::read_to_string(\"docs/agents/unified-market-control.tsv\");"
+        )
+        .is_some()
+    );
+    assert!(
+        raw_boundary_wave2_runtime_input_offense(
+            "let exposed = crate::rewriter::transform::is_c_exposed_fn(tcx, did, names);"
+        )
+        .is_some()
+    );
+    assert!(
+        raw_boundary_wave2_runtime_input_offense(
+            "let rows = std::fs::read_to_string(\"category-a-not-placed-identities.tsv\");"
+        )
+        .is_some()
+    );
+}
+
+fn cached_model_fields(source: &str) -> Vec<String> {
+    let Some((_, tail)) = source.split_once("struct CachedModel {") else {
+        return Vec::new();
+    };
+    let body = tail.split_once('}').map_or(tail, |(body, _)| body);
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let field = line.strip_prefix("pub(crate) ")?.split_once(':')?.0;
+            Some(field.trim().to_owned())
+        })
+        .collect()
+}
+
+/// The E2 carrier is re-derived after cache load; adding a persisted lifetime
+/// product would silently invalidate the frozen-model byte contract.
+#[test]
+fn dependency_ratchet_e2_keeps_cached_model_three_field_schema() {
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/analyses/borrow_ownership/model_cache.rs"),
+    )
+    .expect("model cache source");
+    assert_eq!(
+        cached_model_fields(&source),
+        ["model", "baseline_model", "overlap_receipt"],
+    );
+    assert_eq!(
+        cached_model_fields(
+            "struct CachedModel {\n pub(crate) model: M,\n pub(crate) lifetime_plan: P,\n}"
+        ),
+        ["model", "lifetime_plan"],
+        "the schema parser must expose a synthetic E2 cache breach",
+    );
+}
+
+fn e2_return_bypass_count(source: &str) -> usize {
+    // The production text ends where the test module begins (S11 gates single
+    // test-only items with `#[cfg(test)]` above it, which are not the boundary).
+    let end = source.find("#[cfg(test)]\nmod ").unwrap_or(source.len());
+    source[..end]
+        .lines()
+        .filter(|line| {
+            line.contains("EscapeKind::Return") && line.contains("return_permit(escape.subject)")
+        })
+        .count()
+}
+
+/// There is one typed return-escape opening and no boolean/set bypass.
+#[test]
+fn dependency_ratchet_e2_return_escape_has_one_typed_choke_point() {
+    let source = fs::read_to_string(module_root().join("decision/co_conversion.rs"))
+        .expect("co-conversion source");
+    assert_eq!(e2_return_bypass_count(&source), 1);
+    assert_eq!(
+        e2_return_bypass_count(
+            "match x {\n EscapeKind::Return if allowed.contains(&subject) => None,\n}"
+        ),
+        0,
+        "an untyped boolean/set bypass must not satisfy the ratchet",
+    );
+}
+
+/// Only the decision phase may consume OriginSummaries; later phases receive
+/// LifetimePlan. The shared carrier in mod.rs is transport, not a later-phase
+/// consumer, and is intentionally outside these phase directories.
+#[test]
+fn dependency_ratchet_e2_origin_summary_stays_in_decision_phase() {
+    for phase in ["plan", "apply", "verify", "artifact"] {
+        let dir = phase_dir(phase);
+        let hits = scan_root(&dir, &|_| false, &|line| {
+            line.contains("OriginSummar")
+                .then(|| line.trim().to_owned())
+        });
+        assert!(
+            hits.is_empty(),
+            "{phase} consumes E2 origin facts: {hits:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-phase rules (M1 architecture directive)
+// ---------------------------------------------------------------------------
+
+/// One phase's import restrictions.
+///
+/// The directive names one rule explicitly — `apply/` is analysis-blind and may
+/// see plan structs and the AST only. The remaining rules encode E1 state
+/// visibility's *one-way flow*: a phase may not name a phase downstream of it,
+/// because a back-pointer is exactly how "hands the next phase a finished
+/// value" decays into a shared mutable context.
+struct PhaseRule {
+    /// Directory under `bo_rewriter/`.
+    phase: &'static str,
+    forbidden: &'static [&'static str],
+    why: &'static str,
+}
+
+const PHASE_RULES: &[PhaseRule] = &[
+    PhaseRule {
+        phase: "apply",
+        forbidden: &[
+            "crate::analyses",
+            "super::decision",
+            "crate::bo_rewriter::decision",
+            "BoExport",
+            "export::",
+        ],
+        why: "apply is ANALYSIS-BLIND: it imports plan structs and the AST only. \
+              A question that arises here and is not answered by the plan is a \
+              PLAN defect — importing an analysis to answer it is the failure \
+              this rule exists to prevent",
+    },
+    PhaseRule {
+        phase: "decision",
+        forbidden: &["super::apply", "super::verify"],
+        why: "E1 one-way flow: decision hands plan a finished table and holds no \
+              back-pointer to a later phase",
+    },
+    PhaseRule {
+        phase: "verify",
+        forbidden: &["crate::analyses"],
+        why: "verify gates on the EMITTED crate and on values the earlier phases               handed it — `utils::type_check` plus the structural counters.               Re-consulting an analysis here would make a gate agree with the               decision that produced it, which is not a gate",
+    },
+    PhaseRule {
+        phase: "artifact",
+        forbidden: &["super::apply", "super::verify", "super::plan"],
+        why: "producer A SERIALIZES the decision table and compares nothing. It \
+              may read `decision` (that is its input) and \
+              `coverage_recon::schema` (the wire contract), and nothing else — \
+              a comparison appearing here would put the gate back beside the \
+              collector, which is the co-location this whole slice moved out",
+    },
+    PhaseRule {
+        phase: "plan",
+        forbidden: &["crate::analyses", "super::apply", "super::verify"],
+        why: "E1 one-way flow: plan consumes the decision table by value and may \
+              not re-consult an analysis, nor name a later phase",
+    },
+];
+
+fn phase_dir(phase: &str) -> std::path::PathBuf {
+    module_root().join(phase)
+}
+
+/// Each phase directory obeys its own import restrictions.
+#[test]
+fn phases_obey_their_import_rules() {
+    for rule in PHASE_RULES {
+        let dir = phase_dir(rule.phase);
+        assert!(
+            dir.is_dir(),
+            "phase directory {dir:?} is missing — the phase separation is part of \
+             the architecture, not an optional layout"
+        );
+        let hits = scan_phase(&dir, rule);
+        assert!(
+            hits.is_empty(),
+            "phase `{}` violates its import rule.\n{}\n{}",
+            rule.phase,
+            rule.why,
+            hits.join("\n")
+        );
+    }
+}
+
+/// One phase directory's violations. Extracted for the same reason as
+/// [`scan_root`]: asserting inline left this scan's accumulation unwitnessed,
+/// so deleting it would have gone unnoticed on clean sources.
+fn scan_phase(dir: &Path, rule: &PhaseRule) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_rs_files(dir, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no .rs files under {dir:?}; this check would pass vacuously"
+    );
+    let mut hits = Vec::new();
+    for file in &files {
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("unreadable phase source {file:?}: {e}"));
+        let name = file
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+
+        // (a) IMPORTS — resolved from the use-tree, so a brace-merged form is
+        // matched on its full path rather than on the text of one line.
+        for path in imported_paths(&text) {
+            for fragment in rule.forbidden {
+                if path.contains(fragment) {
+                    hits.push(format!("{name}: imports {path:?} containing {fragment:?}"));
+                }
+            }
+        }
+
+        // (b) NON-IMPORT references — an inline path expression such as
+        // `crate::rewriter::f()` is not a use-tree, so the textual scan is still
+        // needed. It is sound HERE because a path expression cannot be split
+        // across lines by the formatter the way a use-tree can.
+        for (lineno, line) in text.lines().enumerate() {
+            if is_comment(line) || line.trim_start().starts_with("use ") {
+                continue;
+            }
+            for fragment in rule.forbidden {
+                if line.contains(fragment) {
+                    hits.push(format!(
+                        "{name}:{}: names {fragment:?} outside an import",
+                        lineno + 1
+                    ));
+                }
+            }
+        }
+    }
+    hits
+}
+
+/// Every per-phase rule must actually fire on a breach.
+///
+/// Mutation coverage in test form: a rule whose matcher never matches is a rule
+/// that is not enforcing anything, and the whole point of this file is that the
+/// isolation is mechanical rather than aspirational.
+#[test]
+fn every_phase_rule_matches_a_synthetic_breach() {
+    for rule in PHASE_RULES {
+        for fragment in rule.forbidden {
+            let breach = format!("use {fragment}Something;");
+            assert!(
+                breach.contains(fragment),
+                "phase rule {}/{fragment:?} does not match its own synthetic \
+                 breach — the matcher is broken",
+                rule.phase
+            );
+            assert!(
+                !is_comment(&breach),
+                "synthetic breach was classified as a comment, so the scan would \
+                 skip it"
+            );
+        }
+    }
+}
+
+/// The phase set is complete: every directory under `bo_rewriter/` that holds a
+/// phase has a rule, so a new phase cannot be added silently unregulated.
+#[test]
+fn every_phase_directory_has_a_rule() {
+    let mut dirs: Vec<String> = fs::read_dir(module_root())
+        .expect("module root readable")
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "testdata")
+        .collect();
+    dirs.sort();
+    let mut ruled: Vec<String> = PHASE_RULES.iter().map(|r| r.phase.to_owned()).collect();
+    ruled.sort();
+    assert_eq!(
+        dirs, ruled,
+        "a phase directory exists with no import rule (or a rule names a \
+         directory that does not exist). Every phase is regulated, or the \
+         architecture claim is unenforced."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Syntax-aware import resolution (H1)
+// ---------------------------------------------------------------------------
+
+/// Fully-qualified import paths for one source file, with **merged and braced
+/// use-trees flattened**.
+///
+/// # Why this replaced a line scan
+///
+/// The previous matcher tested `line.contains(fragment)`. This repository's
+/// `rustfmt.toml` sets `imports_granularity = "Crate"`, which merges sibling
+/// imports into a braced tree and wraps it — so `use crate::analyses::X;`
+/// becomes
+///
+/// ```text
+/// use crate::{
+///     analyses::X,
+///     utils::Y,
+/// };
+/// ```
+///
+/// and **no line contains `crate::analyses`**. Every `crate::`-prefixed rule
+/// evaded simultaneously, and not hypothetically: `bo_rewriter/mod.rs` already
+/// carries exactly that form, so the rule was already blind to a real import at
+/// the moment it was written. A rule that cannot see the shape its own
+/// formatter produces is not enforcement.
+///
+/// Resolving the use-tree removes the formatter from the trust chain entirely:
+/// `use crate::{analyses::X}` and `use crate::analyses::X;` flatten to the same
+/// path, so how the source is wrapped stops mattering.
+fn imported_paths(text: &str) -> Vec<String> {
+    let Ok(file) = syn::parse_file(text) else {
+        // A file that does not parse cannot be cleared by this check. Returning
+        // a sentinel keeps the failure loud rather than silently vacuous.
+        return vec!["<unparseable — import check could not run>".to_owned()];
+    };
+    let mut out = Vec::new();
+    collect_use_items(&file.items, &mut out);
+    out
+}
+
+fn collect_use_items(items: &[syn::Item], out: &mut Vec<String>) {
+    for item in items {
+        match item {
+            syn::Item::Use(use_item) => flatten_use_tree(&use_item.tree, String::new(), out),
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    collect_use_items(inner, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn flatten_use_tree(tree: &syn::UseTree, prefix: String, out: &mut Vec<String>) {
+    let join = |prefix: &str, seg: &str| {
+        if prefix.is_empty() {
+            seg.to_owned()
+        } else {
+            format!("{prefix}::{seg}")
+        }
+    };
+    match tree {
+        syn::UseTree::Path(p) => {
+            flatten_use_tree(&p.tree, join(&prefix, &p.ident.to_string()), out)
+        }
+        syn::UseTree::Name(n) => out.push(join(&prefix, &n.ident.to_string())),
+        syn::UseTree::Rename(r) => out.push(join(&prefix, &r.ident.to_string())),
+        syn::UseTree::Glob(_) => out.push(join(&prefix, "*")),
+        syn::UseTree::Group(g) => {
+            for item in &g.items {
+                flatten_use_tree(item, prefix.clone(), out);
+            }
+        }
+    }
+}
+
+/// **H1 regression witness.** The matcher must catch BOTH breach shapes —
+/// the brace-merged form the formatter actually produces, and the single-line
+/// form. The old line scan caught only the second.
+///
+/// *Mutation-tested, Rider 0 order.* **Deletion first:** revert
+/// `phases_obey_their_import_rules` to a line scan and the merged case here
+/// stops being detected.
+#[test]
+fn matcher_catches_both_breach_shapes() {
+    let single_line = "use crate::analyses::borrow_ownership::SlotKind;\nfn f() {}\n";
+    let brace_merged = "use crate::{\n    analyses::borrow_ownership::SlotKind,\n    utils::rustc::RustProgram,\n};\nfn f() {}\n";
+
+    for (label, src) in [("single-line", single_line), ("brace-merged", brace_merged)] {
+        let paths = imported_paths(src);
+        assert!(
+            paths.iter().any(|p| p.contains("crate::analyses")),
+            "{label} breach was NOT resolved to a crate::analyses path; \
+             resolved paths were {paths:?}"
+        );
+    }
+
+    // And the shape that defeated the old matcher must be one no LINE contains.
+    assert!(
+        !brace_merged.lines().any(|l| l.contains("crate::analyses")),
+        "the brace-merged fixture no longer exercises the evasion it exists to \
+         reproduce — a line scan would catch it, so this witness is inert"
+    );
+}
+
+/// **H1's first real input.** The matcher is pointed at the merged import that
+/// was already in the tree and already invisible to the line scan.
+///
+/// `mod.rs` is the driver, not a phase, so importing analyses there is
+/// legitimate — what is asserted is that the MATCHER SEES IT. If this stops
+/// resolving, the enforcement has gone blind again in exactly the way H1
+/// described.
+#[test]
+fn matcher_resolves_the_existing_merged_import_in_mod_rs() {
+    let mod_rs = module_root().join("mod.rs");
+    let text = fs::read_to_string(&mod_rs).expect("driver source readable");
+    let paths = imported_paths(&text);
+    assert!(
+        paths.iter().any(|p| p.starts_with("crate::analyses")),
+        "the matcher did not resolve the driver's brace-merged analyses import; \
+         resolved paths were {paths:?}"
+    );
+    // Inspect the actual merged import. Unrelated fully-qualified type uses
+    // elsewhere in the driver do not change whether this import tests H1.
+    let syntax = syn::parse_file(&text).expect("driver syntax parses");
+    let merged = syntax.items.iter().any(|item| {
+        let syn::Item::Use(import) = item else { return false };
+        let syn::UseTree::Path(root) = &import.tree else { return false };
+        let syn::UseTree::Group(group) = &*root.tree else { return false };
+        root.ident == "crate"
+            && group
+                .items
+                .iter()
+                .any(|item| matches!(item, syn::UseTree::Path(path) if path.ident == "analyses"))
+    });
+    assert!(
+        merged,
+        "the driver must retain an actual brace-merged analyses import for H1"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R-C: the `if let` ban on outcome inspection, mechanized
+// ---------------------------------------------------------------------------
+
+/// **`if let RewriteOutcome::` is banned in this module tree.**
+///
+/// Twice a witness placed its load-bearing assertion inside
+/// `if let RewriteOutcome::Degraded { .. } = …` with no `else`, in a fixture
+/// that returns `Emitted` — so the assertion never ran. The second instance was
+/// written *in the commit that repaired the first*. A rule violated twice by
+/// the same author in consecutive rounds is the signature of something that
+/// needs a machine rather than a review note (R-C).
+///
+/// The check is deliberately narrow, and that is what makes it exact: clippy
+/// has no "if let without else" lint (`single_match_else` is the opposite
+/// shape), but the *type name* makes this shape unambiguous. Inspecting an
+/// outcome uses an exhaustive `match`, with every arm either asserting or
+/// documenting why it is unreachable.
+///
+/// A `let …else` (`let RewriteOutcome::Emitted { .. } = x else { panic!() }`)
+/// is NOT banned: its else branch is mandatory and diverging, so the
+/// unexecuted-assertion failure mode cannot arise.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the violation loop
+/// makes `if_let_ban_matches_a_synthetic_breach` fail.
+#[test]
+fn witnesses_never_inspect_an_outcome_with_a_bare_if_let() {
+    let root = module_root();
+    let violations = scan_root(
+        root,
+        &|file| is_denylist_self_reference(file, root),
+        &if_let_offense,
+    );
+
+    assert!(
+        violations.is_empty(),
+        "witnesses inspecting a RewriteOutcome must use an exhaustive `match` \
+         (or a diverging `let …else`), never a bare `if let` — the body is \
+         skipped for the arm the fixture actually takes, which is how two \
+         load-bearing assertions shipped unexecuted:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// The banned shape on one line, or `None`.
+fn if_let_offense(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("if let ") {
+        return None;
+    }
+    if !trimmed.contains("RewriteOutcome::") {
+        return None;
+    }
+    Some("bare `if let` on a RewriteOutcome".to_owned())
+}
+
+/// The R-C check must reject a real violation, not merely pass on clean code.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the
+/// `trimmed.contains("RewriteOutcome::")` guard in [`if_let_offense`] makes the
+/// negative cases below fail; deleting the `starts_with` guard makes the
+/// `match`/`let …else` cases fail.
+#[test]
+fn if_let_ban_matches_a_synthetic_breach() {
+    // The shape that shipped twice.
+    assert!(
+        if_let_offense("    if let RewriteOutcome::Degraded { reason, .. } = rewrite_m1(&src) {")
+            .is_some(),
+        "the exact shape this ban exists for was not detected"
+    );
+    // Indentation must not matter.
+    assert!(
+        if_let_offense("if let RewriteOutcome::Emitted { .. } = outcome {").is_some(),
+        "detection is indentation-sensitive"
+    );
+    // Permitted shapes.
+    assert!(
+        if_let_offense("    match rewrite_m1(&src) {").is_none(),
+        "an exhaustive match must not be flagged"
+    );
+    assert!(
+        if_let_offense("    let RewriteOutcome::Emitted { source, .. } = out else {").is_none(),
+        "a diverging `let …else` must not be flagged — its else branch is \
+         mandatory, so the unexecuted-assertion failure mode cannot arise"
+    );
+    assert!(
+        if_let_offense("    if let Some(span) = spans.first() {").is_none(),
+        "an `if let` on an unrelated type must not be flagged"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S3.0 (ruling 5): every PRODUCTION consumer of a `Decision` is exhaustive
+// ---------------------------------------------------------------------------
+
+/// True at the line that opens a file's inline `#[cfg(test)]` module BLOCK.
+///
+/// **One definition of "where production ends", shared by every
+/// production-scoped scan** — [`emission_call_sites`] and [`scan_production`]
+/// both consult it. It was inlined in the former until S3.0 needed the same
+/// rule; a second copy is how two scans start disagreeing about which lines are
+/// production.
+///
+/// It matches the `#[cfg(test)] mod x {` BLOCK, never the `#[cfg(test)] mod x;`
+/// DECLARATION: declarations sit at the TOP of a module file, so truncating on
+/// one would hide the whole production body — which is what the first version of
+/// this rule did.
+fn is_inline_test_block_start(lines: &[&str], index: usize) -> bool {
+    lines[index].trim() == "#[cfg(test)]"
+        && lines
+            .get(index + 1)
+            .is_some_and(|next| next.contains("mod ") && next.trim_end().ends_with('{'))
+}
+
+/// [`scan_root`], restricted to each file's PRODUCTION region.
+///
+/// Separate from `scan_root` because that function deliberately scans whole
+/// files: an import rule binds in tests too. An exhaustiveness rule does not —
+/// a test may legitimately branch on one variant — so the ruling scopes this
+/// class to production sites, and the scan has to agree with the ruling.
+fn scan_production(
+    root: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+    offense: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no .rs files found under {root:?} — the scan would pass vacuously"
+    );
+    let mut hits = Vec::new();
+    let mut scanned = 0usize;
+    for file in &files {
+        if skip(file) {
+            continue;
+        }
+        scanned += 1;
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
+        let lines: Vec<&str> = text.lines().collect();
+        for index in 0..lines.len() {
+            if is_inline_test_block_start(&lines, index) {
+                break;
+            }
+            if is_comment(lines[index]) {
+                continue;
+            }
+            if let Some(detail) = offense(lines[index]) {
+                hits.push(format!(
+                    "{}:{}: {detail}",
+                    file.strip_prefix(root).unwrap_or(file).display(),
+                    index + 1
+                ));
+            }
+        }
+    }
+    // Same survivor assert as `scan_root`, and for the same measured reason: an
+    // over-broad skip left a scan examining nothing and reporting clean.
+    assert!(
+        scanned > 0,
+        "every file under {root:?} was skipped — the scan examined nothing and \
+         would report clean regardless of what the sources contain"
+    );
+    hits
+}
+
+/// The pattern side of a `let`-family binder — the text between the keyword and
+/// the `=` — or `None` when the line is not one.
+///
+/// Splitting on `=` is what separates **destructuring** from **construction**:
+/// `let Decision::Ref { .. } = d` has `Decision::` on the pattern side and is a
+/// bypass; `let x = Decision::Ref { .. }` has it on the value side and is a
+/// perfectly ordinary construction. A predicate keyed on "the line mentions
+/// `Decision::`" would flag both, and would have been rewritten to silence the
+/// false positives.
+fn let_pattern(trimmed: &str) -> Option<&str> {
+    ["let ", "if let ", "while let "]
+        .iter()
+        .find_map(|kw| trimmed.strip_prefix(kw))
+        .map(|rest| rest.split('=').next().unwrap_or(""))
+}
+
+/// **Bypass shapes on a `Decision` are banned in production code.**
+///
+/// A `Decision` consumer must be an exhaustive `match`, so that adding a
+/// disposition is a compile error at every site that consumes one. Measured at
+/// S3.0 with a temporary third variant: `plan`'s `let …else` and the driver's
+/// `matches!` both compiled clean and silently dropped the subject — no edit, no
+/// `Unplaceable` record, no counted placement — while the two exhaustive sites
+/// failed the build as intended.
+///
+/// **The carve-out is the OPPOSITE of R-C's, and that is not an oversight.**
+/// R-C *permits* `let …else` on a `RewriteOutcome`, because its failure mode is
+/// an unexecuted assertion and a mandatory diverging `else` cannot produce one.
+/// Here `let …else` is the *primary* banned shape, because the failure mode is a
+/// **new variant** silently taking the `else` path. A guard written by analogy to
+/// R-C would miss the very site this rule exists for.
+///
+/// **Stated limitation: a wildcard `_` arm is beyond a line scan.**
+/// `match d { Decision::Ref { .. } => …, _ => … }` bypasses exhaustiveness and is
+/// not detectable here. This guard bans bypass **shapes**; wildcard vigilance
+/// stays with the site comments and review. Saying so at the predicate is the
+/// point — a guard whose reach is overstated is worse than one whose reach is
+/// known.
+fn decision_offense(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    if !trimmed.contains("Decision::") {
+        return None;
+    }
+    if let_pattern(trimmed).is_some_and(|pattern| pattern.contains("Decision::")) {
+        return Some(
+            "`let` / `if let` / `while let` destructuring a Decision — use an \
+             exhaustive `match`"
+                .to_owned(),
+        );
+    }
+    if trimmed.contains("matches!(") {
+        return Some("`matches!` on a Decision — use an exhaustive `match`".to_owned());
+    }
+    None
+}
+
+/// **Fatness must not be named in the emission phases — or, for now, in the
+/// decision phase either.**
+///
+/// Two bans with different lifetimes, deliberately expressed as one predicate
+/// and separated by the SCOPE the caller passes:
+///
+/// - **`apply/**` and `plan/**` — PERMANENT.** This half is architecture:
+///   emission consumes a `Decision`, never an analysis result. E1 states it;
+///   this enforces it.
+/// - **`decision/**` — FOR THE DURATION OF S3.2′-1** (reviewer amendment A).
+///   The slice claims it changes no decision, and a wired-but-dormant path
+///   would satisfy every corpus invariant while violating exactly that claim.
+///   Mechanized rather than left to inspection. **S3.2′-4's micro-plan carries a
+///   named task to lift this entry**, at the point a fat verdict has a form to
+///   select.
+fn fatness_offense(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    for needle in ["FatnessResult", "FatFacts", "type_qualifier"] {
+        if t.contains(needle) {
+            return Some(format!("names `{needle}`"));
+        }
+    }
+    // Bare `Fatness` last, and word-boundary-ish: `FatnessResult` is already
+    // caught above, and matching a bare substring would flag it twice with the
+    // wrong detail.
+    if t.contains("Fatness") {
+        return Some("names `Fatness`".to_owned());
+    }
+    None
+}
+
+/// **A `Subject::hir_id` initialised to `CRATE_HIR_ID` is banned in production.**
+///
+/// Why a *source* ban and not a runtime assert: the damage a placeholder does
+/// here is silent by nature. The two A1 emitability gates key on
+/// `(fn_did, hir_id)`, and `CRATE_HIR_ID` is never what `Res::Local` resolves a
+/// use to — so a placeholder does not weaken the gates, it makes the lookup
+/// **unable to hit**. Nothing fails, no reason is attributed, and the subject
+/// is emitted. S3.1 shipped exactly this for every local: 0 of 3,142 locals
+/// stopped at A1, against 1,231 of 4,306 parameters.
+///
+/// The predicate is deliberately narrow — a **field initialiser** whose name is
+/// `hir_id` — rather than "the line mentions `CRATE_HIR_ID`". A broad version
+/// would flag prose and the `use` item and would have been loosened the first
+/// time it cried wolf, which is how a guard stops being one.
+///
+/// Production-scoped per the ratified deviation: the three synthetic test
+/// constructors carry `CRATE_HIR_ID` beside `CRATE_DEF_ID` and `DUMMY_SP` as a
+/// fixture convention, reach no A1 gate, and are not a defect to repair.
+fn hir_placeholder_offense(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let (field, value) = trimmed.split_once(':')?;
+    if field.trim() != "hir_id" || !value.contains("CRATE_HIR_ID") {
+        return None;
+    }
+    Some(
+        "`Subject::hir_id` initialised to the `CRATE_HIR_ID` placeholder — the \
+         A1 emitability lookups key on it, so a placeholder makes them \
+         unreachable rather than merely weak"
+            .to_owned(),
+    )
+}
+
+/// *Mutation-tested (Rider 0, deletion first):* deleting either repaired
+/// `match` — reverting `plan/mod.rs` to its `let …else` or `mod.rs` to its
+/// `matches!` — makes this test FAIL and name that file. That is simultaneously
+/// this guard's witness and the S3.0 repair's own.
+#[test]
+fn production_decision_consumers_are_exhaustive() {
+    let root = module_root();
+    let violations = scan_production(root, &is_test_only_file, &decision_offense);
+
+    assert!(
+        violations.is_empty(),
+        "production code must consume a `Decision` through an exhaustive \
+         `match`, never a bypass shape — a bypass compiles clean against a new \
+         disposition and drops the subject silently:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// The S3.0 check must reject real violations, not merely pass on clean code.
+///
+/// *Mutation-tested (Rider 0, deletion first), with one claim CORRECTED after
+/// measurement:* deleting the `let_pattern` branch makes the three destructuring
+/// cases fail; deleting the `matches!` branch makes that case fail; narrowing
+/// `let_pattern` makes the `let …else` case fail.
+///
+/// Deleting the `trimmed.contains("Decision::")` early return does **NOT** fail
+/// this test — an earlier draft of this comment claimed it would, and the
+/// mutation refuted it. That case (`if let Some(span) = spans.first()`) has no
+/// `Decision::` in its pattern and no `matches!(`, so it returns `None` either
+/// way. The early return is still load-bearing, but it is witnessed by
+/// [`production_decision_consumers_are_exhaustive`] instead: without it, every
+/// production `matches!(` on any other type is flagged and the scan fails.
+/// Recorded rather than silently re-pointed, because a mutation claim that was
+/// wrong is the kind of thing that gets copied forward.
+#[test]
+fn decision_ban_matches_a_synthetic_breach() {
+    // The two shapes S3.0 repaired.
+    assert!(
+        decision_offense("        let Decision::Ref { mutable } = decision else {").is_some(),
+        "the `let …else` shape this ban exists for was not detected"
+    );
+    assert!(
+        decision_offense("            if !matches!(decision, decision::Decision::Ref { .. }) {")
+            .is_some(),
+        "the `matches!` shape this ban exists for was not detected"
+    );
+    // The mandated amendment: the else-less `if let` is the original member of
+    // R-C's shape family and skips new variants just as silently.
+    assert!(
+        decision_offense("    if let Decision::Ref { mutable } = decision {").is_some(),
+        "a bare `if let` on a Decision must be flagged"
+    );
+    assert!(
+        decision_offense("    while let Decision::Ref { .. } = next() {").is_some(),
+        "a `while let` on a Decision must be flagged"
+    );
+    // Indentation must not matter.
+    assert!(
+        decision_offense("if let Decision::Degraded(r) = d {").is_some(),
+        "detection is indentation-sensitive"
+    );
+    // Permitted shapes.
+    assert!(
+        decision_offense("        let mutable = match decision {").is_none(),
+        "an exhaustive match must not be flagged"
+    );
+    assert!(
+        decision_offense("            Decision::Degraded(_) => continue,").is_none(),
+        "a match ARM must not be flagged"
+    );
+    assert!(
+        decision_offense("    let x = Decision::Ref { mutable: true };").is_none(),
+        "CONSTRUCTING a Decision must not be flagged — only destructuring bypasses"
+    );
+    assert!(
+        decision_offense("    let d = if c { Decision::Ref { mutable: true } } else { other };")
+            .is_none(),
+        "an `if`/`else` VALUE containing a construction must not be flagged — \
+         this is why the predicate splits on `=` rather than looking for ` else`"
+    );
+    assert!(
+        decision_offense("    if let Some(span) = spans.first() {").is_none(),
+        "a binder on an unrelated type must not be flagged"
+    );
+}
+
+/// **No production `Subject` is built with a placeholder HIR binding.**
+///
+/// The S3.1′ guard. It is the generalization the locals-A1 HIGH was missing:
+/// the defect was not that *this* field was wrong, it was that a new population
+/// was admitted without asking whether every `Subject` field keeps its meaning
+/// across populations. This catches the next population — S3.2's owning locals,
+/// M2's struct fields — rather than the one already repaired.
+///
+/// *Mutation-tested (Rider 0, deletion first):* restoring
+/// `hir_id: rustc_hir::CRATE_HIR_ID` in `collect_local_subjects` makes this test
+/// FAIL and name `mod.rs` with the line number. That is simultaneously this
+/// guard's witness and the S3.1′ repair's own.
+#[test]
+fn production_subjects_carry_a_real_hir_binding() {
+    let root = module_root();
+    let violations = scan_production(root, &is_test_only_file, &hir_placeholder_offense);
+
+    assert!(
+        violations.is_empty(),
+        "a production `Subject` carries a placeholder HIR binding — the A1 \
+         emitability gates key on it and cannot hit, so the subject skips them \
+         silently and is emitted with no reason attributed:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// **No EMISSION phase names fatness.**
+///
+/// # The `decision/` entry was LIFTED at S3.2′-2 (U-5), as a named task
+///
+/// The ban covered `decision/` for the duration of S3.2′-1, whose claim was that
+/// it changed no decision — and only a mechanized ban distinguishes *"not
+/// wired"* from *"wired but currently dormant"*, since the two look identical in
+/// every corpus number. That claim is spent: S3.2′-2 consumes fatness as the
+/// borrowed-slice **license**, so the entry is lifted deliberately rather than
+/// eroded.
+///
+/// The lift was scheduled for S3.2′-4 by U-4. **U-5 re-sequenced the ladder and
+/// -2 now leads it**, so the entry moves with the slice that needs it, not with
+/// the slice number that happened to be written down.
+///
+/// `apply/` and `plan/` stay banned **permanently**: emission consumes a
+/// `Decision`, never an analysis result. Narrowing the scan rather than deleting
+/// the test is the point — the ban still has teeth over the two phases whose
+/// analysis-blindness is architectural.
+///
+/// *Mutation-tested (Rider 0, deletion first):* adding
+/// `use crate::analyses::type_qualifier::…` to `plan/mod.rs` or `apply/mod.rs`
+/// fails this test and names the file.
+#[test]
+fn emission_and_decision_phases_do_not_name_fatness() {
+    let root = module_root();
+    let scoped = |p: &Path| {
+        let s = p.display().to_string();
+        // Skip everything that is NOT one of the three regulated phases.
+        !(s.contains("/apply/") || s.contains("/plan/")) || is_test_only_file(p)
+    };
+    let violations = scan_production(root, &scoped, &fatness_offense);
+    assert!(
+        violations.is_empty(),
+        "an EMISSION phase names fatness. `apply/` and `plan/` are banned \
+         permanently — emission consumes a `Decision`, never an analysis \
+         result. (`decision/` was lifted at S3.2′-2 under U-5, deliberately: it \
+         consumes fatness as the borrowed-slice license.):\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// The fatness ban must reject a real breach, not merely pass on clean code.
+#[test]
+fn fatness_ban_matches_a_synthetic_breach() {
+    assert!(
+        fatness_offense("use crate::analyses::type_qualifier::foster::fatness::Fatness;").is_some(),
+        "the import shape S3.2′-4 will add was not detected"
+    );
+    assert!(
+        fatness_offense("    let f: FatnessResult = fatness_analysis(&program);").is_some(),
+        "a FatnessResult binding was not detected"
+    );
+    // The case a surviving mutation exposed. Emptying the needle list left
+    // this test green, because the bare-`Fatness` fallback catches the two
+    // shapes above. It does NOT catch a lowercase import of the analysis
+    // ENTRY POINT — no `Fatness` token appears on the line — and that is the
+    // most natural way to wire the analysis in. Only the `type_qualifier`
+    // needle sees it, so only this assertion pins that needle.
+    assert!(
+        fatness_offense("use crate::analyses::type_qualifier::foster::fatness::fatness_analysis;")
+            .is_some(),
+        "a lowercase import of the analysis entry point carries no `Fatness` \
+         token — the `type_qualifier` needle is the only thing that catches it"
+    );
+    assert!(
+        fatness_offense("    if fat.is_array(s.fn_did, s.local) {").is_none(),
+        "the ban is on NAMING the analysis types, not on any identifier — \
+         `fat.is_array(..)` through an adapter parameter is not itself a breach"
+    );
+    assert!(
+        fatness_offense("    let x = 1;").is_none(),
+        "an unrelated line must not be flagged"
+    );
+}
+
+/// The guard must reject a real violation, not merely pass on clean code.
+///
+/// Deliberately includes the near-misses. A guard keyed on "the line mentions
+/// `CRATE_HIR_ID`" would flag the `use` item and every doc line that explains
+/// *why* the placeholder is banned — and would then be loosened, which is how
+/// this class of guard dies.
+#[test]
+fn hir_placeholder_ban_matches_a_synthetic_breach() {
+    assert!(
+        hir_placeholder_offense("                hir_id: rustc_hir::CRATE_HIR_ID,").is_some(),
+        "the exact shape S3.1 shipped was not detected"
+    );
+    assert!(
+        hir_placeholder_offense("hir_id: CRATE_HIR_ID,").is_some(),
+        "detection must not depend on the path prefix or on indentation"
+    );
+    // Near-misses that must NOT be flagged.
+    assert!(
+        hir_placeholder_offense("                hir_id,").is_none(),
+        "field shorthand carrying a real binding must not be flagged"
+    );
+    assert!(
+        hir_placeholder_offense("                hir_id: pat.hir_id,").is_none(),
+        "a real binding must not be flagged"
+    );
+    assert!(
+        hir_placeholder_offense("use rustc_hir::CRATE_HIR_ID;").is_none(),
+        "the `use` item is not a Subject field initialiser"
+    );
+    assert!(
+        hir_placeholder_offense("    let x = CRATE_HIR_ID;").is_none(),
+        "an unrelated binding of the constant is not this offense"
+    );
+    assert!(
+        hir_placeholder_offense("    other_id: rustc_hir::CRATE_HIR_ID,").is_none(),
+        "the ban is on `hir_id` specifically, not on any field"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// S2a-H amendment (b): the import direction is ONE-WAY
+// ---------------------------------------------------------------------------
+
+/// **`coverage_recon/` imports NOTHING from `bo_rewriter`.**
+///
+/// Only the reverse direction is licensed — `bo_rewriter::artifact` reads
+/// `coverage_recon::schema`, the wire contract. **Producer B is the point of
+/// this rule.** An import from `bo_rewriter` into the independent reference
+/// walker is exactly the conceptual leakage the authorship split exists to
+/// prevent, and unlike the leakage that can hide in a specification, this form
+/// is mechanically detectable — so it is mechanized.
+///
+/// This is the compensating control for keeping `coverage_recon` in-crate
+/// rather than behind a crate boundary: the boundary is enforced by test
+/// instead of by the module system.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the violation
+/// accumulation makes `coverage_recon_rule_matches_a_synthetic_breach` fail.
+#[test]
+fn coverage_recon_never_imports_from_bo_rewriter() {
+    let root = module_root()
+        .parent()
+        .expect("bo_rewriter has a parent")
+        .join("coverage_recon");
+    let violations = scan_root(&root, &|_| false, &bo_rewriter_reference);
+    assert!(
+        violations.is_empty(),
+        "coverage_recon must not reference bo_rewriter — producer B's \
+         independence is the point of this rule:\n  {}",
+        violations.join("\n  ")
+    );
+}
+
+/// A reference to `bo_rewriter` on one line, or `None`.
+fn bo_rewriter_reference(line: &str) -> Option<String> {
+    if line.contains("bo_rewriter") {
+        return Some("reference to bo_rewriter".to_owned());
+    }
+    None
+}
+
+/// The one-way rule must reject a real breach, not merely pass on clean code.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `line.contains`
+/// check in [`bo_rewriter_reference`] fails this.
+#[test]
+fn coverage_recon_rule_matches_a_synthetic_breach() {
+    assert!(
+        bo_rewriter_reference("use crate::bo_rewriter::decision::Subject;").is_some(),
+        "a direct import from bo_rewriter was not detected"
+    );
+    assert!(
+        bo_rewriter_reference("    let x = super::super::bo_rewriter::rewrite_m1(s);").is_some(),
+        "a path reference to bo_rewriter was not detected"
+    );
+    assert!(
+        bo_rewriter_reference("use crate::analyses::borrow_ownership::SlotKind;").is_none(),
+        "an unrelated import must not be flagged"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice D — synthetic-corpus witnesses: every scan's ACCUMULATION is exercised
+// ---------------------------------------------------------------------------
+//
+// Before these, each rule had a "synthetic breach" test that exercised only its
+// MATCHER (`FORBIDDEN.contains`, `if_let_offense`, `bo_rewriter_reference`) and
+// never the scan that calls it. On clean sources the scans return empty, so the
+// accumulation could be deleted with the whole suite still green — verified, at
+// 912/6 unchanged, for the `coverage_recon` rule.
+//
+// Each test below feeds a corpus that genuinely violates its rule to the SAME
+// scan function the production check uses, plus a clean file so the assertion
+// is not satisfied by indiscriminate matching.
+
+/// **Frozen-rewriter scan** reports a real violation in a real corpus.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `hits.push(...)`
+/// in [`scan_root`] fails this.
+#[test]
+fn frozen_rewriter_scan_reports_a_synthetic_corpus_violation() {
+    let dir = temp_corpus(
+        "frozen",
+        &[
+            ("bad.rs", "use crate::rewriter::decision::PtrKind;\n"),
+            (
+                "good.rs",
+                "use crate::analyses::borrow_ownership::SlotKind;\n",
+            ),
+        ],
+    );
+    let hits = scan_root(&dir, &|_| false, &frozen_rewriter_offense);
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly the one violation: {hits:?}"
+    );
+    assert!(hits[0].starts_with("bad.rs:1:"), "{hits:?}");
+    drop_corpus(&dir);
+}
+
+/// **R-C `if let` scan** reports a real violation in a real corpus.
+///
+/// This is the F3 repair proper: the rule's previous witness called
+/// `if_let_offense` directly and never touched the scan.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `hits.push(...)`
+/// in [`scan_root`] fails this.
+#[test]
+fn if_let_scan_reports_a_synthetic_corpus_violation() {
+    let dir = temp_corpus(
+        "iflet",
+        &[
+            (
+                "bad.rs",
+                "fn t() {\n    if let RewriteOutcome::Degraded { .. } = out {}\n}\n",
+            ),
+            (
+                "good.rs",
+                "fn t() {\n    match out {\n        _ => {}\n    }\n}\n",
+            ),
+        ],
+    );
+    let hits = scan_root(&dir, &|_| false, &if_let_offense);
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly the one violation: {hits:?}"
+    );
+    assert!(hits[0].starts_with("bad.rs:2:"), "{hits:?}");
+    drop_corpus(&dir);
+}
+
+/// **`coverage_recon` one-way rule** reports a real violation in a real corpus.
+///
+/// The instance this author introduced one slice after diagnosing the pattern.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting the `hits.push(...)`
+/// in [`scan_root`] fails this.
+#[test]
+fn coverage_recon_scan_reports_a_synthetic_corpus_violation() {
+    let dir = temp_corpus(
+        "recon",
+        &[
+            ("bad.rs", "use crate::bo_rewriter::decision::Subject;\n"),
+            ("good.rs", "use super::schema::Row;\n"),
+        ],
+    );
+    let hits = scan_root(&dir, &|_| false, &bo_rewriter_reference);
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly the one violation: {hits:?}"
+    );
+    assert!(hits[0].starts_with("bad.rs:1:"), "{hits:?}");
+    drop_corpus(&dir);
+}
+
+/// **Per-phase scan** reports a real violation in a real corpus, in BOTH of its
+/// detection modes — the resolved use-tree and the inline path expression.
+///
+/// The fourth instance of the pattern, found by Slice D's audit rather than
+/// named in its scope.
+///
+/// *Mutation-tested (Rider 0, deletion first):* deleting either `hits.push(...)`
+/// in [`scan_phase`] fails this — the two assertions below separate the modes,
+/// so neither deletion hides behind the other.
+#[test]
+fn phase_scan_reports_a_synthetic_corpus_violation() {
+    let rule = PhaseRule {
+        phase: "synthetic",
+        forbidden: &["crate::analyses"],
+        why: "synthetic rule for the witness",
+    };
+    let dir = temp_corpus(
+        "phase",
+        &[
+            (
+                "bad_import.rs",
+                "use crate::analyses::borrow_ownership::SlotKind;\n",
+            ),
+            (
+                "bad_path.rs",
+                "fn f() {\n    let _ = crate::analyses::thing();\n}\n",
+            ),
+            ("good.rs", "use super::schema::Row;\n"),
+        ],
+    );
+    let hits = scan_phase(&dir, &rule);
+    assert!(
+        hits.iter().any(|h| h.starts_with("bad_import.rs: imports")),
+        "the use-tree mode did not report its violation: {hits:?}"
+    );
+    assert!(
+        hits.iter().any(|h| h.starts_with("bad_path.rs:2:")),
+        "the inline-path mode did not report its violation: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.starts_with("good.rs")),
+        "a clean file was reported: {hits:?}"
+    );
+    drop_corpus(&dir);
+}
+
+/// Remove a temp corpus. Called only after assertions pass, so a failing test
+/// leaves its inputs on disk.
+#[cfg(test)]
+fn drop_corpus(dir: &Path) {
+    let _ = fs::remove_dir_all(dir);
+}
+
+// ---------------------------------------------------------------------------
+// S2b.0a.3 — ONE EMISSION PATH.
+//
+// The ruling: the string entry point becomes a thin wrapper over the per-file
+// mechanism, or is retired; no second parallel emission path survives. A second
+// path is the hazard class this milestone exists to remove, because it would be
+// exercised by every test and by nothing real — which is exactly how M1's
+// single-source assumption reached first corpus contact undetected.
+//
+// Mechanized as: **no production code under `bo_rewriter/` compiles a crate
+// from a STRING.** `run_compiler_on_path` is the one compiler entry.
+// ---------------------------------------------------------------------------
+
+/// Non-comment lines under `root` that CALL the emission core, ignoring each
+/// file's inline `#[cfg(test)]` module and the definition itself.
+fn emission_call_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    assert!(
+        !files.is_empty(),
+        "no .rs files found under {root:?} — the scan would pass vacuously"
+    );
+    let mut hits = Vec::new();
+    let mut scanned = 0usize;
+    for file in &files {
+        if skip(file) {
+            continue;
+        }
+        scanned += 1;
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
+        // Truncation rule extracted to `is_inline_test_block_start` at S3.0 —
+        // ONE definition of "where production ends", now shared with
+        // `scan_production`. Its doc carries the block-vs-declaration reasoning
+        // that lived here.
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if is_inline_test_block_start(&lines, index) {
+                break;
+            }
+            if is_comment(line) || line.contains("fn emit_files") {
+                continue;
+            }
+            if line.contains("emit_files(") {
+                hits.push(format!(
+                    "{}:{}: {}",
+                    file.strip_prefix(root).unwrap_or(file).display(),
+                    index + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        scanned > 0,
+        "every file under {root:?} was skipped — the scan examined nothing"
+    );
+    hits
+}
+
+/// Whole-file test modules: these are `#[cfg(test)] mod x;` at their parent, so
+/// there is no `#[cfg(test)]` line inside them to truncate at.
+fn is_test_only_file(path: &Path) -> bool {
+    static FILES: std::sync::OnceLock<std::collections::BTreeSet<std::path::PathBuf>> =
+        std::sync::OnceLock::new();
+    let files = FILES.get_or_init(|| test_only_files(module_root()));
+    path.canonicalize().is_ok_and(|path| files.contains(&path))
+}
+
+/// R218's shared registry: a file is excluded only when all discovered module
+/// routes to it carry an explicit `cfg(test)` gate. Unreferenced files remain
+/// scanned, and an ungated alias of a test module keeps that file in scope.
+fn test_only_files(root: &Path) -> std::collections::BTreeSet<std::path::PathBuf> {
+    use std::{collections::BTreeSet, path::PathBuf};
+
+    use syn::visit::Visit;
+
+    fn test_gate(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Path>()
+                    .is_ok_and(|path| path.is_ident("test"))
+        })
+    }
+
+    fn explicit_path(attrs: &[syn::Attribute]) -> Option<PathBuf> {
+        // An unresolved conditional path could conceal a production route to
+        // a file also reached through a test gate. Refuse that ambiguity.
+        assert!(
+            !attrs.iter().any(|attr| attr.path().is_ident("cfg_attr")),
+            "conditional module attributes need explicit test-file registry resolution"
+        );
+        attrs
+            .iter()
+            .find(|attr| attr.path().is_ident("path"))
+            .map(|attr| {
+                let syn::Meta::NameValue(value) = &attr.meta else {
+                    panic!("module path attribute must name a literal source path")
+                };
+                let syn::Expr::Lit(value) = &value.value else {
+                    panic!("module path attribute must be a string literal")
+                };
+                let syn::Lit::Str(path) = &value.lit else {
+                    panic!("module path attribute must be a string literal")
+                };
+                PathBuf::from(path.value())
+            })
+    }
+
+    // The directory and optional relative component mirror Rust's module
+    // loading rules: foo.rs adds foo/ for default children; explicit #[path]
+    // files behave as mod.rs, and inline modules consume that component.
+    struct Modules<'a> {
+        directory: PathBuf,
+        relative: Option<String>,
+        gated: bool,
+        pending: &'a mut Vec<(PathBuf, Option<String>, bool)>,
+    }
+
+    impl<'ast> Visit<'ast> for Modules<'_> {
+        fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+            let ident = module.ident.to_string();
+            let name = ident.strip_prefix("r#").unwrap_or(&ident);
+            let gated = self.gated || test_gate(&module.attrs);
+            let explicit = explicit_path(&module.attrs);
+            let default_directory = self.relative.as_ref().map_or_else(
+                || self.directory.clone(),
+                |relative| self.directory.join(relative),
+            );
+            if let Some((_, items)) = &module.content {
+                let directory = explicit.map_or_else(
+                    || default_directory.join(name),
+                    |path| self.directory.join(path),
+                );
+                let mut nested = Modules {
+                    directory,
+                    relative: None,
+                    gated,
+                    pending: &mut *self.pending,
+                };
+                for item in items {
+                    nested.visit_item(item);
+                }
+                return;
+            }
+            let (file, relative) = if let Some(path) = explicit {
+                (self.directory.join(path), None)
+            } else {
+                let direct = default_directory.join(format!("{name}.rs"));
+                let nested = default_directory.join(name).join("mod.rs");
+                assert!(
+                    !(direct.is_file() && nested.is_file()),
+                    "ambiguous module source files: {direct:?} and {nested:?}"
+                );
+                if direct.is_file() {
+                    (direct, Some(name.to_owned()))
+                } else {
+                    (nested, None)
+                }
+            };
+            // A missing conditional module excludes no file. Existing but
+            // unregistered files remain in every production scanner's walk.
+            if file.is_file() {
+                self.pending.push((file, relative, gated));
+            }
+        }
+    }
+
+    let entry = ["mod.rs", "lib.rs", "main.rs"]
+        .into_iter()
+        .map(|name| root.join(name))
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("test-file registry has no module entry under {root:?}"));
+    let mut pending = vec![(entry, None, false)];
+    let mut seen = BTreeSet::new();
+    let mut gated_files = BTreeSet::new();
+    let mut production_files = BTreeSet::new();
+    while let Some((file, relative, inherited_gate)) = pending.pop() {
+        let identity = file.canonicalize().expect("module file identity resolves");
+        let directory = file
+            .parent()
+            .expect("module source parent")
+            .canonicalize()
+            .expect("module directory resolves");
+        if !seen.insert((
+            identity.clone(),
+            directory.clone(),
+            relative.clone(),
+            inherited_gate,
+        )) {
+            continue;
+        }
+        let text = fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("module source unreadable at {file:?}: {error}"));
+        let syntax = syn::parse_file(&text)
+            .unwrap_or_else(|error| panic!("module registry could not parse {file:?}: {error}"));
+        let gated = inherited_gate || test_gate(&syntax.attrs);
+        if gated {
+            gated_files.insert(identity);
+        } else {
+            production_files.insert(identity);
+        }
+        Modules {
+            directory,
+            relative,
+            gated,
+            pending: &mut pending,
+        }
+        .visit_file(&syntax);
+    }
+    gated_files.difference(&production_files).cloned().collect()
+}
+
+#[test]
+fn cfg_test_module_files_are_excluded_by_declaration_identity() {
+    let root = temp_corpus(
+        "cfg-test-file-scope",
+        &[
+            (
+                "mod.rs",
+                "pub mod production;\n#[cfg(test)]\nmod fresh_checks;\n#[cfg(test)]\n#[path = \"support/renamed.rs\"]\nmod differently_named;\n#[cfg(test)]\nmod inline_checks { mod nested; }\nmod ordinary_inline { #[cfg(test)] mod selected; mod ordinary; }\n",
+            ),
+            (
+                "production.rs",
+                "#[cfg(test)]\nmod deeply_named;\nmod ordinary;\n",
+            ),
+            ("production/deeply_named.rs", "fn check() {}\n"),
+            ("production/ordinary.rs", "fn production() {}\n"),
+            ("fresh_checks.rs", "mod child;\nfn check() {}\n"),
+            ("fresh_checks/child.rs", "fn inherited_test_scope() {}\n"),
+            ("support/renamed.rs", "fn path_selected_test() {}\n"),
+            (
+                "inline_checks/nested.rs",
+                "fn inline_parent_test_scope() {}\n",
+            ),
+            (
+                "ordinary_inline/selected.rs",
+                "fn individually_gated_test() {}\n",
+            ),
+            ("ordinary_inline/ordinary.rs", "fn production() {}\n"),
+        ],
+    );
+    let expected: std::collections::BTreeSet<_> = [
+        "production/deeply_named.rs",
+        "fresh_checks.rs",
+        "fresh_checks/child.rs",
+        "support/renamed.rs",
+        "inline_checks/nested.rs",
+        "ordinary_inline/selected.rs",
+    ]
+    .into_iter()
+    .map(|relative| root.join(relative))
+    .collect();
+    assert_eq!(
+        test_only_files(&root),
+        expected,
+        "every outlined module gated by cfg(test), including inherited gates, must share the test-only file selection"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn nongated_module_files_are_never_excluded_by_basename() {
+    let root = temp_corpus(
+        "nongated-file-scope",
+        &[
+            (
+                "mod.rs",
+                "pub mod emit_tests;\n#[cfg(not(test))]\nmod goldens;\n#[cfg(any(test, feature = \"production\"))]\nmod import_denylist;\n#[cfg(test)]\n#[path = \"shared.rs\"]\nmod test_view;\n#[path = \"shared.rs\"]\nmod production_view;\n",
+            ),
+            ("emit_tests.rs", "fn production_despite_its_name() {}\n"),
+            ("goldens.rs", "fn explicitly_non_test() {}\n"),
+            (
+                "import_denylist.rs",
+                "fn also_reachable_without_test() {}\n",
+            ),
+            ("shared.rs", "fn both_contexts() {}\n"),
+            (
+                "lifetime_oracle_tests.rs",
+                "fn unregistered_file_is_not_proven_test_only() {}\n",
+            ),
+        ],
+    );
+    assert!(
+        test_only_files(&root).is_empty(),
+        "a familiar filename or one gated path must not hide production-reachable or unregistered source files: {:?}",
+        test_only_files(&root)
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// **Production check — ONE EMISSION PATH.** Exactly one production call site
+/// drives `decide → plan → apply → verify`.
+///
+/// The check was first written as "no production code compiles a crate from a
+/// string". That was the wrong invariant: the ruling is about a second
+/// *emission* path, not about the compiler's input form, and the string entry
+/// point legitimately compiles a string — staging it to disk instead made every
+/// span render against a pid-bearing temp directory. Counting emission call
+/// sites tests the property that was actually ruled.
+#[test]
+fn production_code_has_exactly_one_emission_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bo_rewriter");
+    let hits = emission_call_sites(&root, &is_test_only_file);
+    assert_eq!(
+        hits.len(),
+        1,
+        "expected exactly one production emission call site; a second parallel \
+         path would be exercised by every test and by nothing real:\n  {}",
+        hits.join("\n  ")
+    );
+}
+
+/// **Witness — the scan can fail.** Same function, synthetic corpus with two
+/// call sites. Without this the production check is an unwitnessed scan, which
+/// this file already records four instances of.
+#[test]
+fn the_emission_path_scan_counts_every_call_site() {
+    let dir = temp_corpus(
+        "emission-two-sites",
+        &[
+            (
+                "one.rs",
+                "fn a() {\n    let x = emit_files(tcx, &table);\n}\n",
+            ),
+            (
+                "two.rs",
+                "fn b() {\n    let y = emit_files(tcx, &table);\n}\n",
+            ),
+        ],
+    );
+    let hits = emission_call_sites(&dir, &|_| false);
+    assert_eq!(
+        hits.len(),
+        2,
+        "the scan missed a second emission path: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **Witness — the truncation rule is what makes it selective.** The same call
+/// in a `#[cfg(test)]` tail is not a production path; without truncation the
+/// crate's own witnesses would trip the production check.
+#[test]
+fn the_emission_path_scan_ignores_the_test_tail() {
+    let dir = temp_corpus(
+        "emission-test-tail",
+        &[(
+            "tailed.rs",
+            "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { emit_files(tcx, &table); }\n}\n",
+        )],
+    );
+    let hits = emission_call_sites(&dir, &|_| false);
+    assert!(
+        hits.is_empty(),
+        "a test-tail call was reported as production: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **Witness — a `#[cfg(test)] mod x;` DECLARATION is not a test tail.**
+///
+/// These sit at the top of a module file. The first version of the rule stopped
+/// at any `#[cfg(test)]`, so it truncated `bo_rewriter/mod.rs` at its test-module
+/// declarations and reported ZERO production call sites — a scan that would
+/// have passed forever once someone "fixed" the expected count.
+#[test]
+fn the_emission_path_scan_does_not_stop_at_a_test_module_declaration() {
+    let dir = temp_corpus(
+        "emission-mod-decl",
+        &[(
+            "decl.rs",
+            "#[cfg(test)]\nmod tests;\n\nfn production() {\n    emit_files(tcx, &table);\n}\n",
+        )],
+    );
+    let hits = emission_call_sites(&dir, &|_| false);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a test-module DECLARATION hid the production body: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// S2b.1 F3 — ONE FILLING SITE PER OUTCOME VARIANT.
+//
+// The outcome variants were hand-filled at seven sites, and twice a `Degraded`
+// arm hardcoded a field to `0` that had a real value: `emitted_count` at S2b.0
+// (which blocked the span-bucket axis outright), then `reverted_count` while
+// repairing that. Two instances of one shape is a pattern; this prevents the
+// third structurally rather than by a third patch.
+// ---------------------------------------------------------------------------
+
+/// The brace group opened on `start`, joined to its closing brace.
+///
+/// Comment lines are dropped: a comment can hold a `..` that belongs to prose,
+/// and including it would make a construction read as a pattern — the
+/// fail-OPEN direction.
+///
+/// Bounded, and the bound is stated rather than assumed safe: an unbalanced
+/// group (a brace inside a string literal, say) stops at the cap and is judged
+/// on what was seen. Judging on LESS text can only lose a rest token, and
+/// losing one reports a construction — the fail-CLOSED direction, which is
+/// where this guard must land when it is unsure.
+fn logical_item(lines: &[&str], start: usize) -> String {
+    const MAX_LINES: usize = 64;
+    let mut depth = 0i32;
+    let mut joined = String::new();
+    for line in lines.iter().skip(start).take(MAX_LINES) {
+        if is_comment(line) {
+            continue;
+        }
+        joined.push_str(line.trim());
+        joined.push(' ');
+        for ch in line.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if depth <= 0 {
+            break;
+        }
+    }
+    joined
+}
+
+/// Does this brace group ELIDE fields — i.e. is it a pattern?
+///
+/// The rest token counts only where a FIELD would go: directly after the
+/// opening brace, or after a comma. **A plain `item.contains("..")` would be
+/// wrong in the dangerous direction**: a field's value may legitimately hold a
+/// range (`source: text[..n].to_owned()`), and reading that as elision would
+/// skip a real construction — the one failure mode this guard exists to
+/// prevent. Whitespace is collapsed first so the test is indifferent to where
+/// a formatter puts the newline.
+fn elides_fields(item: &str) -> bool {
+    let flat = item.split_whitespace().collect::<Vec<_>>().join(" ");
+    flat.contains("{ ..") || flat.contains(", ..")
+}
+
+/// Production lines that construct a `RewriteOutcome` variant directly.
+fn outcome_construction_sites(root: &Path, skip: &dyn Fn(&Path) -> bool) -> Vec<String> {
+    let mut files = Vec::new();
+    collect_rs_files(root, &mut files);
+    assert!(!files.is_empty(), "no .rs files under {root:?}");
+    let mut hits = Vec::new();
+    let mut scanned = 0usize;
+    for file in &files {
+        if skip(file) {
+            continue;
+        }
+        scanned += 1;
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("source unreadable at {file:?}: {e}"));
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            let is_test_block = line.trim() == "#[cfg(test)]"
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| next.contains("mod ") && next.trim_end().ends_with('{'));
+            if is_test_block {
+                break;
+            }
+            if is_comment(line) {
+                continue;
+            }
+            if !(line.contains("RewriteOutcome::Emitted {")
+                || line.contains("RewriteOutcome::Degraded {"))
+            {
+                continue;
+            }
+            // A CONSTRUCTION lists every field; a PATTERN elides with `..`.
+            //
+            // SOUNDNESS: functional record update (`..other`) is not available
+            // on enum variants in Rust, so a variant construction MUST name
+            // every field — a rest token in a variant's brace group is
+            // therefore always a rest-pattern, never a construction. If
+            // variants are ever replaced by structs, functional update becomes
+            // legal and this argument LAPSES — the guard must be revisited,
+            // not just re-run.
+            //
+            // **The discriminator reads the LOGICAL ITEM, not the physical
+            // line.** It used to test the opening line alone, and that made
+            // its "exact rather than heuristic" claim rest on a formatting
+            // accident: `cargo fmt` splits the two-variant `match` in
+            // `OutcomeFacts::into_capture` across lines, leaving each arm's
+            // brace alone on a line with its `..` three lines away, and both
+            // arms were then counted as constructions. The `match` even
+            // carried a comment instructing the next author to keep the
+            // patterns single-line. An instrument's exactness may not rest on
+            // formatting; this reads to the closing brace instead, so the
+            // verdict is the same under any formatter.
+            if elides_fields(&logical_item(&lines, index)) {
+                continue;
+            }
+            hits.push(format!(
+                "{}:{}: {}",
+                file.strip_prefix(root).unwrap_or(file).display(),
+                index + 1,
+                line.trim()
+            ));
+        }
+    }
+    assert!(scanned > 0, "every file under {root:?} was skipped");
+    hits
+}
+
+/// **The formatted-`match` witness — the fmt-gate ruling's positive side.**
+///
+/// `cargo fmt` splits a two-variant match arm so each variant's brace lands
+/// alone on a line and its `..` sits three lines below. The line-based
+/// discriminator counted both as constructions; the logical-item one must not.
+///
+/// *Mutation-tested (deletion first):* reverting `elides_fields(&logical_item(..))`
+/// to `line.contains("..")` makes this report 2 hits and fail.
+#[test]
+fn a_formatter_split_destructuring_is_not_a_construction() {
+    let dir = std::env::temp_dir().join(format!("crat-fmtsplit-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("fixture dir");
+    fs::write(
+        dir.join("m.rs"),
+        "fn f(o: RewriteOutcome) -> u8 {\n\
+         \x20   match o {\n\
+         \x20       RewriteOutcome::Emitted {\n\
+         \x20           first_diags,\n\
+         \x20           ..\n\
+         \x20       }\n\
+         \x20       | RewriteOutcome::Degraded {\n\
+         \x20           first_diags,\n\
+         \x20           ..\n\
+         \x20       } => first_diags,\n\
+         \x20   }\n\
+         }\n",
+    )
+    .expect("write fixture");
+    let hits = outcome_construction_sites(&dir, &|_| false);
+    assert!(
+        hits.is_empty(),
+        "a destructuring the FORMATTER split across lines was counted as a \
+         construction — the exactness claim still rests on hand-formatting: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **The negative side: a real double-construction still fails.**
+///
+/// Without this, the repair above could have been "report nothing", which
+/// satisfies every positive case at once and removes the guard entirely.
+#[test]
+fn a_second_construction_is_still_reported_after_the_repair() {
+    let dir = std::env::temp_dir().join(format!("crat-doubleconstruct-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("fixture dir");
+    fs::write(
+        dir.join("m.rs"),
+        "fn a() -> RewriteOutcome {\n\
+         \x20   RewriteOutcome::Emitted {\n\
+         \x20       source,\n\
+         \x20       files,\n\
+         \x20   }\n\
+         }\n\
+         fn b() -> RewriteOutcome {\n\
+         \x20   RewriteOutcome::Degraded { reason }\n\
+         }\n",
+    )
+    .expect("write fixture");
+    let hits = outcome_construction_sites(&dir, &|_| false);
+    assert_eq!(
+        hits.len(),
+        2,
+        "both hand-filled sites must still be reported — a multi-line one and \
+         a single-line one: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **The FAIL-OPEN guard.** A construction whose field value holds a RANGE is
+/// still a construction.
+///
+/// A whole-item `contains("..")` would read `text[..n]` as elision and skip a
+/// real hand-filled site — silently removing the check this whole apparatus
+/// exists to be. `elides_fields` therefore accepts the rest token only where a
+/// field would go.
+///
+/// *Mutation-tested:* replacing `elides_fields` with a bare
+/// `item.contains("..")` makes this report 0 hits and fail.
+#[test]
+fn a_range_expression_in_a_field_value_is_not_elision() {
+    let dir = std::env::temp_dir().join(format!("crat-rangefield-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("fixture dir");
+    fs::write(
+        dir.join("m.rs"),
+        "fn a(text: &str, n: usize) -> RewriteOutcome {\n\
+         \x20   RewriteOutcome::Emitted {\n\
+         \x20       source: text[..n].to_owned(),\n\
+         \x20       files,\n\
+         \x20   }\n\
+         }\n",
+    )
+    .expect("write fixture");
+    let hits = outcome_construction_sites(&dir, &|_| false);
+    assert_eq!(
+        hits.len(),
+        1,
+        "a range inside a field VALUE is not a rest-pattern; reading it as one \
+         skips a real construction, which is the fail-OPEN direction: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **Production check.** Exactly two construction sites — the two constructors
+/// on `OutcomeFacts`. Any third is an arm that can omit a field.
+#[test]
+fn each_outcome_variant_has_exactly_one_filling_site() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bo_rewriter");
+    let hits = outcome_construction_sites(&root, &is_test_only_file);
+    assert_eq!(
+        hits.len(),
+        2,
+        "expected exactly the two `OutcomeFacts` constructors; a hand-filled \
+         site can omit a field, which has already zeroed a real value twice:\n  {}",
+        hits.join("\n  ")
+    );
+}
+
+/// **Witness — the scan can fail.** Same function, synthetic corpus with an
+/// extra hand-filled site.
+#[test]
+fn the_outcome_site_scan_reports_a_hand_filled_arm() {
+    // BOTH shapes: a corpus with only one of them leaves the other arm of the
+    // match unwitnessed, and a mutation disabling it survives.
+    let dir = temp_corpus(
+        "outcome-extra-site",
+        &[
+            (
+                "sneaky.rs",
+                "fn f() {\n    RewriteOutcome::Degraded {\n        reason: r,\n    }\n}\n",
+            ),
+            (
+                "sneakier.rs",
+                "fn g() {\n    RewriteOutcome::Emitted {\n        source: s,\n    }\n}\n",
+            ),
+        ],
+    );
+    let hits = outcome_construction_sites(&dir, &|_| false);
+    assert_eq!(hits.len(), 2, "the scan missed a hand-filled arm: {hits:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **Witness — a DESTRUCTURING is not a construction.** Without this the scan
+/// flags every `match` arm, and the production check fails on code that only
+/// reads an outcome.
+#[test]
+fn the_outcome_site_scan_ignores_a_destructuring() {
+    let dir = temp_corpus(
+        "outcome-destructure",
+        &[(
+            "reader.rs",
+            "fn f(o: RewriteOutcome) {\n    match o {\n        RewriteOutcome::Emitted { source, .. } => source,\n        RewriteOutcome::Degraded { reason, .. } => reason,\n    }\n}\n",
+        )],
+    );
+    let hits = outcome_construction_sites(&dir, &|_| false);
+    assert!(
+        hits.is_empty(),
+        "a destructuring was reported as a construction: {hits:?}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// **R488-1 (wave-6p 026) — every `*_tests.rs` under `bo_rewriter/` is DECLARED.**
+///
+/// A cherry-pick dropped a `mod` line and six of wave-6p's witnesses stopped compiling.
+/// Nothing failed: an undeclared module is not built, so its tests neither pass nor fail,
+/// and the suite count moves by six in a direction nobody reads. A test that is not
+/// compiled is indistinguishable from a test that passes, which is the worst way for a
+/// witness to die.
+///
+/// Declaration is checked ANYWHERE in the crate, not only in `mod.rs`: the wave-6r files
+/// are declared inside `wave5r_tests.rs`, which is legitimate, and a ratchet that demanded
+/// `mod.rs` would fail on correct code and be switched off.
+#[test]
+fn every_bo_rewriter_test_module_is_declared() {
+    use std::collections::BTreeSet;
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let dir = root.join("bo_rewriter");
+
+    let mut files = BTreeSet::new();
+    for entry in std::fs::read_dir(&dir).expect("read bo_rewriter/") {
+        let path = entry.expect("dir entry").path();
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if path.extension().and_then(|e| e.to_str()) == Some("rs") && name.ends_with("_tests") {
+            files.insert(name.to_owned());
+        }
+    }
+    assert!(
+        files.len() > 50,
+        "the scan found {} test modules, which is too few to be the real set",
+        files.len()
+    );
+
+    // Every `mod <name>;` declared anywhere under `src/`, at any nesting.
+    let mut declared = BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            for line in text.lines() {
+                let line = line.trim();
+                // A COMMENTED-OUT declaration declares nothing. The first version of this
+                // ratchet missed exactly that: `// mod x;` still ends in `;` and still
+                // contains `mod `, so the fault check -- commenting one out -- passed
+                // while the suite silently lost five tests.
+                if line.starts_with("//") {
+                    continue;
+                }
+                // `mod x;` and `pub(crate) mod x;`, but not `mod x {` (an inline module
+                // declares nothing about a file).
+                if let Some(rest) = line.strip_suffix(';')
+                    && let Some(name) = rest.rsplit_once("mod ").map(|(_, n)| n.trim())
+                    && !name.is_empty()
+                    && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+                {
+                    declared.insert(name.to_owned());
+                }
+            }
+        }
+    }
+
+    let undeclared = files.difference(&declared).cloned().collect::<Vec<_>>();
+    assert!(
+        undeclared.is_empty(),
+        "these bo_rewriter test modules exist as files but are declared nowhere, so they \
+         are NOT COMPILED and their witnesses cannot fail: {undeclared:?}"
+    );
+}

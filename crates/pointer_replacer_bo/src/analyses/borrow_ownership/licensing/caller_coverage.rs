@@ -1,0 +1,513 @@
+//! Independent compiler body/call observations. Complete means this recorded
+//! graph is covered; it proves no memory effect, retention, or attestation.
+use std::collections::BTreeSet;
+
+use serde::{Deserialize, Serialize};
+
+use super::super::origin_evidence::SourceSite;
+use crate::utils::rustc::RustProgram;
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) struct LocalCall {
+    pub(crate) site: SourceSite,
+    pub(crate) target: String,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Coverage {
+    pub(crate) configured_functions: BTreeSet<String>,
+    pub(crate) compiler_bodies: BTreeSet<String>,
+    /// `#[automatically_derived]` impl bodies, admitted to the roster
+    /// with their role rather than filtered away — a derived `Clone` copies
+    /// pointers, so it must stay visible to every consumer that asks.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) derived_impl_bodies: BTreeSet<String>,
+    /// Const, anonymous-const and static bodies that name no program
+    /// function (no call to one, no function value, no indirect call), and, for
+    /// a static, whose type carries no pointer. They call nothing in the
+    /// program and store nothing a slot could own, so they are accounted for by
+    /// their role, as a derived body is.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) inert_bodies: BTreeSet<String>,
+    pub(crate) local_calls: BTreeSet<LocalCall>,
+    pub(crate) indirect_calls: BTreeSet<SourceSite>,
+    pub(crate) function_values: BTreeSet<SourceSite>,
+    pub(crate) inline_assembly: BTreeSet<SourceSite>,
+    pub(crate) duplicate_functions: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub(crate) enum Reason {
+    ConfiguredFunctions,
+    CompilerBodies,
+    BodyRoster,
+    SourceCalls,
+    IndirectCall,
+    FunctionValue,
+    InlineAssembly,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Status {
+    Missing,
+    Complete,
+    Held(BTreeSet<Reason>),
+}
+impl Coverage {
+    pub(crate) fn collect(program: &RustProgram<'_>) -> Self {
+        use rustc_middle::{
+            mir::{TerminatorKind, visit::Visitor},
+            ty::TyKind,
+        };
+        let tcx = program.tcx;
+        let mut result = Self {
+            configured_functions: program
+                .functions
+                .iter()
+                .map(|&f| tcx.def_path_str(f))
+                .collect(),
+            compiler_bodies: tcx.hir_body_owners().map(|f| tcx.def_path_str(f)).collect(),
+            derived_impl_bodies: tcx
+                .hir_body_owners()
+                .filter(|&owner| {
+                    let parent = tcx.parent(owner.to_def_id());
+                    matches!(tcx.def_kind(parent), rustc_hir::def::DefKind::Impl { .. })
+                        && tcx.is_automatically_derived(parent)
+                })
+                .map(|f| tcx.def_path_str(f))
+                .collect(),
+            inert_bodies: tcx
+                .hir_body_owners()
+                .filter(|&owner| inert_body(tcx, owner))
+                .map(|f| tcx.def_path_str(f))
+                .collect(),
+            ..Self::default()
+        };
+        result.duplicate_functions = result.configured_functions.len() != program.functions.len();
+        for &function in &program.functions {
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let name = tcx.def_path_str(function);
+            let mut values = Values {
+                tcx,
+                body: &body,
+                function: name.clone(),
+                sites: BTreeSet::new(),
+            };
+            for (block, data) in body.basic_blocks.iter_enumerated() {
+                for (statement_index, statement) in data.statements.iter().enumerate() {
+                    values.visit_statement(
+                        statement,
+                        rustc_middle::mir::Location {
+                            block,
+                            statement_index,
+                        },
+                    );
+                }
+                let location = rustc_middle::mir::Location {
+                    block,
+                    statement_index: data.statements.len(),
+                };
+                let site = SourceSite {
+                    function: name.clone(),
+                    block: block.as_u32(),
+                    statement: location.statement_index,
+                };
+                match &data.terminator().kind {
+                    TerminatorKind::Call { func, args, .. }
+                    | TerminatorKind::TailCall { func, args, .. } => {
+                        for arg in args {
+                            values.visit_operand(&arg.node, location);
+                        }
+                        match *func.ty(&*body, tcx).kind() {
+                            TyKind::FnDef(target, _) => {
+                                if let Some(local) = target.as_local()
+                                    && !matches!(
+                                        tcx.hir_node_by_def_id(local),
+                                        rustc_hir::Node::ForeignItem(_)
+                                    )
+                                {
+                                    result.local_calls.insert(LocalCall {
+                                        site,
+                                        target: tcx.def_path_str(target),
+                                    });
+                                }
+                            }
+                            _ => {
+                                result.indirect_calls.insert(site);
+                            }
+                        }
+                    }
+                    TerminatorKind::InlineAsm { .. } => {
+                        result.inline_assembly.insert(site);
+                    }
+                    _ => values.visit_terminator(data.terminator(), location),
+                }
+            }
+            result.function_values.extend(values.sites);
+        }
+        result
+    }
+}
+pub(crate) fn assess(facts: &super::facts::Facts) -> Status {
+    use super::super::origin_evidence::SourceCallee;
+    let Some(coverage) = &facts.caller_coverage else { return Status::Missing };
+    let functions: BTreeSet<_> = facts.source_occurrences.keys().cloned().collect();
+    let mut held = BTreeSet::new();
+    if functions.is_empty()
+        || coverage.duplicate_functions
+        || coverage.configured_functions != functions
+        || facts
+            .source_occurrences
+            .iter()
+            .any(|(function, rows)| rows.iter().any(|row| &row.site.function != function))
+    {
+        held.insert(Reason::ConfiguredFunctions);
+    }
+    // A derived impl body is accounted for by its role, never dropped
+    // from the denominator; so is an inert const or static body. Every
+    // other compiler body still has to be configured.
+    if coverage.compiler_bodies.iter().any(|body| {
+        !coverage.configured_functions.contains(body)
+            && !coverage.derived_impl_bodies.contains(body)
+            && !coverage.inert_bodies.contains(body)
+    }) || coverage
+        .configured_functions
+        .iter()
+        .any(|body| !coverage.compiler_bodies.contains(body))
+    {
+        held.insert(Reason::CompilerBodies);
+    }
+    let expected: BTreeSet<_> = (0..facts.constructions)
+        .flat_map(|construction| {
+            functions
+                .iter()
+                .cloned()
+                .map(move |function| (construction, function))
+        })
+        .collect();
+    let bodies: BTreeSet<_> = facts
+        .body_rosters
+        .iter()
+        .filter_map(|body| {
+            body.point
+                .function
+                .clone()
+                .map(|function| (body.point.construction, function))
+        })
+        .collect();
+    if facts.constructions == 0 || bodies != expected || bodies.len() != facts.body_rosters.len() {
+        held.insert(Reason::BodyRoster);
+    }
+    let recorded: Vec<_> = facts
+        .source_occurrences
+        .values()
+        .flat_map(|rows| rows.iter())
+        .filter_map(|row| match &row.callee {
+            Some(SourceCallee::Local(target)) => Some(LocalCall {
+                site: row.site.clone(),
+                target: target.clone(),
+            }),
+            _ => None,
+        })
+        .collect();
+    let calls: BTreeSet<_> = recorded.iter().cloned().collect();
+    if calls.len() != recorded.len()
+        || calls != coverage.local_calls
+        || calls.iter().any(|call| {
+            !functions.contains(&call.site.function)
+                || !(functions.contains(&call.target)
+                    || coverage.derived_impl_bodies.contains(&call.target))
+        })
+    {
+        held.insert(Reason::SourceCalls);
+    }
+    if !coverage.indirect_calls.is_empty() {
+        held.insert(Reason::IndirectCall);
+    }
+    if !coverage.function_values.is_empty() {
+        held.insert(Reason::FunctionValue);
+    }
+    if !coverage.inline_assembly.is_empty() {
+        held.insert(Reason::InlineAssembly);
+    }
+    if held.is_empty() {
+        Status::Complete
+    } else {
+        Status::Held(held)
+    }
+}
+
+/// A const-like body that names no program function, or a static that
+/// does so and whose type carries no pointer (its initializer is a store).
+fn inert_body(tcx: rustc_middle::ty::TyCtxt<'_>, owner: rustc_hir::def_id::LocalDefId) -> bool {
+    use rustc_hir::def::DefKind;
+    let statik = match tcx.def_kind(owner) {
+        DefKind::Const | DefKind::AssocConst | DefKind::AnonConst => false,
+        DefKind::Static { .. } => true,
+        _ => return false,
+    };
+    if statik
+        && carries_pointer(
+            tcx,
+            tcx.type_of(owner).instantiate_identity(),
+            &mut rustc_hash::FxHashSet::default(),
+        )
+    {
+        return false;
+    }
+    names_no_function(tcx, owner)
+}
+
+/// The collector's tests (no program callee, no function value), read from the
+/// body's type-check results, never its MIR: const evaluation steals a const's
+/// MIR, and `ty_shape` reads a static's after this pass. A program function
+/// named in the body, a function pointer or a closure anywhere, or a method
+/// resolved to a program function, and the body is not inert.
+fn names_no_function(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    owner: rustc_hir::def_id::LocalDefId,
+) -> bool {
+    use rustc_hir::def::DefKind;
+    use rustc_middle::ty::TyKind;
+    let named = |ty: rustc_middle::ty::Ty<'_>| {
+        ty.walk()
+            .filter_map(|arg| arg.as_type())
+            .any(|ty| match *ty.kind() {
+                TyKind::FnDef(target, _) => target.is_local(),
+                TyKind::FnPtr(..) | TyKind::Closure(..) => true,
+                _ => false,
+            })
+    };
+    let results = tcx.typeck(owner);
+    !results.node_types().items().any(|(_, &ty)| named(ty))
+        && !results
+            .adjustments()
+            .items()
+            .any(|(_, adjustments)| adjustments.iter().any(|a| named(a.target)))
+        && !results.type_dependent_defs().items().any(|(_, def)| {
+            matches!(def, Ok((DefKind::Fn | DefKind::AssocFn, target)) if target.is_local())
+        })
+}
+
+pub(crate) fn carries_pointer<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    ty: rustc_middle::ty::Ty<'tcx>,
+    seen: &mut rustc_hash::FxHashSet<rustc_hir::def_id::DefId>,
+) -> bool {
+    use rustc_middle::ty::TyKind;
+    match *ty.kind() {
+        TyKind::Bool
+        | TyKind::Char
+        | TyKind::Int(_)
+        | TyKind::Uint(_)
+        | TyKind::Float(_)
+        | TyKind::Str
+        | TyKind::Never => false,
+        TyKind::Array(element, _) | TyKind::Slice(element) => carries_pointer(tcx, element, seen),
+        TyKind::Tuple(items) => items.iter().any(|item| carries_pointer(tcx, item, seen)),
+        TyKind::Adt(adt, args) => {
+            seen.insert(adt.did())
+                && adt
+                    .all_fields()
+                    .any(|field| carries_pointer(tcx, field.ty(tcx, args), seen))
+        }
+        _ => true,
+    }
+}
+
+struct Values<'a, 'tcx> {
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    body: &'a rustc_middle::mir::Body<'tcx>,
+    function: String,
+    sites: BTreeSet<SourceSite>,
+}
+impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for Values<'_, 'tcx> {
+    fn visit_operand(
+        &mut self,
+        operand: &rustc_middle::mir::Operand<'tcx>,
+        location: rustc_middle::mir::Location,
+    ) {
+        if matches!(
+            operand.ty(self.body, self.tcx).kind(),
+            rustc_middle::ty::TyKind::FnDef(..) | rustc_middle::ty::TyKind::FnPtr(..)
+        ) {
+            self.sites.insert(SourceSite {
+                function: self.function.clone(),
+                block: location.block.as_u32(),
+                statement: location.statement_index,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        super::{graph_tests::with_facts, snapshot::Snapshot},
+        *,
+    };
+    const CODE: &str = r#"
+unsafe extern "C" {fn malloc(n:usize)->*mut core::ffi::c_void;fn free(p:*mut core::ffi::c_void);}
+pub struct Cell {ptr:*mut i32}
+pub unsafe fn make()->*mut i32 {let p=malloc(4) as *mut i32;*p=5;p}
+pub unsafe fn put(c:*mut Cell,p:*mut i32){(*c).ptr=p;}
+pub unsafe fn take(c:*mut Cell)->*mut i32 {let p=(*c).ptr;(*c).ptr=0 as *mut i32;p}
+pub unsafe fn release(c:*mut Cell){let p=take(c);free(p as *mut core::ffi::c_void);}
+pub unsafe fn f(){let owner=make();let mut c=Cell{ptr:0 as *mut i32};put(&mut c,owner);release(&mut c);}
+"#;
+    fn held(status: Status, reason: Reason) {
+        assert!(matches!(status,Status::Held(reasons) if reasons.contains(&reason)));
+    }
+    #[test]
+    fn c04_caller_coverage_complete_direct_graph_and_snapshot_readback() {
+        with_facts(CODE, |facts| {
+            let coverage = facts
+                .caller_coverage
+                .as_ref()
+                .expect("normative compiler coverage is always produced");
+            assert_eq!(assess(facts), Status::Complete);
+            assert_eq!(coverage.configured_functions.len(), 5);
+            assert_eq!(coverage.local_calls.len(), 4);
+            let snapshot = Snapshot::capture(facts, 0).unwrap();
+            let decoded: Snapshot =
+                serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            assert_eq!(
+                decoded.metadata.facts().caller_coverage,
+                facts.caller_coverage
+            );
+            assert_eq!(decoded.caller_coverage, Status::Complete);
+            decoded.validate().unwrap();
+            let mut missing = decoded.clone();
+            missing.metadata.caller_coverage = None;
+            assert!(missing.validate().is_err());
+            let mut corrupt = decoded.clone();
+            corrupt
+                .metadata
+                .caller_coverage
+                .as_mut()
+                .unwrap()
+                .local_calls
+                .clear();
+            assert!(corrupt.validate().is_err());
+        });
+    }
+    #[test]
+    fn c04_caller_coverage_missing_function_body_and_source_call_hold() {
+        with_facts(CODE, |facts| {
+            assert_eq!(assess(facts), Status::Complete);
+            let mut missing = facts.clone();
+            missing.source_occurrences.remove("take");
+            held(assess(&missing), Reason::ConfiguredFunctions);
+            let mut missing = facts.clone();
+            missing
+                .body_rosters
+                .retain(|body| body.point.function.as_deref() != Some("take"));
+            held(assess(&missing), Reason::BodyRoster);
+            let mut missing = facts.clone();
+            missing
+                .source_occurrences
+                .get_mut("f")
+                .unwrap()
+                .retain(|row| {
+                    row.callee.as_ref()
+                        != Some(&super::super::super::origin_evidence::SourceCallee::Local(
+                            "put".into(),
+                        ))
+                });
+            held(assess(&missing), Reason::SourceCalls);
+            let mut missing = facts.clone();
+            missing
+                .caller_coverage
+                .as_mut()
+                .unwrap()
+                .compiler_bodies
+                .remove("take");
+            held(assess(&missing), Reason::CompilerBodies);
+        });
+    }
+    #[test]
+    fn c04_caller_coverage_function_values_and_indirect_calls_are_local_holds() {
+        for (code, reason) in [
+            (
+                format!("{CODE}\npub fn escape()->unsafe fn(*mut Cell){{release}}"),
+                Reason::FunctionValue,
+            ),
+            (
+                format!(
+                    "{CODE}\npub unsafe fn indirect(p:*mut Cell){{let callback:unsafe fn(*mut Cell)=release;callback(p);}}"
+                ),
+                Reason::IndirectCall,
+            ),
+        ] {
+            with_facts(&code, move |facts| {
+                assert!(facts.caller_coverage.is_some());
+                held(assess(facts), reason);
+                Snapshot::capture(facts, 0).unwrap().validate().unwrap();
+            });
+        }
+    }
+    /// The fork's `pub const NULL` item, a pointer-free
+    /// static and an array length name no program function, so they hold no
+    /// coverage; a pointer-carrying static and a const that calls a program
+    /// function still do.
+    #[test]
+    fn c04_caller_coverage_inert_const_and_static_bodies() {
+        with_facts(
+            &format!(
+                "{CODE}\npub const NULL:*mut core::ffi::c_void=core::ptr::null_mut::<core::ffi::c_void>();\npub static mut COUNT:i32=0;\npub struct Buf{{b:[u8;16]}}"
+            ),
+            |facts| {
+                assert_eq!(assess(facts), Status::Complete);
+                let inert = &facts.caller_coverage.as_ref().unwrap().inert_bodies;
+                assert!(
+                    inert.contains("NULL") && inert.contains("COUNT"),
+                    "{inert:?}"
+                );
+                assert!(inert.iter().any(|b| b.contains("{constant#")), "{inert:?}");
+                Snapshot::capture(facts, 0).unwrap().validate().unwrap();
+            },
+        );
+        for code in [
+            format!("{CODE}\npub static mut HEAD:*mut i32=0 as *mut i32;"),
+            format!("{CODE}\npub const fn seven()->i32{{7}}\npub const SEVEN:i32=seven();"),
+        ] {
+            with_facts(&code, |facts| held(assess(facts), Reason::CompilerBodies));
+        }
+    }
+    #[test]
+    fn c04_caller_coverage_const_and_omitted_nested_body_are_local_gaps() {
+        with_facts(
+            &format!("{CODE}\npub const CALLBACK:unsafe fn(*mut Cell)=release;"),
+            |facts| {
+                held(assess(facts), Reason::CompilerBodies);
+                Snapshot::capture(facts, 0).unwrap().validate().unwrap();
+            },
+        );
+        with_facts(
+            &format!("{CODE}\npub fn outer(){{fn nested(){{}}nested();}}"),
+            |facts| {
+                let nested = facts
+                    .caller_coverage
+                    .as_ref()
+                    .unwrap()
+                    .compiler_bodies
+                    .iter()
+                    .find(|f| f.ends_with("::nested"))
+                    .unwrap()
+                    .clone();
+                let mut missing = facts.clone();
+                missing.source_occurrences.remove(&nested);
+                held(assess(&missing), Reason::ConfiguredFunctions);
+                missing
+                    .caller_coverage
+                    .as_mut()
+                    .unwrap()
+                    .configured_functions
+                    .remove(&nested);
+                missing
+                    .body_rosters
+                    .retain(|body| body.point.function.as_ref() != Some(&nested));
+                held(assess(&missing), Reason::CompilerBodies);
+            },
+        );
+    }
+}

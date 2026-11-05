@@ -1,0 +1,1262 @@
+//! RED-first R220 family preservation controls.
+
+use std::collections::BTreeSet;
+
+use super::{
+    additive::{self, FamilyPolicy, FamilyStage, SoundnessWithdrawal, StageSnapshot},
+    bridge_receipt::{BridgeCalleeId, SignatureClassId},
+    decision::{Arm, Decision, DecisionTable, Degradation, DegradeReason, RequiredArmSet},
+    plan::{self, ClassInput, ClassSite, Plan},
+};
+
+const BASELINE: &str = r#"
+unsafe fn earlier_callee(callee_value: *const i32) -> i32 { *callee_value.offset(0) }
+pub unsafe fn reference(reference_value: *const i32) -> i32 { *reference_value }
+pub unsafe fn slice(slice_values: *const i32) -> i32 { *slice_values.offset(1) }
+pub unsafe fn caller(caller_value: *const i32) -> i32 { earlier_callee(caller_value) }
+"#;
+
+/// R1315-1 (relay main/373; step B's restatement): `BASELINE` with the caller handing the
+/// callee an address (`&*caller_value`) rather than its bare binding. Under the thin-into-fat
+/// rule (55's line, step B) a bare hand-on to a slice formal makes the caller a slice of the
+/// callee's class, so `BASELINE`'s two classes and their bare call-adapter edge are one class;
+/// the address keeps the thin caller, the slice callee and the adapter edge between them,
+/// which is what the two R220 dependency controls below are about.
+const BASELINE_ADAPTER_EDGE: &str = r#"
+unsafe fn earlier_callee(callee_value: *const i32) -> i32 { *callee_value.offset(0) }
+pub unsafe fn reference(reference_value: *const i32) -> i32 { *reference_value }
+pub unsafe fn slice(slice_values: *const i32) -> i32 { *slice_values.offset(1) }
+pub unsafe fn caller(caller_value: *const i32) -> i32 { earlier_callee(&*caller_value) }
+"#;
+
+fn with_baseline(test: impl FnOnce(StageSnapshot) + Send) {
+    with_baseline_of(BASELINE, test)
+}
+
+fn with_baseline_of(baseline: &'static str, test: impl FnOnce(StageSnapshot) + Send) {
+    let rendered = super::emit_tests::ast_emitted_source_of(baseline).expect("prior rendering");
+    assert!(rendered.contains("reference_value: &i32"), "{rendered}");
+    assert!(rendered.contains("slice_values: &[i32]"), "{rendered}");
+    assert!(
+        super::verify::type_checks_str(&rendered),
+        "prior rendering must type/borrow-check"
+    );
+    ::utils::compilation::run_compiler_on_str(baseline, |tcx| {
+        let (table, ctx) = super::decide_table_with_ctx(tcx).expect("prior decisions");
+        let emission = super::emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_copy_plans,
+        )
+        .expect("prior terminal plan");
+        let prior = StageSnapshot {
+            table,
+            plan: emission.plan,
+        };
+        for binding in [
+            "reference_value",
+            "slice_values",
+            "callee_value",
+            "caller_value",
+        ] {
+            assert!(
+                prior.plan.class_finalization.classes[&owner(&prior, binding)].is_ready(),
+                "{binding} must be previously delivered"
+            );
+        }
+        assert!(matches!(
+            subject(&prior, "reference_value").1,
+            Decision::Ref { .. }
+        ));
+        assert!(matches!(
+            subject(&prior, "slice_values").1,
+            Decision::Slice { .. }
+        ));
+        test(prior);
+    })
+    .expect("baseline compiler identities");
+}
+
+fn subject<'a>(
+    snapshot: &'a StageSnapshot,
+    binding: &str,
+) -> &'a (super::decision::Subject, Decision) {
+    snapshot
+        .table
+        .entries
+        .iter()
+        .find(|(subject, _)| subject.param_name.as_deref() == Some(binding))
+        .unwrap_or_else(|| panic!("fixture binding {binding}"))
+}
+
+fn owner(snapshot: &StageSnapshot, binding: &str) -> SignatureClassId {
+    SignatureClassId::of(subject(snapshot, binding).0.fn_did)
+}
+
+fn class_inputs(snapshot: &StageSnapshot) -> Vec<ClassInput> {
+    snapshot
+        .plan
+        .class_finalization
+        .classes
+        .values()
+        .map(|class| ClassInput {
+            id: class.id,
+            required_arms: class.required_arms,
+            sites: class.sites.clone(),
+            depends_on: class.depends_on.clone(),
+            block_reasons: class.hold_reasons().to_vec(),
+        })
+        .collect()
+}
+
+fn candidate(prior: &StageSnapshot, inputs: Vec<ClassInput>) -> StageSnapshot {
+    let mut candidate = prior.clone();
+    candidate.plan.class_finalization = plan::finalize_class_inputs(inputs);
+    let ready = candidate
+        .plan
+        .class_finalization
+        .classes
+        .values()
+        .filter(|class| class.is_ready())
+        .map(|class| class.id)
+        .collect::<BTreeSet<_>>();
+    candidate.plan.by_file.retain(|_, edits| {
+        edits.retain(|edit| edit.owner_class.is_none_or(|owner| ready.contains(&owner)));
+        !edits.is_empty()
+    });
+    candidate
+}
+
+/// **035 clause (3).** The owners the loop RECORDED as unresolved: it saw the
+/// terminal, found no candidate whose own sites participate in it, and declined
+/// to widen. These rows retire nothing, which is the whole point of them.
+fn unresolved_owners(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    stage: FamilyStage,
+    soundness: &[SoundnessWithdrawal],
+) -> BTreeSet<SignatureClassId> {
+    additive::withdrawals(prior, candidate, &FamilyPolicy::at(stage), soundness)
+        .into_iter()
+        .filter(|withdrawal| withdrawal.unresolved)
+        .map(|withdrawal| {
+            assert!(
+                withdrawal.cause.starts_with("interface-path-unresolved:"),
+                "an unresolved row carries the typed cause: {}",
+                withdrawal.cause
+            );
+            assert!(
+                withdrawal.subjects.is_empty(),
+                "an unresolved row retires nothing"
+            );
+            withdrawal.owner
+        })
+        .collect()
+}
+
+fn requested_owners(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    stage: FamilyStage,
+    soundness: &[SoundnessWithdrawal],
+) -> BTreeSet<SignatureClassId> {
+    additive::withdrawals(prior, candidate, &FamilyPolicy::at(stage), soundness)
+        .into_iter()
+        // 035 clause (3): an unresolved row retires nothing, so it is not a
+        // requested owner. It is recorded and read, never acted on.
+        .filter(|withdrawal| !withdrawal.unresolved)
+        .map(|withdrawal| {
+            assert!(
+                !withdrawal.cause.is_empty(),
+                "every family rollback needs attribution"
+            );
+            withdrawal.owner
+        })
+        .collect()
+}
+
+fn unsatisfied_family(stage: FamilyStage, kind: &str) {
+    with_baseline(|prior| {
+        let observed = ["reference_value", "slice_values"].map(|binding| {
+            let owner = owner(&prior, binding);
+            let mut inputs = class_inputs(&prior);
+            inputs
+                .iter_mut()
+                .find(|input| input.id == owner)
+                .unwrap()
+                .sites
+                .push(ClassSite::dropped(
+                    owner,
+                    owner,
+                    Arm::Surface,
+                    kind,
+                    "r220-new-family-site-unbuilt",
+                ));
+            let candidate = candidate(&prior, inputs);
+            assert!(!candidate.plan.class_finalization.classes[&owner].is_ready());
+            // **035 (R453-2).** The terminal names no participant — the
+            // anchor moved nothing of its own — so under clause (1) there is
+            // nothing this rule may retire, and under clause (3) the loop
+            // records it instead of dropping the owner's whole family. The
+            // control's claim is unchanged in substance: the prior safe
+            // disposition is not forced Raw. What changed is HOW: by retiring
+            // nothing rather than by withdrawing the owner.
+            // 035 (R453-2): a DROPPED SITE of this class is named by the
+            // terminal, so the class's own mechanics are the participant and
+            // clause (1) retires them. The rule removes the widening, not this.
+            (
+                (
+                    requested_owners(&prior, &candidate, stage, &[]),
+                    unresolved_owners(&prior, &candidate, stage, &[]),
+                ),
+                (BTreeSet::from([owner]), BTreeSet::new()),
+            )
+        });
+        for (actual, expected) in observed {
+            assert_eq!(
+                actual, expected,
+                "{stage:?} must restore the prior safe disposition, not force it Raw"
+            );
+        }
+    });
+}
+
+#[test]
+fn r220_slice_construction_failure_preserves_prior_ref_and_slice() {
+    unsatisfied_family(FamilyStage::SliceConstruction, "slice-local-construction");
+}
+
+#[test]
+fn r220_slice_use_failure_preserves_prior_ref_and_slice() {
+    unsatisfied_family(FamilyStage::SliceUse, "slice-use-adapter");
+}
+
+#[test]
+fn r220_option_failure_preserves_prior_ref_and_slice() {
+    unsatisfied_family(FamilyStage::Option, "option-presentation");
+}
+
+#[test]
+fn r220_previously_safe_callee_does_not_make_a_new_receipt_required() {
+    with_baseline_of(BASELINE_ADAPTER_EDGE, |prior| {
+        let caller = owner(&prior, "caller_value");
+        let callee = owner(&prior, "callee_value");
+        let mut inputs = class_inputs(&prior);
+        let mut failed = ClassSite::dropped(
+            caller,
+            caller,
+            Arm::C,
+            "slice-use-adapter",
+            "slice-use-existing-c-interface-carrier-unmapped",
+        );
+        failed.key.callee = BridgeCalleeId::Local(callee.local_def_id());
+        inputs
+            .iter_mut()
+            .find(|input| input.id == caller)
+            .unwrap()
+            .sites
+            .push(failed);
+        let candidate = candidate(&prior, inputs);
+        assert!(
+            candidate.plan.class_finalization.classes[&callee].is_ready(),
+            "callee stays safe in both stages"
+        );
+        assert!(!candidate.plan.class_finalization.classes[&caller].is_ready());
+        assert_eq!(
+            requested_owners(&prior, &candidate, FamilyStage::SliceUse, &[]),
+            BTreeSet::from([caller]),
+            "the pre-existing safe interface is not a new-family consistency requirement"
+        );
+    });
+}
+
+#[test]
+fn r220_collision_yields_the_new_site_independently_of_order_and_class_ids() {
+    with_baseline(|prior| {
+        let a = owner(&prior, "reference_value");
+        let b = owner(&prior, "slice_values");
+        for (older, newer) in [(a, b), (b, a)] {
+            let old_site = prior.plan.class_finalization.classes[&older]
+                .sites
+                .iter()
+                .find(|site| {
+                    site.edit_key != "-" && site.key.file != "-" && site.key.lo < site.key.hi
+                })
+                .expect("prior applied text site")
+                .clone();
+            for reverse in [false, true] {
+                let mut inputs = class_inputs(&prior);
+                let new_site = ClassSite::edit(
+                    newer,
+                    older,
+                    Arm::Surface,
+                    &old_site.key.file,
+                    old_site.key.lo,
+                    old_site.key.hi,
+                    "subject-use",
+                );
+                let new_key = new_site.edit_key.clone();
+                inputs
+                    .iter_mut()
+                    .find(|input| input.id == newer)
+                    .unwrap()
+                    .sites
+                    .push(new_site);
+                if reverse {
+                    inputs.reverse();
+                }
+                let candidate = candidate(&prior, inputs);
+                assert!(
+                    candidate
+                        .plan
+                        .class_finalization
+                        .collisions
+                        .iter()
+                        .any(|collision| {
+                            (collision.left_edit_key == old_site.edit_key
+                                && collision.right_edit_key == new_key)
+                                || (collision.right_edit_key == old_site.edit_key
+                                    && collision.left_edit_key == new_key)
+                        }),
+                    "the collision must name the exact old and added edit keys"
+                );
+                assert_eq!(
+                    requested_owners(&prior, &candidate, FamilyStage::Option, &[]),
+                    BTreeSet::from([newer]),
+                    "newer transaction yields; class order is not provenance (reverse={reverse})"
+                );
+                // 035 (R453-2): the OLDER class is anchored by the same
+                // collision but the terminal names no site of its own, so it is
+                // recorded and retires nothing — the half of this control that
+                // used to be carried by it not being requested.
+                assert!(
+                    !unresolved_owners(&prior, &candidate, FamilyStage::Option, &[])
+                        .contains(&newer),
+                    "the participating class is retired, not recorded"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn r220_unwitnessed_new_refusal_rolls_back_its_root_not_the_delivered_dependent() {
+    with_baseline_of(BASELINE_ADAPTER_EDGE, |prior| {
+        let root = owner(&prior, "callee_value");
+        let dependent = owner(&prior, "caller_value");
+        let mut inputs = class_inputs(&prior);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == root)
+            .unwrap()
+            .block_reasons
+            .push("blocked-subject:slice-cursor-use".to_owned());
+        // wave-6k narrowing (R217-2(a) migration): the caller's dependency on
+        // the callee is a bare call-adapter edge, which the planning-time hold
+        // no longer propagates over — the edge is recorded as narrowed and the
+        // delivered dependent stays READY while the root is held.
+        let dependency = inputs
+            .iter_mut()
+            .find(|input| input.id == dependent)
+            .unwrap();
+        assert!(
+            !dependency.depends_on.contains(&root),
+            "a bare call-adapter edge is narrowed, not a dependency"
+        );
+        assert!(
+            prior
+                .plan
+                .narrowed_dependency_edges
+                .contains(&(dependent, root)),
+            "the narrowed edge is recorded"
+        );
+        let mut candidate = candidate(&prior, inputs);
+        let (subject, decision) = candidate
+            .table
+            .entries
+            .iter_mut()
+            .find(|(subject, _)| subject.param_name.as_deref() == Some("callee_value"))
+            .unwrap();
+        *decision = Decision::Degraded(Degradation {
+            subject: subject.identity_key("earlier_callee"),
+            site: "R220 exact callee binding".to_owned(),
+            reason: DegradeReason::SliceCursorUse,
+        });
+        assert!(!candidate.plan.class_finalization.classes[&root].is_ready());
+        assert!(candidate.plan.class_finalization.classes[&dependent].is_ready());
+        assert_eq!(
+            requested_owners(&prior, &candidate, FamilyStage::SliceUse, &[]),
+            BTreeSet::from([root]),
+            "a new refusal label without a soundness witness cannot erase either prior delivery"
+        );
+    });
+}
+
+#[test]
+fn r220_new_dependency_on_an_already_held_class_rolls_back_the_edge_owner() {
+    with_baseline(|baseline| {
+        let edge_owner = owner(&baseline, "reference_value");
+        let old_held = owner(&baseline, "slice_values");
+        let mut inputs = class_inputs(&baseline);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == old_held)
+            .unwrap()
+            .block_reasons
+            .push("pre-existing-held-class".to_owned());
+        let prior = candidate(&baseline, inputs);
+        assert!(prior.plan.class_finalization.classes[&edge_owner].is_ready());
+        assert!(!prior.plan.class_finalization.classes[&old_held].is_ready());
+        assert!(
+            !prior.plan.class_finalization.classes[&edge_owner]
+                .depends_on
+                .contains(&old_held)
+        );
+
+        let mut inputs = class_inputs(&prior);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == edge_owner)
+            .unwrap()
+            .depends_on
+            .push(old_held);
+        let candidate = candidate(&prior, inputs);
+        assert!(!candidate.plan.class_finalization.classes[&edge_owner].is_ready());
+        assert_eq!(
+            prior.table.entries, candidate.table.entries,
+            "the new edge is the only decision-level change"
+        );
+        assert_eq!(
+            prior.plan.class_finalization.classes[&edge_owner].sites,
+            candidate.plan.class_finalization.classes[&edge_owner].sites,
+            "no changed subject or edit may accidentally identify the culprit"
+        );
+        assert_eq!(
+            requested_owners(&prior, &candidate, FamilyStage::SliceUse, &[]),
+            BTreeSet::from([edge_owner]),
+            "the new dependency yields; its already-held target has no new transaction to withdraw"
+        );
+    });
+}
+
+fn with_null_ref_history(
+    two_bindings: bool,
+    test: impl FnOnce(StageSnapshot, StageSnapshot, SoundnessWithdrawal, SignatureClassId) + Send,
+) {
+    let extra = if two_bindings {
+        "let other: *const i32 = 0 as *const i32; let _ = other.is_null();"
+    } else {
+        ""
+    };
+    let input = format!(
+        "pub unsafe fn null_history() -> bool {{ let bad: *const i32 = 0 as *const i32; {extra} bad.is_null() }}"
+    );
+    assert!(
+        super::verify::type_checks_str(&input),
+        "the input itself has no null dereference"
+    );
+    ::utils::compilation::run_compiler_on_str(&input, |tcx| {
+        let (table, ctx) =
+            super::decide_table_with_ctx(tcx).expect("null-history compiler identities");
+        let entries = table
+            .entries
+            .into_iter()
+            .filter_map(|(subject, _)| {
+                matches!(subject.param_name.as_deref(), Some("bad" | "other"))
+                    .then_some((subject, Decision::Ref { mutable: false }))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), if two_bindings { 2 } else { 1 });
+        assert!(entries.iter().all(|(subject, _)| subject.null_init));
+        let bad = entries
+            .iter()
+            .find(|(subject, _)| subject.param_name.as_deref() == Some("bad"))
+            .unwrap()
+            .0
+            .clone();
+        let owner = SignatureClassId::of(bad.fn_did);
+        let null_construction = ctx.constructions.init_spans[&(bad.fn_did, bad.hir_id)];
+        assert!(super::decision::emitability::is_zero_literal(
+            tcx.hir_node(ctx.constructions.init_hirs[&(bad.fn_did, bad.hir_id)])
+                .expect_expr()
+        ));
+        let mut arms = RequiredArmSet::default();
+        arms.insert(Arm::Surface);
+        let mut old = ClassInput::new(owner, arms);
+        // Deliberately reconstruct a bad historical emission verdict, not an
+        // analysis/model value: the UB-free input only tests these nulls.
+        for (subject, _) in &entries {
+            let span = subject.ty_span.expect("explicit raw declaration");
+            let mut site = ClassSite::edit(
+                owner,
+                owner,
+                Arm::Surface,
+                "null-history.rs",
+                span.lo().0,
+                span.hi().0,
+                "historical-ref-declaration",
+            );
+            site.expected_form = "ref-shared".to_owned();
+            site.found_form = "raw".to_owned();
+            old.sites.push(site);
+        }
+        let prior = StageSnapshot {
+            table: DecisionTable {
+                entries,
+                ..DecisionTable::default()
+            },
+            plan: Plan {
+                class_finalization: plan::finalize_class_inputs(vec![old.clone()]),
+                ..Plan::default()
+            },
+        };
+        assert!(prior.plan.class_finalization.classes[&owner].is_ready());
+        let mut candidate = candidate(&prior, vec![old.blocked("blocked-subject:null-init")]);
+        candidate
+            .table
+            .entries
+            .iter_mut()
+            .find(|(subject, _)| subject.hir_id == bad.hir_id)
+            .unwrap()
+            .1 = Decision::Degraded(Degradation {
+            subject: bad.identity_key("null_history"),
+            site: tcx
+                .sess
+                .source_map()
+                .span_to_diagnostic_string(null_construction),
+            reason: DegradeReason::NullInit,
+        });
+        let witness = SoundnessWithdrawal::null_required_reference(
+            tcx,
+            &ctx.constructions,
+            &prior,
+            (bad.fn_did, bad.hir_id),
+        )
+        .expect("the exact null initializer proves the old required-reference error");
+        test(prior, candidate, witness, owner);
+    })
+    .expect("null-history parser context");
+}
+
+#[test]
+fn r220_exact_null_ref_soundness_witness_permits_its_own_withdrawal() {
+    with_null_ref_history(false, |prior, candidate, witness, _| {
+        assert!(
+            requested_owners(&prior, &candidate, FamilyStage::Option, &[witness]).is_empty(),
+            "a matching witness may reject the genuinely bad prior Ref at null"
+        );
+    });
+}
+
+#[test]
+fn r220_one_soundness_witness_does_not_exempt_another_lost_binding() {
+    with_null_ref_history(true, |prior, candidate, witness, owner| {
+        let rows = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::Option),
+            &[witness],
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| !row.unresolved)
+                .map(|row| row.owner)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([owner]),
+            "the other old Ref still needs delivery protection despite a sibling's witness"
+        );
+    });
+}
+
+#[test]
+fn r220_null_ref_witness_cannot_exempt_a_later_valid_optional_prior() {
+    with_null_ref_history(false, |mut prior, candidate, witness, owner| {
+        // The private factory validated this witness against the historical
+        // Ref. A subsequent predecessor has fixed that error by using Option.
+        prior.table.entries[0].1 = Decision::Opt {
+            mutable: false,
+            slice: false,
+            uses: Vec::new(),
+        };
+        for site in &mut prior
+            .plan
+            .class_finalization
+            .classes
+            .get_mut(&owner)
+            .unwrap()
+            .sites
+        {
+            site.expected_form = "opt-ref-shared".to_owned();
+        }
+        assert!(prior.plan.class_finalization.classes[&owner].is_ready());
+        let rows = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::Option),
+            &[witness],
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| !row.unresolved)
+                .map(|row| row.owner)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([owner]),
+            "a proof about the old required Ref does not justify losing a valid Option declaration"
+        );
+    });
+}
+
+#[test]
+fn r220_later_carrier_retries_and_restores_the_exact_predecessor_profile() {
+    with_baseline(|prior| {
+        let class = owner(&prior, "reference_value");
+        let did = class.local_def_id();
+        let mut policy = FamilyPolicy::at(FamilyStage::SliceConstruction);
+        policy
+            .withdrawn
+            .insert((FamilyStage::SliceConstruction, class));
+        assert!(!policy.enabled(did, FamilyStage::SliceConstruction));
+        policy.stage = FamilyStage::SliceUse;
+        assert!(
+            policy.enabled(did, FamilyStage::SliceConstruction),
+            "a new carrier may complete the earlier constructor"
+        );
+        policy.withdrawn.insert((FamilyStage::SliceUse, class));
+        assert!(
+            !policy.enabled(did, FamilyStage::SliceConstruction),
+            "a failed retry restores the old constructor refusal"
+        );
+        assert!(!policy.enabled(did, FamilyStage::SliceUse));
+        assert!(
+            policy.enabled(
+                owner(&prior, "slice_values").local_def_id(),
+                FamilyStage::SliceUse
+            ),
+            "another owner's transaction is independent"
+        );
+    });
+}
+
+/// **Relay 043 (wave-6o 016 STOP 1, R397-6(a)) — the retirement arm.**
+///
+/// wave-6s2's `computed-suffix-raw-view` carries the evidence
+/// `body-local-raw-alias-schedule-unproved`, premised on the destination
+/// staying RAW. When the Option family takes that destination the receipt
+/// layer drops the adapter as `slice-use-evidence-held`, and the exclusion
+/// re-derivation used to read that drop as a family site that failed — which
+/// falls the WHOLE owner back to the predecessor's mechanics, one stage before
+/// wave-6o's own arm runs (their report 016 claims 3–5, five rows).
+///
+/// The site is SUPERSEDED, not unsatisfied. Pinned both ways on one input: with
+/// the destination moving to the Option family nothing is requested; without
+/// that move the same drop still requests, so the exception cannot widen into
+/// "a dropped slice-use adapter never counts".
+#[test]
+fn r397_6a_a_superseded_slice_use_adapter_is_not_an_unsatisfied_family_site() {
+    with_baseline(|prior| {
+        let owner = owner(&prior, "slice_values");
+        let dropped = |from: &StageSnapshot| {
+            let mut inputs = class_inputs(from);
+            inputs
+                .iter_mut()
+                .find(|input| input.id == owner)
+                .unwrap()
+                .sites
+                .push(ClassSite::dropped(
+                    owner,
+                    owner,
+                    Arm::Surface,
+                    "slice-use-adapter",
+                    "slice-use-evidence-held",
+                ));
+            candidate(from, inputs)
+        };
+
+        // (1) The destination does not move: the drop is an unsatisfied family
+        //     site and the owner falls back, exactly as before this arm.
+        // 035 (R453-2): the drop names no participant, so it is recorded and
+        // retires nothing. What this half of the control pins is that the loop
+        // still SEES it — the supersession below removes the row entirely.
+        let bare = dropped(&prior);
+        assert_eq!(
+            requested_owners(&prior, &bare, FamilyStage::Option, &[]),
+            BTreeSet::from([owner]),
+            "without the destination move the drop must still request"
+        );
+
+        // (2) The destination moves to the Option family — wave-6o's shape,
+        //     where it was `degraded:null-init` in the predecessor and becomes
+        //     `Option<&[u8]>` here. The adapter is superseded, not failed.
+        let mut before = prior.clone();
+        for (subject, decided) in &mut before.table.entries {
+            if SignatureClassId::of(subject.fn_did) == owner {
+                *decided = Decision::Degraded(Degradation {
+                    subject: subject.label.clone(),
+                    site: "<the destination, still raw>".to_owned(),
+                    reason: DegradeReason::KindRaw,
+                });
+            }
+        }
+        let mut composed = dropped(&before);
+        for (subject, decided) in &mut composed.table.entries {
+            if SignatureClassId::of(subject.fn_did) == owner {
+                *decided = Decision::Opt {
+                    mutable: false,
+                    slice: true,
+                    uses: Vec::new(),
+                };
+            }
+        }
+        assert!(
+            requested_owners(&before, &composed, FamilyStage::Option, &[]).is_empty(),
+            "a superseded adapter must not fall the owner back"
+        );
+        assert!(
+            unresolved_owners(&before, &composed, FamilyStage::Option, &[]).is_empty(),
+            "a superseded adapter leaves no row at all, not even an unresolved one"
+        );
+    });
+}
+
+/// **035 clause (2), protection (a) — a candidate PLACED at the predecessor
+/// frame is not retired by a terminal that names no site of its own.**
+///
+/// The shape wave-6s 020 and slicecursor 030 measured: a neighbour's row moves
+/// into or out of a family, an anchor appears, and candidates that were placed
+/// a frame ago — heman's `edt::{w,z}` and `edt_with_payload::{w,z}`, wave-6s's
+/// twelve — are retired by proximity although none of them participates in the
+/// terminal. Placement IS the statement that the previous frame's interface was
+/// consistent with the candidate; a change that does not touch its interval
+/// cannot have made it inconsistent.
+///
+/// The control is the second half: a candidate that is NOT placed at the
+/// predecessor still yields, so this is a protection and not a refusal to
+/// retire anything.
+#[test]
+fn r453_2_a_candidate_placed_at_the_predecessor_is_not_retired_by_proximity() {
+    with_baseline(|prior| {
+        let subject_class = owner(&prior, "slice_values");
+        // A terminal on this class that names no site of its own: a dropped
+        // site whose caller is ANOTHER class, so `own_site` is false and the
+        // candidate path decides.
+        let other_class = owner(&prior, "reference_value");
+        let mut inputs = class_inputs(&prior);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == subject_class)
+            .unwrap()
+            .sites
+            .push(ClassSite::dropped(
+                other_class,
+                other_class,
+                Arm::Surface,
+                "slice-use-adapter",
+                "r220-new-family-site-unbuilt",
+            ));
+        let mut candidate = candidate(&prior, inputs);
+        // Move the candidate: its decision differs from the predecessor's.
+        for (subject, decided) in &mut candidate.table.entries {
+            if SignatureClassId::of(subject.fn_did) == subject_class {
+                *decided = Decision::Opt {
+                    mutable: false,
+                    slice: true,
+                    uses: Vec::new(),
+                };
+            }
+        }
+        let rows = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::Option),
+            &[],
+        );
+        let retired = rows
+            .iter()
+            .filter(|row| !row.unresolved)
+            .flat_map(|row| row.subjects.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            retired.is_empty(),
+            "a placed candidate was retired by a terminal it does not participate in: {rows:#?}"
+        );
+    });
+}
+
+/// **R459-5 (wave-5d2 029 §3) — a degraded subject whose emitted declaration
+/// another subject's plan renders is not a blocker of its class.**
+///
+/// heman's `transform_to_*` views `f` / `d` are degraded `copy-source-coupled`
+/// while the OWNER's plan renders their declarations as exact suffixes. R456-8's
+/// counter already calls such a row delivered whichever plan rendered it; until
+/// this predicate the class hold still read it as a blocker, so the two
+/// consumers disagreed about one row.
+///
+/// Pinned on both halves of the predicate: an edit of ANOTHER subject covering
+/// the degraded subject's declaration puts it in the set, and the same edit
+/// carrying the subject's OWN identity tail does not — a subject never
+/// discharges itself.
+#[test]
+fn r459_5_a_declaration_rendered_by_another_plan_is_not_a_blocker() {
+    with_baseline(|prior| {
+        let (degraded, _) = subject(&prior, "slice_values").clone();
+        let owner = SignatureClassId::of(degraded.fn_did);
+        let tail = format!(
+            "::{}#{}",
+            degraded.param_name.as_deref().unwrap(),
+            degraded.local.as_u32()
+        );
+        let mut table = prior.table.clone();
+        for (subject, decision) in &mut table.entries {
+            if subject.hir_id == degraded.hir_id {
+                *decision = Decision::Degraded(Degradation {
+                    subject: subject.label.clone(),
+                    site: "<the derived view>".to_owned(),
+                    reason: DegradeReason::KindRaw,
+                });
+            }
+        }
+        // The declaration range this fake locator reports for every subject.
+        let locate = |_: rustc_span::Span| {
+            Ok((
+                plan::FileKey::Virtual("main.rs".to_owned()),
+                100usize,
+                120usize,
+            ))
+        };
+        let covering = |subject_id: &str| {
+            let mut planned = prior.plan.clone();
+            let mut edit = planned
+                .by_file
+                .values()
+                .flatten()
+                .next()
+                .expect("the baseline plans at least one edit")
+                .clone();
+            edit.lo = 90;
+            edit.hi = 130;
+            edit.edit_kind = "subject-declaration";
+            edit.owner_class = Some(owner);
+            edit.subject_id = subject_id.to_owned();
+            planned.by_file.clear();
+            planned
+                .by_file
+                .insert(plan::FileKey::Virtual("main.rs".to_owned()), vec![edit]);
+            plan::declarations_rendered_by_another_plan(&planned, &table, locate)
+                .contains(&(degraded.fn_did, degraded.hir_id))
+        };
+        assert!(
+            covering("some_other::owner_value#7"),
+            "another subject's declaration edit covers this one"
+        );
+        assert!(
+            !covering(&format!("slice{tail}")),
+            "a subject must not discharge itself"
+        );
+    });
+}
+
+/// **R606-3 — roots first.** `slice` carries a new refusal of its own (the root),
+/// `reference` newly depends on it and is held only through that dependency, and
+/// `earlier_callee` newly depends on `reference`. The round retires the root and
+/// `reference`'s edge to it; `earlier_callee`'s request, triggered by a
+/// dependency-only hold, waits for the next round, when `reference` may be ready
+/// again (brotli's fourteen `StitchToPreviousBlockH*` behind 2337 behind 2440).
+#[test]
+fn r606_3_a_dependency_only_hold_waits_for_its_root() {
+    with_baseline(|prior| {
+        let root = owner(&prior, "slice_values");
+        let middle = owner(&prior, "reference_value");
+        let dependent = owner(&prior, "callee_value");
+        let mut inputs = class_inputs(&prior);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == root)
+            .unwrap()
+            .block_reasons
+            .push("blocked-subject:slice-cursor-use".to_owned());
+        inputs
+            .iter_mut()
+            .find(|input| input.id == middle)
+            .unwrap()
+            .depends_on
+            .push(root);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == dependent)
+            .unwrap()
+            .depends_on
+            .push(middle);
+        let candidate = candidate(&prior, inputs);
+        let classes = &candidate.plan.class_finalization.classes;
+        assert!(
+            classes[&middle]
+                .hold_reasons()
+                .iter()
+                .all(|r| r.starts_with("dependency-class-held:")),
+            "the middle class is held only through its dependency: {:?}",
+            classes[&middle].hold_reasons()
+        );
+        assert!(!classes[&dependent].is_ready());
+        let withdrawals = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::SliceUse),
+            &[],
+        );
+        let requested = withdrawals
+            .iter()
+            .filter(|w| !w.unresolved)
+            .map(|w| (w.owner, w.cause.clone()))
+            .collect::<Vec<_>>();
+        let owners = requested.iter().map(|(o, _)| *o).collect::<BTreeSet<_>>();
+        assert!(owners.contains(&root), "{requested:?}");
+        assert!(owners.contains(&middle), "{requested:?}");
+        assert!(
+            !owners.contains(&dependent),
+            "a dependency-only hold waits while its root is retired: {requested:?}"
+        );
+    });
+}
+
+/// **R606-3 control — a round with no root still retires.** `slice` was already
+/// held at the prior stage and `reference` already depended on it, so the only new
+/// fact is `earlier_callee`'s edge to `reference`, held only through a dependency.
+/// No request of the round has a root, so that request is issued (strict progress).
+#[test]
+fn r606_3_a_round_with_only_dependency_only_requests_issues_them() {
+    with_baseline(|baseline| {
+        let root = owner(&baseline, "slice_values");
+        let middle = owner(&baseline, "reference_value");
+        let dependent = owner(&baseline, "callee_value");
+        let mut inputs = class_inputs(&baseline);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == root)
+            .unwrap()
+            .block_reasons
+            .push("pre-existing-held-class".to_owned());
+        inputs
+            .iter_mut()
+            .find(|input| input.id == middle)
+            .unwrap()
+            .depends_on
+            .push(root);
+        let prior = candidate(&baseline, inputs);
+        assert!(!prior.plan.class_finalization.classes[&middle].is_ready());
+        assert!(prior.plan.class_finalization.classes[&dependent].is_ready());
+        let mut inputs = class_inputs(&prior);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == dependent)
+            .unwrap()
+            .depends_on
+            .push(middle);
+        let candidate = candidate(&prior, inputs);
+        assert_eq!(
+            requested_owners(&prior, &candidate, FamilyStage::SliceUse, &[]),
+            BTreeSet::from([dependent]),
+            "with no root in the round, the dependency-only request is issued"
+        );
+    });
+}
+
+/// **R615-2 — roots first, v2: a restore root waits for the root its walk
+/// reaches.** `earlier_callee` already depended on `reference` at the prior
+/// stage. Now `slice` adds a site over `reference`'s own interval: a collision
+/// whose newer side (`slice`) is the round's root, and which holds `reference`
+/// too. `earlier_callee` is then held only through `reference`, loses its prior
+/// delivery, and its walk ends at `reference`, whose collision the root already
+/// covers. The walk explains the loss by a root this round retires, so
+/// `earlier_callee` is not made a restore anchor this round (brotli's 2337, held
+/// through 2440's collision with 1293, whose nearest-first restore withdrew the
+/// Stitch* the collision never involved). `caller`, a changed neighbour, is what
+/// that restore would reach.
+#[test]
+fn r615_2_a_restore_root_waits_for_the_root_its_walk_reaches() {
+    with_baseline(|baseline| {
+        let collided = owner(&baseline, "reference_value");
+        let newer = owner(&baseline, "slice_values");
+        let held = owner(&baseline, "callee_value");
+        let neighbour = owner(&baseline, "caller_value");
+        let mut inputs = class_inputs(&baseline);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == held)
+            .unwrap()
+            .depends_on
+            .push(collided);
+        let prior = candidate(&baseline, inputs);
+        assert!(prior.plan.class_finalization.classes[&held].is_ready());
+        let old_site = prior.plan.class_finalization.classes[&collided]
+            .sites
+            .iter()
+            .find(|site| site.edit_key != "-" && site.key.file != "-" && site.key.lo < site.key.hi)
+            .expect("prior applied text site")
+            .clone();
+        let mut inputs = class_inputs(&prior);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == newer)
+            .unwrap()
+            .sites
+            .push(ClassSite::edit(
+                newer,
+                collided,
+                Arm::Surface,
+                &old_site.key.file,
+                old_site.key.lo,
+                old_site.key.hi,
+                "subject-use",
+            ));
+        // The neighbour changes a site of its own (no decision moves), so a
+        // restore from `held` would reach it.
+        let far = old_site.key.hi.saturating_add(10_000);
+        inputs
+            .iter_mut()
+            .find(|input| input.id == neighbour)
+            .unwrap()
+            .sites
+            .push(ClassSite::edit(
+                neighbour,
+                neighbour,
+                Arm::Surface,
+                &old_site.key.file,
+                far,
+                far.saturating_add(1),
+                "subject-use",
+            ));
+        let candidate = candidate(&prior, inputs);
+        let classes = &candidate.plan.class_finalization.classes;
+        assert!(
+            classes[&held]
+                .hold_reasons()
+                .iter()
+                .all(|r| r.starts_with("dependency-class-held:")),
+            "held only through the collided class: {:?}",
+            classes[&held].hold_reasons()
+        );
+        let rows = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::SliceUse),
+            &[],
+        );
+        let causes = rows
+            .iter()
+            .map(|w| format!("{} {} {}", w.owner.order_key(), w.cause, w.unresolved))
+            .collect::<Vec<_>>();
+        assert!(
+            rows.iter().any(|w| !w.unresolved && w.owner == newer),
+            "the collision's newer side is the round's root: {causes:#?}"
+        );
+        let from_held = |cause: &str| {
+            cause.contains(&format!(
+                "restore-family-interface-path:[{}",
+                held.order_key()
+            )) || cause.contains(&format!(
+                "restore-family-unconnected-root:{}",
+                held.order_key()
+            ))
+        };
+        assert!(
+            !rows.iter().any(|w| from_held(&w.cause)),
+            "the dependency-held owner waits for the root instead of restoring: {causes:#?}"
+        );
+    });
+}
+
+/// The v3 fixture: `earlier_callee` and `slice` depended on `reference` at the
+/// prior stage; now `reference` is held on `root_reason`. `earlier_callee`
+/// changes a site of its own next to `reference` (its decision moves only when
+/// `neighbour_moves`), and `caller` changes a site that ties it to `slice` alone,
+/// with a moved decision. Returns every row as `(owner, cause, unresolved)` and
+/// the four classes.
+fn v3_rows(
+    root_reason: impl Fn(&[SignatureClassId; 4]) -> String + Sync,
+    neighbour_moves: bool,
+) -> (Vec<(SignatureClassId, String, bool)>, [SignatureClassId; 4]) {
+    let mut out = None;
+    with_baseline(|baseline| {
+        let classes = [
+            owner(&baseline, "callee_value"),
+            owner(&baseline, "reference_value"),
+            owner(&baseline, "slice_values"),
+            owner(&baseline, "caller_value"),
+        ];
+        let [first, root, later, far] = classes;
+        assert!(first < root && root < later, "the walks run in this order");
+        let mut inputs = class_inputs(&baseline);
+        for dependent in [first, later] {
+            inputs
+                .iter_mut()
+                .find(|input| input.id == dependent)
+                .unwrap()
+                .depends_on
+                .push(root);
+        }
+        let prior = candidate(&baseline, inputs);
+        for class in classes {
+            assert!(prior.plan.class_finalization.classes[&class].is_ready());
+        }
+        let text = prior
+            .plan
+            .class_finalization
+            .classes
+            .values()
+            .flat_map(|class| class.sites.iter())
+            .find(|site| site.edit_key != "-" && site.key.file != "-" && site.key.lo < site.key.hi)
+            .expect("prior applied text site")
+            .clone();
+        let at = |offset: u32| text.key.hi.saturating_add(offset);
+        let mut inputs = class_inputs(&prior);
+        let input = |inputs: &mut Vec<ClassInput>, id| {
+            inputs.iter_mut().position(|input| input.id == id).unwrap()
+        };
+        let i = input(&mut inputs, root);
+        inputs[i].block_reasons.push(root_reason(&classes));
+        let i = input(&mut inputs, first);
+        inputs[i].sites.push(ClassSite::edit(
+            first,
+            first,
+            Arm::Surface,
+            &text.key.file,
+            at(10_000),
+            at(10_001),
+            "subject-use",
+        ));
+        let i = input(&mut inputs, far);
+        inputs[i].sites.push(ClassSite::edit(
+            far,
+            later,
+            Arm::Surface,
+            &text.key.file,
+            at(20_000),
+            at(20_001),
+            "subject-use",
+        ));
+        let mut candidate = candidate(&prior, inputs);
+        for (subject, decided) in &mut candidate.table.entries {
+            let class = SignatureClassId::of(subject.fn_did);
+            if class == far || (neighbour_moves && class == first) {
+                *decided = Decision::Opt {
+                    mutable: false,
+                    slice: true,
+                    uses: Vec::new(),
+                };
+            }
+        }
+        assert!(!candidate.plan.class_finalization.classes[&later].is_ready());
+        let rows = additive::withdrawals(
+            &prior,
+            &candidate,
+            &FamilyPolicy::at(FamilyStage::SliceUse),
+            &[],
+        );
+        out = Some((
+            rows.into_iter()
+                .map(|w| (w.owner, w.cause, w.unresolved))
+                .collect::<Vec<_>>(),
+            classes,
+        ));
+    });
+    out.expect("the fixture ran")
+}
+
+/// Whether `rows` carry a restore anchored at `anchor`.
+fn restores_from(rows: &[(SignatureClassId, String, bool)], anchor: SignatureClassId) -> bool {
+    rows.iter().any(|(_, cause, _)| {
+        cause.contains(&format!(
+            "restore-family-interface-path:[{}",
+            anchor.order_key()
+        )) || cause.contains(&format!(
+            "restore-family-unconnected-root:{}",
+            anchor.order_key()
+        ))
+    })
+}
+
+/// **R645-4 — roots first, v3: a walk that reaches a class held on its own
+/// reason has reached a root, in any walk order.** `reference` is held on its
+/// own collision, which no request of the round names. `earlier_callee`'s walk
+/// reaches it first and makes it a restore anchor; `slice`'s walk reaches it
+/// after that, adds nothing, and under v2 (which asks only whether the round
+/// has REQUESTED the class) is made a restore anchor itself. Brotli's
+/// `StitchToPreviousBlockH*`: the first walk to reach 2440 (held on its
+/// collision with 1293) made it a restore anchor (`anchor=2440:[2440, 1297]` in
+/// 094's record), and every later `Stitch*` walk then restored its own nearest
+/// neighbours, the nineteen `StoreH*` / `InitOrStitch` rows.
+#[test]
+fn r645_4_a_walk_that_reaches_an_own_reason_root_waits_for_it_in_any_order() {
+    let (rows, [first, root, later, _]) =
+        v3_rows(|_| "cross-class-interval-collision".to_owned(), true);
+    assert!(
+        restores_from(&rows, root) && !restores_from(&rows, first),
+        "the root is the round's restore anchor: {rows:#?}"
+    );
+    assert!(
+        !restores_from(&rows, later),
+        "the later walk waits for the root it reached: {rows:#?}"
+    );
+}
+
+/// **R645-4 control — a class held on another's reason is not a root.** The
+/// same walks, with `reference` held only on a dependency's reason: `slice`'s
+/// walk reaches no root, so it restores as under v2.
+#[test]
+fn r645_4_a_walk_that_reaches_only_another_s_hold_still_restores() {
+    let (rows, [_, _, later, _]) = v3_rows(
+        |classes| format!("dependency-class-held:{}", classes[3].order_key()),
+        true,
+    );
+    assert!(
+        restores_from(&rows, later),
+        "no root was reached, so the owner restores: {rows:#?}"
+    );
+}
+
+/// **R645-4 control — strict progress.** The root's restore finds only a
+/// changed neighbour with no moved decision, so the round would retire nothing:
+/// the owner that waited for the root restores in the same round.
+#[test]
+fn r645_4_a_waiting_owner_restores_when_the_round_retires_nothing_else() {
+    let (rows, [_, _, later, _]) = v3_rows(|_| "cross-class-interval-collision".to_owned(), false);
+    assert!(
+        restores_from(&rows, later) && rows.iter().any(|(_, _, unresolved)| !unresolved),
+        "the waiting owner restores and the round retires something: {rows:#?}"
+    );
+}
+
+/// The independent review's MED 5 (relay 182 item 4): a `null-init` loss of
+/// a non-optional prior is the soundness rule only where the candidate's
+/// stage did withdraw the subject's Option stage. With the Option stage
+/// still enabled, the same loss is a lost delivery.
+#[test]
+fn r824_2_a_null_init_loss_with_the_option_stage_enabled_is_still_a_loss() {
+    with_null_ref_history(false, |prior, candidate, _, _| {
+        assert!(
+            additive::preservation_error(
+                &prior,
+                &candidate,
+                &[],
+                &FamilyPolicy::at(FamilyStage::Option)
+            )
+            .is_some(),
+            "the label alone does not exempt the loss"
+        );
+    });
+}
+
+/// Control: the Option stage withdrawn for the owner, the same loss is the
+/// R824-2 fallback, not a lost delivery.
+#[test]
+fn r824_2_control_a_null_init_loss_with_the_option_stage_withdrawn_is_the_rule() {
+    with_null_ref_history(false, |prior, candidate, _, owner| {
+        let mut policy = FamilyPolicy::at(FamilyStage::Option);
+        policy.withdrawn.insert((FamilyStage::Option, owner));
+        assert_eq!(
+            additive::preservation_error(&prior, &candidate, &[], &policy),
+            None
+        );
+    });
+}

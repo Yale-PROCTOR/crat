@@ -1,0 +1,1050 @@
+//! Owned J27 replay evidence, projected directly from typed native receipts.
+//! Retained validation does not consult a compiler context or saved verdict.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+
+use super::{
+    RawBoundaryArtifacts,
+    bridge_receipt::{
+        BridgeCalleeId, BridgeExtentKind, BridgeReceiptEvent, BridgeReceiptStage,
+        BridgeReceiptState, BridgeRetentionTier, BridgeSiteKey, RAW_BOUNDARY_T2_WAIVER_ID,
+    },
+    decision::raw_boundary::{self, RetentionVerdict},
+    mechanical_receipt::{
+        self, CanonicalCallee, CanonicalLocation, MechanicalExtent, MechanicalFamily,
+        MechanicalMechanism, MechanicalObligationKey, MechanicalRetention, MechanicalStage,
+        MechanicalState, MechanicalSubjectKey, NegativeWriteEvidence, TerminalContract,
+    },
+};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Capture {
+    pub(crate) required: Vec<Requirement>,
+    pub(crate) rows: Vec<Row>,
+    pub(crate) common: Vec<Common>,
+    pub(crate) bridges: Vec<Bridge>,
+    pub(crate) rendered_tsv: String,
+    pub(crate) capture_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Subject {
+    pub(crate) key: String,
+    pub(crate) local: Option<(u32, u32, u32)>,
+    pub(crate) generated: Option<(u32, String, u32)>,
+}
+
+fn subject(value: &MechanicalSubjectKey) -> Subject {
+    Subject {
+        key: value.receipt_key(),
+        generated: match value {
+            MechanicalSubjectKey::Generated {
+                owner,
+                key,
+                slot_depth,
+            } => Some((owner.local_def_index.as_u32(), key.clone(), *slot_depth)),
+            MechanicalSubjectKey::Local { .. } => None,
+        },
+        local: match value {
+            MechanicalSubjectKey::Local {
+                owner,
+                mir_local,
+                slot_depth,
+            } => Some((owner.local_def_index.as_u32(), *mir_local, *slot_depth)),
+            MechanicalSubjectKey::Generated { .. } => None,
+        },
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Key {
+    pub(crate) key: String,
+    pub(crate) family: String,
+    pub(crate) owner: u32,
+    pub(crate) caller: u32,
+    pub(crate) subject: Subject,
+    pub(crate) endpoint: Option<String>,
+    pub(crate) endpoint_def_id: Option<(u32, u32)>,
+    pub(crate) hir_owner: Option<u32>,
+    pub(crate) hir_item_local_id: Option<u32>,
+    pub(crate) argument_index: Option<u32>,
+    pub(crate) slot_depth: u32,
+}
+
+fn endpoint(value: &CanonicalCallee) -> String {
+    value.receipt_key()
+}
+
+fn key(value: &MechanicalObligationKey) -> Key {
+    Key {
+        key: value.receipt_key(),
+        family: value.family.key().into(),
+        owner: value.owner_class.order_key(),
+        caller: value.site.owner.local_def_index.as_u32(),
+        subject: subject(&value.subject),
+        endpoint: value.site.callee.as_ref().map(endpoint),
+        endpoint_def_id: match value.site.callee.as_ref() {
+            Some(CanonicalCallee::Local(did)) => Some((did.krate.as_u32(), did.index.as_u32())),
+            Some(CanonicalCallee::Foreign(_) | CanonicalCallee::Generated { .. }) | None => None,
+        },
+        hir_owner: match value.site.location {
+            CanonicalLocation::Hir { owner, .. } => Some(owner.local_def_index.as_u32()),
+            CanonicalLocation::Mir { .. }
+            | CanonicalLocation::Declaration { .. }
+            | CanonicalLocation::Generated { .. } => None,
+        },
+        hir_item_local_id: match value.site.location {
+            CanonicalLocation::Hir { item_local_id, .. } => Some(item_local_id),
+            CanonicalLocation::Mir { .. }
+            | CanonicalLocation::Declaration { .. }
+            | CanonicalLocation::Generated { .. } => None,
+        },
+        argument_index: value.site.argument_index,
+        slot_depth: value.site.slot_depth,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct BridgeKey {
+    pub(crate) key: String,
+    pub(crate) owner: u32,
+    pub(crate) caller: u32,
+    pub(crate) callee: Option<u32>,
+    pub(crate) endpoint: String,
+    pub(crate) endpoint_def_id: Option<(u32, u32)>,
+    pub(crate) arm: String,
+    pub(crate) file: String,
+    pub(crate) lo: u32,
+    pub(crate) hi: u32,
+    pub(crate) kind: String,
+    pub(crate) position: String,
+}
+
+fn bridge_key(value: &BridgeSiteKey) -> BridgeKey {
+    let (callee, endpoint, endpoint_def_id) = match &value.callee {
+        BridgeCalleeId::Local(did) => (
+            Some(did.local_def_index.as_u32()),
+            endpoint(&CanonicalCallee::Local(did.to_def_id())),
+            Some((
+                did.to_def_id().krate.as_u32(),
+                did.to_def_id().index.as_u32(),
+            )),
+        ),
+        BridgeCalleeId::Foreign(symbol) => (None, format!("foreign:{symbol}"), None),
+    };
+    BridgeKey {
+        key: value.receipt_key(),
+        owner: value.owner_class.order_key(),
+        caller: value.caller.local_def_index.as_u32(),
+        callee,
+        endpoint,
+        endpoint_def_id,
+        arm: value.arm.clone(),
+        file: value.file.clone(),
+        lo: value.lo,
+        hi: value.hi,
+        kind: value.bridge_kind.clone(),
+        position: value.position.clone(),
+    }
+}
+
+fn canonical_subject(value: &Subject) -> Option<String> {
+    match (value.local, &value.generated) {
+        (Some((owner, local, depth)), None) => Some(format!("local:{owner}:{local}:depth={depth}")),
+        (None, Some((owner, key, depth))) => Some(format!("generated:{owner}:{key}:depth={depth}")),
+        _ => None,
+    }
+}
+
+fn canonical_obligation(value: &Key) -> Option<String> {
+    let subject = canonical_subject(&value.subject)?;
+    if subject != value.subject.key {
+        return None;
+    }
+    let (krate, index) = value.endpoint_def_id?;
+    let endpoint = format!("def-id:{krate}:{index}");
+    if value.endpoint.as_ref() != Some(&endpoint) {
+        return None;
+    }
+    let owner = value.hir_owner?;
+    let item = value.hir_item_local_id?;
+    let argument = value
+        .argument_index
+        .map_or_else(|| "-".into(), |index| index.to_string());
+    let site = format!(
+        "owner={}:location=hir:{owner}:{item}:callee={endpoint}:arg={argument}:depth={}",
+        value.caller, value.slot_depth
+    );
+    Some(format!(
+        "class={}:subject={subject}:site={site}:family={}",
+        value.owner, value.family
+    ))
+}
+
+fn canonical_bridge(value: &BridgeKey) -> Option<String> {
+    let callee = value.callee?;
+    let (krate, index) = value.endpoint_def_id?;
+    if index != callee
+        || krate != rustc_hir::def_id::LOCAL_CRATE.as_u32()
+        || value.endpoint != format!("def-id:{krate}:{index}")
+    {
+        return None;
+    }
+    Some(format!(
+        "{}:{}:local:{callee}:{}:{}:{}:{}:{}:{}",
+        value.owner,
+        value.caller,
+        value.arm,
+        value.position,
+        value.file,
+        value.lo,
+        value.hi,
+        value.kind
+    ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RetentionUnknownReason {
+    CalleeUnresolved,
+    FnPtrWeb,
+    OpenBoundary,
+    MultiDef,
+    NontransparentDef,
+    ProjectionAmbiguous,
+    OutputStorage,
+    FieldOrGlobalStore,
+    Return,
+    LocalSummaryUnknown,
+    AttestationAbsent,
+    AnalysisIncomplete,
+    ReturnedAliasUsed,
+    ReturnedAliasUnknown,
+}
+
+fn unknown(value: raw_boundary::RetentionUnknownReason) -> RetentionUnknownReason {
+    use raw_boundary::RetentionUnknownReason as Native;
+    match value {
+        Native::CalleeUnresolved => RetentionUnknownReason::CalleeUnresolved,
+        Native::FnPtrWeb => RetentionUnknownReason::FnPtrWeb,
+        Native::OpenBoundary => RetentionUnknownReason::OpenBoundary,
+        Native::MultiDef => RetentionUnknownReason::MultiDef,
+        Native::NontransparentDef => RetentionUnknownReason::NontransparentDef,
+        Native::ProjectionAmbiguous => RetentionUnknownReason::ProjectionAmbiguous,
+        Native::OutputStorage => RetentionUnknownReason::OutputStorage,
+        Native::FieldOrGlobalStore => RetentionUnknownReason::FieldOrGlobalStore,
+        Native::Return => RetentionUnknownReason::Return,
+        Native::LocalSummaryUnknown => RetentionUnknownReason::LocalSummaryUnknown,
+        Native::AttestationAbsent => RetentionUnknownReason::AttestationAbsent,
+        Native::AnalysisIncomplete => RetentionUnknownReason::AnalysisIncomplete,
+        Native::ReturnedAliasUsed => RetentionUnknownReason::ReturnedAliasUsed,
+        Native::ReturnedAliasUnknown => RetentionUnknownReason::ReturnedAliasUnknown,
+        // R481-2: a waived positive retention travels as the transport's
+        // nearest unknown; the transported row's own waiver id is what names
+        // it, and this enum has no wire variant to add without a schema bump.
+        Native::PositiveRetentionWaived => RetentionUnknownReason::AnalysisIncomplete,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RetentionEventKind {
+    Transparent,
+    Return,
+    OutputStorage,
+    FieldOrGlobalStore,
+    UnknownCall,
+    KnownNoRetainCall,
+    LocalCall,
+    DereferenceOnly,
+    Free,
+    MultiDef,
+    Nontransparent,
+    ReturnedAlias,
+    ReturnedChildSink,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RetentionStep {
+    pub(crate) location: String,
+    pub(crate) kind: RetentionEventKind,
+    pub(crate) detail: String,
+}
+
+fn step(value: &raw_boundary::RetentionStep) -> RetentionStep {
+    use raw_boundary::RetentionEventKind as Native;
+    let kind = match value.kind {
+        Native::Transparent => RetentionEventKind::Transparent,
+        Native::Return => RetentionEventKind::Return,
+        Native::OutputStorage => RetentionEventKind::OutputStorage,
+        Native::FieldOrGlobalStore => RetentionEventKind::FieldOrGlobalStore,
+        Native::UnknownCall => RetentionEventKind::UnknownCall,
+        Native::KnownNoRetainCall => RetentionEventKind::KnownNoRetainCall,
+        Native::LocalCall => RetentionEventKind::LocalCall,
+        Native::DereferenceOnly => RetentionEventKind::DereferenceOnly,
+        Native::Free => RetentionEventKind::Free,
+        Native::MultiDef => RetentionEventKind::MultiDef,
+        Native::Nontransparent => RetentionEventKind::Nontransparent,
+        Native::ReturnedAlias => RetentionEventKind::ReturnedAlias,
+        Native::ReturnedChildSink => RetentionEventKind::ReturnedChildSink,
+    };
+    RetentionStep {
+        location: value.location.clone(),
+        kind,
+        detail: value.detail.clone(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RetentionCertificate {
+    pub(crate) function: String,
+    pub(crate) argument_index: usize,
+    pub(crate) steps: Vec<RetentionStep>,
+    pub(crate) attestation: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Retention {
+    NoRetain {
+        certificate: RetentionCertificate,
+    },
+    Retains {
+        sink: RetentionStep,
+        path: Vec<RetentionStep>,
+    },
+    Unknown {
+        reason: RetentionUnknownReason,
+        frontier: Vec<RetentionStep>,
+    },
+}
+
+fn retention(value: &RetentionVerdict) -> Retention {
+    match value {
+        RetentionVerdict::NoRetain { certificate } => Retention::NoRetain {
+            certificate: RetentionCertificate {
+                function: certificate.function.clone(),
+                argument_index: certificate.argument_index,
+                steps: certificate.steps.iter().map(step).collect(),
+                attestation: certificate.attestation.into(),
+            },
+        },
+        RetentionVerdict::Retains { sink, path } => Retention::Retains {
+            sink: step(sink),
+            path: path.iter().map(step).collect(),
+        },
+        RetentionVerdict::Unknown { reason, frontier } => Retention::Unknown {
+            reason: unknown(*reason),
+            frontier: frontier.iter().map(step).collect(),
+        },
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Requirement {
+    pub(crate) key: Key,
+    pub(crate) bridge: BridgeKey,
+    pub(crate) adapter: String,
+    pub(crate) retention: Option<Retention>,
+    pub(crate) native_lifetime: Option<mechanical_receipt::NativeReturnEvidence>,
+    pub(crate) origins: Vec<Subject>,
+    pub(crate) terminal_interface: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Row {
+    pub(crate) required: Requirement,
+    pub(crate) boundary_kind: String,
+    pub(crate) endpoint: String,
+    pub(crate) position: String,
+    pub(crate) source_form: String,
+    pub(crate) target_form: String,
+    pub(crate) negative_write: String,
+    pub(crate) tier: String,
+    pub(crate) waiver: String,
+    pub(crate) pair_role: String,
+    pub(crate) effect_carrier: Option<String>,
+    pub(crate) stage: String,
+    pub(crate) state: String,
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Common {
+    pub(crate) key: Key,
+    pub(crate) source_form: String,
+    pub(crate) target_form: String,
+    pub(crate) argument_kind: String,
+    pub(crate) negative_write: String,
+    pub(crate) tier: String,
+    pub(crate) waiver: String,
+    pub(crate) terminal_interface: Option<String>,
+    pub(crate) return_adapter: bool,
+    pub(crate) extent_none: bool,
+    pub(crate) stage: String,
+    pub(crate) state: String,
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Bridge {
+    pub(crate) key: BridgeKey,
+    pub(crate) source_form: String,
+    pub(crate) target_form: String,
+    pub(crate) argument_kind: String,
+    pub(crate) tier: String,
+    pub(crate) waiver: String,
+    pub(crate) extent_none: bool,
+    pub(crate) stage: String,
+    pub(crate) state: String,
+    pub(crate) reason: Option<String>,
+}
+
+fn stage(value: MechanicalStage) -> String {
+    match value {
+        MechanicalStage::Plan => "plan",
+        MechanicalStage::Terminal => "terminal",
+    }
+    .into()
+}
+
+fn state(value: MechanicalState) -> String {
+    match value {
+        MechanicalState::Planned => "planned",
+        MechanicalState::Applied => "applied",
+        MechanicalState::Dropped => "dropped",
+        MechanicalState::HeldNonmechanical => "held-nonmechanical",
+        MechanicalState::Reclassified => "reclassified",
+    }
+    .into()
+}
+
+fn tier(value: &MechanicalRetention) -> (String, String) {
+    let (tier, waiver) = match value {
+        MechanicalRetention::None => ("none", "-"),
+        MechanicalRetention::T1 => ("T1", "-"),
+        MechanicalRetention::T2 { waiver_id } => ("T2", waiver_id.as_str()),
+        MechanicalRetention::PositiveRetention => ("positive-retention", "-"),
+    };
+    (tier.into(), waiver.into())
+}
+
+fn negative(value: &NegativeWriteEvidence) -> String {
+    match value {
+        NegativeWriteEvidence::NotApplicable => "not-applicable".into(),
+        NegativeWriteEvidence::FosterImmutable => "foster-immutable".into(),
+        NegativeWriteEvidence::LibcReadOnly(contract) => format!("libc-read-only:{contract}"),
+        NegativeWriteEvidence::Missing => "negative-write-absent".into(),
+    }
+}
+
+pub(crate) fn capture(artifact: &RawBoundaryArtifacts) -> Capture {
+    let required = artifact
+        .outbound_return_required
+        .iter()
+        .map(|value| Requirement {
+            key: key(&value.key),
+            bridge: bridge_key(&value.associated_bridge),
+            adapter: value.adapter.clone(),
+            retention: value.retention_evidence.as_ref().map(retention),
+            native_lifetime: value.native_lifetime.clone(),
+            origins: value.lifetime_origin.iter().map(subject).collect(),
+            terminal_interface: value.terminal_interface.clone(),
+        })
+        .collect();
+    let rows = artifact
+        .outbound_return_rows
+        .iter()
+        .map(|value| {
+            let (tier, waiver) = tier(&value.retention);
+            Row {
+                required: Requirement {
+                    key: key(&value.terminal.obligation_key),
+                    bridge: bridge_key(&value.associated_bridge),
+                    adapter: value.adapter.clone(),
+                    retention: value.retention_evidence.as_ref().map(retention),
+                    native_lifetime: value.native_lifetime.clone(),
+                    origins: value.lifetime_origin.iter().map(subject).collect(),
+                    terminal_interface: value.terminal_interface.clone(),
+                },
+                boundary_kind: value.boundary_kind.clone(),
+                endpoint: endpoint(&value.endpoint),
+                position: value.position.clone(),
+                source_form: value.source_form.clone(),
+                target_form: value.target_form.clone(),
+                negative_write: negative(&value.negative_write),
+                tier,
+                waiver,
+                pair_role: value.pair_role.clone(),
+                effect_carrier: value.effect_carrier.as_ref().map(|site| site.receipt_key()),
+                stage: stage(value.terminal.stage),
+                state: state(value.terminal.state),
+                reason: value.terminal.reason.as_ref().map(|reason| reason.key()),
+            }
+        })
+        .collect();
+    let common = artifact
+        .mechanical_events
+        .iter()
+        .filter(|value| mechanical_receipt::is_outbound_return_family(value.key.family))
+        .map(|value| {
+            let (tier, waiver) = tier(&value.evidence.retention);
+            Common {
+                key: key(&value.key),
+                source_form: value.found_form.clone(),
+                target_form: value.expected_form.clone(),
+                argument_kind: value.argument_kind.clone(),
+                negative_write: negative(&value.evidence.negative_write),
+                tier,
+                waiver,
+                terminal_interface: match &value.evidence.terminal_contract {
+                    TerminalContract::Required { interface } => Some(interface.clone()),
+                    TerminalContract::Optional { .. }
+                    | TerminalContract::NotApplicable
+                    | TerminalContract::Missing => None,
+                },
+                return_adapter: value.mechanism
+                    == if value.key.family == MechanicalFamily::FlowsIntoRawParam {
+                        MechanicalMechanism::RawParameterView
+                    } else {
+                        MechanicalMechanism::ReturnAdapter
+                    },
+                extent_none: value.evidence.extent == MechanicalExtent::None,
+                stage: stage(value.stage),
+                state: state(value.state),
+                reason: value.terminal_reason.as_ref().map(|reason| reason.key()),
+            }
+        })
+        .collect();
+    // Independent reverse inventory: do not filter these through output rows.
+    let active = artifact
+        .bridge_events
+        .iter()
+        .filter(|value| {
+            mechanical_receipt::is_return_receipt_kind(&value.site.bridge_kind)
+                && value.stage == BridgeReceiptStage::Terminal
+                && value.state == BridgeReceiptState::Applied
+        })
+        .map(|value| value.site.receipt_key())
+        .collect::<BTreeSet<_>>();
+    let bridges = artifact
+        .bridge_events
+        .iter()
+        .filter(|value| active.contains(&value.site.receipt_key()))
+        .map(project_bridge)
+        .collect();
+    let mut capture_errors = artifact
+        .outbound_return_error
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Err(error) = mechanical_receipt::reconcile_outbound_return_rows(
+        &artifact.outbound_return_required,
+        &artifact.outbound_return_rows,
+        &artifact.mechanical_events,
+        &artifact.bridge_events,
+    ) {
+        capture_errors.push(error);
+    }
+    Capture {
+        required,
+        rows,
+        common,
+        bridges,
+        rendered_tsv: mechanical_receipt::render_outbound_return_rows(
+            &artifact.outbound_return_rows,
+        ),
+        capture_errors,
+    }
+}
+
+fn project_bridge(value: &BridgeReceiptEvent) -> Bridge {
+    Bridge {
+        key: bridge_key(&value.site),
+        source_form: value.found_form.clone(),
+        target_form: value.expected_form.clone(),
+        argument_kind: value.argument_kind.clone(),
+        tier: match value.retention {
+            BridgeRetentionTier::None => "none",
+            BridgeRetentionTier::T1 => "T1",
+            BridgeRetentionTier::T2 => "T2",
+        }
+        .into(),
+        waiver: value.waiver_id.clone().unwrap_or_else(|| "-".into()),
+        extent_none: value.extent == BridgeExtentKind::None,
+        stage: match value.stage {
+            BridgeReceiptStage::Plan => "plan",
+            BridgeReceiptStage::Terminal => "terminal",
+        }
+        .into(),
+        state: match value.state {
+            BridgeReceiptState::Planned => "planned",
+            BridgeReceiptState::Applied => "applied",
+            BridgeReceiptState::Dropped => "dropped",
+        }
+        .into(),
+        reason: value.drop_reason.clone(),
+    }
+}
+
+fn fail(reason: &str) -> String {
+    format!("outbound-return-transport:{reason}")
+}
+
+pub(crate) fn validate(capture: &Capture) -> Result<(), String> {
+    if !capture.capture_errors.is_empty() {
+        return Err(fail("native-capture-error"));
+    }
+    let mut required = BTreeMap::new();
+    let mut expected_bridges = BTreeMap::new();
+    for value in &capture.required {
+        let key = &value.key;
+        let bridge = &value.bridge;
+        let expression = bridge.kind == "outbound-native-return-argument";
+        let Some(callee) = bridge.callee else { return Err(fail("nonlocal-endpoint")) };
+        if canonical_obligation(key).as_ref() != Some(&key.key)
+            || canonical_bridge(bridge).as_ref() != Some(&bridge.key)
+            || key.endpoint_def_id != bridge.endpoint_def_id
+            || key.argument_index.is_some() != expression
+            || key.slot_depth != 0
+            || required.insert(key.key.clone(), value).is_some()
+            || expected_bridges
+                .insert(bridge.key.clone(), key.key.clone())
+                .is_some()
+            || key.family
+                != if expression {
+                    "flows-into-raw-param"
+                } else {
+                    "return-not-adapted"
+                }
+            || key.owner != bridge.owner
+            || (!expression && bridge.owner != callee)
+            || key.caller != bridge.caller
+            || key.endpoint.as_ref() != Some(&bridge.endpoint)
+            || key.hir_owner != Some(bridge.caller)
+            || !mechanical_receipt::is_return_receipt_kind(&bridge.kind)
+            || value.adapter.is_empty()
+            || value.adapter == "-"
+            || value.terminal_interface.is_empty()
+            || value.terminal_interface == "raw"
+        {
+            return Err(fail("required-identity-or-evidence"));
+        }
+        let null = bridge.kind == "return-null-to-option";
+        if bridge.kind == "return-caller-receive-raw" {
+            if value.native_lifetime.is_some()
+                || !matches!(value.retention, Some(Retention::Unknown { .. }))
+            {
+                return Err(fail("raw-receiver-evidence"));
+            }
+        } else if expression {
+            let Some(proof) = &value.native_lifetime else {
+                return Err(fail("missing-argument-lifetime"));
+            };
+            if proof.owner != key.owner
+                || proof.lifetime.is_empty()
+                || proof.plan_digest.is_empty()
+                || !matches!(
+                    value.retention,
+                    Some(Retention::NoRetain { .. } | Retention::Unknown { .. })
+                )
+            {
+                return Err(fail("argument-native-retention-evidence"));
+            }
+        } else {
+            let Some(proof) = &value.native_lifetime else {
+                return Err(fail("missing-native-lifetime"));
+            };
+            if value.retention.is_some()
+                || proof.owner != callee
+                || proof.lifetime.is_empty()
+                || proof.plan_digest.is_empty()
+                || bridge.caller != callee
+            {
+                return Err(fail("native-lifetime-evidence"));
+            }
+        }
+        if expression {
+            if !matches!(&key.subject.generated, Some((owner, name, 0)) if *owner == bridge.caller
+                && key.hir_item_local_id.is_some_and(|hir| *name == format!("outbound-expression:{hir}")))
+            {
+                return Err(fail("native-argument-subject"));
+            }
+        } else if null {
+            if !matches!(&key.subject.generated, Some((owner, name, 0)) if *owner == bridge.caller
+                && key.hir_item_local_id.is_some_and(|hir| *name == format!("return-expression:{hir}")))
+                || !value.origins.is_empty()
+            {
+                return Err(fail("null-return-subject"));
+            }
+        } else if !matches!(key.subject.local, Some((owner, local, 0)) if owner == bridge.caller && local > 0)
+        {
+            return Err(fail("borrowed-return-subject"));
+        }
+        let origin_owner = if expression { key.owner } else { callee };
+        let mut origins = BTreeSet::new();
+        if (!null && value.origins.is_empty()) || value.origins.iter().any(|origin| {
+            !matches!(origin.local, Some((owner, local, 0)) if owner == origin_owner && local > 0)
+                || canonical_subject(origin).as_ref() != Some(&origin.key)
+                || !origins.insert(origin.key.clone())
+        }) {
+            return Err(fail("origin-custody"));
+        }
+    }
+    let mut bridges = BTreeMap::new();
+    for value in &capture.bridges {
+        if !expected_bridges.contains_key(&value.key.key)
+            || bridges
+                .insert((value.key.key.clone(), value.stage.clone()), value)
+                .is_some()
+        {
+            return Err(fail("unowned-or-duplicate-bridge"));
+        }
+    }
+    let mut common = BTreeMap::new();
+    for value in &capture.common {
+        if required.get(&value.key.key).map(|required| &required.key) != Some(&value.key)
+            || common
+                .insert((value.key.key.clone(), value.stage.clone()), value)
+                .is_some()
+        {
+            return Err(fail("unowned-or-duplicate-common"));
+        }
+    }
+    let mut rows = BTreeMap::new();
+    for value in &capture.rows {
+        if required.get(&value.required.key.key).copied() != Some(&value.required)
+            || rows
+                .insert((value.required.key.key.clone(), value.stage.clone()), value)
+                .is_some()
+        {
+            return Err(fail("unowned-duplicate-or-metadata-row"));
+        }
+    }
+    if rows.len() != required.len() * 2 || common.len() != rows.len() || bridges.len() != rows.len()
+    {
+        return Err(fail("stage-cardinality"));
+    }
+    for (key, required) in &required {
+        for (stage, state) in [("plan", "planned"), ("terminal", "applied")] {
+            let tuple = (key.clone(), stage.to_owned());
+            let row = rows
+                .get(&tuple)
+                .ok_or_else(|| fail("missing-specialized-stage"))?;
+            let event = common
+                .get(&tuple)
+                .ok_or_else(|| fail("missing-common-stage"))?;
+            let bridge = bridges
+                .get(&(required.bridge.key.clone(), stage.to_owned()))
+                .ok_or_else(|| fail("missing-bridge-stage"))?;
+            let source_contract = match row.boundary_kind.as_str() {
+                "outbound-native-return-argument" => {
+                    row.source_form == required.terminal_interface
+                        && row.target_form == "raw"
+                        && match (&required.retention, row.tier.as_str(), row.waiver.as_str()) {
+                            (Some(Retention::NoRetain { certificate }), "T1", "-") => {
+                                required
+                                    .key
+                                    .argument_index
+                                    .and_then(|index| usize::try_from(index).ok())
+                                    == Some(certificate.argument_index)
+                            }
+                            (Some(Retention::Unknown { .. }), "T2", waiver) => {
+                                waiver == RAW_BOUNDARY_T2_WAIVER_ID
+                            }
+                            _ => false,
+                        }
+                }
+                "return-caller-receive-raw" => {
+                    row.source_form == required.terminal_interface
+                        && row.target_form == "raw"
+                        && row.tier == "T2"
+                        && row.waiver == RAW_BOUNDARY_T2_WAIVER_ID
+                }
+                "return-raw-to-ref" => {
+                    // **R494-1(b)** — W6L-1's raw-field return view rides the T2 waiver.
+                    //
+                    // This clause read `tier == "T1" && waiver == "-"` unconditionally,
+                    // which was true of every `return-raw-to-ref` row any corpus head had
+                    // ever produced. It is not true of the shape W6L-1 was written for.
+                    // `seam.rs` decides tier and waiver in ONE match on the same fact this
+                    // reads:
+                    //
+                    //     match through_raw_field {
+                    //         Some(reuse) => (T2, Some(RAW_BOUNDARY_T2_WAIVER_ID), ":through_raw_field=.."),
+                    //         None        => (T1, None, ""),
+                    //     }
+                    //
+                    // so the traversal receipt in the position IS the tier, and the ledger
+                    // asks for exactly the pairing the emission produces. heman's
+                    // `heman_image_texel` — the callee named in `return_through_raw_field`'s
+                    // own module doc — is the first corpus row to carry it.
+                    //
+                    // Both directions are asserted: a raw-field view must carry T2 and the
+                    // named waiver, and everything else must still carry T1 and none. A
+                    // clause that accepted either tier on either shape would be no clause.
+                    let raw_field_view = required.bridge.position.contains(":through_raw_field=");
+                    row.target_form == required.terminal_interface
+                        && !row.source_form.is_empty()
+                        && row.target_form != "raw"
+                        && if raw_field_view {
+                            row.tier == "T2" && row.waiver == RAW_BOUNDARY_T2_WAIVER_ID
+                        } else {
+                            row.tier == "T1" && row.waiver == "-"
+                        }
+                }
+                "return-null-to-option" => {
+                    row.target_form == required.terminal_interface
+                        && matches!(
+                            row.target_form.as_str(),
+                            "opt-ref-mut" | "opt-ref-shared" | "opt-slice-mut" | "opt-slice-shared"
+                        )
+                        && row.source_form == "raw"
+                        && row.tier == "none"
+                        && row.waiver == "-"
+                }
+                _ => false,
+            };
+            // **R493-1** — name the clause that drifted.
+            //
+            // This was one 27-clause conjunction reporting a single word, so a refusal
+            // said only that the ledger and the tree disagree somewhere. Settling a
+            // drift means moving the LEDGER'S expectation to what the tree carries, and
+            // that cannot be done without knowing which expectation moved. The checks are
+            // unchanged; only their reporting is.
+            let drift: [(&str, bool); 27] = [
+                ("source-contract", !source_contract),
+                ("row-state", row.state != state),
+                ("event-state", event.state != state),
+                ("bridge-state", bridge.state != state),
+                ("row-reason", row.reason.is_some()),
+                ("event-reason", event.reason.is_some()),
+                ("bridge-reason", bridge.reason.is_some()),
+                ("boundary-kind", row.boundary_kind != required.bridge.kind),
+                ("endpoint", row.endpoint != required.bridge.endpoint),
+                ("position", row.position != required.bridge.position),
+                ("pair-role", row.pair_role != "not-applicable"),
+                ("effect-carrier", row.effect_carrier.is_some()),
+                ("row-source-form", row.source_form != event.source_form),
+                ("row-target-form", row.target_form != event.target_form),
+                ("negative-write", row.negative_write != event.negative_write),
+                ("row-tier", row.tier != event.tier),
+                ("row-waiver", row.waiver != event.waiver),
+                (
+                    "terminal-interface",
+                    event.terminal_interface.as_ref() != Some(&required.terminal_interface),
+                ),
+                ("return-adapter", !event.return_adapter),
+                ("event-extent-none", !event.extent_none),
+                ("bridge-key", bridge.key != required.bridge),
+                ("bridge-source-form", bridge.source_form != row.source_form),
+                ("bridge-target-form", bridge.target_form != row.target_form),
+                (
+                    "bridge-argument-kind",
+                    bridge.argument_kind != event.argument_kind,
+                ),
+                ("bridge-tier", bridge.tier != row.tier),
+                ("bridge-waiver", bridge.waiver != row.waiver),
+                ("bridge-extent-none", !bridge.extent_none),
+            ];
+            if let Some((clause, _)) = drift.iter().find(|(_, failed)| *failed) {
+                return Err(fail(&format!("common-specialized-bridge-drift:{clause}")));
+            }
+        }
+        let planned = rows[&(key.clone(), "plan".into())];
+        let mut terminal = (*rows[&(key.clone(), "terminal".into())]).clone();
+        terminal.stage = planned.stage.clone();
+        terminal.state = planned.state.clone();
+        terminal.reason = planned.reason.clone();
+        if &terminal != planned {
+            return Err(fail("cross-stage-metadata"));
+        }
+    }
+    if capture.rendered_tsv != render(&capture.rows) {
+        return Err(fail("rendered-sidecar-drift"));
+    }
+    Ok(())
+}
+
+fn render(rows: &[Row]) -> String {
+    let mut lines = rows
+        .iter()
+        .map(|row| {
+            let required = &row.required;
+            let origins = required
+                .origins
+                .iter()
+                .map(|origin| origin.key.as_str())
+                .collect::<Vec<_>>()
+                .join(";");
+            [
+                required.key.key.clone(),
+                row.boundary_kind.clone(),
+                row.endpoint.clone(),
+                row.position.clone(),
+                row.source_form.clone(),
+                row.target_form.clone(),
+                required.adapter.clone(),
+                row.negative_write.clone(),
+                match (&required.retention, &required.native_lifetime) {
+                    (Some(retention), Some(native)) => {
+                        format!("retention={retention:?};native_lifetime={native:?}")
+                    }
+                    (Some(retention), None) => format!("{retention:?}"),
+                    (None, Some(native)) => format!("{native:?}"),
+                    (None, None) => "-".into(),
+                },
+                row.tier.clone(),
+                row.waiver.clone(),
+                if origins.is_empty() {
+                    "-".into()
+                } else {
+                    origins
+                },
+                row.pair_role.clone(),
+                row.effect_carrier.clone().unwrap_or_else(|| "-".into()),
+                required.terminal_interface.clone(),
+                row.stage.clone(),
+                row.state.clone(),
+                row.reason.clone().unwrap_or_else(|| "-".into()),
+            ]
+            .join("\t")
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    let mut output = mechanical_receipt::specialized_receipt_headers()
+        [crate::raw_boundary_census_schema::OUTBOUND_RETURN_BRIDGE_ROWS]
+        .join("\t");
+    output.push('\n');
+    for line in lines {
+        output.push_str(&line);
+        output.push('\n');
+    }
+    output
+}
+
+#[cfg(test)]
+mod drift_clause_tests {
+    /// **R493-1 — a drift refusal must name the clause that drifted.**
+    ///
+    /// This comparator held one 27-clause conjunction and reported a single word. Route
+    /// B's heman run ends `instrument-error / data=false` on it, and settling a drift
+    /// means moving the LEDGER'S expectation to what the tree carries — which cannot be
+    /// done without knowing which expectation moved. A refusal that says only "something
+    /// disagrees" is a refusal nobody can act on.
+    ///
+    /// The checks themselves are unchanged. This pins that each has a name, that the
+    /// names are distinct (two clauses sharing one label would send a reader to the wrong
+    /// expectation), and that the list still covers all 27.
+    #[test]
+    fn r493_1_every_drift_clause_is_named_and_distinct() {
+        let source = include_str!("outbound_return_transport.rs");
+        let table = source
+            .split("let drift: [(&str, bool); 27] = [")
+            .nth(1)
+            .expect("the clause table exists");
+        let table = &table[..table.find("\n            ];").expect("the table closes")];
+
+        // The names are the FIRST quoted string of each entry, and rustfmt may split an
+        // entry across lines -- the first version of this witness required `("name",` on
+        // one line and found 26 of 27 for exactly that reason, which would have read as a
+        // missing clause rather than a parser that was too strict.
+        let names = table
+            .split(',')
+            .filter_map(|piece| {
+                let piece = piece.trim();
+                piece
+                    .trim_start_matches('(')
+                    .trim_start()
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.split('"').next())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(names.len(), 27, "every clause is named: {names:?}");
+        let unique = names.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            unique.len(),
+            27,
+            "two clauses sharing a label would send a reader to the wrong expectation: {names:?}"
+        );
+
+        // And the refusal carries the name rather than the bare word.
+        assert!(
+            source.contains(r#"common-specialized-bridge-drift:{clause}"#),
+            "the refusal must carry the clause"
+        );
+    }
+
+    /// **R494-1(b) — the `source-contract` clause, settled on the heman shape.**
+    ///
+    /// The fixture is not hand-built: it is the ONE `return-raw-to-ref` quadruple that
+    /// refused on the Route B reproduction (`probe-routeb` = `32caeabf4`, heman, realized
+    /// 442), lifted out of that run's `heman.raw-boundary-outbound-return-custody.json`
+    /// with only the absolute worktree path normalized. Its bridge is
+    /// `heman_image_texel` — the callee `return_through_raw_field`'s own module doc names
+    /// as W6L-1's motivating example — and it carries `tier=T2` with the named waiver
+    /// because `seam.rs` derives tier, waiver and the `:through_raw_field=` receipt from
+    /// one match on one fact.
+    ///
+    /// Four cases, because a one-directional clause is not a clause: the raw-field view
+    /// must be T2-with-waiver and is refused at T1, and an ordinary return view must be
+    /// T1-without-waiver and is refused at T2. The two faults are the second and fourth.
+    #[test]
+    fn r494_1b_a_raw_field_return_view_carries_t2_and_only_it_may() {
+        use super::{Capture, render, validate};
+
+        let fixture = include_str!("testdata/r494-route-b/heman-untied-return-view.json");
+        // Flipping the receipt in the TEXT flips it everywhere it occurs -- the bridge
+        // key, the required position and the row position all embed it, and a capture
+        // where they disagree would be refused by a different clause (`bridge-key`),
+        // which would make this witness pass for the wrong reason.
+        let ordinary = fixture.replace(
+            ":through_raw_field=arg1/deref1/field:untied-return-view",
+            "",
+        );
+        assert!(
+            !ordinary.contains(":through_raw_field="),
+            "the receipt is gone"
+        );
+
+        let load = |text: &str, tier: &str, waiver: &str| {
+            let text = text
+                .replace(r#""tier": "T2""#, &format!(r#""tier": "{tier}""#))
+                .replace(
+                    r#""waiver": "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01""#,
+                    &format!(r#""waiver": "{waiver}""#),
+                );
+            let mut capture: Capture =
+                serde_json::from_str(&text).expect("the captured quadruple deserializes");
+            // The sidecar's own rendering is a separate clause; this witness is about the
+            // source contract, so the rendering is made consistent by construction.
+            capture.rendered_tsv = render(&capture.rows);
+            validate(&capture)
+        };
+
+        const WAIVER: &str = super::RAW_BOUNDARY_T2_WAIVER_ID;
+
+        assert_eq!(
+            load(fixture, "T2", WAIVER),
+            Ok(()),
+            "W6L-1's raw-field return view rides the T2 waiver -- this is the row Route B refused"
+        );
+        assert!(
+            load(fixture, "T1", "-")
+                .unwrap_err()
+                .contains("common-specialized-bridge-drift:source-contract"),
+            "a raw-field view claiming no-retention is still a drift"
+        );
+        assert_eq!(
+            load(&ordinary, "T1", "-"),
+            Ok(()),
+            "an ordinary return view is unchanged"
+        );
+        assert!(
+            load(&ordinary, "T2", WAIVER)
+                .unwrap_err()
+                .contains("common-specialized-bridge-drift:source-contract"),
+            "a waiver without the traversal receipt that licenses it is still a drift"
+        );
+    }
+}

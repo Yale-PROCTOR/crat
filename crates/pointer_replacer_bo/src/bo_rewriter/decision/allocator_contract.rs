@@ -1,0 +1,1568 @@
+//! wave-6a: **the allocator-contract consumer** (relay wave-6a/006, USER
+//! DECISION seat addendum 409, R409-1/3).
+//!
+//! brotli's `alloc_func` / `free_func` pair is malloc/free-like — the pinned
+//! contract `allocator-contract:brotli-memory-manager/v1@2026-09-15`:
+//! `BrotliAllocate(m, size)` returns a fresh owned allocation of `size`
+//! bytes, non-null after brotli's `exit(1)` guard; released exactly once
+//! through `BrotliFree(m, p)`. era-5c builds the analysis root behind a pin
+//! (the ≈ 60 brotli allocation locals become Owning when L01⁗ lands); this
+//! consumer plans the rows now, on the contract's evidence, exactly as the
+//! allocation-return certificate plans its receivers on the source proof
+//! (R410-5 §1: the certificate supersedes the model's Raw).
+//!
+//! **Emission rule (R409-3), binding on every consumer.** A contract-rooted
+//! allocation local emits `Box<T>` / `Box<[T]>` — the count read from the
+//! size expression exactly as W6A-B1's sealed-constructor typing reads it
+//! (`n.wrapping_mul(size_of::<T>())` → `n`; `size_of::<T>()` → sized) —
+//! constructed FROM the contract allocator's result (`Box::from_raw(..)`:
+//! the memory manager's accounting stays the program's), and its C free
+//! site `BrotliFree(m, x as *mut c_void)` emitted as
+//! `BrotliFree(m, Box::into_raw(x) as *mut c_void)` — the source-proved
+//! deallocator transfer of batch 6 with the custom deallocator as the sink.
+//! **NO implicit close**: addendum 101's `waiver-drop(scope-exit | overwrite
+//! | unwind)` does NOT extend to contract allocations (Rust's global
+//! allocator dropping memory of a custom `free_func` is UB). A path on which
+//! the owner is neither freed, transferred nor stored — a `return` between
+//! the allocation and its free, a free inside a branch of the allocating
+//! block, no free at all — is the typed hold
+//! `contract-allocation:implicit-close`; an overwrite of a live owner
+//! likewise (`contract-allocation:overwrite`); the `BROTLI_FREE` null store
+//! right after the free (`x = 0 as *mut T`) is `x = None` / deleted. The
+//! conditional allocation `if n > 0 { BrotliAllocate(..) } else { null }`
+//! is `Option<Box<[T]>>` with `None` on the else arm.
+//!
+//! Uses are the certificate's receiver walk (`return_certificate::owner_uses`):
+//! element accesses (`x[i]`, through `as_deref[_mut]().unwrap()` for an
+//! optional owner), derefs, null tests, stores into raw places
+//! (`Box::into_raw`), lends to Ref-modeled local formals read from the
+//! callee's body and to libc positions the contract table calls `NoRetain`
+//! + `BorrowView` (`memset`, `memcpy`, ..) — the optional owner's lend is
+//! the R130 void bridge `x.as_deref_mut().map_or(null_mut(), |s|
+//! s.as_mut_ptr())`; a lend to a LOCAL callee whose formal converts is the
+//! seam's owner-view glue (`&*x` at a slice formal, R422-5). A `return x`
+//! of the owner holds (`contract-allocation:returned`: the return interface
+//! is A1's, and a contract allocation must not be closed by a receiver's
+//! drop).
+//!
+//! Receipt `allocator-contract` per site (the receipts table).
+
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::{
+    Expr, ExprKind, HirId, QPath,
+    def::{DefKind, Res},
+    def_id::{DefId, LocalDefId},
+    intravisit::{self, Visitor},
+};
+use rustc_middle::ty::{TyCtxt, TyKind};
+use rustc_span::Span;
+
+use super::{
+    Ctx, Decision, DecisionTable, DegradeReason, Subject, SubjectKind,
+    box_facts::{BoxExprEdit, BoxOwnershipFacts, BoxPlan, BoxPlanFailure, BoxShape},
+    construction::ConstructionFacts,
+    declaration::pointee_source,
+    return_certificate::{LendOracle, owner_uses},
+    seam::ExplicitDeclarationSite,
+};
+use crate::{
+    analyses::borrow_ownership::{SlotKind, crate_slots::CrateSlots, solver::SlotRef},
+    bo_rewriter::bridge_receipt::SignatureClassId,
+};
+
+/// How one allocator of a contract states the extent of the block it returns.
+pub(crate) enum Extent {
+    /// The argument at this index is a BYTE count: `malloc(n * size_of::<T>())`
+    /// is `n` elements, `malloc(size_of::<T>())` is one.
+    SizeArgument(usize),
+    /// `calloc(n, size_of::<T>())`: the count is the first argument, and the
+    /// second must be the pointee's own size.
+    ElementCount {
+        count_index: usize,
+        size_index: usize,
+    },
+    /// `strdup(s)`: the block is the NUL-terminated copy of `s`, so its extent
+    /// is a POSTCONDITION of the contract — `strlen + 1` — and is read off the
+    /// RESULT, never off the argument (R434-4 §1). Reading the result keeps
+    /// the count independent of whatever form another family gives `s`.
+    NulTerminatedCopy,
+}
+
+/// One pinned allocator of a contract.
+pub(crate) struct Allocator {
+    pub(crate) name: &'static str,
+    pub(crate) extent: Extent,
+}
+
+/// One pinned allocator contract: a set of allocators and the ONE deallocator
+/// that releases what they return.
+pub(crate) struct Contract {
+    pub(crate) id: &'static str,
+    pub(crate) allocators: &'static [Allocator],
+    /// The deallocator's item name and the index of its pointer argument.
+    pub(crate) free: &'static str,
+    pub(crate) pointer_index: usize,
+}
+
+/// The contract table (USER DECISION, seat addendum 409; the libc row is
+/// R434-4 §3). `realloc` is deliberately ABSENT: it releases one generation
+/// and creates another in one call, which is neither of this table's two
+/// events, so a local it touches keeps its typed hold.
+pub(crate) const CONTRACTS: &[Contract] = &[
+    Contract {
+        id: "allocator-contract:brotli-memory-manager/v1@2026-09-15",
+        allocators: &[Allocator {
+            name: "BrotliAllocate",
+            extent: Extent::SizeArgument(1),
+        }],
+        free: "BrotliFree",
+        pointer_index: 1,
+    },
+    Contract {
+        id: "allocator-contract:libc/v1@2026-09-17",
+        allocators: &[
+            Allocator {
+                name: "malloc",
+                extent: Extent::SizeArgument(0),
+            },
+            Allocator {
+                name: "calloc",
+                extent: Extent::ElementCount {
+                    count_index: 0,
+                    size_index: 1,
+                },
+            },
+            Allocator {
+                name: "strdup",
+                extent: Extent::NulTerminatedCopy,
+            },
+        ],
+        free: "free",
+        pointer_index: 0,
+    },
+];
+
+const IMPLICIT_CLOSE: &str = "contract-allocation:implicit-close";
+const OVERWRITE: &str = "contract-allocation:overwrite";
+const RETURNED: &str = "contract-allocation:returned";
+const COUNT: &str = "contract-allocation:count";
+const USE: &str = "contract-allocation:use";
+
+fn typed_key(hold: &str) -> &'static str {
+    [IMPLICIT_CLOSE, OVERWRITE, RETURNED, COUNT, USE]
+        .into_iter()
+        .find(|key| hold.starts_with(key))
+        .unwrap_or(USE)
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Plans {
+    /// Every subject the consumer plans: (function, binding) → plan.
+    pub(crate) plans: FxHashMap<(LocalDefId, HirId), BoxPlan>,
+    /// Refusals: binding → (label, typed reason). These DEGRADE the subject,
+    /// so only a contract that owns its subjects records them.
+    pub(crate) holds: FxHashMap<(LocalDefId, HirId), (String, String)>,
+    /// The libc row's refusals. libc's allocators are the whole corpus's, not
+    /// this rule's alone: a local it cannot claim belongs to whichever family
+    /// does claim it, so the refusal is a RECEIPT and never a decision.
+    pub(crate) yields: Vec<(String, String)>,
+    /// Admitted rows: (label, receipt).
+    pub(crate) admitted: Vec<(String, String)>,
+    /// **R641-11 (a)** — owners whose null guard is kept on the raw result;
+    /// its return is copied in the enclosing function's raw spelling.
+    pub(crate) kept_guards: FxHashSet<(LocalDefId, HirId)>,
+    /// **R450-8 rung 3**: owners whose release is a callee's — (owner, callee,
+    /// argument index, label, whether this contract's refusals are receipts).
+    /// [`confirm_transfers`] demotes every owner whose callee the chain did
+    /// not plan, exactly as the allocation-return certificate withdraws an
+    /// unconfirmed transfer of its own.
+    pub(crate) transfers: Vec<((LocalDefId, HirId), DefId, usize, String, bool)>,
+}
+
+/// **R450-8 rung 3** — the chain has spoken: every owner whose release was a
+/// transfer into a formal `box_param` did NOT plan is demoted here, because
+/// its generation would then reach the callee as a `Box` at a raw formal and
+/// close at a scope exit this rule never admits.
+pub(crate) fn confirm_transfers(
+    plans: &mut Plans,
+    tcx: TyCtxt<'_>,
+    confirmed: &dyn Fn(DefId, usize) -> bool,
+) {
+    for (node, did, index, label, yields) in std::mem::take(&mut plans.transfers) {
+        if confirmed(did, index) || !plans.plans.contains_key(&node) {
+            continue;
+        }
+        plans.plans.remove(&node);
+        plans.admitted.retain(|(l, _)| *l != label);
+        let reason = format!(
+            "{USE}:transfer-unconfirmed:{}#{index}",
+            tcx.def_path_str(did)
+        );
+        if yields {
+            plans.yields.push((label, reason));
+        } else {
+            plans.holds.insert(node, (label, reason));
+        }
+    }
+}
+
+impl Plans {
+    pub(crate) fn receipts_tsv(&self) -> String {
+        let mut out = String::from("subject\tkind\tdetail\n");
+        let mut yielded = self.yields.clone();
+        yielded.sort();
+        for (label, reason) in yielded {
+            out.push_str(&format!("{label}\tyielded\t{reason}\n"));
+        }
+        let mut admitted = self.admitted.clone();
+        admitted.sort();
+        for (label, receipt) in admitted {
+            out.push_str(&format!("{label}\tadmitted\t{receipt}\n"));
+        }
+        let mut holds: Vec<&(String, String)> = self.holds.values().collect();
+        holds.sort();
+        for (label, hold) in holds {
+            out.push_str(&format!("{label}\theld\t{hold}\n"));
+        }
+        out
+    }
+}
+
+/// Decision-phase hook, before the model's verdict is applied: a subject the
+/// consumer plans is a Box on the contract's evidence; a subject it refused
+/// carries the typed hold.
+pub(crate) fn planned(ctx: &Ctx<'_, '_>, subject: &Subject, site: &str) -> Option<Decision> {
+    let node = (subject.fn_did, subject.hir_id);
+    if let Some(plan) = ctx.allocator_contracts.plans.get(&node) {
+        // R641-11 (a), from the review of `38dccedfd`: a kept guard's return
+        // is copied in the enclosing function's raw spelling. Where the
+        // return certificate converts that function's return, the copy would
+        // not type, so the libc row yields the owner (a receipt, never a
+        // decision) and the certificate renders the original guard's return.
+        if ctx.allocator_contracts.kept_guards.contains(&node)
+            && ctx
+                .return_certificates
+                .callees
+                .contains_key(&subject.fn_did)
+        {
+            return None;
+        }
+        return Some(Decision::Box(plan.clone()));
+    }
+    let (_, hold) = ctx.allocator_contracts.holds.get(&node)?;
+    Some(Decision::Degraded(super::Degradation {
+        subject: subject.label.clone(),
+        site: site.to_owned(),
+        reason: DegradeReason::BoxFailure {
+            failure: BoxPlanFailure::NativeEvidenceHeld {
+                prior_key: typed_key(hold),
+                detail: hold.clone(),
+            },
+        },
+    }))
+}
+
+/// After the decisions: the planned locals get their `Box<..>` spelled out
+/// (the custody instrument reads only explicit types).
+pub(crate) fn append_explicit_declarations(tcx: TyCtxt<'_>, table: &mut DecisionTable) {
+    let mut sites = Vec::new();
+    for (subject, decision) in &table.entries {
+        let node = (subject.fn_did, subject.hir_id);
+        let plan = match decision {
+            Decision::Box(plan) => plan,
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Slice { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Cursor { .. }
+            | Decision::Opt { .. }
+            | Decision::Degraded(_) => continue,
+        };
+        if !table.allocator_contracts.plans.contains_key(&node) || subject.ty_span.is_some() {
+            continue;
+        }
+        let Some(name) = subject.param_name.as_deref() else { continue };
+        if table
+            .seams
+            .explicit_declarations
+            .iter()
+            .any(|site| site.category == "local" && site.node == Some(node))
+        {
+            continue;
+        }
+        let binding_type = tcx.typeck(subject.fn_did).node_type(subject.hir_id);
+        let TyKind::RawPtr(pointee, _) = binding_type.kind() else { continue };
+        let element = pointee_source(tcx, *pointee);
+        let base = match plan.shape {
+            BoxShape::Sized => format!("Box<{element}>"),
+            BoxShape::Slice => format!("Box<[{element}]>"),
+        };
+        let emitted_type = if plan.optional {
+            format!("Option<{base}>")
+        } else {
+            base
+        };
+        sites.push(ExplicitDeclarationSite {
+            owner_class: SignatureClassId::of(subject.fn_did),
+            caller: subject.fn_did,
+            node: Some(node),
+            span: Some(subject.binding_span),
+            category: "local",
+            replacement: Some(format!(
+                "{}{name}: {emitted_type}",
+                if subject.mut_binding { "mut " } else { "" }
+            )),
+            emitted_type,
+            arm: "surface",
+        });
+    }
+    table.seams.explicit_declarations.extend(sites);
+}
+
+fn peel_casts<'h>(mut e: &'h Expr<'h>) -> &'h Expr<'h> {
+    while let ExprKind::Cast(inner, _) = &e.kind {
+        e = inner;
+    }
+    e
+}
+
+fn bare_local(e: &Expr<'_>) -> Option<HirId> {
+    match &peel_casts(e).kind {
+        ExprKind::Path(QPath::Resolved(_, path)) => match path.res {
+            Res::Local(hir) => Some(hir),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// **R608-1** — `block` is an arm of an `if` (the other path carries the
+/// owner's `None` to the join; two creating arms are an overwrite, which the
+/// simulation refuses, R619-5 (3)), and no loop lies between that `if` and the
+/// block that declares `binding` (a loop would run the arm again over a live
+/// generation, an overwrite the simulation never sees).
+fn branch_outside_loops(tcx: TyCtxt<'_>, block: HirId, binding: HirId) -> bool {
+    let Some(declared_in) = tcx
+        .hir_parent_iter(binding)
+        .find_map(|(id, node)| matches!(node, rustc_hir::Node::Block(_)).then_some(id))
+    else {
+        return false;
+    };
+    let mut ancestors = tcx.hir_parent_iter(block);
+    let (Some((_, rustc_hir::Node::Expr(arm))), Some((_, rustc_hir::Node::Expr(branch)))) =
+        (ancestors.next(), ancestors.next())
+    else {
+        return false;
+    };
+    if !matches!(arm.kind, ExprKind::Block(..)) || !matches!(branch.kind, ExprKind::If(..)) {
+        return false;
+    }
+    for (id, node) in ancestors {
+        if id == declared_in {
+            return true;
+        }
+        if let rustc_hir::Node::Expr(e) = node
+            && matches!(e.kind, ExprKind::Loop(..))
+        {
+            return false;
+        }
+    }
+    false
+}
+
+/// **R450-8 rung 3** — the statement hands a bare local to a LOCAL callee,
+/// `f(x);` or `return f(x);`. Only the shape is read here: which callee, at
+/// which index. Whether that callee CONSUMES the argument is the chain's
+/// question (`box_param::consuming_formals`), and the derive asks it.
+fn transfer_call<'h>(tcx: TyCtxt<'_>, e: &'h Expr<'h>) -> Option<(HirId, DefId, usize)> {
+    let call = match &e.kind {
+        ExprKind::Ret(Some(inner)) => inner,
+        _ => e,
+    };
+    let ExprKind::Call(_, args) = &call.kind else {
+        return None;
+    };
+    let did = callee_of(call)?;
+    if !did.is_local() || contract_of(tcx, did).is_some() {
+        return None;
+    }
+    let (argument, hir) = args
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| Some((index, bare_local(arg)?)))?;
+    Some((hir, did, argument))
+}
+
+fn null_literal(e: &Expr<'_>) -> bool {
+    matches!(
+        &peel_casts(e).kind,
+        ExprKind::Lit(lit) if matches!(lit.node, rustc_ast::LitKind::Int(v, _) if v.get() == 0)
+    )
+}
+
+fn callee_of(e: &Expr<'_>) -> Option<DefId> {
+    let ExprKind::Call(callee, _) = &e.kind else { return None };
+    let ExprKind::Path(QPath::Resolved(_, path)) = &callee.kind else { return None };
+    match path.res {
+        Res::Def(DefKind::Fn, did) => Some(did),
+        _ => None,
+    }
+}
+
+/// The contract a callee belongs to, by item name (the pinned symbol).
+fn contract_of(
+    tcx: TyCtxt<'_>,
+    did: DefId,
+) -> Option<(&'static Contract, Option<&'static Allocator>)> {
+    let name = tcx.item_name(did);
+    CONTRACTS.iter().find_map(|c| {
+        if let Some(allocator) = c.allocators.iter().find(|a| name.as_str() == a.name) {
+            Some((c, Some(allocator)))
+        } else if name.as_str() == c.free {
+            Some((c, None))
+        } else {
+            None
+        }
+    })
+}
+
+/// **R641-11 (a) — a null guard kept on the raw result.** libc's allocators
+/// return null on failure, where C's guard (`if x.is_null() { return 0; }`)
+/// takes a defined path; a `Box` built first would already be UB there. So
+/// the guard's test moves onto the allocator's result, before the `Box`
+/// exists — which is the same place only when the guard is the statement
+/// right after the one that allocates, in the same block. The guard's
+/// then-block text, or `None`.
+pub(crate) fn adjacent_null_guard(
+    tcx: TyCtxt<'_>,
+    function: LocalDefId,
+    creation: Span,
+    guard: Span,
+) -> Option<String> {
+    struct Find {
+        creation: Span,
+        guard: Span,
+        then: Option<Span>,
+    }
+    impl<'tcx> Visitor<'tcx> for Find {
+        fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
+            for pair in block.stmts.windows(2) {
+                if pair[0].span.contains(self.creation)
+                    && let rustc_hir::StmtKind::Expr(e) | rustc_hir::StmtKind::Semi(e) =
+                        pair[1].kind
+                    && e.span == self.guard
+                    && let ExprKind::If(_, then, None) = e.kind
+                {
+                    self.then = Some(then.span);
+                }
+            }
+            intravisit::walk_block(self, block);
+        }
+    }
+    let mut find = Find {
+        creation,
+        guard,
+        then: None,
+    };
+    find.visit_body(tcx.hir_body_owned_by(function));
+    find.then
+        .and_then(|then| tcx.sess.source_map().span_to_snippet(then).ok())
+}
+
+/// The count of a contract allocation from its size argument: `n *
+/// size_of::<T>()` (either order, through casts) → `Slice` with count `n`;
+/// `size_of::<T>()` alone → `Sized`.
+/// **R615-4** — `calloc(1, size_of::<T>())` under its casts, with `T` the
+/// owner's pointee: ONE zero-filled `T`, the allocation-return certificate's
+/// filled-in-place source. The span is the whole cast chain, which the
+/// certificate's `Box::from_raw(..)` wraps.
+pub(crate) fn single_zeroed_allocation<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    owner: LocalDefId,
+    e: &Expr<'_>,
+    pointee: rustc_middle::ty::Ty<'tcx>,
+) -> Option<Span> {
+    let call = peel_casts(e);
+    let (_, allocator) = contract_of(tcx, callee_of(call)?)?;
+    let Extent::ElementCount {
+        count_index,
+        size_index,
+    } = allocator?.extent
+    else {
+        return None;
+    };
+    let ExprKind::Call(_, args) = &call.kind else { return None };
+    let count = peel_casts(args.get(count_index)?);
+    let ExprKind::Lit(lit) = &count.kind else { return None };
+    let rustc_ast::LitKind::Int(value, _) = lit.node else { return None };
+    let size = peel_casts(args.get(size_index)?);
+    let ExprKind::Call(size_of, []) = &size.kind else { return None };
+    let measured = tcx.typeck(owner).node_args(size_of.hir_id).types().next()?;
+    (value.get() == 1 && size_of_call(size) && measured == pointee).then_some(e.span)
+}
+
+fn size_of_call(e: &Expr<'_>) -> bool {
+    let e = peel_casts(e);
+    let ExprKind::Call(callee, args) = &e.kind else { return false };
+    args.is_empty()
+        && matches!(
+            &callee.kind,
+            ExprKind::Path(QPath::Resolved(_, path))
+                if path.segments.last().is_some_and(|s| s.ident.name.as_str() == "size_of")
+        )
+}
+
+fn shape_of(tcx: TyCtxt<'_>, size: &Expr<'_>) -> Result<(BoxShape, Option<String>), String> {
+    let is_size_of = size_of_call;
+    let snippet = |span: Span| {
+        tcx.sess
+            .source_map()
+            .span_to_snippet(span)
+            .unwrap_or_default()
+    };
+    let size = peel_casts(size);
+    if is_size_of(size) {
+        return Ok((BoxShape::Sized, None));
+    }
+    if let ExprKind::MethodCall(seg, recv, [arg], _) = &size.kind
+        && seg.ident.name.as_str() == "wrapping_mul"
+    {
+        if is_size_of(arg) {
+            return Ok((BoxShape::Slice, Some(snippet(recv.span))));
+        }
+        if is_size_of(recv) {
+            return Ok((BoxShape::Slice, Some(snippet(arg.span))));
+        }
+    }
+    if let ExprKind::Binary(op, lhs, rhs) = &size.kind
+        && op.node == rustc_hir::BinOpKind::Mul
+    {
+        if is_size_of(rhs) {
+            return Ok((BoxShape::Slice, Some(snippet(lhs.span))));
+        }
+        if is_size_of(lhs) {
+            return Ok((BoxShape::Slice, Some(snippet(rhs.span))));
+        }
+    }
+    Err(format!("{COUNT}:{}", snippet(size.span)))
+}
+
+/// A contract allocation expression: `<Allocate>(m, size) as *mut T` (the
+/// outermost cast, if any, is the binding's type).
+struct Allocation {
+    contract: &'static Contract,
+    /// The whole cast chain over the call (what the `Box::from_raw` wraps).
+    span: Span,
+    shape: BoxShape,
+    count: Option<String>,
+    /// The extent is the contract's own postcondition on the RESULT — a
+    /// NUL-terminated copy — so the construction binds the block and measures
+    /// it, instead of spelling a count over the allocator's arguments.
+    nul_terminated: bool,
+}
+
+fn allocation_contract(tcx: TyCtxt<'_>, e: &Expr<'_>) -> Option<&'static Contract> {
+    let did = callee_of(peel_casts(e))?;
+    let (contract, allocator) = contract_of(tcx, did)?;
+    allocator.map(|_| contract)
+}
+
+fn allocation<'h>(tcx: TyCtxt<'_>, e: &'h Expr<'h>) -> Option<Result<Allocation, String>> {
+    let call = peel_casts(e);
+    let did = callee_of(call)?;
+    let (contract, allocator) = contract_of(tcx, did)?;
+    let allocator = allocator?;
+    let ExprKind::Call(_, args) = &call.kind else { return None };
+    let snippet = |span: Span| {
+        tcx.sess
+            .source_map()
+            .span_to_snippet(span)
+            .unwrap_or_default()
+    };
+    let read = match &allocator.extent {
+        Extent::SizeArgument(index) => shape_of(tcx, args.get(*index)?),
+        Extent::ElementCount {
+            count_index,
+            size_index,
+        } => {
+            let size = args.get(*size_index)?;
+            if size_of_call(size) {
+                Ok((BoxShape::Slice, Some(snippet(args.get(*count_index)?.span))))
+            } else {
+                Err(format!("{COUNT}:element-size:{}", snippet(size.span)))
+            }
+        }
+        // The postcondition, read off the RESULT: the block is a NUL-terminated
+        // copy, so its extent is its own `CStr` length plus the terminator.
+        // Nothing here depends on the argument's emitted form.
+        Extent::NulTerminatedCopy => Ok((BoxShape::Slice, None)),
+    };
+    let nul_terminated = matches!(allocator.extent, Extent::NulTerminatedCopy);
+    Some(read.map(|(shape, count)| Allocation {
+        contract,
+        span: e.span,
+        shape,
+        count,
+        nul_terminated,
+    }))
+}
+
+/// A statement of a block that concerns a contract owner.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Role {
+    /// `let x = <allocation>` / `let x = if c { <allocation> } else { null }`.
+    Let,
+    /// `x = <allocation>` — build 2's assignment receiver (brotli's
+    /// ensure-capacity idiom allocates into a null-initialized local).
+    Alloc,
+    /// `x = y` with `y` another contract owner — the generation MOVES in.
+    MoveIn,
+    /// `y = x` with `y` another contract owner — it moves out.
+    MoveOut,
+    /// `<Free>(m, x as *mut c_void);`
+    Free,
+    /// **R450-8 rung 3**: `f(x)` / `return f(x);` where `f` consumes the
+    /// formal — the generation's RELEASE is the callee's, and the chain
+    /// (W6A-C1) plans that free as a `drop`. Whether it really is a release
+    /// depends on `consuming_formals`, which the derive asks; a call to any
+    /// other callee stays a plain use.
+    Transfer,
+    /// `x = <null>;`
+    NullStore,
+    /// `let x = <null>;` — build 2: the ensure-capacity idiom declares the
+    /// receiver empty and allocates into it further down.
+    NullInit,
+    /// Any other assignment to the binding.
+    Store,
+}
+
+impl Role {}
+
+#[derive(Default)]
+struct Scan {
+    /// (binding, block, statement index, role, statement span).
+    statements: Vec<(HirId, HirId, usize, Role, Span)>,
+    /// Every `return` in the body.
+    returns: Vec<Span>,
+    /// `<Free>(m, x)` calls: (binding, call span, argument span).
+    frees: Vec<(HirId, Span, Span)>,
+    /// Every assignment to a bare local: (binding, value span).
+    assigns: Vec<(HirId, Span)>,
+    /// build 2: `x = <allocation>` — (binding, the value's span, its id).
+    alloc_assigns: Vec<(HirId, Span, HirId)>,
+    /// build 2: `x = y` with `y` a bare local — (binding, source, value span).
+    moves: Vec<(HirId, HirId, Span)>,
+    /// build 2: `let x = <null>;` — (binding, the initializer's span).
+    null_inits: Vec<(HirId, Span)>,
+    /// R450-8 rung 3: statements that hand the binding to a local callee —
+    /// (binding, callee, argument index, statement span).
+    transfer_calls: Vec<(HirId, DefId, usize, Span)>,
+    /// Every CAST of a bare local — (binding, the cast's span). The owner walk
+    /// must have spelled each one: a cast this rule leaves alone is a use of
+    /// the owner in another pointee's shape, which the emitted `Box` cannot
+    /// satisfy (lodepng's `mem as *const c_void`, the counted-void family's).
+    casts: Vec<(HirId, Span)>,
+}
+
+struct ScanWalk<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    out: Scan,
+}
+
+impl<'tcx> Visitor<'tcx> for ScanWalk<'tcx> {
+    type NestedFilter = rustc_middle::hir::nested_filter::OnlyBodies;
+
+    fn maybe_tcx(&mut self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+
+    fn visit_block(&mut self, block: &'tcx rustc_hir::Block<'tcx>) {
+        for (index, stmt) in block.stmts.iter().enumerate() {
+            let role = match &stmt.kind {
+                rustc_hir::StmtKind::Let(local) => local.init.and_then(|init| {
+                    let rustc_hir::PatKind::Binding(_, hir, _, None) = local.pat.kind else {
+                        return None;
+                    };
+                    let value = match &init.kind {
+                        ExprKind::If(_, then, Some(_)) => match then.kind {
+                            ExprKind::Block(b, _) => b.expr?,
+                            _ => then,
+                        },
+                        _ => init,
+                    };
+                    if allocation(self.tcx, value).is_some() {
+                        return Some((hir, Role::Let));
+                    }
+                    if null_literal(init) {
+                        self.out.null_inits.push((hir, init.span));
+                        return Some((hir, Role::NullInit));
+                    }
+                    None
+                }),
+                rustc_hir::StmtKind::Semi(e) | rustc_hir::StmtKind::Expr(e) => match &e.kind {
+                    ExprKind::Call(_, args) => callee_of(e)
+                        .and_then(|did| contract_of(self.tcx, did))
+                        .filter(|(_, allocator)| allocator.is_none())
+                        .and_then(|(c, _)| {
+                            let arg = args.get(c.pointer_index)?;
+                            let hir = bare_local(arg)?;
+                            self.out.frees.push((hir, e.span, arg.span));
+                            Some((hir, Role::Free))
+                        }),
+                    ExprKind::Assign(lhs, rhs, _) => bare_local(lhs)
+                        .filter(|_| matches!(lhs.kind, ExprKind::Path(_)))
+                        .map(|hir| {
+                            self.out.assigns.push((hir, rhs.span));
+                            // build 2 (relay wave-6a/018): the ensure-capacity
+                            // idiom allocates into a null-initialized local
+                            // (`new_array = if n > 0 { BrotliAllocate(..) }
+                            // else { null }`) and RE-SEATS the owner it
+                            // replaces (`all_histograms = new_array`).
+                            let value = match &rhs.kind {
+                                ExprKind::If(_, then, Some(_)) => match then.kind {
+                                    ExprKind::Block(b, _) => b.expr.unwrap_or(rhs),
+                                    _ => then,
+                                },
+                                _ => rhs,
+                            };
+                            let role = if null_literal(rhs) {
+                                Role::NullStore
+                            } else if allocation(self.tcx, value).is_some() {
+                                self.out.alloc_assigns.push((hir, rhs.span, rhs.hir_id));
+                                Role::Alloc
+                            } else if let Some(source) = bare_local(rhs) {
+                                self.out.moves.push((hir, source, rhs.span));
+                                Role::MoveIn
+                            } else {
+                                Role::Store
+                            };
+                            (hir, role)
+                        })
+                        // R607-1: the owner stored into a place that is not a
+                        // local (`(*rb).data_ = new_data`) moves out HERE, in
+                        // this block. The owner walk renders the store
+                        // (`Box::into_raw`, or refuses a non-raw place); the
+                        // simulation needs the release where it happens, or a
+                        // store on one branch would close the other.
+                        .or_else(|| {
+                            if matches!(lhs.kind, ExprKind::Path(_))
+                                || !matches!(rhs.kind, ExprKind::Path(_))
+                            {
+                                return None;
+                            }
+                            bare_local(rhs).map(|source| (source, Role::MoveOut))
+                        }),
+                    _ => None,
+                },
+                rustc_hir::StmtKind::Item(_) => None,
+            };
+            // R450-8 rung 3: a statement that hands the binding to a LOCAL
+            // callee — `f(x);` or `return f(x);`. The scan records the shape;
+            // only the derive knows (from `consuming_formals`) whether that
+            // call is the generation's release.
+            let role = role.or_else(|| {
+                let (rustc_hir::StmtKind::Semi(e) | rustc_hir::StmtKind::Expr(e)) = &stmt.kind
+                else {
+                    return None;
+                };
+                let (hir, did, argument) = transfer_call(self.tcx, e)?;
+                self.out
+                    .transfer_calls
+                    .push((hir, did, argument, stmt.span));
+                Some((hir, Role::Transfer))
+            });
+            if let Some((hir, role)) = role {
+                self.out
+                    .statements
+                    .push((hir, block.hir_id, index, role, stmt.span));
+            }
+        }
+        intravisit::walk_block(self, block);
+    }
+
+    fn visit_expr(&mut self, e: &'tcx Expr<'tcx>) {
+        if let ExprKind::Cast(inner, _) = &e.kind
+            && let ExprKind::Path(QPath::Resolved(_, path)) = &inner.kind
+            && let Res::Local(hir) = path.res
+        {
+            self.out.casts.push((hir, e.span));
+        }
+        match &e.kind {
+            ExprKind::Ret(_) => self.out.returns.push(e.span),
+            // An assignment outside statement position (`(x = ..)` as a
+            // value) is a store too.
+            ExprKind::Assign(lhs, rhs, _) if matches!(lhs.kind, ExprKind::Path(_)) => {
+                if let Some(hir) = bare_local(lhs)
+                    && !self
+                        .out
+                        .assigns
+                        .iter()
+                        .any(|(h, s)| *h == hir && *s == rhs.span)
+                {
+                    self.out.assigns.push((hir, rhs.span));
+                }
+            }
+            _ => {}
+        }
+        intravisit::walk_expr(self, e);
+    }
+}
+
+/// Derive every contract-rooted owner plan for the crate.
+pub(crate) fn derive<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    functions: &[LocalDefId],
+    subjects: &[Subject],
+    slots: &CrateSlots,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    consuming_formals: &FxHashSet<(DefId, usize)>,
+    box_facts: &BoxOwnershipFacts,
+    constructions: &ConstructionFacts,
+) -> Plans {
+    let mut out = Plans::default();
+    let lend_oracle = LendOracle::new(tcx, functions, slots, model);
+    let lend_ok = |did: DefId, index: usize| -> bool { lend_oracle.lend(did, index) };
+    // **R450-8 rung 3**: the generation's RELEASE may be a callee's. A local
+    // callee that frees its formal exactly once and reads it only through
+    // element accesses is the chain's own shape (`box_param::consuming_formals`
+    // — syntactic, optimistic, the same set the allocation-return certificate
+    // asks); the owner moves into it and the chain plans that free as a
+    // `drop`. The chain CONFIRMS the formal afterwards, and
+    // [`confirm_transfers`] demotes any owner whose callee it did not plan.
+    let transfer_ok =
+        |did: DefId, index: usize| -> bool { consuming_formals.contains(&(did, index)) };
+    let snippet = |span: Span| {
+        tcx.sess
+            .source_map()
+            .span_to_snippet(span)
+            .unwrap_or_default()
+    };
+    for &function in functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(function).body_id() else { continue };
+        let mut walk = ScanWalk {
+            tcx,
+            out: Scan::default(),
+        };
+        walk.visit_body(tcx.hir_body(body_id));
+        let scan = walk.out;
+        // build 2: the function's contract-owner candidates — a local the
+        // contract allocates into itself. The receiver walk consults the set
+        // so a RE-SEAT of one contract owner from another reads as a move of
+        // the generation; a copy into any other local is a second owner this
+        // rule cannot follow, and holds.
+        let candidates: FxHashSet<HirId> = scan
+            .statements
+            .iter()
+            .filter(|(_, _, _, role, _)| matches!(role, Role::Let | Role::Alloc))
+            .map(|(hir, _, _, _, _)| *hir)
+            .collect();
+        let move_ok = |destination: HirId| candidates.contains(&destination);
+        // A move's destination must be an owner this rule ADMITS, not merely a
+        // candidate: `moves` records each admitted mover's destination and the
+        // loop after this one demotes any whose destination is not admitted.
+        let mut moves: Vec<(HirId, (LocalDefId, HirId), String, bool, String)> = Vec::new();
+        for subject in subjects
+            .iter()
+            .filter(|s| s.fn_did == function && s.kind == SubjectKind::Local)
+        {
+            let node = (subject.fn_did, subject.hir_id);
+            let label = subject.label.clone();
+            let name = subject.param_name.clone().unwrap_or_else(|| "?".to_owned());
+            // Which contract's subject this is, known BEFORE any refusal: the
+            // libc row's refusals are receipts, every other contract's are
+            // decisions (`Plans::yields` says why).
+            let subject_contract = scan
+                .statements
+                .iter()
+                .filter(|(hir, _, _, role, _)| {
+                    *hir == subject.hir_id && matches!(role, Role::Let | Role::Alloc)
+                })
+                .find_map(|(hir, _, _, role, span)| {
+                    let init = match role {
+                        Role::Let => tcx
+                            .hir_node(*hir)
+                            .parent_hir_node_let(tcx)
+                            .and_then(|local| local.init),
+                        _ => scan
+                            .alloc_assigns
+                            .iter()
+                            .find(|(h, value, _)| h == hir && span.contains(*value))
+                            .map(|(_, _, id)| tcx.hir_node(*id).expect_expr()),
+                    }?;
+                    let value = match &init.kind {
+                        ExprKind::If(_, then, Some(_)) => match then.kind {
+                            ExprKind::Block(b, _) => b.expr.unwrap_or(init),
+                            _ => then,
+                        },
+                        _ => init,
+                    };
+                    allocation_contract(tcx, value)
+                });
+            let yields =
+                subject_contract.is_some_and(|c| c.id.starts_with("allocator-contract:libc"));
+            let hold = |out: &mut Plans, reason: String| {
+                if yields {
+                    out.yields.push((label.clone(), reason));
+                } else {
+                    out.holds.insert(node, (label.clone(), reason));
+                }
+            };
+            // **The owner's generations** (build 2, relay wave-6a/018). Every
+            // event on the binding, in source order: a CREATION (the `let`'s
+            // allocation, an assignment of one — brotli's ensure-capacity
+            // idiom allocates into a null-initialized local — or a move in
+            // from another owner), a RELEASE (the contract free, or a move
+            // out into another owner), the `BROTLI_FREE` null store, and the
+            // uses. The simulation below proves the owner is never read while
+            // it holds nothing, never re-seated over a live generation, and
+            // never live at a `return` or at the body's end — the C free of a
+            // Rust block is UB and this rule adds no drop.
+            #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+            enum Event {
+                Create,
+                Release,
+                NullStore,
+                Use,
+                Store,
+            }
+            let mut events: Vec<(Span, HirId, Event, Role)> = Vec::new();
+            for (hir, block, _, role, span) in &scan.statements {
+                if *hir == subject.hir_id {
+                    // A move in from a local that is not itself a contract
+                    // owner carries no generation — the value came from
+                    // somewhere this rule does not follow, so it reads as an
+                    // opaque store (and a local no contract touches keeps
+                    // every event it has: none).
+                    let role = &if *role == Role::MoveIn
+                        && !scan.moves.iter().any(|(dest, source, value)| {
+                            dest == hir && span.contains(*value) && candidates.contains(source)
+                        }) {
+                        Role::Store
+                    } else {
+                        *role
+                    };
+                    let event = match role {
+                        Role::Let | Role::Alloc | Role::MoveIn => Event::Create,
+                        Role::Free | Role::MoveOut => Event::Release,
+                        Role::NullStore | Role::NullInit => Event::NullStore,
+                        Role::Store => Event::Store,
+                        // Rung 3: a release only where the callee consumes the
+                        // argument. Any other call is an ordinary use, and the
+                        // owner walk decides it (a proven lend, or a refusal).
+                        Role::Transfer => {
+                            if scan.transfer_calls.iter().any(|(h, did, index, s)| {
+                                *h == subject.hir_id && s == span && transfer_ok(*did, *index)
+                            }) {
+                                Event::Release
+                            } else {
+                                Event::Use
+                            }
+                        }
+                    };
+                    events.push((*span, *block, event, *role));
+                } else if *role == Role::MoveIn
+                    && scan
+                        .moves
+                        .iter()
+                        .any(|(dest, source, _)| dest == hir && *source == subject.hir_id)
+                {
+                    events.push((*span, *block, Event::Release, Role::MoveOut));
+                }
+            }
+            if events.is_empty() {
+                continue;
+            }
+            // The creations decide the shape, the optionality and the text.
+            let mut creations: Vec<(Span, Option<Span>, Allocation)> = Vec::new();
+            let mut creation_error: Option<String> = None;
+            let mut moved_in = 0usize;
+            for (span, _, event, role) in &events {
+                if *event != Event::Create {
+                    continue;
+                }
+                if *role == Role::MoveIn {
+                    moved_in += 1;
+                    continue;
+                }
+                let value_expr = match role {
+                    Role::Let => tcx
+                        .hir_node(subject.hir_id)
+                        .parent_hir_node_let(tcx)
+                        .and_then(|local| local.init),
+                    _ => scan
+                        .alloc_assigns
+                        .iter()
+                        .find(|(hir, value, _)| *hir == subject.hir_id && span.contains(*value))
+                        .map(|(_, _, id)| tcx.hir_node(*id).expect_expr()),
+                };
+                let Some(init) = value_expr else {
+                    creation_error = Some(format!("{USE}:creation-unreadable"));
+                    break;
+                };
+                let (value, else_null) = match &init.kind {
+                    ExprKind::If(_, then, Some(otherwise)) => {
+                        let value = match then.kind {
+                            ExprKind::Block(b, _) => b.expr.unwrap_or(then),
+                            _ => then,
+                        };
+                        let null = match otherwise.kind {
+                            ExprKind::Block(b, _) => b.expr.filter(|e| null_literal(e)),
+                            _ => None,
+                        };
+                        let Some(null) = null else {
+                            creation_error = Some(format!(
+                                "{USE}:conditional-else:{}",
+                                snippet(otherwise.span)
+                            ));
+                            break;
+                        };
+                        (value, Some(null.span))
+                    }
+                    _ => (init, None),
+                };
+                match allocation(tcx, value) {
+                    Some(Ok(a)) => creations.push((a.span, else_null, a)),
+                    Some(Err(reason)) => {
+                        creation_error = Some(reason);
+                        break;
+                    }
+                    None => {
+                        creation_error = Some(format!("{USE}:creation-not-an-allocation"));
+                        break;
+                    }
+                }
+            }
+            if let Some(reason) = creation_error {
+                hold(&mut out, reason);
+                continue;
+            }
+            if creations.is_empty() {
+                // Every generation of this local came from another owner; the
+                // source owns the contract and this one is its receiver — not
+                // a shape this build plans.
+                if moved_in > 0 {
+                    hold(&mut out, format!("{USE}:moved-in-only"));
+                }
+                continue;
+            }
+            let shape = creations[0].2.shape;
+            let contract = creations[0].2.contract;
+            // **The one shape the System declaration does not cover** (R443-1):
+            // libc's allocators guarantee alignment for any fundamental type
+            // (16 bytes here), and `System`'s `dealloc` of an over-aligned
+            // layout is not `free`. A pointee that asks for more keeps a typed
+            // hold rather than a Box whose release would not match its
+            // allocation.
+            let binding_type = tcx.typeck(subject.fn_did).node_type(subject.hir_id);
+            if let TyKind::RawPtr(pointee, _) = binding_type.kind()
+                && let Ok(layout) = tcx.layout_of(
+                    rustc_middle::ty::TypingEnv::post_analysis(tcx, subject.fn_did)
+                        .as_query_input(*pointee),
+                )
+                && layout.align.abi.bytes() > 16
+            {
+                hold(
+                    &mut out,
+                    format!(
+                        "{USE}:box-over-aligned-pointee:{}",
+                        layout.align.abi.bytes()
+                    ),
+                );
+                continue;
+            }
+            // **The libc row yields to the fields family on a model-OWNING
+            // local.** The licensing-wall supersession this rule applies is for
+            // subjects the model calls Raw or Ref — report 017's 82. A local
+            // the model already calls Owning is ownership-fields' body-local
+            // population (their `box_w1` / `box_w2` / `box2_*` witnesses), and
+            // two families planning one binding is an ill-typed function, not
+            // an arbitration.
+            //
+            // **R450-8 rung 3 narrows it**: a local whose RELEASE is a
+            // consuming callee's is not that population. The fields family
+            // plans a body local it sees freed here; this one is freed THERE,
+            // and the chain's caller side reads `box-initializer-unsupported`
+            // for exactly it (a struct pointee the ordinary Box arm has no
+            // initializer form for). Yielding it leaves the binding to nobody,
+            // so this rule keeps it and the chain consumes its plan — one
+            // family, one binding, as before.
+            //
+            // The exception is narrow on purpose: it holds only where the
+            // ORDINARY Box arm cannot plan the local either. Where it can — a
+            // scalar or array owner whose initializer that arm renders
+            // (`Box::new(7)`) — the chain plans its own member and this rule
+            // yields as it did before rung 3; two renderings of one binding
+            // would otherwise race, and the contract's would win by accident.
+            let released_by_a_callee =
+                scan.transfer_calls.iter().any(|(hir, did, index, _)| {
+                    *hir == subject.hir_id && transfer_ok(*did, *index)
+                }) && slots
+                    .fn_local_slots
+                    .get(&subject.fn_did)
+                    .and_then(|u| u.slot_for_local_depth(subject.local, 0))
+                    .map(|slot| SlotRef::Local(subject.fn_did, slot))
+                    .is_none_or(|slot| {
+                        box_facts
+                            .without_boundary_hold(slot)
+                            .plan_for_subject(tcx, subject, slot, constructions, slots, subjects)
+                            .is_err()
+                    });
+            if contract.id.starts_with("allocator-contract:libc")
+                && !released_by_a_callee
+                && slots
+                    .fn_local_slots
+                    .get(&subject.fn_did)
+                    .and_then(|u| u.slot_for_local_depth(subject.local, 0))
+                    .is_some_and(|slot| {
+                        model.get(&SlotRef::Local(subject.fn_did, slot)) == Some(&SlotKind::Owning)
+                    })
+            {
+                hold(&mut out, format!("{USE}:model-owning-is-the-fields-family"));
+                continue;
+            }
+            // **The libc row yields to the fields family on a model-OWNING
+            // local** (R434-4 §3). The licensing-wall supersession this rule
+            // applies is for subjects the model calls Raw or Ref — report 017's
+            // 82. A local the model already calls Owning is ownership-fields'
+            // body-local population, and two families planning one subject is
+            // exactly what the class layer would have to arbitrate.
+
+            if creations.iter().any(|(_, _, a)| a.shape != shape) {
+                hold(&mut out, format!("{USE}:shapes-disagree"));
+                continue;
+            }
+            // One generation created unconditionally and released once is the
+            // non-optional owner; anything else (a conditional allocation, a
+            // null-initialized local, several generations) carries `None`.
+            let optional = creations.len() + moved_in > 1
+                || creations
+                    .iter()
+                    .any(|(_, else_null, _)| else_null.is_some())
+                || events[0].2 != Event::Create;
+            let frees: Vec<(Span, Span)> = scan
+                .frees
+                .iter()
+                .filter(|(hir, _, _)| *hir == subject.hir_id)
+                .map(|(_, call, arg)| (*call, *arg))
+                .collect();
+            let uses = match owner_uses(
+                tcx,
+                subject,
+                shape,
+                optional,
+                !optional,
+                &frees,
+                &lend_ok,
+                &transfer_ok,
+                &move_ok,
+            ) {
+                Ok(uses) => uses,
+                Err(form) => {
+                    hold(&mut out, format!("{USE}:{form}"));
+                    continue;
+                }
+            };
+            if let Some(span) = uses.returns.first() {
+                hold(&mut out, format!("{RETURNED}:{}", snippet(*span)));
+                continue;
+            }
+            // Every CAST of the owner must be one this rule spelled: an edit
+            // covers it, or it is the free's own argument. A cast left alone
+            // is the owner used in another pointee's shape — the counted-void
+            // family's `mem as *const c_void` — which the emitted `Box` cannot
+            // satisfy, so the subject is not this rule's.
+            if let Some((_, cast)) = scan.casts.iter().find(|(hir, span)| {
+                *hir == subject.hir_id
+                    && !uses
+                        .edits
+                        .iter()
+                        .any(|e| e.span == *span || e.span.contains(*span))
+                    && !frees.iter().any(|(_, arg)| arg.contains(*span))
+                    && !creations.iter().any(|(c, _, _)| c.contains(*span))
+            }) {
+                hold(&mut out, format!("{USE}:unbridged-cast:{}", snippet(*cast)));
+                continue;
+            }
+
+            // **R641-11 (a)**: under libc a non-optional owner's dead null
+            // guard is not dead — `malloc` returns null on failure — so each
+            // one is kept on the raw result, before the `Box` exists; one that
+            // is not right after its allocation cannot be moved there.
+            let mut kept_guards: Vec<(Span, String, Span)> = Vec::new();
+            if contract.id.starts_with("allocator-contract:libc") && !optional {
+                let mut apart = None;
+                for guard in &uses.dead_guards {
+                    match creations.iter().find_map(|(creation, _, _)| {
+                        adjacent_null_guard(tcx, function, *creation, *guard)
+                            .map(|then| (*creation, then))
+                    }) {
+                        Some((creation, then)) => kept_guards.push((creation, then, *guard)),
+                        None => {
+                            apart = Some(*guard);
+                            break;
+                        }
+                    }
+                }
+                if let Some(guard) = apart {
+                    hold(
+                        &mut out,
+                        format!("{USE}:null-guard-not-adjacent:{}", snippet(guard)),
+                    );
+                    continue;
+                }
+            }
+            for edit in &uses.edits {
+                if !events
+                    .iter()
+                    .any(|(span, _, _, _)| span.contains(edit.span))
+                {
+                    events.push((edit.span, events[0].1, Event::Use, Role::Store));
+                }
+            }
+            for store in &uses.stores {
+                if !events.iter().any(|(span, _, _, _)| span.contains(*store)) {
+                    events.push((*store, events[0].1, Event::Release, Role::MoveOut));
+                }
+            }
+            events.sort_by_key(|(span, _, _, _)| (span.lo(), span.hi()));
+            // The simulation: Dead → Create → Live → Release → Dead.
+            let mut live = false;
+            let mut block_state: FxHashMap<HirId, (bool, bool)> = FxHashMap::default();
+            let mut sequence_error = None;
+            for (span, block, event, role) in &events {
+                let entry = block_state.entry(*block).or_insert((live, live));
+                match event {
+                    // **The overwrite of a live owner is refused** (R619-5 (3),
+                    // P5: a contract allocation never meets a Rust drop). The
+                    // input leaks the generation this assignment replaces; the
+                    // emitted program would close it with Rust's overwrite drop,
+                    // which R434-4 §2 once admitted under R443-1's allocator
+                    // declaration (never emitted; fan-out 008 items 7 / 16).
+                    Event::Create if live => {
+                        sequence_error = Some(format!("{OVERWRITE}:{}", snippet(*span)));
+                    }
+                    Event::Create => live = true,
+                    Event::Release if !live => {
+                        sequence_error = Some(format!(
+                            "{IMPLICIT_CLOSE}:release-without-generation:{}",
+                            snippet(*span)
+                        ));
+                    }
+                    Event::Release => live = false,
+                    Event::Use if !live => {
+                        sequence_error = Some(format!("{USE}:read-while-empty:{}", snippet(*span)));
+                    }
+                    Event::Use | Event::NullStore => {}
+                    Event::Store => {
+                        sequence_error = Some(format!("{OVERWRITE}:{}", snippet(*span)));
+                    }
+                }
+                let _ = role;
+                entry.1 = live;
+                if sequence_error.is_some() {
+                    break;
+                }
+            }
+            if let Some(reason) = sequence_error {
+                hold(&mut out, reason);
+                continue;
+            }
+            if live {
+                hold(&mut out, format!("{IMPLICIT_CLOSE}:live-at-exit"));
+                continue;
+            }
+            // Every block the owner touches must leave it as it found it: a
+            // branch that frees a generation must re-seat one (brotli's
+            // ensure-capacity), and one that creates must release.
+            //
+            // **R608-1** — except a block that CREATES the generation (dead on
+            // entry, live on exit) when it is an `if` arm outside any loop up
+            // to the owner's declaration: the other path carries
+            // `None` to the join (a block dead on entry means an earlier null
+            // or release, so the owner is optional), and the simulation above
+            // has already proved the generation released before any exit
+            // (brotli's `literal_context_modes`).
+            if let Some((_, (entry, exit))) = block_state.iter().find(|(block, (a, b))| {
+                a != b && !(!*a && branch_outside_loops(tcx, **block, subject.hir_id))
+            }) {
+                hold(
+                    &mut out,
+                    format!("{IMPLICIT_CLOSE}:block-unbalanced:{entry}->{exit}"),
+                );
+                continue;
+            }
+            // A `return` while a generation is live would drop it in Rust.
+            let live_spans: Vec<(Span, Span)> = {
+                let mut spans = Vec::new();
+                let mut open: Option<Span> = None;
+                for (span, _, event, _) in &events {
+                    match event {
+                        Event::Create => open = Some(*span),
+                        Event::Release => {
+                            if let Some(start) = open.take() {
+                                spans.push((start, *span));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                spans
+            };
+            // A return inside a DEAD null guard is not a path of the emitted
+            // program: the guard tests a `Box`, which cannot be null, and the
+            // owner walk already replaces the whole `if` with `{}`. libc's
+            // allocators are the reason this matters — brotli's exits on a
+            // null result, so no fixture of this rule had a guard before.
+            if let Some(ret) = scan.returns.iter().find(|r| {
+                !uses.dead_guards.iter().any(|guard| guard.contains(**r))
+                    && live_spans
+                        .iter()
+                        .any(|(start, end)| r.lo() > start.hi() && r.lo() < end.lo())
+            }) {
+                hold(
+                    &mut out,
+                    format!("{IMPLICIT_CLOSE}:return:{}", snippet(*ret)),
+                );
+                continue;
+            }
+            // The edits: one construction per generation, `None` on every
+            // else arm and every null store, `Box::into_raw` at every free.
+            let mut expr_edits = uses.edits;
+            let mut delete_statements = Vec::new();
+            for (span, _, event, role) in &events {
+                if *event != Event::NullStore {
+                    continue;
+                }
+                if *role == Role::NullInit {
+                    let (_, init) = scan
+                        .null_inits
+                        .iter()
+                        .find(|(hir, _)| *hir == subject.hir_id)
+                        .expect("the null initializer");
+                    expr_edits.push(BoxExprEdit {
+                        span: *init,
+                        replacement: "None".to_owned(),
+                        receipt: "allocator-contract-null-init",
+                    });
+                    continue;
+                }
+                if optional {
+                    let (_, value) = scan
+                        .assigns
+                        .iter()
+                        .find(|(hir, v)| *hir == subject.hir_id && span.contains(*v))
+                        .expect("the null store's value");
+                    expr_edits.push(BoxExprEdit {
+                        span: *value,
+                        replacement: "None".to_owned(),
+                        receipt: "allocator-contract-null-store",
+                    });
+                } else {
+                    delete_statements.push(*span);
+                }
+            }
+            for (span, else_null, a) in &creations {
+                // **The construction is TWO INSERTIONS, not a replacement**
+                // (relay wave-6a/020 (ii), R432-2). The allocator call text is
+                // left exactly where it is and the `Box` is spelled around it:
+                // a prefix at the allocation's opening boundary and a suffix at
+                // its closing one. A replacement of the whole allocation would
+                // CONTAIN every edit another class plans inside the call — at
+                // 26 brotli receivers that is the raw-boundary C arm bridging
+                // the contract's own manager argument (`BrotliAllocate(&mut *m,
+                // ..)`, one byte inside the initializer), and containment holds
+                // both classes (`cross-class-interval-collision`, report 014
+                // claim 4). Two zero-width insertions at the boundaries contain
+                // nothing: the bridge renders where it was planned, inside text
+                // this rule never claims.
+                let kept = kept_guards
+                    .iter()
+                    .find(|(creation, _, _)| creation == span)
+                    .map(|(_, then, _)| then.as_str());
+                let (open, close) = match (&a.shape, &a.count, a.nul_terminated, kept) {
+                    (BoxShape::Sized, _, _, Some(then)) => (
+                        "{ let __crat_raw = ".to_owned(),
+                        format!("; if __crat_raw.is_null() {then} Box::from_raw(__crat_raw) }}"),
+                    ),
+                    (BoxShape::Sized, _, _, None) => ("Box::from_raw(".to_owned(), ")".to_owned()),
+                    // The contract's postcondition: bind the block the
+                    // allocator returned and measure IT. The count never
+                    // mentions the allocator's arguments, so no other family's
+                    // rendering of them can make it stale.
+                    (BoxShape::Slice, _, true, kept) => (
+                        "{ let __crat_alloc = ".to_owned(),
+                        format!(
+                            "; {}Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_alloc, \
+                             core::ffi::CStr::from_ptr(__crat_alloc).to_bytes().len().wrapping_add(1))) }}",
+                            kept.map_or_else(String::new, |then| format!(
+                                "if __crat_alloc.is_null() {then} "
+                            ))
+                        ),
+                    ),
+                    (BoxShape::Slice, Some(count), false, Some(then)) => (
+                        "{ let __crat_raw = ".to_owned(),
+                        format!(
+                            "; if __crat_raw.is_null() {then} \
+                             Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_raw, ({count}) as usize)) }}"
+                        ),
+                    ),
+                    (BoxShape::Slice, Some(count), false, None) => (
+                        "Box::from_raw(core::ptr::slice_from_raw_parts_mut(".to_owned(),
+                        format!(", ({count}) as usize))"),
+                    ),
+                    (BoxShape::Slice, None, false, _) => {
+                        unreachable!("a counted slice shape carries its count")
+                    }
+                };
+                let (open, close) = if optional {
+                    (format!("Some({open}"), format!("{close})"))
+                } else {
+                    (open, close)
+                };
+                expr_edits.push(BoxExprEdit {
+                    span: span.shrink_to_lo(),
+                    replacement: open,
+                    receipt: "allocator-contract-construction",
+                });
+                expr_edits.push(BoxExprEdit {
+                    span: span.shrink_to_hi(),
+                    replacement: close,
+                    receipt: "allocator-contract-construction-close",
+                });
+                if let Some(null) = else_null {
+                    expr_edits.push(BoxExprEdit {
+                        span: *null,
+                        replacement: "None".to_owned(),
+                        receipt: "allocator-contract-none-arm",
+                    });
+                }
+            }
+            for (_, arg) in &frees {
+                let arg_text = snippet(*arg);
+                let casts = arg_text
+                    .strip_prefix(name.as_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                expr_edits.push(BoxExprEdit {
+                    span: *arg,
+                    replacement: if optional {
+                        format!("{name}.map_or(core::ptr::null_mut(), |b| Box::into_raw(b){casts})")
+                    } else {
+                        format!("Box::into_raw({name}){casts}")
+                    },
+                    receipt: "allocator-contract-free-transfer",
+                });
+            }
+            expr_edits.sort_by_key(|e| (e.span.lo(), e.span.hi()));
+            expr_edits.retain(|e| !delete_statements.iter().any(|d| d.contains(e.span)));
+            let mut receipts = vec![
+                format!("allocator-contract {}", contract.id),
+                format!(
+                    "shape={} optional={optional} generations={} moves_in={moved_in} frees={}",
+                    match shape {
+                        BoxShape::Sized => "sized",
+                        BoxShape::Slice => "slice",
+                    },
+                    creations.len(),
+                    frees.len()
+                ),
+            ];
+            for (call, _) in &frees {
+                receipts.push(format!(
+                    "allocator-contract site={}",
+                    super::emitability::EmitabilityFacts::site(tcx, *call)
+                ));
+            }
+            for (_, _, guard) in &kept_guards {
+                receipts.push(format!(
+                    "null-guard-before-box site={}",
+                    super::emitability::EmitabilityFacts::site(tcx, *guard)
+                ));
+            }
+            for receipt in &receipts {
+                out.admitted.push((label.clone(), receipt.clone()));
+            }
+            // Rung 3: the callee this owner's generation moves into. The chain
+            // confirms the formal (`confirm_transfers`) or this owner is
+            // demoted with it.
+            for (did, index, _) in &uses.transfers {
+                out.transfers
+                    .push((node, *did, *index, label.clone(), yields));
+            }
+            // The destinations this owner's generation moves into; the loop
+            // after this one demotes the owner if one of them is not itself an
+            // admitted owner (report 027).
+            for (destination, source, _) in &scan.moves {
+                if *source == subject.hir_id {
+                    let destination_label = subjects
+                        .iter()
+                        .find(|s| s.fn_did == function && s.hir_id == *destination)
+                        .map_or_else(|| "?".to_owned(), |s| s.label.clone());
+                    moves.push((*destination, node, label.clone(), yields, destination_label));
+                }
+            }
+            out.plans.insert(
+                node,
+                BoxPlan {
+                    shape,
+                    optional,
+                    expr_edits,
+                    delete_statements,
+                    receipts,
+                    fabricated_extent: false,
+                    pointee_override: None,
+                    inferred_binding: subject.ty_span.is_none(),
+                    overwrite_spans: Vec::new(),
+                    retained_sink: true,
+                    implicit_scope_close: false,
+                },
+            );
+            if !kept_guards.is_empty() {
+                out.kept_guards.insert(node);
+            }
+        }
+        // **A move's destination must be an owner this rule ADMITS**, not
+        // merely a candidate (report 027). The destination has its own uses and
+        // may hold on any of them — brotli's ensure-capacity `all_histograms`
+        // holds at `BrotliHistogramCombine*` (`use:call-argument-not-a-lend`) —
+        // and admitting the mover alone assigns an `Option<Box<[T]>>` into a
+        // place that stays raw. That was the one diagnostic each of batch 12's
+        // six `verify-reverted` Box classes carried: `expected raw pointer
+        // *mut HistogramLiteral, found enum Option<Box<[HistogramLiteral]>>`.
+        // A demotion can strip the destination of ITS mover, so the loop runs
+        // until nothing moves into an unadmitted owner; each turn removes one
+        // plan, which bounds it.
+        while let Some((node, label, yields, text)) = moves
+            .iter()
+            .find(|(destination, node, _, _, _)| {
+                out.plans.contains_key(node) && !out.plans.contains_key(&(function, *destination))
+            })
+            .map(|(_, node, label, yields, text)| (*node, label.clone(), *yields, text.clone()))
+        {
+            out.plans.remove(&node);
+            out.admitted.retain(|(l, _)| *l != label);
+            let reason = format!("{USE}:moved-into-unadmitted-owner:{text}");
+            if yields {
+                out.yields.push((label, reason));
+            } else {
+                out.holds.insert(node, (label, reason));
+            }
+        }
+    }
+    out
+}
+
+/// The `let` statement a binding pattern belongs to.
+trait ParentLet<'tcx> {
+    fn parent_hir_node_let(&self, tcx: TyCtxt<'tcx>) -> Option<&'tcx rustc_hir::LetStmt<'tcx>>;
+}
+
+impl<'tcx> ParentLet<'tcx> for rustc_hir::Node<'tcx> {
+    fn parent_hir_node_let(&self, tcx: TyCtxt<'tcx>) -> Option<&'tcx rustc_hir::LetStmt<'tcx>> {
+        let rustc_hir::Node::Pat(pat) = self else { return None };
+        match tcx.parent_hir_node(pat.hir_id) {
+            rustc_hir::Node::LetStmt(local) => Some(local),
+            _ => None,
+        }
+    }
+}

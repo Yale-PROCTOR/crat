@@ -1,0 +1,2609 @@
+//! Tests for the BO export surface.
+
+use rustc_hash::FxHashMap;
+use rustc_hir::{ItemKind, OwnerNode};
+use rustc_middle::ty::TyCtxt;
+
+use super::*;
+use crate::{
+    analyses::borrow_ownership::{
+        CrateCtxt,
+        borrow_verify::{
+            RoundStats, model_accepts, verify_guarded_to_fixpoint_counting, verify_to_fixpoint,
+            verify_to_fixpoint_counting,
+        },
+        coherence::add_coherence,
+        construction::{
+            CopyLendMode, TestValidationBackend, construct_bo_into,
+            verify_bo_construction_counting, verify_bo_construction_counting_for_test,
+            verify_bo_construction_l2_for_test,
+        },
+        crate_slots::CrateSlots,
+        emit_crate_ownership_constraints,
+        mutability_facts::MutFacts,
+        origin_flow::analyze_program_origin_flow,
+        origins::compute_origins,
+        solver::{
+            KindSolver, RoundModelFailure, SelectorTraceOutcome, SlotRef,
+            with_assumption_check_trace, with_selector_trace,
+        },
+    },
+    utils::rustc::RustProgram,
+};
+
+/// Local copy of `bo_c1::collect_program` (bo_c1.rs:46): every top-level
+/// fn/struct item, in HIR owner order. Kept local so bo_c1 stays untouched.
+fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+    let mut functions = Vec::new();
+    let mut structs = Vec::new();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        match item.kind {
+            ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+            ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+            _ => {}
+        }
+    }
+    RustProgram {
+        tcx,
+        functions,
+        structs,
+    }
+}
+
+fn function_named(program: &RustProgram<'_>, name: &str) -> rustc_span::def_id::LocalDefId {
+    program
+        .functions
+        .iter()
+        .copied()
+        .find(|did| program.tcx.item_name(did.to_def_id()).as_str() == name)
+        .unwrap_or_else(|| panic!("missing function {name}"))
+}
+
+fn named_depth0_slot(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    function: rustc_span::def_id::LocalDefId,
+    name: &str,
+) -> SlotRef {
+    let local = named_local(program, function, name);
+    let slot = slots.fn_local_slots[&function]
+        .slot_for_local_depth(local, 0)
+        .unwrap_or_else(|| panic!("missing depth-zero slot for {name}"));
+    SlotRef::Local(function, slot)
+}
+
+fn named_local(
+    program: &RustProgram<'_>,
+    function: rustc_span::def_id::LocalDefId,
+    name: &str,
+) -> rustc_middle::mir::Local {
+    let body = program
+        .tcx
+        .mir_drops_elaborated_and_const_checked(function)
+        .borrow();
+    body.var_debug_info
+        .iter()
+        .find_map(|info| {
+            (info.name.as_str() == name).then(|| match info.value {
+                rustc_middle::mir::VarDebugInfoContents::Place(place) => Some(place.local),
+                _ => None,
+            })?
+        })
+        .unwrap_or_else(|| panic!("missing local {name}"))
+}
+
+/// Solve one inline program under export capture, exactly as `bo_c1`'s
+/// smallest harness does, and hand back both the model and the recording.
+fn capture_solve(code: &str) -> (Option<FxHashMap<SlotRef, super::SlotKindAlias>>, BoExport) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+        })
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+/// The same solve with NO capture scope — the feature-off path.
+fn plain_solve(code: &str) -> Option<FxHashMap<SlotRef, super::SlotKindAlias>> {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new(&slots);
+        let (_stats, selectors) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &compute_origins(&program),
+            &solver,
+        )
+        .expect("emission");
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, &slots, g, &body);
+        }
+        assert!(!capturing(), "no capture scope must be active on this path");
+        verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+const MALLOC_FREE: &str = r#"
+unsafe extern "C" {
+    fn malloc(n: usize) -> *mut u8;
+    fn free(p: *mut u8);
+}
+unsafe fn f(c: i32) -> i32 {
+    let p: *mut i32 = malloc(4) as *mut i32;
+    *p = c;
+    let v = *p;
+    free(p as *mut u8);
+    v
+}
+"#;
+
+#[test]
+fn e5_p_sink_construction_carries_inventory_to_export() {
+    ::utils::compilation::run_compiler_on_str(MALLOC_FREE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let (construction, captured) = with_bo_export(|| {
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("construction");
+            assert!(
+                verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &construction,
+                    &facts,
+                )
+                .0
+                .is_some()
+            );
+            construction
+        });
+        let events = captured
+            .source_events
+            .expect("E5-P-SINK missing carried source inventory");
+        assert_eq!(events, construction.source_events);
+        assert_eq!(
+            captured.replay_source_events.as_ref(),
+            Some(&events),
+            "replay must receive the carried inventory"
+        );
+        assert_eq!(
+            events
+                .retirements
+                .values()
+                .filter(|event| event.key.role
+                    == crate::analyses::borrow_ownership::source_events::SourceRole::Free)
+                .count(),
+            1
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+const CALL_ARG: &str = r#"
+unsafe fn g(p: *mut i32) { *p = 9; }
+unsafe fn f(p: *mut i32) -> i32 {
+    g(p);
+    *p
+}
+"#;
+
+// -------------------------------------------------------------------------
+// Gating and identity
+// -------------------------------------------------------------------------
+
+// There is no `CRAT_BO_EXPORT` env switch to parse: capture is gated by scope
+// alone. The test below is the gating witness and asserts the stronger
+// property: capture is off unless a scope opened it, with no ambient path that
+// can turn it on.
+
+/// Capture is inert unless a scope is open.
+///
+/// The first assertion fails if ambient enablement is
+/// ever reintroduced — an env flag, a global, a lazy install inside
+/// `capturing()` — because this test runs with no scope open. Mutation-tested:
+/// restoring the `if flag_enabled() { install }` branch with the flag forced on
+/// fails it here.
+///
+/// The body observes `capturing()` and that recording is a no-op, and asserts
+/// nothing about allocation. The zero-allocation property rests on `record`'s
+/// early return, which is an argument, not a measurement.
+#[test]
+fn export_off_records_nothing() {
+    assert!(!capturing(), "capture must be inactive by default");
+    // Recording outside a scope must be a no-op, not a panic.
+    record_selector(BoundaryRole::Source, Var::from_u32(0));
+    record_loan(LoanIdentity {
+        key: LoanKey {
+            fn_did: rustc_hir::def_id::CRATE_DEF_ID,
+            place: PlaceKey {
+                local: Local::from_u32(0),
+                proj: Vec::new(),
+            },
+            location: MirLocationKey::new(0, 0),
+            borrower: BorrowerKind::Assign {
+                owner: OwnerKey::Local(0),
+            },
+        },
+        run_local_handle: 0,
+        kind: LoanKind::NoProvenance,
+        class: LoanClass::Existing,
+        invalid: false,
+    });
+    assert!(!capturing(), "capture must still be inactive");
+}
+
+/// The scope must restore cleanly, including on unwind.
+#[test]
+fn export_scope_restores_on_unwind() {
+    let _ = std::panic::catch_unwind(|| {
+        with_bo_export(|| panic!("boom"));
+    });
+    assert!(!capturing(), "capture leaked after an unwinding scope");
+}
+
+/// Capture must not perturb the analysis.
+///
+/// The full check is corpus-scale (`export-on == export-off` on every
+/// counter). This is the same property at fixture scale: the accepted model
+/// must be byte-identical with capture on and off.
+#[test]
+fn export_on_equals_off_on_the_accepted_model() {
+    for code in [MALLOC_FREE, CALL_ARG] {
+        let with_capture = capture_solve(code).0;
+        let without_capture = plain_solve(code);
+        assert_eq!(
+            with_capture, without_capture,
+            "capture perturbed the accepted model — it must be recording-only"
+        );
+    }
+}
+
+// -------------------------------------------------------------------------
+// Version sites and move points
+// -------------------------------------------------------------------------
+
+/// Every consume site the emission visits is recorded.
+#[test]
+fn version_sites_are_recorded() {
+    let (model, export) = capture_solve(MALLOC_FREE);
+    assert!(model.is_some(), "fixture must be accepted");
+    assert!(
+        !export.version_sites.is_empty(),
+        "E-R2 recorded no consume sites"
+    );
+    assert!(
+        export
+            .version_sites
+            .iter()
+            .any(|s| s.use_var.is_some() || s.def_var.is_some()),
+        "every recorded site had empty ownership vars"
+    );
+}
+
+/// Per-`Var` ownership is read from the accepted model.
+#[test]
+fn version_owns_is_populated_from_the_accepted_model() {
+    let (model, export) = capture_solve(MALLOC_FREE);
+    assert!(model.is_some());
+    assert!(
+        export.version_owns.is_some(),
+        "E-R2 var->bool map was never read from the model"
+    );
+}
+
+/// Move-point candidates are derivable, and the method is honest that they are
+/// candidates (a `free` also drops ownership).
+#[test]
+fn move_point_candidates_require_a_populated_model() {
+    let empty = BoExport::default();
+    assert!(
+        empty
+            .move_point_candidates(rustc_hir::def_id::CRATE_DEF_ID, Local::from_u32(1))
+            .is_empty(),
+        "without version_owns there can be no candidates"
+    );
+}
+
+// -------------------------------------------------------------------------
+// Selector provenance
+// -------------------------------------------------------------------------
+
+/// A malloc/free fixture records both a source and a sink selector,
+/// each attributed to its call site.
+#[test]
+fn selector_sites_are_recorded_with_provenance() {
+    let (model, export) = capture_solve(MALLOC_FREE);
+    assert!(model.is_some());
+    assert!(
+        !export.source_sites.is_empty(),
+        "E-R3 recorded no source selectors for a malloc fixture"
+    );
+    assert!(
+        !export.sink_sites.is_empty(),
+        "E-R3 recorded no sink selectors for a free fixture"
+    );
+    let callees: Vec<_> = export
+        .source_sites
+        .iter()
+        .filter_map(|s| s.call.as_ref().map(|c| c.callee.clone()))
+        .collect();
+    assert!(
+        callees.iter().any(|c| c == "malloc"),
+        "source selector was not attributed to the malloc call; got {callees:?}"
+    );
+}
+
+// -------------------------------------------------------------------------
+// Loan identity
+// -------------------------------------------------------------------------
+
+/// The COMPLETE final `BorrowSet` is exported, not the invalid subset, so
+/// equality with the invalid-loan count would be the wrong property.
+#[test]
+fn loan_identity_covers_the_complete_borrow_set() {
+    let (model, export) = capture_solve(CALL_ARG);
+    assert!(model.is_some());
+    assert!(!export.loans.is_empty(), "E-R4 recorded no loans");
+    assert!(
+        export.surviving_loans().count() > 0,
+        "no SURVIVING loans exported — a re-route would have nothing to match against"
+    );
+
+    // Exact cardinality, not non-emptiness: a recorder that appended across
+    // CEGAR rounds would hold N copies of every loan, which no non-emptiness
+    // assertion can see. One record per (fn, loan index) is the property that
+    // pins "the FINAL round's BorrowSet".
+    let mut seen = rustc_hash::FxHashSet::default();
+    for loan in &export.loans {
+        assert!(
+            seen.insert(loan.key.clone()),
+            "loan {:?} recorded more than once — the export is accumulating \
+             across validation rounds instead of holding the accepted round (D1)",
+            loan.key
+        );
+    }
+}
+
+/// The borrower class and borrowed place are carried.
+#[test]
+fn loan_identity_carries_place_and_borrower() {
+    let (_model, export) = capture_solve(CALL_ARG);
+    assert!(
+        export
+            .loans
+            .iter()
+            .any(|l| matches!(l.key.borrower, BorrowerKind::CallArg { .. })),
+        "no CallArg loan recorded for a fixture whose only borrow is a call argument"
+    );
+}
+
+/// The kind is keyed on the BASE local, projections
+/// ignored. A `CallArg` loan on `(*arg)` reports the kind of `arg`.
+#[test]
+fn loan_kind_keyed_on_base_local() {
+    let (_model, export) = capture_solve(CALL_ARG);
+    let call_args: Vec<_> = export
+        .loans
+        .iter()
+        .filter(|l| matches!(l.key.borrower, BorrowerKind::CallArg { .. }))
+        .collect();
+    assert!(!call_args.is_empty(), "expected a CallArg loan");
+    for loan in call_args {
+        // The construction applies a Deref, so the projected place has depth
+        // >= 1 while the KEY stays the base local.
+        assert!(
+            loan.key.place.derefs() >= 1,
+            "CallArg loan should carry the deref projection: {:?}",
+            loan.key.place
+        );
+        assert_ne!(
+            loan.kind,
+            LoanKind::NoProvenance,
+            "a pointer argument should have a provenance, so its kind is derivable"
+        );
+    }
+}
+
+/// `NoProvenance` is distinct from `Shared`.
+///
+/// Collapsing them would invert the engine's guard, which is
+/// `if let Some(p) = .. && !is_mutable(p)`.
+#[test]
+fn loan_kind_no_provenance_is_not_shared() {
+    assert!(!LoanKind::NoProvenance.skips_invalidation());
+    assert!(LoanKind::Shared.skips_invalidation());
+    assert!(!LoanKind::Mut.skips_invalidation());
+    assert_ne!(LoanKind::NoProvenance, LoanKind::Shared);
+
+    assert_eq!(
+        LoanKind::from_provenance_mutability(None),
+        LoanKind::NoProvenance
+    );
+    assert_eq!(
+        LoanKind::from_provenance_mutability(Some(false)),
+        LoanKind::Shared
+    );
+    assert_eq!(
+        LoanKind::from_provenance_mutability(Some(true)),
+        LoanKind::Mut
+    );
+}
+
+/// A mutability provider the TEST controls, so the derivation can be checked
+/// against a known answer rather than against its own definition.
+struct SelectiveMut {
+    /// Locals declared immutable; everything else is mutable.
+    immutable: Vec<Local>,
+}
+
+impl crate::analyses::borrow_ownership::mutability_facts::MutProvider for &SelectiveMut {
+    fn is_mutable(&self, _fn_did: rustc_hir::def_id::LocalDefId, local: Local) -> bool {
+        !self.immutable.contains(&local)
+    }
+}
+
+/// Solve under a caller-supplied mutability provider, with capture active.
+fn capture_solve_with(
+    code: &str,
+    immutable: Vec<u32>,
+) -> (Option<FxHashMap<SlotRef, super::SlotKindAlias>>, BoExport) {
+    ::utils::compilation::run_compiler_on_str(code, move |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let facts = SelectiveMut {
+            immutable: immutable.iter().copied().map(Local::from_u32).collect(),
+        };
+        with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            verify_to_fixpoint(&program, &slots, &solver, &selectors, &facts)
+        })
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+/// The exported kind checked against GROUND TRUTH.
+///
+/// Asserting `skips_invalidation() == (kind == Shared)` would be a tautology:
+/// true by the definition of `skips_invalidation` and unable to fail if the
+/// fork-side derivation drifted from the engine.
+///
+/// Ground truth is a mutability provider the test supplies. The derivation must
+/// reproduce `is_mutable(fn_did, borrowed.local)` — so this simultaneously
+/// witnesses that the key is the **base local**: a derivation that
+/// keyed on the projected place would look up a different local and disagree.
+#[test]
+fn loan_kind_matches_ground_truth_provider() {
+    // Local 1 is the first argument. Declaring it immutable must show up as a
+    // Shared kind on every loan whose borrowed base local is 1, and must NOT
+    // change the kind of loans rooted at any other local.
+    let (model, export) = capture_solve_with(CALL_ARG, vec![1]);
+    assert!(model.is_some(), "fixture must be accepted");
+    assert!(!export.loans.is_empty(), "no loans recorded");
+
+    let mut checked = 0usize;
+    for loan in &export.loans {
+        let expected = if loan.key.place.local == Local::from_u32(1) {
+            // Provenance exists (it is a pointer argument) and we declared it
+            // immutable, so the engine's guard fires: Shared.
+            LoanKind::Shared
+        } else {
+            // Mutable, or no provenance at all — either way NOT Shared.
+            assert_ne!(
+                loan.kind,
+                LoanKind::Shared,
+                "loan rooted at {:?} derived Shared, but only local 1 was declared immutable",
+                loan.key.place.local
+            );
+            checked += 1;
+            continue;
+        };
+        assert_eq!(
+            loan.kind, expected,
+            "derivation disagreed with the supplied provider for base local {:?} \
+             (borrowed place {:?}) — the key or the lookup has drifted",
+            loan.key.place.local, loan.key.place
+        );
+        checked += 1;
+    }
+    assert!(
+        checked > 0,
+        "no loan was actually checked against ground truth"
+    );
+}
+
+/// The same fixture with NOTHING declared immutable must derive no `Shared`
+/// loans at all. Paired with the test above, this is the discrimination check:
+/// a derivation that ignored the provider would fail one or the other.
+#[test]
+fn loan_kind_follows_the_provider_both_ways() {
+    let (_m, all_mut) = capture_solve_with(CALL_ARG, vec![]);
+    assert!(!all_mut.loans.is_empty());
+    assert!(
+        all_mut.loans.iter().all(|l| l.kind != LoanKind::Shared),
+        "a Shared loan appeared with no local declared immutable — the derivation \
+         is not consulting the provider"
+    );
+
+    let (_m2, some_shared) = capture_solve_with(CALL_ARG, vec![1]);
+    assert!(
+        some_shared.loans.iter().any(|l| l.kind == LoanKind::Shared),
+        "no Shared loan appeared after declaring local 1 immutable — the \
+         derivation is not consulting the provider"
+    );
+}
+
+// -------------------------------------------------------------------------
+// PlaceKey
+// -------------------------------------------------------------------------
+
+#[test]
+fn place_key_counts_derefs_and_fields() {
+    // Constructed indirectly through the capture, since building a Place
+    // outside a TyCtxt is not possible.
+    let (_model, export) = capture_solve(CALL_ARG);
+    assert!(
+        export.loans.iter().any(|l| l.key.place.derefs() >= 1),
+        "expected at least one deref-projected borrowed place"
+    );
+}
+
+// -------------------------------------------------------------------------
+// The accept-point certificate
+// -------------------------------------------------------------------------
+
+/// The certificate is RECORDED at the accept point.
+///
+/// As a bare `Vec`, "recorded, none tolerated" and "never recorded" would be the
+/// same value, so `is_empty()` would hold with the recorder deleted. `Option`
+/// separates the states and `is_some()` is exactly the obligation.
+///
+/// *Mutation-tested.* Removing the `record_residuals` call at the accept point
+/// leaves the field `None` and fails this test; recording a fabricated residual
+/// fails the emptiness assertion.
+///
+/// The emptiness assertion is not load-bearing for recording: it records an
+/// empirical fact (no fixture is known that tolerates a residual at accept, and
+/// there is no argument that none *can*).
+#[test]
+fn certificate_is_recorded_at_the_accept_point() {
+    // A multi-round fixture: rounds 1 and 2 each commit, round 3 accepts — so a
+    // recorder that fired on the wrong round is distinguishable from one that
+    // fires at the accept.
+    let (model, stats, export) = capture_solve_counting(CASCADE);
+    assert!(model.is_some(), "fixture must be accepted");
+    assert_eq!(stats.rounds, 3, "the witness needs the committing rounds");
+    assert_eq!(
+        stats.commits_per_round,
+        vec![1, 1, 0],
+        "rounds 1-2 must commit for this fixture to distinguish rounds"
+    );
+    // Both repairs share the accept at `committed == 0`, which records the
+    // residual certificate.
+    let residuals = export.residual_conflicts.as_ref().expect(
+        "D14: the accept point ran but recorded no certificate — `record_residuals` \
+         is missing from the `committed == 0` accept, or `begin_round()` cleared it \
+         afterwards. `None` means NEVER RECORDED, which is not `Some(vec![])`",
+    );
+    // Empirical, not a theorem: no known fixture tolerates a residual at accept,
+    // and there is no argument that none can.
+    assert!(
+        residuals.is_empty(),
+        "this fixture accepted while tolerating residuals {residuals:?} — that is \
+         not wrong, but it is new: it would be the first known witness for D15, \
+         and `BoExport::residual_conflicts`' doc should be updated to say the \
+         shape is reachable"
+    );
+    // No "well-formedness" check that every residual has an issuer or a
+    // requirer: it would iterate a collection the assert above has just
+    // required to be empty, and it would be wrong — an owner-less residual
+    // (`issuer: None, requirers: []`) is not malformed, it is precisely the
+    // shape the emptiness assertion watches for, and such a check would
+    // misdiagnose it.
+}
+
+/// A DECLINING run records no certificate.
+///
+/// This is the invariant the `Option` exists to carry and the half the positive
+/// witness cannot reach: `None` must mean "the accept point never ran". The
+/// positive test can only show that an accepting run records `Some`.
+///
+/// The decline is forced with a solver contradiction (a slot both assumed
+/// `Ref` and excluded from `Ref`) rather than with a fixture, because no
+/// declining fixture was found — see the limitation below.
+///
+/// **Stated limitation, not papered over.** This exercises the *pre-loop*
+/// decline (the first solve returns UNSAT), so it pins the invariant for that
+/// route only. It does **not** exercise the in-loop `residual_nonref_field`
+/// decline, and therefore does NOT catch moving `record_residuals` above that
+/// decline. Four candidate fixtures were
+/// probed for an in-loop decline (field own+borrow, aliased double free,
+/// cross-function field escape, address-of-local store); all four accepted.
+/// Recorded as a gap rather than claimed as covered.
+///
+/// *Mutation-tested.* Make the decline path record a certificate — e.g.
+/// `record_residuals(vec![])` before the early return — and this fails.
+#[test]
+fn declining_run_records_no_certificate() {
+    ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let ((model, failure), export) = with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            // Force a contradiction on some slot: assumed `Ref` and excluded
+            // from `Ref` at once.
+            let victim = slots
+                .fn_local_slots
+                .iter()
+                .find(|(_, universe)| universe.len() > 0)
+                .map(|(did, _)| SlotRef::Local(*did, super::super::slots::SlotId::from_usize(0)))
+                .expect("fixture has at least one local slot");
+            solver.assume(victim, super::SlotKindAlias::Ref);
+            solver.add_borrow_exclusion(Some(victim), &[]);
+            let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true);
+            (model, solver.round_model_failure())
+        });
+        assert!(
+            model.is_none(),
+            "the contradiction did not force a decline — witness would be inert"
+        );
+        assert!(
+            export.residual_conflicts.is_none(),
+            "F4: a DECLINING run recorded a certificate. `None` must mean the \
+             accept point never ran; anything else destroys the invariant the \
+             Option was introduced to carry. Got {:?}",
+            export.residual_conflicts
+        );
+        let Some(RoundModelFailure::HardUnsat {
+            active_endpoint_retraction,
+            core_labels,
+        }) = failure
+        else {
+            panic!("pre-loop contradiction lacks its typed first failure: {failure:?}");
+        };
+        assert_eq!(active_endpoint_retraction, 0);
+        assert!(core_labels.iter().any(|label| label.contains("kind-pin")));
+        assert!(
+            core_labels
+                .iter()
+                .any(|label| label.contains("borrow-exclusion"))
+        );
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+/// The exported candidacy agrees with the accepted model.
+#[test]
+fn certificate_candidacy_matches_model() {
+    let (model, export) = capture_solve(MALLOC_FREE);
+    let model = model.expect("accepted");
+    // As above, `None` is the correct guarded-repair behaviour.
+    let residuals = export
+        .residual_conflicts
+        .as_ref()
+        .expect("the accept point must have recorded a certificate");
+    // Every residual slot mentioned must exist in the accepted model, so the
+    // certificate and the model describe the same slot universe.
+    for r in residuals {
+        for slot in r.issuer.iter().chain(r.requirers.iter()) {
+            assert!(
+                model.contains_key(slot),
+                "residual names a slot absent from the accepted model: {slot:?}"
+            );
+        }
+    }
+}
+
+/// Selector provenance is index-aligned with `Selectors` by
+/// construction: each push site writes exactly once, in order.
+#[test]
+fn selector_provenance_index_aligned() {
+    let (_model, export) = capture_solve(MALLOC_FREE);
+    // Sources and sinks are recorded into separate vectors in push order, so
+    // their indices are the `Selectors::sources()` / `sinks()` indices.
+    for (i, s) in export.source_sites.iter().enumerate() {
+        assert_eq!(
+            s.role,
+            BoundaryRole::Source,
+            "source vector index {i} misfiled"
+        );
+    }
+    for (i, s) in export.sink_sites.iter().enumerate() {
+        assert_eq!(s.role, BoundaryRole::Sink, "sink vector index {i} misfiled");
+    }
+}
+
+/// A surviving sink resolves to the `free` call site.
+#[test]
+fn sink_site_names_the_free_call() {
+    let (_model, export) = capture_solve(MALLOC_FREE);
+    let callees: Vec<_> = export
+        .sink_sites
+        .iter()
+        .filter_map(|s| s.call.as_ref().map(|c| c.callee.clone()))
+        .collect();
+    assert!(
+        callees.iter().any(|c| c == "free"),
+        "sink selector was not attributed to the free call; got {callees:?}"
+    );
+}
+
+const E5_REALLOC_FAILURE_FREE: &str = r#"
+unsafe extern "C" {
+    fn realloc(p: *mut u8, n: usize) -> *mut u8;
+    fn free(p: *mut u8);
+}
+pub unsafe fn resize(p: *mut u8) -> u8 {
+    let q = realloc(p, 8);
+    if q.is_null() {
+        let value = *p;
+        free(p);
+        value
+    } else {
+        free(q);
+        0
+    }
+}
+"#;
+
+fn check_e5_realloc_failure_free(backend: TestValidationBackend) {
+    check_e5_realloc_failure_free_code(backend, E5_REALLOC_FAILURE_FREE);
+}
+
+fn check_e5_realloc_failure_free_code(backend: TestValidationBackend, code: &str) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let function = function_named(&program, "resize");
+        let body = tcx.mir_drops_elaborated_and_const_checked(function).borrow();
+        let failure_free_sites: Vec<_> = body.basic_blocks.iter_enumerated().filter_map(|(block, data)| {
+            let snippet = tcx.sess.source_map().span_to_snippet(data.terminator().source_info.span).ok()?;
+            (snippet == "free(p)").then_some(MirLocationKey::new(block.as_u32(), data.statements.len()))
+        }).collect();
+        assert_eq!(failure_free_sites.len(), 1, "fixture must independently identify the failure-path free");
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(&program, &slots, &origins, &facts, &solver, CopyLendMode::Baseline).expect("construction");
+        let failure_free_index = construction.selectors.keys().iter().position(|key| key.fn_did == function && key.location == failure_free_sites[0] && key.callee == "free" && key.role == BoundaryRole::Sink).expect("typed failure-path free endpoint");
+        let ((model, _stats), trace) = with_selector_trace(|| verify_bo_construction_counting_for_test(&program, &slots, &origins, &solver, &construction, &facts, backend));
+        assert!(model.is_some(), "supported direct realloc split must remain analyzable");
+        let final_epoch = trace.epochs.last().expect("selector trace");
+        assert!(!final_epoch.final_dropped.contains(&failure_free_index), "E5-R-FAIL: failed realloc must preserve the old responsibility for its exact later free; key={:?}, trace={final_epoch:?}", construction.selectors.keys()[failure_free_index]);
+        assert!(final_epoch.final_dropped.is_empty(), "all four exact source/realloc/free endpoints should be retained in this linear two-outcome fixture: {final_epoch:?}");
+    }).unwrap_or_else(|error| error.raise());
+}
+
+#[test]
+fn e5_r_t2_failed_realloc_preserves_old_free_hard() {
+    check_e5_realloc_failure_free(TestValidationBackend::HardCheckRoundOptimize);
+}
+
+#[test]
+fn e5_r219_pipeline_admits_success_implied_and_unobserved_results() {
+    const PREAMBLE: &str =
+        "unsafe extern \"C\" { fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); }";
+    for backend in [
+        TestValidationBackend::HardCheckRoundOptimize,
+        TestValidationBackend::LegacyOptimize,
+    ] {
+        for (body, expected_cases) in [
+            (
+                "pub unsafe fn f(p: *mut u8) -> u8 { let q = realloc(p, 8); let value = *q; free(q); value }",
+                1,
+            ),
+            (
+                "pub unsafe fn f(p: *mut u8) { let q = realloc(p, 8); free(q); }",
+                2,
+            ),
+        ] {
+            ::utils::compilation::run_compiler_on_str(&format!("{PREAMBLE} {body}"), |tcx| {
+            let program = collect_program(tcx);
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            let capture = arm_scope();
+            let construction = construct_bo_into(&program, &slots, &origins, &facts, &solver, CopyLendMode::Baseline).expect("R219 classifiable source continuation");
+            let site = &construction.source_events.reallocations[0];
+            let cases = crate::analyses::borrow_ownership::realloc::classify(site).expect("source cases");
+            assert_eq!(cases.len(), expected_cases);
+            let continuation = match &site.result {
+                crate::analyses::borrow_ownership::realloc::ReallocResult::SuccessImplied(continuation)
+                | crate::analyses::borrow_ownership::realloc::ReallocResult::Unobserved(continuation) => continuation,
+                other => panic!("R219 continuation: {other:?}"),
+            };
+            let keys: Vec<_> = construction.selectors.keys().iter().filter(|key| key.callee == "realloc").collect();
+            assert_eq!(keys.len(), 2, "exact old/result T2 endpoints");
+            for (role, endpoint) in [(BoundaryRole::Sink, continuation.old_place.as_ref().expect("old place")), (BoundaryRole::Source, &continuation.result_place)] {
+                assert_eq!(keys.iter().filter(|key| key.role == role && key.endpoint.as_ref() == Some(endpoint)
+                    && key.realloc_outcome == Some(crate::analyses::borrow_ownership::realloc::ReallocOutcome::Success)
+                    && key.location == MirLocationKey::new(site.key.block, site.key.statement)).count(), 1);
+            }
+            let ((model, _), trace) = with_selector_trace(|| verify_bo_construction_counting_for_test(&program, &slots, &origins, &solver, &construction, &facts, backend));
+            assert!(model.is_some());
+            assert!(trace.epochs.last().expect("T2 trace").final_dropped.is_empty(), "these closed source/continuation endpoints remain provable");
+            let export = capture.finish();
+            assert_eq!(export.realloc_cases.len(), expected_cases);
+            let owns = export.version_owns.as_ref().expect("valuation");
+            for receipt in &export.realloc_cases {
+                assert!(owns[receipt.old_before.expect("non-null-old input claim")]);
+                assert!(!owns[receipt.old_after.expect("non-null-old closed claim")]);
+                match receipt.case.outcome {
+                    crate::analyses::borrow_ownership::realloc::ReallocOutcome::Success => assert!(owns[receipt.result_claim.expect("success claim")]),
+                    crate::analyses::borrow_ownership::realloc::ReallocOutcome::Failure => {
+                        assert_eq!(receipt.result_claim, None);
+                        assert_eq!(receipt.case.old, crate::analyses::borrow_ownership::realloc::OldResponsibility::LoseClaimIfPresent);
+                    }
+                }
+            }
+        }).unwrap_or_else(|error| error.raise());
+        }
+    }
+}
+
+#[test]
+fn e5_r219_dynamic_null_and_distinct_site_receipts() {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::analyses::{
+        borrow_ownership::{
+            realloc::{
+                ContentsRelation, OldInput, OldResponsibility, ReallocCase, ReallocOutcome,
+                ReallocResult, ReallocRetirementAvailability, ReallocSize, ResultResponsibility,
+                ZeroSizeFeasibility, retirement_availability,
+            },
+            source_events::{SourceCondition, SourcePhase, SourceRole},
+        },
+        mir::{CallKind, TerminatorExt},
+    };
+
+    const PREAMBLE: &str = "unsafe extern \"C\" { fn malloc(n: usize) -> *mut u8; fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); }";
+    for backend in [
+        TestValidationBackend::HardCheckRoundOptimize,
+        TestValidationBackend::LegacyOptimize,
+    ] {
+        for (fixture, expected_sites, null_old) in [
+            (
+                "pub unsafe fn f(p: *mut u8, n: usize) { let q = realloc(p, n); free(q); }",
+                1,
+                false,
+            ),
+            (
+                "pub unsafe fn f(n: usize) { let q = realloc(0 as *mut u8, n); free(q); }",
+                1,
+                true,
+            ),
+            (
+                "pub unsafe fn f(n: usize) { let p = malloc(8); let q = realloc(p, n); free(q); let r = malloc(8); let s = realloc(r, n); free(s); }",
+                2,
+                false,
+            ),
+        ] {
+            ::utils::compilation::run_compiler_on_str(&format!("{PREAMBLE} {fixture}"), |tcx| {
+                let program = collect_program(tcx);
+                let function = function_named(&program, "f");
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                // Derive endpoint identity from original MIR, independently of
+                // both the source-event inventory and the exported endpoint-retraction keys.
+                let original: BTreeMap<_, _> = body
+                    .basic_blocks
+                    .iter_enumerated()
+                    .filter_map(|(block, data)| {
+                        let call = data.terminator().as_call(tcx)?;
+                        if !matches!(call.func, CallKind::LibC(name) if name.as_str() == "realloc")
+                        {
+                            return None;
+                        }
+                        Some((
+                            MirLocationKey::new(block.as_u32(), data.statements.len()),
+                            (
+                                call.args
+                                    .first()
+                                    .and_then(|arg| arg.node.place())
+                                    .map(PlaceKey::from_place),
+                                PlaceKey::from_place(call.destination),
+                            ),
+                        ))
+                    })
+                    .collect();
+                assert_eq!(original.len(), expected_sites, "fixture call identities");
+
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let solver = KindSolver::new(&slots);
+                let capture = arm_scope();
+                let construction = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    &solver,
+                    CopyLendMode::Baseline,
+                )
+                .expect("dynamic-byte unobserved continuation");
+                let sites = &construction.source_events.reallocations;
+                assert_eq!(sites.len(), expected_sites);
+                assert_eq!(
+                    sites
+                        .iter()
+                        .map(|site| MirLocationKey::new(site.key.block, site.key.statement))
+                        .collect::<BTreeSet<_>>(),
+                    original.keys().copied().collect::<BTreeSet<_>>()
+                );
+                let keys: Vec<_> = construction
+                    .selectors
+                    .keys()
+                    .iter()
+                    .filter(|key| key.callee == "realloc")
+                    .collect();
+                assert_eq!(keys.len(), expected_sites * if null_old { 1 } else { 2 });
+                let ((model, _), trace) = with_selector_trace(|| {
+                    verify_bo_construction_counting_for_test(
+                        &program,
+                        &slots,
+                        &origins,
+                        &solver,
+                        &construction,
+                        &facts,
+                        backend,
+                    )
+                });
+                assert!(model.is_some(), "{fixture}");
+                assert!(
+                    trace
+                        .epochs
+                        .last()
+                        .expect("T2 trace")
+                        .final_dropped
+                        .is_empty(),
+                    "closed endpoints: {fixture}"
+                );
+                let export = capture.finish();
+                assert_eq!(export.realloc_cases.len(), 2 * expected_sites);
+                let owns = export.version_owns.as_ref().expect("ownership valuation");
+
+                for site in sites {
+                    let location = MirLocationKey::new(site.key.block, site.key.statement);
+                    let (old_place, result_place) = &original[&location];
+                    assert_eq!(site.key.function, "f");
+                    assert_eq!(site.key.phase, SourcePhase::Call);
+                    assert_eq!(
+                        site.size,
+                        ReallocSize::ByteCount,
+                        "dynamic bytes are not nonzero evidence"
+                    );
+                    assert_eq!(site.zero_size, Some(ZeroSizeFeasibility::Possible));
+                    assert_eq!(
+                        site.old_input,
+                        if null_old {
+                            OldInput::KnownNull
+                        } else {
+                            OldInput::MayBeNonNull
+                        }
+                    );
+                    let ReallocResult::Unobserved(continuation) = &site.result else {
+                        panic!("expected both source alternatives: {:?}", site.result);
+                    };
+                    assert!(continuation.witness.is_none());
+                    assert_eq!(&continuation.old_place, old_place);
+                    assert_eq!(&continuation.result_place, result_place);
+
+                    let receipts: Vec<_> = export
+                        .realloc_cases
+                        .iter()
+                        .filter(|receipt| receipt.event == site.key)
+                        .collect();
+                    assert_eq!(receipts.len(), 2, "one pair per exact source site");
+                    assert_eq!(
+                        receipts
+                            .iter()
+                            .map(|receipt| receipt.case.outcome)
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from([ReallocOutcome::Success, ReallocOutcome::Failure])
+                    );
+                    let success = receipts
+                        .iter()
+                        .find(|receipt| receipt.case.outcome == ReallocOutcome::Success)
+                        .unwrap();
+                    let failure = receipts
+                        .iter()
+                        .find(|receipt| receipt.case.outcome == ReallocOutcome::Failure)
+                        .unwrap();
+                    assert_eq!(
+                        success.case,
+                        ReallocCase {
+                            outcome: ReallocOutcome::Success,
+                            old: if null_old {
+                                OldResponsibility::Absent
+                            } else {
+                                OldResponsibility::RetireIfPresent
+                            },
+                            result: ResultResponsibility::FreshGeneration,
+                            contents: if null_old {
+                                ContentsRelation::NoOldObject
+                            } else {
+                                ContentsRelation::RequiredPrefixPreserved
+                            },
+                        }
+                    );
+                    assert_eq!(
+                        failure.case,
+                        ReallocCase {
+                            outcome: ReallocOutcome::Failure,
+                            old: if null_old {
+                                OldResponsibility::Absent
+                            } else {
+                                OldResponsibility::LoseClaimIfPresent
+                            },
+                            result: ResultResponsibility::None,
+                            contents: if null_old {
+                                ContentsRelation::NoOldObject
+                            } else {
+                                ContentsRelation::TargetDependentZeroSize
+                            },
+                        }
+                    );
+                    assert_eq!(
+                        retirement_availability(site, &success.case),
+                        if null_old {
+                            ReallocRetirementAvailability::None
+                        } else {
+                            ReallocRetirementAvailability::WholeOldGeneration
+                        }
+                    );
+                    assert_eq!(
+                        retirement_availability(site, &failure.case),
+                        if null_old {
+                            ReallocRetirementAvailability::None
+                        } else {
+                            ReallocRetirementAvailability::MayRetireOnZero
+                        }
+                    );
+                    let retirement_conditions: BTreeSet<_> = construction
+                        .source_events
+                        .retirements
+                        .keys()
+                        .filter(|key| {
+                            key.function == site.key.function
+                                && key.block == site.key.block
+                                && key.statement == site.key.statement
+                                && key.role == SourceRole::ReallocOld
+                        })
+                        .map(|key| key.condition)
+                        .collect();
+                    assert_eq!(
+                        retirement_conditions,
+                        if null_old {
+                            BTreeSet::new()
+                        } else {
+                            BTreeSet::from([
+                                SourceCondition::ReallocSuccess,
+                                SourceCondition::ReallocZeroSizePossible,
+                            ])
+                        }
+                    );
+
+                    let site_keys: Vec<_> = keys
+                        .iter()
+                        .copied()
+                        .filter(|key| key.location == location)
+                        .collect();
+                    assert_eq!(site_keys.len(), if null_old { 1 } else { 2 });
+                    assert!(site_keys.iter().all(|key| key.fn_did == function
+                        && key.function_path == site.key.function
+                        && key.realloc_outcome == Some(ReallocOutcome::Success)));
+                    let sources: Vec<_> = site_keys
+                        .iter()
+                        .copied()
+                        .filter(|key| key.role == BoundaryRole::Source)
+                        .collect();
+                    let sinks: Vec<_> = site_keys
+                        .iter()
+                        .copied()
+                        .filter(|key| key.role == BoundaryRole::Sink)
+                        .collect();
+                    assert_eq!(sources.len(), 1);
+                    assert_eq!(sources[0].endpoint.as_ref(), Some(result_place));
+                    let result_claim = success.result_claim.expect("success result claim");
+                    assert_eq!(sources[0].var, result_claim);
+                    assert!(owns[result_claim]);
+                    assert_eq!(
+                        failure.result_claim, None,
+                        "failure creates no result claim"
+                    );
+                    assert_eq!(
+                        (failure.old_before, failure.old_after),
+                        (success.old_before, success.old_after)
+                    );
+                    if null_old {
+                        assert!(sinks.is_empty(), "None has no old sink endpoint");
+                        // A literal null can lack an SSA operand; a materialized
+                        // null must carry two explicitly non-owning versions.
+                        match (success.old_before, success.old_after) {
+                            (None, None) => {}
+                            (Some(before), Some(after)) => {
+                                assert!(!owns[before]);
+                                assert!(!owns[after]);
+                            }
+                            values => panic!("incomplete null operand versions: {values:?}"),
+                        }
+                    } else {
+                        assert_eq!(sinks.len(), 1);
+                        assert_eq!(sinks[0].endpoint.as_ref(), old_place.as_ref());
+                        let before = success.old_before.expect("old input claim");
+                        let after = success.old_after.expect("closed old claim");
+                        assert_eq!(sinks[0].var, before);
+                        assert!(owns[before]);
+                        assert!(!owns[after]);
+                    }
+                }
+            })
+            .unwrap_or_else(|error| error.raise());
+        }
+    }
+}
+
+#[test]
+fn e5_r_t2_failed_realloc_preserves_old_free_optimize() {
+    check_e5_realloc_failure_free(TestValidationBackend::LegacyOptimize);
+}
+
+#[test]
+fn e5_r_result_cast_transports_branch_responsibility() {
+    const CODE: &str = r#"
+unsafe extern "C" { fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); }
+pub unsafe fn resize(p: *mut u8) -> u8 {
+    let q = realloc(p, 8);
+    let r = q as *mut i8;
+    if r.is_null() { let value = *p; free(p); value } else { free(r as *mut u8); 0 }
+}
+"#;
+    check_e5_realloc_failure_free_code(TestValidationBackend::HardCheckRoundOptimize, CODE);
+}
+
+#[test]
+fn e5_r_exported_edge_values_match_both_source_outcomes() {
+    ::utils::compilation::run_compiler_on_str(E5_REALLOC_FAILURE_FREE, |tcx| {
+        use crate::analyses::borrow_ownership::realloc::ReallocOutcome;
+        let program = collect_program(tcx);
+        let function = function_named(&program, "resize");
+        let p = named_local(&program, function, "p");
+        let q = named_local(&program, function, "q");
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let ((model, _stats), capture) = with_bo_export(|| {
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("construction");
+            verify_bo_construction_counting(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &facts,
+            )
+        });
+        assert!(model.is_some());
+        let owns = capture.version_owns.as_ref().expect("ownership values");
+        for (local, outcome, expected) in [
+            (p, ReallocOutcome::Success, false),
+            (p, ReallocOutcome::Failure, true),
+            (q, ReallocOutcome::Success, true),
+            (q, ReallocOutcome::Failure, false),
+        ] {
+            let rows: Vec<_> = capture
+                .realloc_version_sites
+                .iter()
+                .filter(|row| {
+                    row.fn_did == function && row.local == local && row.outcome == outcome
+                })
+                .collect();
+            assert_eq!(
+                rows.len(),
+                1,
+                "exact entry definition for {local:?}/{outcome:?}"
+            );
+            assert_eq!(
+                owns[rows[0].def_var], expected,
+                "source outcome value {local:?}/{outcome:?}"
+            );
+        }
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+#[test]
+fn e5_r_t2_realloc_keys_are_guarded_by_success() {
+    ::utils::compilation::run_compiler_on_str(E5_REALLOC_FAILURE_FREE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("construction");
+        let keys: Vec<_> = construction
+            .selectors
+            .keys()
+            .iter()
+            .filter(|key| key.callee == "realloc")
+            .collect();
+        assert_eq!(keys.len(), 2, "success result and old-block endpoints");
+        assert!(
+            keys.iter().all(|key| key.realloc_outcome
+                == Some(crate::analyses::borrow_ownership::realloc::ReallocOutcome::Success)
+                && key.endpoint.is_some()),
+            "realloc endpoints require exact source outcome and operand identities: {keys:?}"
+        );
+        let ordinary: Vec<_> = construction
+            .selectors
+            .keys()
+            .iter()
+            .filter(|key| key.callee == "free")
+            .collect();
+        assert_eq!(ordinary.len(), 2);
+        assert!(
+            ordinary
+                .iter()
+                .all(|key| key.realloc_outcome.is_none() && key.endpoint.is_none()),
+            "ordinary free key contract stays unchanged"
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+#[test]
+fn e5_r_null_old_later_allocation_keeps_real_ownership_exports() {
+    const CODE: &str = r#"
+unsafe extern "C" { fn malloc(n: usize) -> *mut u8; fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); }
+pub unsafe fn f() {
+    let mut p = 0 as *mut u8;
+    let q = realloc(p, 8);
+    if q.is_null() { p = malloc(8); free(p); } else { free(q); }
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let function = function_named(&program, "f");
+        let p = named_local(&program, function, "p");
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let ((model, _stats), capture) = with_bo_export(|| {
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("supported null-old branch");
+            assert!(
+                construction
+                    .selectors
+                    .keys()
+                    .iter()
+                    .all(|key| !(key.callee == "realloc" && key.role == BoundaryRole::Sink)),
+                "null old input has no old sink"
+            );
+            verify_bo_construction_counting(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &facts,
+            )
+        });
+        assert!(model.is_some());
+        let owns = capture.version_owns.as_ref().expect("ownership valuation");
+        let owning_p_versions: Vec<_> = capture
+            .version_sites
+            .iter()
+            .filter(|site| site.fn_did == function && site.local == p)
+            .flat_map(|site| [site.use_var, site.def_var])
+            .flatten()
+            .filter(|var| owns[*var])
+            .collect();
+        assert!(
+            !owning_p_versions.is_empty(),
+            "real post-branch malloc/free ownership must not disappear as a realloc placeholder"
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+#[test]
+fn e5_r_live_outcome_join_is_explicitly_unsupported() {
+    const CODE: &str = r#"
+unsafe extern "C" { fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); }
+pub unsafe fn f(p: *mut u8) -> u8 {
+    let q = realloc(p, 8);
+    let value = if q.is_null() { *p } else { *q };
+    if q.is_null() { free(p); } else { free(q); }
+    value
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let ((model,_),capture)=with_bo_export(|| {
+            let construction=construct_bo_into(&program,&slots,&origins,&facts,&solver,CopyLendMode::Baseline).expect("live join holds locally");
+            verify_bo_construction_counting(&program,&slots,&origins,&solver,&construction,&facts)
+        });
+        let model=model.expect("held live join retains model");
+        let holds=&capture.realloc_coverage_holds;
+        assert!(!holds.is_empty());
+        assert!(holds.iter().all(|row| row.reason==crate::analyses::borrow_ownership::realloc_ssa::coverage_hold::Reason::LiveOutcomeJoin));
+        for row in holds { for target in &row.slots { assert_eq!(model[target],crate::analyses::borrow_ownership::SlotKind::Raw); } }
+        assert!(capture.source_events.as_ref().unwrap().retirements.keys().any(|key|
+            key.role==crate::analyses::borrow_ownership::source_events::SourceRole::ReallocOld));
+        assert!(capture.realloc_version_sites.is_empty(), "held correlation creates no outcome ownership versions");
+        let ctxt=crate::analyses::borrow_ownership::CrateCtxt::new(&program);
+        let function=function_named(&program,"f");
+        let body=tcx.mir_drops_elaborated_and_const_checked(function).borrow();
+        let mut defs=crate::analyses::borrow_ownership::ssa::consume::initial_definitions(&body,&ctxt);
+        let sites=crate::analyses::borrow_ownership::realloc::collect_sites(&program);
+        let plans=crate::analyses::borrow_ownership::realloc_ssa::plan_body(&ctxt,&body,&mut defs,&sites).unwrap();
+        assert_eq!(plans.len(),1);
+        assert!(plans[0].operations.is_empty() && plans[0].old.is_none());
+    }).unwrap_or_else(|error| error.raise());
+}
+
+/// Retracting realloc ownership assertions must neither erase
+/// the source retirement nor relax the mandatory laws that reject restoration.
+#[test]
+fn e5_r_t2_opaque_old_realloc_retracts_without_erasing_retirement() {
+    use std::collections::BTreeSet;
+
+    use crate::analyses::{
+        borrow_ownership::{
+            realloc::{OldResponsibility, ReallocOutcome, ReallocResult, ResultResponsibility},
+            solver::SelectorTracePhase,
+            source_events::{Coverage, SourceCondition, SourceObject, SourceRegion, SourceRole},
+        },
+        mir::TerminatorExt,
+    };
+
+    const CODE: &str = r#"
+unsafe extern "C" {
+    fn opaque() -> *mut u8;
+    fn realloc(p: *mut u8, n: usize) -> *mut u8;
+}
+unsafe fn resize() {
+    let p = opaque();
+    let _q = realloc(p, 8);
+}
+"#;
+    for backend in [
+        TestValidationBackend::HardCheckRoundOptimize,
+        TestValidationBackend::LegacyOptimize,
+    ] {
+        ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+            let program = collect_program(tcx);
+            let function = function_named(&program, "resize");
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            let arm = arm_scope();
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("unobserved realloc construction");
+            let inventory = construction.source_events.clone();
+            assert_eq!(inventory.reallocations.len(), 1);
+            let site = &inventory.reallocations[0];
+            assert!(matches!(&site.result, ReallocResult::Unobserved(_)));
+            let location = MirLocationKey::new(site.key.block, site.key.statement);
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let call = body.basic_blocks[rustc_middle::mir::BasicBlock::from_u32(site.key.block)]
+                .terminator()
+                .as_call(tcx)
+                .expect("original realloc call");
+            let old_place =
+                PlaceKey::from_place(call.args[0].node.place().expect("opaque old operand"));
+            let result_place = PlaceKey::from_place(call.destination);
+
+            let keys = construction.selectors.keys();
+            assert_eq!(keys.len(), 2, "only the realloc Source and Sink exist");
+            let endpoint_index = |role, endpoint: &PlaceKey| {
+                let indices: Vec<_> = keys
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, key)| {
+                        (key.fn_did == function
+                            && key.function_path == site.key.function
+                            && key.location == location
+                            && key.callee == "realloc"
+                            && key.role == role
+                            && key.realloc_outcome == Some(ReallocOutcome::Success)
+                            && key.endpoint.as_ref() == Some(endpoint))
+                        .then_some(index)
+                    })
+                    .collect();
+                assert_eq!(indices.len(), 1, "exact outcome/operand endpoint");
+                indices[0]
+            };
+            let sink_index = endpoint_index(BoundaryRole::Sink, &old_place);
+            let source_index = endpoint_index(BoundaryRole::Source, &result_place);
+            assert_ne!(sink_index, source_index);
+            let sink_label = keys[sink_index].label();
+            let retirements: Vec<_> = inventory
+                .retirements
+                .values()
+                .filter(|event| {
+                    event.key.function == site.key.function
+                        && event.key.block == site.key.block
+                        && event.key.statement == site.key.statement
+                        && event.key.role == SourceRole::ReallocOld
+                })
+                .collect();
+            assert_eq!(retirements.len(), 1, "one source success retirement");
+            let retirement = retirements[0];
+            assert_eq!(retirement.key.condition, SourceCondition::ReallocSuccess);
+            assert_eq!(retirement.object, SourceObject::HeapThrough(old_place));
+            assert_eq!(retirement.region, SourceRegion::WholeAllocation);
+            assert_eq!(retirement.coverage, Coverage::UnresolvedWholeObject);
+
+            let ((model, _), trace) = with_selector_trace(|| {
+                verify_bo_construction_counting_for_test(
+                    &program,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &construction,
+                    &facts,
+                    backend,
+                )
+            });
+            let model = model.expect("T2 retraction preserves acceptance");
+            let epoch = trace.epochs.last().expect("T2 retraction epoch");
+            assert_eq!(
+                epoch.final_dropped.iter().copied().collect::<BTreeSet<_>>(),
+                BTreeSet::from([sink_index, source_index]),
+                "both unused/unlicensed endpoints must be dropped before full no-T2 comparison"
+            );
+            let dropped = epoch
+                .events
+                .iter()
+                .find(|event| {
+                    event.selector_index == sink_index
+                        && event.phase == SelectorTracePhase::Drop
+                        && event.outcome == SelectorTraceOutcome::Dropped
+                })
+                .expect("exact old Sink drop event");
+            assert!(dropped.active_before.contains(&sink_index));
+            assert!(dropped.core_selectors.contains(&sink_index));
+            assert!(dropped.core_labels.contains(&sink_label));
+            let is_license =
+                |label: &str| label.contains("own-assume") || label.contains("link-own");
+            let license_labels: Vec<_> = dropped
+                .core_labels
+                .iter()
+                .filter(|label| is_license(label))
+                .collect();
+            assert!(
+                !license_labels.is_empty(),
+                "old Sink has a mixed T2/licensing core"
+            );
+            let restored = epoch
+                .events
+                .iter()
+                .find(|event| {
+                    event.selector_index == sink_index
+                        && event.phase == SelectorTracePhase::Reenable
+                        && event.outcome == SelectorTraceOutcome::StayedDropped
+                })
+                .expect("mandatory licensing rejects the old Sink restoration attempt");
+            assert!(restored.active_before.contains(&sink_index));
+            assert!(restored.core_selectors.contains(&sink_index));
+            assert!(restored.core_labels.contains(&sink_label));
+            assert!(restored.core_labels.iter().any(|label| is_license(label)));
+
+            let export = arm.finish();
+            assert_eq!(construction.source_events, inventory);
+            assert_eq!(export.source_events.as_ref(), Some(&inventory));
+            assert_eq!(export.replay_source_events.as_ref(), Some(&inventory));
+            assert_eq!(export.realloc_cases.len(), 2);
+            assert_eq!(
+                export
+                    .realloc_cases
+                    .iter()
+                    .map(|receipt| receipt.case.outcome)
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([ReallocOutcome::Success, ReallocOutcome::Failure])
+            );
+            let owns = export
+                .version_owns
+                .as_ref()
+                .expect("post-retraction ownership valuation");
+            for receipt in &export.realloc_cases {
+                assert_eq!(receipt.event, site.key);
+                let before = receipt
+                    .old_before
+                    .expect("opaque input has a tracked ownership version");
+                let after = receipt.old_after.expect("closed old ownership version");
+                assert_eq!(before, keys[sink_index].var);
+                assert!(
+                    !owns[before],
+                    "mandatory opaque-origin law survives the Sink retraction"
+                );
+                assert!(!owns[after]);
+                match receipt.case.outcome {
+                    ReallocOutcome::Success => {
+                        assert_eq!(receipt.case.old, OldResponsibility::RetireIfPresent);
+                        assert_eq!(receipt.case.result, ResultResponsibility::FreshGeneration);
+                        let result = receipt
+                            .result_claim
+                            .expect("tracked unused result qualifier");
+                        assert_eq!(result, keys[source_index].var);
+                        assert!(!owns[result], "unused result ownership remains unlicensed");
+                    }
+                    ReallocOutcome::Failure => {
+                        assert_eq!(receipt.case.old, OldResponsibility::LoseClaimIfPresent);
+                        assert_eq!(receipt.case.result, ResultResponsibility::None);
+                        assert_eq!(receipt.result_claim, None);
+                    }
+                }
+            }
+            let (baseline, checks) = with_assumption_check_trace(|| {
+                solver.model_without_endpoint_retraction_for_test(&construction.selectors)
+            });
+            assert_eq!(model, baseline.expect("mandatory no-T2 baseline accepts"));
+            assert!(
+                checks.iter().any(|check| {
+                    check.outcome == z3::SatResult::Sat
+                        && check.explicit.len() == keys.len()
+                        && check.bundle.len() > check.explicit.len()
+                        && license_labels
+                            .iter()
+                            .all(|label| check.labels.contains(label))
+                }),
+                "no-T2 baseline must still assume the mandatory laws from the mixed core"
+            );
+        })
+        .unwrap_or_else(|error| error.raise());
+    }
+}
+
+/// An exact free endpoint whose incoming value has no modeled origin cannot
+/// retain the endpoint assertion. The mandatory licensing clause appears beside
+/// the typed endpoint-retraction label, endpoint retraction yields first,
+/// restoration fails, and the post-retraction model equals the baseline without
+/// endpoint assertions.
+#[test]
+fn t2_unknown_origin_free_retracts_with_named_license_core() {
+    const CODE: &str = r#"
+unsafe extern "C" {
+    fn opaque() -> *mut i32;
+    fn free(p: *mut core::ffi::c_void);
+}
+unsafe fn release() {
+    let p = opaque();
+    free(p as *mut core::ffi::c_void);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let mut_facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &mut_facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("shared construction");
+        let sink_index = construction
+            .selectors
+            .keys()
+            .iter()
+            .position(|key| key.callee == "free" && key.role == BoundaryRole::Sink)
+            .expect("typed free assertion");
+        let ((model, _stats), trace) = with_selector_trace(|| {
+            verify_bo_construction_counting(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &mut_facts,
+            )
+        });
+        assert!(solver.lazy_plain_hard_check_count() > 0);
+        assert!(
+            solver.lazy_tracked_recheck_count() > 0,
+            "an UNSAT endpoint set must re-enter the tracked core backend"
+        );
+        assert_eq!(
+            solver.lazy_plain_materialization_count(),
+            solver.optimize_materialization_count(),
+            "every accepted round model must materialize without assumptions"
+        );
+        let model = model.expect("T2 retraction preserves acceptance");
+        let baseline = solver
+            .model_without_endpoint_retraction_for_test(&construction.selectors)
+            .expect("no-T2 baseline accepts");
+        assert_eq!(
+            model, baseline,
+            "W2 post-retraction model must equal baseline"
+        );
+        let release = function_named(&program, "release");
+        let p = named_depth0_slot(&program, &slots, release, "p");
+        assert_eq!(model.get(&p), baseline.get(&p));
+
+        let epoch = trace.epochs.last().expect("T2 trace epoch");
+        assert!(epoch.final_dropped.contains(&sink_index));
+        let dropped = epoch
+            .events
+            .iter()
+            .find(|event| event.selector_index == sink_index && event.core_labels.len() > 1)
+            .expect("typed T2+license core");
+        assert!(
+            dropped
+                .core_labels
+                .iter()
+                .any(|label| label.contains("t2-assert"))
+        );
+        assert!(
+            dropped
+                .core_labels
+                .iter()
+                .any(|label| label.contains("own-assume") || label.contains("link-own"))
+        );
+        assert!(epoch.events.iter().any(|event| {
+            event.selector_index == sink_index
+                && event.outcome == SelectorTraceOutcome::StayedDropped
+        }));
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// A long move chain receives assertions at its allocation and
+/// deallocation endpoints only. Chain middles remain governed exclusively by
+/// existing transfer/coherence constraints.
+#[test]
+fn t2_chain_middles_do_not_receive_assertions() {
+    const CODE: &str = r#"
+unsafe extern "C" {
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+unsafe fn chain() {
+    let p = malloc(4) as *mut i32;
+    let q = p;
+    let r = q;
+    free(r as *mut core::ffi::c_void);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("shared construction");
+        let keys = construction.selectors.keys();
+        assert_eq!(keys.len(), 2, "only malloc/free endpoints may assert");
+        assert_eq!(
+            keys.iter()
+                .map(|key| key.callee.as_str())
+                .collect::<Vec<_>>(),
+            vec!["malloc", "free"]
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// Local functions that merely reuse libc spellings are not boundary
+/// rows and therefore create no endpoint assertions.
+#[test]
+fn t2_local_wrapper_names_do_not_match_foreign_boundaries() {
+    const CODE: &str = r#"
+unsafe fn malloc(_n: usize) -> *mut i32 { core::ptr::null_mut() }
+unsafe fn free(_p: *mut i32) {}
+unsafe fn wrapper() {
+    let p = malloc(4);
+    free(p);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("shared construction");
+        assert!(construction.selectors.keys().is_empty());
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// Observation-only causal-chain dump of endpoint retraction on a
+/// malloc-copy-free chain. It makes no assertion about the expected repair; the
+/// diagnostic output is the deliverable.
+#[test]
+fn t2_w1_causal_chain_diagnostic() {
+    const CODE: &str = r#"
+unsafe extern "C" {
+    fn malloc(n: usize) -> *mut core::ffi::c_void;
+    fn free(p: *mut core::ffi::c_void);
+}
+unsafe fn chain() {
+    let p = malloc(core::mem::size_of::<i32>()) as *mut i32;
+    let q = p;
+    free(q as *mut core::ffi::c_void);
+}
+"#;
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let arm = arm_scope();
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("shared construction");
+        eprintln!("T2-W1 keys={}", construction.selectors.keys().len());
+        for (index, (key, literal)) in construction
+            .selectors
+            .keys()
+            .iter()
+            .zip(construction.selectors.all())
+            .enumerate()
+        {
+            eprintln!("T2-W1 key[{index}]={} literal={literal}", key.label());
+        }
+
+        let (((model, stats), checks), selector_trace) = with_selector_trace(|| {
+            with_assumption_check_trace(|| {
+                verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &construction,
+                    &facts,
+                )
+            })
+        });
+        let export = arm.finish();
+        for (index, check) in checks.iter().enumerate() {
+            let t2 = construction
+                .selectors
+                .all()
+                .iter()
+                .enumerate()
+                .filter(|(_, literal)| check.bundle.iter().any(|item| item == *literal))
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            eprintln!(
+                "T2-W1 check[{index}] phase={:?} outcome={:?} explicit={} bundle={} t2={t2:?}",
+                check.phase,
+                check.outcome,
+                check.explicit.len(),
+                check.bundle.len(),
+            );
+            eprintln!("T2-W1 check[{index}] labels={:?}", check.labels);
+        }
+        for (epoch, trace) in selector_trace.epochs.iter().enumerate() {
+            eprintln!(
+                "T2-W1 epoch[{epoch}] final_dropped={:?} events={:#?}",
+                trace.final_dropped, trace.events
+            );
+        }
+
+        let model = model.expect("W1 accepts");
+        let chain = function_named(&program, "chain");
+        let p_slot = named_depth0_slot(&program, &slots, chain, "p");
+        let q_slot = named_depth0_slot(&program, &slots, chain, "q");
+        let owns = export.version_owns.as_ref().expect("version ownerships");
+        for (name, local, slot) in [
+            ("p", named_local(&program, chain, "p"), p_slot),
+            ("q", named_local(&program, chain, "q"), q_slot),
+        ] {
+            let versions = export
+                .version_sites
+                .iter()
+                .filter(|site| site.fn_did == chain && site.local == local)
+                .map(|site| {
+                    let use_value = site.use_var.map(|var| (var, owns[var]));
+                    let def_value = site.def_var.map(|var| (var, owns[var]));
+                    (site.location, use_value, def_value)
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "T2-W1 model {name}: versions={versions:?} own_bit={} kind={:?}",
+                model.get(&slot) == Some(&SlotKindAlias::Owning),
+                model.get(&slot)
+            );
+        }
+        eprintln!(
+            "T2-W1 stats dropped_sources={} dropped_sinks={} optimize_materializations={}",
+            stats.dropped_sources,
+            stats.dropped_sinks,
+            solver.optimize_materialization_count(),
+        );
+        assert!(solver.lazy_plain_hard_check_count() > 0);
+        assert_eq!(
+            solver.lazy_tracked_recheck_count(),
+            0,
+            "an all-SAT endpoint set must never pay for tracked core extraction"
+        );
+        assert_eq!(
+            solver.lazy_plain_materialization_count(),
+            solver.optimize_materialization_count(),
+            "every accepted round model must materialize without assumptions"
+        );
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// A transfer produces a move-point candidate; a plain
+/// allocate-and-free does not produce one spuriously *for the same local at the
+/// free site alone*. The candidate set is deliberately over-approximate (a
+/// `free` also clears ownership), which is why the API says "candidates".
+#[test]
+fn move_point_candidates_are_recorded_for_a_transfer() {
+    const TRANSFER: &str = r#"
+unsafe extern "C" {
+    fn malloc(n: usize) -> *mut u8;
+    fn free(p: *mut u8);
+}
+unsafe fn f() -> i32 {
+    let p: *mut i32 = malloc(4) as *mut i32;
+    let q: *mut i32 = p;
+    *q = 7;
+    let v = *q;
+    free(q as *mut u8);
+    v
+}
+"#;
+    let (model, export) = capture_solve(TRANSFER);
+    assert!(model.is_some());
+    assert!(
+        export.version_owns.is_some(),
+        "move-point derivation needs the per-version model"
+    );
+    // At least one local in the transfer fixture must have a candidate site.
+    // `LocalDefId` is not `Ord`, so dedupe via the hash set the crate already
+    // uses rather than a BTreeSet.
+    let pairs: rustc_hash::FxHashSet<_> = export
+        .version_sites
+        .iter()
+        .map(|s| (s.fn_did, s.local))
+        .collect();
+    let any = pairs
+        .into_iter()
+        .any(|(f, l)| !export.move_point_candidates(f, l).is_empty());
+    assert!(any, "no move-point candidate found in a transfer fixture");
+}
+
+// -------------------------------------------------------------------------
+// Regression witnesses
+// -------------------------------------------------------------------------
+
+/// A shape that forces the CEGAR loop to commit and re-solve before accepting.
+///
+/// `x = id(p)` is a live `Ref` requirer invalidated by the write through the
+/// base `b = p`, so the loop commits twice and accepts on round 3. The
+/// round count is pinned by `bo_c1.rs:6461` (`commit.rounds == 3`), and this
+/// test pins it again locally so a change in fixture behaviour cannot silently
+/// turn the multi-round witness into a single-round no-op.
+const CASCADE: &str = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+     unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
+
+/// Solve with capture, returning the round counters as well.
+///
+/// `verify_to_fixpoint` is a thin wrapper over the counting loop, so this
+/// observes the same run
+/// `capture_solve` does, plus the stats needed to pin the round count.
+fn capture_solve_counting(
+    code: &str,
+) -> (
+    Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
+    RoundStats,
+    BoExport,
+) {
+    ::utils::compilation::run_compiler_on_str(code, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let ((model, stats), export) = with_bo_export(|| {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            verify_to_fixpoint_counting(&program, &slots, &solver, &selectors, true)
+        });
+        (model, stats, export)
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+fn capture_solve_counting_backend(
+    code: &str,
+    backend: TestValidationBackend,
+) -> (
+    Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
+    RoundStats,
+    BoExport,
+) {
+    ::utils::compilation::run_compiler_on_str(code, move |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let mut_facts = MutFacts::from_program(&program);
+        let ((model, stats), export) = with_bo_export(|| {
+            let solver = KindSolver::new(&slots);
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &mut_facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("shared construction");
+            verify_bo_construction_counting_for_test(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &mut_facts,
+                backend,
+            )
+        });
+        (model, stats, export)
+    })
+    .unwrap_or_else(|error| error.raise())
+}
+
+#[test]
+fn decomposed_multi_round_model_commits_and_export_match_legacy() {
+    let legacy = capture_solve_counting_backend(CASCADE, TestValidationBackend::LegacyOptimize);
+    let decomposed =
+        capture_solve_counting_backend(CASCADE, TestValidationBackend::HardCheckRoundOptimize);
+    assert_eq!(decomposed, legacy);
+}
+
+fn capture_solve_l2_backend(
+    code: &str,
+    backend: TestValidationBackend,
+) -> (
+    Option<FxHashMap<SlotRef, super::SlotKindAlias>>,
+    RoundStats,
+    BoExport,
+) {
+    ::utils::compilation::run_compiler_on_str(code, move |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let mut_facts = MutFacts::from_program(&program);
+        let ((model, stats), export) = with_bo_export(|| {
+            let solver = KindSolver::new(&slots);
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &mut_facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("shared construction");
+            verify_bo_construction_l2_for_test(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &mut_facts,
+                backend,
+            )
+        });
+        (model, stats, export)
+    })
+    .unwrap_or_else(|error| error.raise())
+}
+
+#[test]
+fn decomposed_l2_model_actions_and_export_match_legacy() {
+    let legacy = capture_solve_l2_backend(CASCADE, TestValidationBackend::LegacyOptimize);
+    let decomposed =
+        capture_solve_l2_backend(CASCADE, TestValidationBackend::HardCheckRoundOptimize);
+    assert_eq!(decomposed, legacy);
+}
+
+/// A fixture that drives more than one validation round must still
+/// export exactly one record per loan.
+///
+/// The round count is **pinned**: without it, a fixture
+/// that quietly collapsed to one round would make the uniqueness assertion
+/// inert (duplicates can only arise ACROSS rounds), and the test would pass
+/// with the `begin_round()` reset deleted. `model.is_some()` and non-emptiness
+/// are asserted for the same reason — a first-solve decline would otherwise
+/// satisfy an empty-loan-set uniqueness check with zero signal.
+///
+/// *Mutation-tested.* Deleting `export::begin_round()` from the plain repair
+/// loop fails this test with "loan … appears more than once".
+#[test]
+fn multi_round_export_holds_only_the_final_round() {
+    let (model, stats, export) = capture_solve_counting(CASCADE);
+    assert!(model.is_some(), "the cascade fixture must be ACCEPTED");
+    assert_eq!(
+        stats.rounds, 3,
+        "the D1 witness needs a genuinely multi-round fixture (2 commits + accept)"
+    );
+    assert!(
+        !export.loans.is_empty(),
+        "a multi-round accept recorded no loans at all — nothing is being witnessed"
+    );
+    let mut seen = rustc_hash::FxHashSet::default();
+    for loan in &export.loans {
+        assert!(
+            seen.insert(loan.key.clone()),
+            "D1: loan {:?} appears more than once — rounds are accumulating",
+            loan.key
+        );
+    }
+}
+
+/// The `pub(crate)` guarded-repair door carries the load-bearing precondition.
+///
+/// A tracked solver's hard constraints are track-gated, so every solve in this
+/// loop would be vacuously SAT and the accepted model meaningless. The door
+/// refuses one, naming itself in the message.
+///
+/// **The `expected` string is deliberately door-specific.** Matching "tracked
+/// KindSolver must not enter" would pass with the door's assert DELETED,
+/// because `KindSolver::model_kinds_relaxing` carries its own release-active
+/// guard whose message shares that prefix, and the loop hits it moments later.
+/// The hazard is therefore already guarded release-active, so this door's
+/// `debug_assert!` is a fail-earlier tripwire, not the thing preventing a
+/// meaningless model.
+///
+/// *Mutation-tested.* Removing the `debug_assert!` makes this test fail — the
+/// panic that does occur comes from the solver accessor and no longer matches
+/// `expected`.
+#[test]
+// `debug_assert!` is compiled out in release, where the panic instead comes
+// from `model_kinds_relaxing`'s own release-active guard with a DIFFERENT
+// message — so this `expected` would not match and the test would fail on
+// `cargo test --release`. Gate it on the profile that has the assert. The
+// hazard itself remains guarded in release by that downstream assert, which is
+// why this door's tripwire is fail-earlier rather than load-bearing.
+#[cfg(debug_assertions)]
+#[should_panic(expected = "must not enter the guarded-repair door")]
+fn l2_door_rejects_a_tracked_solver() {
+    ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origin_flows = analyze_program_origin_flow(&program);
+        let crate_ctxt = CrateCtxt::new(&program);
+        // The one thing the door must refuse.
+        let solver = KindSolver::new_tracked(&slots);
+        let (_stats, selectors) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &compute_origins(&program),
+            &solver,
+        )
+        .expect("emission");
+        let _ = verify_guarded_to_fixpoint_counting(
+            &program,
+            &slots,
+            &origin_flows,
+            &solver,
+            &selectors,
+            true,
+            None,
+            None,
+        );
+        None::<()>
+    })
+    .unwrap_or_else(|e| e.raise());
+}
+
+/// Loan KEYS are stable across re-inference; indices are not.
+///
+/// This is the witness the whole content-key change exists for. `BorrowSet`
+/// numbering permutes because `utils/dsa/union_find.rs` hashes with
+/// `RandomState` and `borrow/mod.rs` pushes sibling loans in `group()` order,
+/// and a fresh `UnionFind` is built per inference — so two analyses of the same
+/// program can number the same loans differently.
+///
+/// **Non-vacuity is asserted, not assumed:** the fixture must produce sibling
+/// loans (more than one loan at one location), or the permutation has nothing
+/// to permute and the test proves nothing.
+///
+/// *Mutation-tested.* The mutation compares
+/// `(fn_did, run_local_handle, place.local)` triples instead of `key`s:
+/// **failed 8/8 runs; unmutated passed 8/8.**
+///
+/// Comparing bare `run_local_handle` sets instead of `key` sets would be a
+/// weaker mutation that does NOT fail: handles are exactly
+/// `0..n_f-1` per function in both runs (`record_loan_identities` walks
+/// `loans.iter_enumerated()` with no filtering), so the bare-handle sets are
+/// equal by construction.
+///
+/// **Known gap:** nothing asserts a permutation actually
+/// OCCURRED between the two runs, so this witness would silently stop guarding
+/// if `utils/dsa/union_find.rs` ever used a deterministic hasher. The stronger
+/// form is to build `handle -> key` maps for both runs and `assert_ne!` them.
+#[test]
+fn loan_keys_are_stable_across_reinference() {
+    let first = capture_solve(CASCADE).1;
+    let second = capture_solve(CASCADE).1;
+
+    assert!(!first.loans.is_empty(), "no loans recorded — witness inert");
+    // Non-vacuity: sibling loans exist (>1 loan sharing one (fn, location)).
+    let mut per_site: rustc_hash::FxHashMap<_, usize> = Default::default();
+    for l in &first.loans {
+        *per_site.entry((l.key.fn_did, l.key.location)).or_default() += 1;
+    }
+    // NOTE (accepted limitation): >1 loan at one site is a PROXY for a
+    // multi-member `group()`, and it is not exact — a call with two pointer
+    // arguments also puts two `CallArg` loans at one terminator, and those come
+    // from a deterministic `args.iter().enumerate()`, not from `group()`. For
+    // CASCADE (single-argument `id`) the proxy is satisfied via group siblings,
+    // but a different fixture could satisfy it with nothing permutable.
+    assert!(
+        per_site.values().any(|n| *n > 1),
+        "fixture has no sibling loans, so nothing can permute — this witness \
+         would be vacuous. Pick a fixture whose group() returns >1 member."
+    );
+
+    let keys_a: std::collections::BTreeSet<_> = first.loans.iter().map(|l| l.key.clone()).collect();
+    let keys_b: std::collections::BTreeSet<_> =
+        second.loans.iter().map(|l| l.key.clone()).collect();
+    assert_eq!(
+        keys_a, keys_b,
+        "D19: loan CONTENT keys differed between two analyses of the same \
+         program. The key is supposed to be numbering-independent."
+    );
+    assert_eq!(
+        first.loans.len(),
+        second.loans.len(),
+        "loan COUNT differed between runs"
+    );
+}
+
+/// Deterministic form of key stability: an INJECTED push-order permutation
+/// leaves the key set unchanged while the handles move.
+///
+/// The run-twice form above relies on `RandomState` actually permuting
+/// `group()` between the two runs — true today (measured 8/8), but
+/// contingent: it would silently stop guarding if `utils/dsa/union_find.rs`
+/// ever used a deterministic hasher, and its "sibling loans exist" proxy is
+/// satisfiable by two `CallArg` loans at one terminator, which come from a
+/// deterministic `args.iter().enumerate()` and cannot permute at all.
+///
+/// Here the permutation is INJECTED rather than hoped for: the same loan
+/// records are built twice with explicitly reversed push order. Content keys
+/// must be identical as a SET; handles must actually differ, which is asserted
+/// so the test cannot pass by accident on an empty or singleton set.
+///
+/// *Mutation-tested.* Put `run_local_handle` back into `LoanKey` (or key the
+/// set on `(key, run_local_handle)`) and the two key sets diverge — deterministically,
+/// on every run, with no hash-seed reliance.
+#[test]
+fn injected_push_order_permutation_preserves_keys() {
+    fn identity(handle: usize, local: u32, field: u32) -> LoanIdentity {
+        LoanIdentity {
+            key: LoanKey {
+                fn_did: rustc_hir::def_id::CRATE_DEF_ID,
+                place: PlaceKey {
+                    local: Local::from_u32(local),
+                    proj: vec![ProjKey::Deref, ProjKey::Field(field)],
+                },
+                location: MirLocationKey::new(1, 3),
+                borrower: BorrowerKind::Assign {
+                    owner: OwnerKey::Local(local),
+                },
+            },
+            run_local_handle: handle,
+            kind: LoanKind::Mut,
+            class: LoanClass::Existing,
+            invalid: false,
+        }
+    }
+
+    // Sibling loans at ONE location, exactly the shape `group()` produces:
+    // same owner, same point, distinct base locals.
+    let siblings: Vec<(u32, u32)> = vec![(1, 0), (2, 1), (3, 2)];
+
+    let forward: Vec<LoanIdentity> = siblings
+        .iter()
+        .enumerate()
+        .map(|(h, (local, field))| identity(h, *local, *field))
+        .collect();
+    // The injected permutation: same loans, reversed push order, so the
+    // handles land on different loans.
+    let reversed: Vec<LoanIdentity> = siblings
+        .iter()
+        .rev()
+        .enumerate()
+        .map(|(h, (local, field))| identity(h, *local, *field))
+        .collect();
+
+    let keys_forward: std::collections::BTreeSet<_> =
+        forward.iter().map(|l| l.key.clone()).collect();
+    let keys_reversed: std::collections::BTreeSet<_> =
+        reversed.iter().map(|l| l.key.clone()).collect();
+    assert_eq!(
+        keys_forward, keys_reversed,
+        "content keys must be invariant under push-order permutation — that is \
+         the whole reason LoanKey exists (D19)"
+    );
+
+    // Non-vacuity, deterministic: the permutation genuinely moved the handles.
+    let pairs_forward: std::collections::BTreeSet<_> = forward
+        .iter()
+        .map(|l| (l.run_local_handle, l.key.place.local))
+        .collect();
+    let pairs_reversed: std::collections::BTreeSet<_> = reversed
+        .iter()
+        .map(|l| (l.run_local_handle, l.key.place.local))
+        .collect();
+    assert_ne!(
+        pairs_forward, pairs_reversed,
+        "the injected permutation did not move any handle, so the key-invariance \
+         assertion above proves nothing"
+    );
+}
+
+/// The run-local handle must not leak into the consumer as identity.
+///
+/// A grep-shaped guard in the same family as the import-denylist test: the
+/// greenfield rewriter module may name the content key, never the handle.
+///
+/// *Mutation-tested.* Add a single `run_local_handle` mention under
+/// `bo_rewriter/` and this fails.
+#[test]
+fn run_local_handle_is_not_used_as_identity() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bo_rewriter");
+    let mut offenders = Vec::new();
+    let mut stack = vec![root.clone()];
+    let mut files_scanned = 0usize;
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files_scanned += 1;
+                let text = std::fs::read_to_string(&path).expect("read bo_rewriter source");
+                if text.contains("run_local_handle") {
+                    offenders.push(path);
+                }
+            }
+        }
+    }
+    assert!(
+        files_scanned > 0,
+        "scanned no files under {root:?} — the guard would be vacuous"
+    );
+    assert!(
+        offenders.is_empty(),
+        "bo_rewriter names the run-local loan handle, which is NOT an identity \
+         (D19 permutes it between runs and between CEGAR rounds). Use \
+         `LoanIdentity::key`. Offending files: {offenders:?}"
+    );
+}
+
+/// **ALLOW-LIST** — probe barrage: work outside the armed region records
+/// nothing, and the region's boundary is load-bearing.
+///
+/// The property is positional, not a DENY-LIST ("each probe surface suspends
+/// capture"), which is hard to keep complete because probe surfaces are also
+/// reached through helpers. Capture is armed only around the accepted run, so
+/// anything outside it records nothing with no list to maintain.
+///
+/// The barrage runs representatives of the shapes that corrupted the export
+/// under a deny-list: a full RE-EMISSION (the `build_probe_base` shape, which
+/// appended a second copy of every selector site), a SECOND full fixpoint (the
+/// CHECK_REAL shape, whose `begin_round()` wiped the certificate), and a
+/// COUNTERFACTUAL oracle probe (the `probe_accepts_with_ref` /
+/// `measure_collateral` shape, which overwrote `version_owns`).
+///
+/// Two assertions, the second keeping the first honest:
+/// 1. the NARROW (shipped) arm yields exactly the accepted run's export;
+/// 2. a WIDE arm that swallows the barrage yields a DIFFERENT export.
+///
+/// (2) is the mutation, built in: it proves the barrage genuinely corrupts, so
+/// (1) cannot pass vacuously. Widening the shipped arm in `run_bo` reproduces
+/// case (2); this test pins case (1) as the contract.
+#[test]
+fn probes_outside_the_armed_region_record_nothing() {
+    ::utils::compilation::run_compiler_on_str(CASCADE, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+
+        let accepted_run = || {
+            let crate_ctxt = CrateCtxt::new(&program);
+            let solver = KindSolver::new(&slots);
+            let (_stats, selectors) = emit_crate_ownership_constraints(
+                &crate_ctxt,
+                &slots,
+                &compute_origins(&program),
+                &solver,
+            )
+            .expect("emission");
+            for &g in &program.functions {
+                let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+                add_coherence(&solver, &slots, g, &body);
+            }
+            verify_to_fixpoint(&program, &slots, &solver, &selectors, true)
+                .expect("cascade fixture accepts")
+        };
+
+        // Recording shapes: safe to run in either position.
+        let barrage = || {
+            // (i) re-emission — the probe-base shape.
+            let ctxt2 = CrateCtxt::new(&program);
+            let solver2 = KindSolver::new(&slots);
+            let (_s2, sel2) = emit_crate_ownership_constraints(
+                &ctxt2,
+                &slots,
+                &compute_origins(&program),
+                &solver2,
+            )
+            .expect("re-emission");
+            // (ii) a second full fixpoint — the CHECK_REAL shape.
+            let _ = verify_to_fixpoint(&program, &slots, &solver2, &sel2, true);
+        };
+        // (iii) the counterfactual ORACLE probe. Only legal outside the arm:
+        // inside it, the allow-list tripwire in `model_accepts_with_flows`
+        // fires by design (witnessed by
+        // `oracle_probe_inside_the_armed_region_trips_the_wire`).
+        let oracle_probe = |model: &FxHashMap<SlotRef, super::SlotKindAlias>| {
+            let counterfactual: FxHashMap<SlotRef, super::SlotKindAlias> = model
+                .keys()
+                .map(|k| (*k, super::SlotKindAlias::Ref))
+                .collect();
+            let _ = model_accepts(&program, &slots, &counterfactual, true);
+        };
+
+        // (1) NARROW arm — the shipped boundary; barrage runs after finish().
+        let arm = arm_scope();
+        let model = accepted_run();
+        let narrow = arm.finish();
+        barrage();
+        oracle_probe(&model);
+        assert!(
+            !narrow.loans.is_empty(),
+            "accepted run recorded nothing — inert"
+        );
+        assert!(
+            narrow.residual_conflicts.is_some(),
+            "accepted run recorded no certificate — inert"
+        );
+
+        // Reference: the accepted run with no barrage at all.
+        let arm2 = arm_scope();
+        let _ = accepted_run();
+        let reference = arm2.finish();
+        assert_eq!(
+            narrow, reference,
+            "the barrage changed the export even though it ran OUTSIDE the arm"
+        );
+
+        // (2) WIDE arm — the built-in mutation.
+        let arm3 = arm_scope();
+        let _model3 = accepted_run();
+        barrage();
+        let wide = arm3.finish();
+        assert_ne!(
+            wide, narrow,
+            "the barrage did NOT corrupt an over-wide arm, so assertion (1) \
+             proves nothing — pick probes that actually record"
+        );
+    })
+    .unwrap_or_else(|e| e.raise())
+}
+
+/// **ALLOW-LIST TRIPWIRE** — an oracle probe inside the armed region fails loud.
+///
+/// `model_accepts_with_flows` asserts rather than suspending capture.
+/// Suspension would MASK an allow-list violation — a probe that somehow ran inside the armed region
+/// would quietly record nothing and look correct; the assertion names the
+/// invariant instead. A backstop that hides the bug it backstops is worse than
+/// no backstop.
+///
+/// `#[cfg(debug_assertions)]` for the same reason as the guarded-repair door
+/// test: a `debug_assert!` is compiled out in release, where this would not panic.
+///
+/// *Mutation-tested.* Remove the `debug_assert!` and no panic occurs, so
+/// `should_panic` is unsatisfied.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "allow-list violation")]
+fn oracle_probe_inside_the_armed_region_trips_the_wire() {
+    ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let _arm = arm_scope();
+        let model: FxHashMap<SlotRef, super::SlotKindAlias> = FxHashMap::default();
+        // Armed region + probe entry point = the violation the wire names.
+        let _ = model_accepts(&program, &slots, &model, true);
+        None::<()>
+    })
+    .unwrap_or_else(|e| e.raise());
+}
+
+/// The ambient arm records nothing.
+///
+/// This keeps timings comparable: `run_bo` arms through `arm_capture`, so an
+/// unset flag means the corpus worker pays no recording cost and its
+/// `t_emit_s`/`t_fixpoint_s` stay comparable to runs without capture.
+#[test]
+fn ambient_arm_is_inert() {
+    ::utils::compilation::run_compiler_on_str(CALL_ARG, |tcx| {
+        let program = collect_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let arm = arm_capture();
+        // A real accepted run, so the capture points genuinely execute.
+        let crate_ctxt = CrateCtxt::new(&program);
+        let solver = KindSolver::new(&slots);
+        let (_stats, selectors) = emit_crate_ownership_constraints(
+            &crate_ctxt,
+            &slots,
+            &compute_origins(&program),
+            &solver,
+        )
+        .expect("emission");
+        for &g in &program.functions {
+            let body = tcx.mir_drops_elaborated_and_const_checked(g).borrow();
+            add_coherence(&solver, &slots, g, &body);
+        }
+        let model = verify_to_fixpoint(&program, &slots, &solver, &selectors, true);
+        assert!(
+            model.is_some(),
+            "fixture must be accepted — else witness inert"
+        );
+        assert!(
+            !capturing(),
+            "flag off, yet capture is active — the ambient arm is not gated"
+        );
+        let export = arm.finish();
+        assert_eq!(
+            export,
+            BoExport::default(),
+            "flag off, yet the ambient arm recorded: {export:?}"
+        );
+        Some(())
+    })
+    .unwrap_or_else(|e| e.raise());
+}

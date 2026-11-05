@@ -1,0 +1,2219 @@
+//! wave-6a: the allocator-contract consumer (`decision/allocator_contract.rs`,
+//! relay wave-6a/006, R409-1/3): brotli's `BrotliAllocate` / `BrotliFree` pair
+//! is malloc/free-like by USER DECISION — a contract-rooted allocation local
+//! is `Box<T>` / `Box<[T]>` (count from the size expression), released
+//! exactly once through `BrotliFree(m, Box::into_raw(x) as *mut c_void)`;
+//! NO implicit close (the global allocator must never drop memory of a
+//! custom `free_func`) — a path that neither frees, transfers nor stores
+//! the owner is the typed hold `contract-allocation:implicit-close`.
+//!
+//! Reduced from brotli `ClusterBlocksCommand` (`block_splitter_inc.h`): two
+//! conditional allocations (`num_blocks > 0`), element writes, `memset`, a
+//! lend to a local reader, the `BROTLI_FREE` pair (free + null store).
+
+use super::wave6a_allocation_tests::{compact, emitted, reason_of};
+
+const PRELUDE: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn memset(s: *mut std::os::raw::c_void, c: i32, n: usize) -> *mut std::os::raw::c_void;
+    fn exit(code: i32) -> !;
+}
+#[repr(C)]
+pub struct MemoryManager {
+    pub alloc_func: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, usize) -> *mut std::os::raw::c_void>,
+    pub free_func: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void)>,
+    pub opaque: *mut std::os::raw::c_void,
+}
+pub unsafe extern "C" fn BrotliAllocate(mut m: *mut MemoryManager, mut n: usize) -> *mut std::os::raw::c_void {
+    let mut result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+    if result.is_null() { exit(1 as i32); }
+    return result;
+}
+pub unsafe extern "C" fn BrotliFree(mut m: *mut MemoryManager, mut p: *mut std::os::raw::c_void) {
+    ((*m).free_func).expect("non-null function pointer")((*m).opaque, p);
+}
+pub unsafe extern "C" fn ReindexSymbols(mut symbols: *mut u32, mut n: usize) -> u32 {
+    let mut i = 0 as usize;
+    let mut max = 0 as u32;
+    while i < n {
+        if *symbols.offset(i as isize) > max { max = *symbols.offset(i as isize); }
+        i = i.wrapping_add(1);
+    }
+    return max;
+}
+"#;
+
+const CLUSTER: &str = r#"
+pub unsafe extern "C" fn ClusterBlocksCommand(mut m: *mut MemoryManager, num_blocks: usize, mut split: *mut u32) {
+    let mut histogram_symbols = if num_blocks > 0 as usize {
+        BrotliAllocate(m, num_blocks.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    let mut block_lengths = if num_blocks > 0 as usize {
+        BrotliAllocate(m, num_blocks.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    let mut i = 0 as usize;
+    while i < num_blocks {
+        *histogram_symbols.offset(i as isize) = i as u32;
+        *block_lengths.offset(i as isize) = 0 as u32;
+        i = i.wrapping_add(1);
+    }
+    i = 0 as usize;
+    let mut max = 0 as u32;
+    while i < num_blocks {
+        *block_lengths.offset(i as isize) = (*block_lengths.offset(i as isize)).wrapping_add(1);
+        if *histogram_symbols.offset(i as isize) > max { max = *histogram_symbols.offset(i as isize); }
+        i = i.wrapping_add(1);
+    }
+    *split = max;
+    BrotliFree(m, block_lengths as *mut std::os::raw::c_void);
+    block_lengths = 0 as *mut u32;
+    BrotliFree(m, histogram_symbols as *mut std::os::raw::c_void);
+    histogram_symbols = 0 as *mut u32;
+}
+"#;
+
+/// The ClusterBlocksCommand shape delivers: `Option<Box<[u32]>>` from the
+/// conditional allocation (`None` on the else arm), element accesses through
+/// the option, the `memset` lend as the R130 void bridge, the local reader
+/// lent, `BrotliFree(m, x.map_or(null_mut(), |b| Box::into_raw(b) as ..))`
+/// and the `BROTLI_FREE` null store as `= None`.
+#[test]
+fn w6a_ac_cluster_blocks_command_delivers_option_boxed_slices() {
+    let out = emitted("ac-cluster", &format!("{PRELUDE}{CLUSTER}"));
+    if let Ok(path) = std::env::var("W6A_DUMP_EMITTED") {
+        std::fs::write(path, &out.source).expect("dump");
+    }
+    let text = compact(&out.source);
+    for expected in [
+        "letmuthistogram_symbols:Option<Box<[u32]>>=ifnum_blocks>0asusize{Some(Box::from_raw(core::ptr::slice_from_raw_parts_mut(BrotliAllocate(m,num_blocks.wrapping_mul(::core::mem::size_of::<u32>()))as*mutu32,(num_blocks)asusize)))}else{None};",
+        "letmutblock_lengths:Option<Box<[u32]>>=ifnum_blocks>0asusize{Some(Box::from_raw(",
+        "histogram_symbols.as_deref_mut().unwrap()[(i)asusize]=iasu32;",
+        "block_lengths.as_deref_mut().unwrap()[(i)asusize]=block_lengths.as_deref().unwrap()[(i)asusize].wrapping_add(1);",
+        "ifhistogram_symbols.as_deref().unwrap()[(i)asusize]>max{max=histogram_symbols.as_deref().unwrap()[(i)asusize];}",
+        "BrotliFree(m,block_lengths.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutstd::os::raw::c_void));",
+        "block_lengths=None;",
+        "BrotliFree(m,histogram_symbols.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutstd::os::raw::c_void));",
+        "histogram_symbols=None;",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing `{expected}`\n{}\n{:#?}",
+            out.source,
+            out.degradations
+        );
+    }
+    assert!(!text.contains("drop("), "{}", out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "ClusterBlocksCommand::histogram_symbols"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "ClusterBlocksCommand::block_lengths"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert!(
+        receipts.contains("allocator-contract:brotli-memory-manager/v1@2026-09-15"),
+        "{receipts}"
+    );
+    assert!(
+        receipts.contains("ClusterBlocksCommand::histogram_symbols\tadmitted\t"),
+        "{receipts}"
+    );
+    assert_eq!(receipts.matches("waiver-drop").count(), 0, "{receipts}");
+}
+
+/// NO implicit close: an early `return` between the allocation and its
+/// `BrotliFree` leaves a live owner for Rust to drop on that path — the
+/// typed hold `contract-allocation:implicit-close`; the sibling without the
+/// early return still delivers.
+#[test]
+fn w6a_ac_early_return_before_the_free_is_held_implicit_close() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn early(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;\n\
+    if n > 4 as usize {{ return; }}\n\
+    *syms.offset(0 as isize) = 1 as u32;\n\
+    *split = *syms.offset(0 as isize);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n\
+pub unsafe extern \"C\" fn plain(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;\n\
+    *syms.offset(0 as isize) = 1 as u32;\n\
+    *split = *syms.offset(0 as isize);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n"
+    );
+    let out = emitted("ac-early-return", &src);
+    let text = compact(&out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "early::syms").as_deref(),
+        Some("contract-allocation:implicit-close"),
+        "{:#?}",
+        out.degradations
+    );
+    assert!(
+        out.artifacts
+            .allocator_contract_receipts
+            .contains("early::syms\theld\tcontract-allocation:implicit-close"),
+        "{}",
+        out.artifacts.allocator_contract_receipts
+    );
+    assert!(
+        text.contains(
+            "letmutsyms=BrotliAllocate(m,n.wrapping_mul(::core::mem::size_of::<u32>()))as*mutu32;"
+        ),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains("letmutsyms:Box<[u32]>=Box::from_raw(core::ptr::slice_from_raw_parts_mut(BrotliAllocate(m,n.wrapping_mul(::core::mem::size_of::<u32>()))as*mutu32,(n)asusize));"),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert!(
+        text.contains("BrotliFree(m,Box::into_raw(syms)as*mutstd::os::raw::c_void);"),
+        "{}",
+        out.source
+    );
+    assert!(text.contains("syms[(0)asusize]=1asu32;"), "{}", out.source);
+    assert!(text.contains("*split=syms[(0)asusize];"), "{}", out.source);
+}
+
+/// (i) `memset(x, 0, n)` follows the pinned libc table: without a `memset`
+/// row the lend is unproven and the owner is a typed hold; with one (wave-4's
+/// rows, relays 013 §4 / 014 — `batch-9-dry2` `4bc42b57`) the owner delivers
+/// and the CAST argument takes the view (`zeroed.as_mut_ptr() as *mut
+/// c_void`): the raw-boundary glue bridges a bare argument, not the operand
+/// of a cast. (ii) A SLICE owner lent to a local reader whose formal converts
+/// to `&[u32]` delivers through the seam's owner-view glue (R422-5):
+/// `ReindexSymbols(&*lent, n)` — no `from_raw_parts` over the Box, no
+/// fabricated extent at the call. (iii) The plain owner delivers. Each shape
+/// sits in its own function: a typed hold holds its class.
+#[test]
+fn w6a_ac_memset_lend_follows_the_libc_table_and_the_slice_lend_takes_the_owner_view() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn zeroing(mut m: *mut MemoryManager, n: usize) {{\n\
+    let mut zeroed = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;\n\
+    memset(zeroed as *mut std::os::raw::c_void, 0 as i32, n.wrapping_mul(::core::mem::size_of::<u32>()));\n\
+    *zeroed.offset(0 as isize) = 1 as u32;\n\
+    BrotliFree(m, zeroed as *mut std::os::raw::c_void);\n\
+}}\n\
+pub unsafe extern \"C\" fn lending(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut lent = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;\n\
+    *lent.offset(0 as isize) = 1 as u32;\n\
+    *split = ReindexSymbols(lent, n);\n\
+    BrotliFree(m, lent as *mut std::os::raw::c_void);\n\
+}}\n\
+pub unsafe extern \"C\" fn keeping(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut kept = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;\n\
+    *kept.offset(0 as isize) = 1 as u32;\n\
+    *split = *kept.offset(0 as isize);\n\
+    BrotliFree(m, kept as *mut std::os::raw::c_void);\n\
+}}\n"
+    );
+    let out = emitted("ac-lends", &src);
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    // The libc table decides the `memset` lend; both outcomes are pinned.
+    if receipts.contains("zeroing::zeroed\tadmitted\t") {
+        assert!(
+            text.contains("memset(zeroed.as_mut_ptr()as*mutstd::os::raw::c_void,"),
+            "{}\n{receipts}",
+            out.source
+        );
+        assert_eq!(
+            reason_of(&out.degradations, "zeroing::zeroed"),
+            None,
+            "{:#?}",
+            out.degradations
+        );
+    } else {
+        assert!(
+            receipts.contains(
+                "zeroing::zeroed\theld\tcontract-allocation:use:call-argument-not-a-lend:memset("
+            ),
+            "{receipts}"
+        );
+        assert_eq!(
+            reason_of(&out.degradations, "zeroing::zeroed").as_deref(),
+            Some("contract-allocation:use"),
+            "{:#?}",
+            out.degradations
+        );
+    }
+    assert!(receipts.contains("lending::lent\tadmitted\t"), "{receipts}");
+    assert!(
+        text.contains("*split=ReindexSymbols(&*lent,n);"),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert!(
+        text.contains("letmutlent:Box<[u32]>=Box::from_raw("),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert!(receipts.contains("keeping::kept\tadmitted\t"), "{receipts}");
+    assert!(
+        text.contains("letmutkept:Box<[u32]>=Box::from_raw("),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert!(
+        text.contains(",Box::into_raw(kept)as*mutstd::os::raw::c_void);"),
+        "{}",
+        out.source
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "keeping::kept"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "lending::lent"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+}
+
+/// An OPTIONAL owner (`Option<Box<[u32]>>`) lent to the local reader: the
+/// owner view unwraps first — `&*syms.as_mut().unwrap()` is `&Box<[u32]>`,
+/// which deref-coerces to the `&[u32]` formal at the call (R422-5). A
+/// shared `.unwrap()` would move the owner out of its `Option`.
+#[test]
+fn w6a_ac_optional_owner_lent_takes_the_owner_view() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    *syms.offset(0 as isize) = 7 as u32;\n\
+    *split = ReindexSymbols(syms, n);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("ac-optional-lend", &src);
+    let text = compact(&out.source);
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(
+        text.contains("*split=ReindexSymbols(&*syms.as_mut().unwrap(),n);"),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert!(
+        text.contains("letmutsyms:Option<Box<[u32]>>="),
+        "{}",
+        out.source
+    );
+    assert!(text.contains("syms=None;"), "{}", out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "optional::syms"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+}
+
+/// **Build 2 (relay wave-6a/018): the assignment receiver and the re-seated
+/// owner** — brotli's `BROTLI_ENSURE_CAPACITY` idiom, the 55 rows of report
+/// 008's market. The receiver is declared empty and allocated into further
+/// down (`let mut new_array = 0 as *mut T; new_array = if n > 0 {
+/// BrotliAllocate(..) } else { null };`), the owner it replaces is freed,
+/// nulled and RE-SEATED from it (`all_histograms = new_array`), and the
+/// re-seated generation is freed again at the end. The owner's generations
+/// are simulated (Dead → create → Live → release → Dead) with every block it
+/// touches balanced, so the moves need no edit at all and each free is the
+/// contract transfer.
+#[test]
+fn w6a_ac_ensure_capacity_receiver_and_reseat_deliver() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn cluster(mut m: *mut MemoryManager, mut n: usize, mut split: *mut u32) {{\n\
+    let mut all_histograms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    let mut capacity = n;\n\
+    if capacity < n.wrapping_add(4 as usize) {{\n\
+        let mut new_size = capacity.wrapping_add(4 as usize);\n\
+        let mut new_array = 0 as *mut u32;\n\
+        new_array = if new_size > 0 as usize {{ BrotliAllocate(m, new_size.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+        BrotliFree(m, all_histograms as *mut std::os::raw::c_void);\n\
+        all_histograms = 0 as *mut u32;\n\
+        all_histograms = new_array;\n\
+        capacity = new_size;\n\
+    }}\n\
+    *all_histograms.offset(0 as isize) = 3 as u32;\n\
+    *split = *all_histograms.offset(0 as isize);\n\
+    BrotliFree(m, all_histograms as *mut std::os::raw::c_void);\n\
+    all_histograms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("ac-ensure-capacity", &src);
+    if let Ok(path) = std::env::var("W6A_DUMP_EMITTED") {
+        std::fs::write(path, &out.source).expect("dump");
+    }
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    for expected in [
+        "letmutall_histograms:Option<Box<[u32]>>=ifn>0asusize{Some(Box::from_raw(",
+        "letmutnew_array:Option<Box<[u32]>>=None;",
+        "new_array=ifnew_size>0asusize{Some(Box::from_raw(",
+        "BrotliFree(m,all_histograms.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutstd::os::raw::c_void));",
+        "all_histograms=None;",
+        "all_histograms=new_array;",
+        "all_histograms.as_deref_mut().unwrap()[(0)asusize]=3asu32;",
+        "*split=all_histograms.as_deref().unwrap()[(0)asusize];",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing `{expected}`\n{}\n{receipts}",
+            out.source
+        );
+    }
+    assert!(
+        receipts.contains("generations=1 moves_in=1 frees=2"),
+        "{receipts}"
+    );
+    assert!(
+        receipts.contains("cluster::new_array\tadmitted\t"),
+        "{receipts}"
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "cluster::all_histograms"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "cluster::new_array"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+}
+
+/// **Build 2's generation state machine, one control per gate.** Each shape
+/// sits in its own function and names the exact receipt, so exactly one hold
+/// answers for exactly one gate: (1) a generation still live at the body's
+/// end, (2) a block that does not leave the owner as it found it — here a
+/// release inside a branch of the allocating block (the conditional
+/// allocation inside a branch, released after the join, is admitted since
+/// R608-1: `w6a_r608_*`), (3) a read of the
+/// owner after its release, (4) a second allocation over a live generation
+/// (refused: R619-5 (3), P5),
+/// (5) a release before any generation exists, (6) the owner copied into a
+/// local that is not itself a contract owner — a second owner this rule
+/// cannot follow.
+/// (5) and (6) are UB-free-input shapes only in the trivial sense; they hold
+/// fail-closed either way.
+#[test]
+fn w6a_ac_generation_gates_each_hold_their_own_class() {
+    let alloc = "BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32";
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn live_at_exit(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = {alloc};\n\
+    *syms.offset(0 as isize) = 1 as u32;\n\
+    *split = *syms.offset(0 as isize);\n\
+}}\n\
+pub unsafe extern \"C\" fn unbalanced(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = {alloc};\n\
+    if n > 4 as usize {{ BrotliFree(m, syms as *mut std::os::raw::c_void); syms = 0 as *mut u32; }}\n\
+}}\n\
+pub unsafe extern \"C\" fn read_after_release(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = {alloc};\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    *split = *syms.offset(0 as isize);\n\
+}}\n\
+pub unsafe extern \"C\" fn reseat_over_live(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = {alloc};\n\
+    syms = {alloc};\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n\
+pub unsafe extern \"C\" fn release_first(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = 0 as *mut u32;\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = {alloc};\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n\
+pub unsafe extern \"C\" fn plain_alias(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut copy = 0 as *mut u32;\n\
+    copy = split;\n\
+    *copy.offset(0 as isize) = 5 as u32;\n\
+}}\n\
+pub unsafe extern \"C\" fn copied_into_plain_local(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = {alloc};\n\
+    let mut alias = 0 as *mut u32;\n\
+    alias = syms;\n\
+    *split = *alias.offset(0 as isize);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n"
+    );
+    let out = emitted("ac-generation-gates", &src);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    for (subject, detail) in [
+        (
+            "live_at_exit::syms",
+            "contract-allocation:implicit-close:live-at-exit",
+        ),
+        (
+            "unbalanced::syms",
+            "contract-allocation:implicit-close:block-unbalanced",
+        ),
+        (
+            "read_after_release::syms",
+            "contract-allocation:use:read-while-empty",
+        ),
+        (
+            "release_first::syms",
+            "contract-allocation:implicit-close:release-without-generation",
+        ),
+        (
+            "copied_into_plain_local::syms",
+            "contract-allocation:use:copied-into-local",
+        ),
+    ] {
+        assert!(
+            receipts.contains(&format!("{subject}\theld\t{detail}")),
+            "missing `{subject} held {detail}`\n{receipts}"
+        );
+        assert!(
+            reason_of(&out.degradations, subject).is_some(),
+            "{subject} not degraded\n{:#?}",
+            out.degradations
+        );
+    }
+    // (4) The re-seat over a live generation: REFUSED (R619-5 (3), P5 — a
+    // contract allocation never meets a Rust drop; R434-4 §2's admission
+    // rested on an allocator declaration never emitted).
+    assert!(
+        receipts.contains("reseat_over_live::syms\theld\tcontract-allocation:overwrite:"),
+        "{receipts}"
+    );
+    assert!(!receipts.contains("waiver-drop(overwrite)"), "{receipts}");
+    // (7) A local assigned from something that is not a contract owner is
+    // not a generation at all: the rule leaves it alone — no receipt, no
+    // degradation. Every program with a contract in it holds locals like
+    // this one, and the shared Option/alias families emit them.
+    assert!(
+        !receipts.contains("plain_alias::copy"),
+        "the plain alias is not the contract's\n{receipts}"
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "plain_alias::copy")
+            .filter(|r| r.starts_with("contract-allocation")),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    // No function of this fixture delivers: every gate's owner keeps its
+    // typed hold, which the per-subject assertions above already name.
+    assert_eq!(
+        compact(&out.source).matches("Box<[u32]>").count(),
+        0,
+        "{}",
+        out.source
+    );
+}
+
+/// **The containment the batch-9 census measured** (report 014 claim 4,
+/// relay wave-6a/020 (ii)): when the manager the contract allocates through is
+/// RAW in the caller — brotli's shape at 26 receivers — the C arm bridges it
+/// AT THE ARGUMENT, `BrotliAllocate(&mut *m, ..)`, and that one-byte edit sits
+/// INSIDE the initializer this rule rewrites. A construction rendered as ONE
+/// replacement of the allocation CONTAINS it, and the signature-class layer
+/// holds both classes with `cross-class-interval-collision`. Rendered as two
+/// insertions at the allocation's boundaries, this rule claims no interval of
+/// the call at all: the bridge renders where it was planned and the collision
+/// term is gone from the hold.
+///
+/// The fixture sources its manager from a foreign call, which is the only
+/// shape that keeps a manager raw without arithmetic; that leaves this class
+/// with wave-6l's own `return-not-adapted` subject, so the assertion is the
+/// hold's TERMS, not the delivery. The idiom that delivers is the
+/// ensure-capacity witness above, whose bytes the insertions reproduce
+/// exactly.
+#[test]
+fn w6a_ac_the_construction_contains_no_edit_of_the_allocator_call() {
+    let src = format!(
+        "{PRELUDE}\
+extern \"C\" {{\n\
+    fn get_manager() -> *mut MemoryManager;\n\
+}}\n\
+pub unsafe extern \"C\" fn raw_manager(mut n: usize, mut split: *mut u32) {{\n\
+    let mut m = get_manager();\n\
+    let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    *syms.offset(0 as isize) = 3 as u32;\n\
+    *split = *syms.offset(0 as isize);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("ac-raw-manager", &src);
+    let text = compact(&out.source);
+    // The degradation of a class-held subject carries its MIR suffix, and the
+    // terms live in the reason's detail, so the hold is read whole.
+    let hold = out
+        .degradations
+        .iter()
+        .filter(|d| d.subject.starts_with("raw_manager::syms"))
+        .map(|d| format!("{:?}", d.reason))
+        .collect::<Vec<_>>()
+        .join(";");
+    assert!(
+        !hold.contains("cross-class-interval-collision"),
+        "this rule must claim no interval of the allocator call; hold = {hold}\n{}",
+        out.source
+    );
+    if hold.is_empty() {
+        // Wherever the class is otherwise clean, the construction is spelled
+        // AROUND the call and the call's own text is untouched.
+        assert!(
+            text.contains("Some(Box::from_raw(core::ptr::slice_from_raw_parts_mut(BrotliAllocate("),
+            "{}",
+            out.source
+        );
+    } else {
+        // On this lane's head the residue is wave-6l's `return-not-adapted`
+        // on the foreign call's receiver; the bridge the C arm planned inside
+        // the allocator call still renders, which is the half a containing
+        // replacement used to lose.
+        assert!(
+            text.contains("BrotliAllocate(&mut*m,"),
+            "the C arm's bridge must render at the argument; hold = {hold}\n{}",
+            out.source
+        );
+    }
+    // The rule itself admitted the subject: the residue is other families'.
+    assert!(
+        out.artifacts
+            .allocator_contract_receipts
+            .contains("raw_manager::syms\tadmitted\t"),
+        "{}",
+        out.artifacts.allocator_contract_receipts
+    );
+}
+
+/// **The overwrite of a live unique owner is REFUSED** (R619-5 (3), P5: a
+/// contract allocation never meets a Rust drop). `dup = strdup(src)` over a
+/// generation the owner still holds: the input LEAKS the first block, and the
+/// emitted program would close it with Rust's overwrite drop — admitted once
+/// (R434-4 §2 under R443-1) on an allocator declaration that was never
+/// emitted (fan-out 008 items 7 / 16). The owner keeps the typed hold.
+///
+/// Uniqueness is not assumed: a copy into another local, an unproven lend or
+/// an unbridged cast each refuse the subject before the simulation runs.
+const OVERWRITTEN_OWNER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+    fn strdup(s: *const std::os::raw::c_char) -> *mut std::os::raw::c_char;
+    fn strcmp(a: *const std::os::raw::c_char, b: *const std::os::raw::c_char) -> i32;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+pub unsafe extern "C" fn twice(mut src: *const std::os::raw::c_char) -> i32 {
+    let mut dup = strdup(src);
+    if dup.is_null() {
+        return 0 as i32;
+    }
+    let mut first = strcmp(dup, src);
+    dup = strdup(src);
+    let mut second = strcmp(dup, src);
+    free(dup as *mut core::ffi::c_void);
+    return first + second;
+}
+"#;
+
+#[test]
+fn w6a_ac_an_overwrite_of_a_live_owner_is_refused() {
+    let out = emitted("ac-overwrite", OVERWRITTEN_OWNER);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert!(
+        receipts.contains("twice::dup\tyielded\tcontract-allocation:overwrite:")
+            || receipts.contains("twice::dup\theld\tcontract-allocation:overwrite:"),
+        "{receipts}"
+    );
+    assert!(!receipts.contains("waiver-drop(overwrite)"), "{receipts}");
+    assert!(
+        compact(&out.source).contains("letmutdup=strdup("),
+        "{}\n{receipts}",
+        out.source
+    );
+}
+
+/// **The optional owner lent at a LOCAL callee's raw formal** (relay
+/// wave-6a/029, R451-3): brotli's `BrotliHistogramCombine{Literal,Distance,
+/// Command}` shape. The callee keeps a raw formal, so the seam's owner-view
+/// glue (which converts) does not apply and the ordinary raw bridge renders
+/// `x.as_mut_ptr()` — on an `Option`, 27 of batch 10's 44 reverts. The owner's
+/// own view is spelled here instead, keyed on its decision FORM:
+/// `.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())`, under
+/// the argument's own casts (the `*mut u8` vs `*mut c_void` spelling, 18 more).
+const LOCAL_RAW_FORMAL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn memset(s: *mut std::os::raw::c_void, c: i32, n: usize) -> *mut std::os::raw::c_void;
+    fn exit(code: i32) -> !;
+}
+#[repr(C)]
+pub struct MemoryManager {
+    pub alloc_func: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, usize) -> *mut std::os::raw::c_void>,
+    pub free_func: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void)>,
+    pub opaque: *mut std::os::raw::c_void,
+}
+pub unsafe extern "C" fn BrotliAllocate(mut m: *mut MemoryManager, mut n: usize) -> *mut std::os::raw::c_void {
+    let mut result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+    if result.is_null() { exit(1 as i32); }
+    return result;
+}
+pub unsafe extern "C" fn BrotliFree(mut m: *mut MemoryManager, mut p: *mut std::os::raw::c_void) {
+    ((*m).free_func).expect("non-null function pointer")((*m).opaque, p);
+}
+pub unsafe extern "C" fn combine_void(mut region: *mut std::os::raw::c_void, mut n: usize) -> u32 {
+    let mut words = region as *mut u32;
+    let mut i = 0 as usize;
+    let mut acc = 0 as u32;
+    while i < n {
+        acc = acc.wrapping_add(*words.offset(i as isize));
+        i = i.wrapping_add(1);
+    }
+    return acc;
+}
+pub unsafe extern "C" fn cluster_combine(mut m: *mut MemoryManager, mut n: usize, mut split: *mut u32) {
+    let mut syms = if n > 0 as usize { BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 } else { 0 as *mut u32 };
+    *syms.offset(0 as isize) = 3 as u32;
+    *split = combine_void(syms as *mut std::os::raw::c_void, n);
+    BrotliFree(m, syms as *mut std::os::raw::c_void);
+    syms = 0 as *mut u32;
+}
+"#;
+
+#[test]
+fn w6a_ac_an_optional_owner_lent_at_a_local_raw_formal_takes_its_own_view() {
+    let out = emitted("ac-local-raw-formal", LOCAL_RAW_FORMAL);
+    if let Ok(path) = std::env::var("W6A_DUMP_EMITTED") {
+        std::fs::write(path, &out.source).expect("dump");
+    }
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(
+        out.reverted, 0,
+        "{}\n{:#?}\n{receipts}",
+        out.source, out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "cluster_combine::syms"),
+        None,
+        "{:#?}\n{receipts}",
+        out.degradations
+    );
+    assert!(
+        text.contains("combine_void(syms.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr())as*mutstd::os::raw::c_void,n)"),
+        "the owner's own raw view, under the argument's cast\n{}",
+        out.source
+    );
+}
+
+/// **The four Box cells of the raw-view vocabulary** (R452-3(3)). One template
+/// used to render every owner — `core::ptr::from_mut(X.as_mut())` — which is
+/// right for exactly one of the four shapes. A fat owner's raw view is the
+/// SLICE's (the whole allocation, not a pointer to the `Box`), and an OPTIONAL
+/// owner must be opened before it is viewed, with `None` as the null pointer.
+/// Batch 10 measured the cost of the missing cells: 27 brotli reverts reading
+/// `no method named as_mut_ptr found for enum Option`, and wave-6f's three
+/// `verify-reverted` roots (their report 031 §6).
+#[test]
+fn w6a_glue_each_box_shape_renders_its_own_raw_view() {
+    use super::decision::{
+        Decision,
+        box_facts::{BoxPlan, BoxShape},
+        raw_boundary::{BridgeRender, BridgeTemplate, RawMutability, RawTargetType, template_for},
+    };
+
+    let plan = |shape: BoxShape, optional: bool| {
+        Decision::Box(BoxPlan {
+            shape,
+            optional,
+            expr_edits: Vec::new(),
+            delete_statements: Vec::new(),
+            receipts: Vec::new(),
+            fabricated_extent: false,
+            pointee_override: None,
+            inferred_binding: false,
+            overwrite_spans: Vec::new(),
+            retained_sink: false,
+            implicit_scope_close: false,
+        })
+    };
+    let target = |mutability: RawMutability| RawTargetType {
+        rendered: format!(
+            "*{} u32",
+            if mutability == RawMutability::Mut {
+                "mut"
+            } else {
+                "const"
+            }
+        ),
+        pointee: "u32".to_owned(),
+        mutability,
+        depth2: None,
+    };
+    let render = |shape: BoxShape, optional: bool, mutability: RawMutability| {
+        let decision = plan(shape, optional);
+        let template = template_for(&decision, &target(mutability), None, false)
+            .expect("a Box owner has a raw view");
+        let slice = shape == BoxShape::Slice;
+        match template
+            .render("x", mutability, slice, Some("u32"))
+            .expect("the cell renders")
+        {
+            BridgeRender::Edit(text) => (template, text),
+            other => panic!("{other:?}"),
+        }
+    };
+
+    // The selection is by the owner's FORM, and the census receipts name it.
+    let (t, text) = render(BoxShape::Sized, false, RawMutability::Mut);
+    assert_eq!(t, BridgeTemplate::BoxBorrowViewToRaw);
+    assert_eq!(text, "core::ptr::from_mut(x.as_mut())");
+
+    let (t, text) = render(BoxShape::Slice, false, RawMutability::Mut);
+    assert_eq!(t, BridgeTemplate::BoxBorrowViewToRaw);
+    assert_eq!(text, "x.as_mut_ptr()");
+
+    let (t, text) = render(BoxShape::Sized, true, RawMutability::Mut);
+    assert_eq!(t, BridgeTemplate::OptionalBoxBorrowViewToRaw);
+    assert_eq!(
+        text,
+        "x.as_deref_mut().map_or(core::ptr::null_mut(), core::ptr::from_mut)"
+    );
+
+    let (t, text) = render(BoxShape::Slice, true, RawMutability::Mut);
+    assert_eq!(t, BridgeTemplate::OptionalBoxBorrowViewToRaw);
+    assert_eq!(
+        text,
+        "x.as_deref_mut().map_or(core::ptr::null_mut(), |s| s.as_mut_ptr())"
+    );
+
+    // …and the four shared twins.
+    assert_eq!(
+        render(BoxShape::Sized, false, RawMutability::Const).1,
+        "core::ptr::from_ref(x.as_ref())"
+    );
+    assert_eq!(
+        render(BoxShape::Slice, false, RawMutability::Const).1,
+        "x.as_ptr()"
+    );
+    assert_eq!(
+        render(BoxShape::Sized, true, RawMutability::Const).1,
+        "x.as_deref().map_or(core::ptr::null(), core::ptr::from_ref)"
+    );
+    assert_eq!(
+        render(BoxShape::Slice, true, RawMutability::Const).1,
+        "x.as_deref().map_or(core::ptr::null(), |s| s.as_ptr())"
+    );
+}
+
+const MOVE_INTO_HELD_OWNER: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types, non_snake_case)]
+extern "C" {
+    fn exit(code: i32) -> !;
+}
+#[repr(C)]
+pub struct MemoryManager {
+    pub alloc_func: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, usize) -> *mut std::os::raw::c_void>,
+    pub free_func: Option<unsafe extern "C" fn(*mut std::os::raw::c_void, *mut std::os::raw::c_void)>,
+    pub opaque: *mut std::os::raw::c_void,
+}
+pub unsafe extern "C" fn BrotliAllocate(mut m: *mut MemoryManager, mut n: usize) -> *mut std::os::raw::c_void {
+    let mut result = ((*m).alloc_func).expect("non-null function pointer")((*m).opaque, n);
+    if result.is_null() { exit(1 as i32); }
+    return result;
+}
+pub unsafe extern "C" fn BrotliFree(mut m: *mut MemoryManager, mut p: *mut std::os::raw::c_void) {
+    ((*m).free_func).expect("non-null function pointer")((*m).opaque, p);
+}
+pub unsafe extern "C" fn ensure_capacity(mut m: *mut MemoryManager, mut n: usize) -> *mut u32 {
+    let mut all_values = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    let mut new_array = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(2 as usize).wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    *new_array.offset(0 as isize) = *all_values.offset(0 as isize);
+    BrotliFree(m, all_values as *mut std::os::raw::c_void);
+    all_values = new_array;
+    return all_values;
+}
+pub unsafe extern "C" fn ensure_capacity_freed(mut m: *mut MemoryManager, mut n: usize) {
+    let mut all_values = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    let mut new_array = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(2 as usize).wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+    } else { 0 as *mut u32 };
+    *new_array.offset(0 as isize) = *all_values.offset(0 as isize);
+    BrotliFree(m, all_values as *mut std::os::raw::c_void);
+    all_values = new_array;
+    BrotliFree(m, all_values as *mut std::os::raw::c_void);
+    all_values = 0 as *mut u32;
+}
+"#;
+
+/// **A move's destination must be an owner this rule ADMITS, not merely a
+/// candidate** (report 027). `new_array` hands its generation to
+/// `all_values` — brotli's ensure-capacity shape — and `all_values` is HELD
+/// (here by its return; on the corpus by `use:call-argument-not-a-lend` at
+/// `BrotliHistogramCombine*`). Admitting the mover alone assigns an
+/// `Option<Box<[T]>>` into a place that stays raw, which is exactly the one
+/// diagnostic each of batch 12's six `verify-reverted` Box classes carried:
+/// `expected raw pointer *mut HistogramLiteral, found enum
+/// Option<Box<[HistogramLiteral]>>` (24 of brotli's 45 reverted Box rows, and
+/// the 20 `closure:partition` rows behind them).
+///
+/// One fault: let the destination be any candidate (the pre-fix `move_ok`) and
+/// `new_array` is admitted again — the receipt flips to `admitted` and the
+/// emitted text carries the Box into the raw place.
+#[test]
+fn w6a_ac_a_move_into_a_held_owner_is_refused() {
+    let out = emitted("ac-move-into-held", MOVE_INTO_HELD_OWNER);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(
+        receipts.contains(
+            "ensure_capacity::new_array\theld\tcontract-allocation:use:moved-into-unadmitted-owner:ensure_capacity::all_values"
+        ),
+        "the mover is held with its destination\n{receipts}"
+    );
+    assert!(
+        !receipts.contains("ensure_capacity::new_array\tadmitted"),
+        "no admission for the mover\n{receipts}"
+    );
+    let text = compact(&out.source);
+    let held_fn = &text[text
+        .find("fnensure_capacity(")
+        .expect("the held-destination function")
+        ..text.find("fnensure_capacity_freed").expect("the sibling")];
+    assert!(
+        held_fn.contains("all_values=new_array;"),
+        "the move keeps its text\n{}",
+        out.source
+    );
+    assert!(
+        !held_fn.contains("Box<"),
+        "no Box anywhere in the held-destination function\n{}",
+        out.source
+    );
+    // The fix is a condition on the destination, not a ban on moves: the
+    // sibling whose destination this rule DOES admit (it frees the moved
+    // generation here) keeps both owners and the move's own text.
+    assert!(
+        receipts.contains("ensure_capacity_freed::new_array\tadmitted"),
+        "a move into an admitted owner still delivers\n{receipts}"
+    );
+    assert!(
+        text.contains("fnensure_capacity_freed")
+            && text.contains("letmutall_values:Option<Box<[u32]>>"),
+        "the admitted destination is the Box\n{}",
+        out.source
+    );
+}
+
+const OPTIONAL_SLICE_DEREF: &str = r#"
+#[repr(C)]
+pub struct Cmd {
+    pub arity: i32,
+    pub used: i32,
+}
+pub unsafe extern "C" fn add_func(mut m: *mut MemoryManager, mut n: usize) -> i32 {
+    let mut cmd = if n > 0 as usize {
+        BrotliAllocate(m, (1 as usize).wrapping_mul(::core::mem::size_of::<Cmd>())) as *mut Cmd
+    } else { 0 as *mut Cmd };
+    (*cmd).arity = 2 as i32;
+    (*cmd).used = 1 as i32;
+    let mut seen = (*cmd).arity;
+    BrotliFree(m, cmd as *mut std::os::raw::c_void);
+    cmd = 0 as *mut Cmd;
+    return seen;
+}
+"#;
+
+/// **A4 / R483-3(i): `*b` on an `Option<Box<[T]>>` is its first element.** The
+/// walk refused this shape (`use:optional-slice-deref`) although the
+/// rendering is the one the `.offset` arm already writes with an index of
+/// zero. The corpus's two rows are lil's `add_func::cmd` and
+/// `lil_clone_value::val` — `calloc(1, size_of::<T>())` owners whose every use
+/// is `(*cmd).field` — and this fixture is that shape over the brotli
+/// contract, with a write and a read of the same owner.
+///
+/// The write must be seen THROUGH the field projection: `(*cmd).name = name`
+/// writes the owner, so the view is `as_deref_mut()`; the read beside it takes
+/// `as_deref()`. One fault: refuse the shape again and the owner degrades.
+#[test]
+fn w6a_ac_an_optional_slice_owner_derefs_to_its_first_element() {
+    let out = emitted(
+        "ac-optional-deref",
+        &format!("{PRELUDE}{OPTIONAL_SLICE_DEREF}"),
+    );
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+    assert!(
+        receipts.contains("add_func::cmd\tadmitted"),
+        "the deref is a rendering, not a refusal\n{receipts}"
+    );
+    assert!(!receipts.contains("optional-slice-deref"), "{receipts}");
+    let text = compact(&out.source);
+    // The writes take the mutable view, through the projection …
+    assert!(
+        text.contains("cmd.as_deref_mut().unwrap()[0].arity=2asi32;"),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains("cmd.as_deref_mut().unwrap()[0].used=1asi32;"),
+        "{}",
+        out.source
+    );
+    // … and the read beside them takes the shared one.
+    assert!(
+        text.contains("letmutseen=cmd.as_deref().unwrap()[0].arity;"),
+        "{}",
+        out.source
+    );
+    // The free stays at the C free site.
+    assert!(
+        text.contains("BrotliFree(m,cmd.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutstd::os::raw::c_void));"),
+        "{}",
+        out.source
+    );
+}
+
+/// **A4 part 1's second half (R485-2): a body may prove a lend the model does
+/// not.** The oracle required the callee's formal to be model-`Ref`; the 37
+/// `contract-allocation:use:call-argument-not-a-lend` rows at batch 16 — 18 of
+/// them `BrotliHistogramCombine{Literal,Distance,Command}` — are owners whose
+/// callee the model calls `Raw`, which is the absence of a verdict, not a
+/// claim of ownership. `LendWalk` is the evidence there: a free, a store, a
+/// return or a copy of the formal each refuse it.
+///
+/// `Owning` is a positive claim and is NOT superseded by this walk, and a
+/// formal with no slot answers nothing. This witness pins those four answers;
+/// the end-to-end effect is the next census's to measure, because no small
+/// fixture of this lane holds a formal at model-`Raw` (five shapes tried
+/// across reports 024 and 039).
+#[test]
+fn w6a_a_body_proves_a_lend_for_every_slotted_formal() {
+    use super::{
+        super::analyses::borrow_ownership::SlotKind,
+        decision::return_certificate::model_admits_lend,
+    };
+
+    // The model's own lend verdict, and the absence the body may fill.
+    assert!(model_admits_lend(Some(SlotKind::Ref)));
+    assert!(model_admits_lend(Some(SlotKind::Raw)));
+    // **Restated for W6A-A1-e** (relay wave-6a/049). Report 039 read the
+    // `Owning` case as a claim a use walk may not supersede. That reading was
+    // about the FORMAL — and this oracle does not touch the formal. It answers
+    // one question for the CALLER, whether its certificate survives the call,
+    // and the formal keeps its kind, its raw form and its own family
+    // (ownership-fields emits exactly these as raw views with the `Owning`
+    // label recorded beside them). Nothing is overturned, so the claim is
+    // admitted and the body walk alone decides.
+    assert!(model_admits_lend(Some(SlotKind::Owning)));
+    // A formal the model never slotted answers nothing, in every reading.
+    assert!(!model_admits_lend(None));
+}
+
+/// **R551-5 joint (a) (relay wave-6a/083–084).** A Box owner lent to a local
+/// callee whose converted formal falls back to its raw input form. brotli's
+/// `ClusterBlocks*` pass `histogram_symbols` to `BrotliHistogramCombine*`, a
+/// class the A5 site proof holds; the caller's partition reverted because
+/// `callee_parameter_input` refused any source decided `Box`. The owner now
+/// supplies its raw view, tiered by the raw boundary's own disposition of
+/// the site, through the template every raw-boundary Box site renders.
+///
+/// Returns the emitted tree with the CALLEE's class reverted, and the
+/// callee-parameter input plan's current source for `callee`'s argument
+/// from `caller`: its bridge kind and tier, or its refusal key.
+fn box_source_at_reverted_callee(
+    name: &str,
+    src: &str,
+    caller: &str,
+    callee: &str,
+) -> (
+    String,
+    Result<(String, super::bridge_receipt::BridgeRetentionTier), &'static str>,
+) {
+    let (source, input) = ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        let capture = super::ast_transform::capture_ast(tcx).expect("one original AST");
+        let (table, ctx) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::OverlapMode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("one decision pipeline");
+        let function = |name: &str| {
+            table
+                .entries
+                .iter()
+                .map(|(subject, _)| subject.fn_did)
+                .find(|did| {
+                    tcx.def_path_str(did.to_def_id())
+                        .ends_with(&format!("::{name}"))
+                        || tcx.def_path_str(did.to_def_id()) == name
+                })
+                .unwrap_or_else(|| panic!("function {name} has subjects"))
+        };
+        let (caller, callee) = (function(caller), function(callee));
+        let emission = super::emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_copy_plans,
+        )
+        .expect("one terminal plan");
+        let inputs = emission
+            .plan
+            .terminal_call_plans
+            .callee_parameter_inputs
+            .values()
+            .filter(|input| input.caller == caller && input.node.0 == callee)
+            .collect::<Vec<_>>();
+        let [input] = inputs.as_slice() else {
+            panic!("{name}: one callee-parameter input for {callee:?}: {inputs:#?}")
+        };
+        let input = input
+            .current_source
+            .as_ref()
+            .map_err(|reason| *reason)
+            .map(|alternative| {
+                let bridge = alternative
+                    .bridge
+                    .as_ref()
+                    .expect("an adapter carries its bridge");
+                (bridge.bridge_kind.clone(), bridge.retention)
+            });
+        let mut reverted = emission.plan.held_classes();
+        reverted.insert(super::bridge_receipt::SignatureClassId::of(callee));
+        let (files, rollbacks, ..) = super::round_files(
+            tcx,
+            &capture,
+            &emission.plan,
+            &emission.texts,
+            &reverted,
+            &std::collections::BTreeSet::new(),
+            emission.plan.root_file.as_ref(),
+            &table,
+        )
+        .expect("the reverted-callee emission");
+        assert!(
+            rollbacks.is_empty(),
+            "{name}: no structural rollback: {rollbacks:#?}"
+        );
+        (files.into_values().next().expect("one file"), input)
+    })
+    .expect("the fixture compiles");
+    (source, input)
+}
+
+const LENT_TO_A_REVERTED_CALLEE: &str = r#"
+pub unsafe extern "C" fn lending(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {
+    let mut lent = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    *lent.offset(0 as isize) = 1 as u32;
+    *split = ReindexSymbols(lent, n);
+    BrotliFree(m, lent as *mut std::os::raw::c_void);
+}
+"#;
+
+/// The owner's raw view at the fallen-back formal: `lent.as_mut_ptr()`,
+/// `box-borrow-view-to-raw` at tier 1 (`ReindexSymbols` only reads), and the
+/// tree type-checks with the callee raw and the owner still `Box<[u32]>`.
+#[test]
+fn w6a_r551_a_box_owner_lends_its_raw_view_to_a_reverted_callee() {
+    let (source, input) = box_source_at_reverted_callee(
+        "r551-box-source",
+        &format!("{PRELUDE}{LENT_TO_A_REVERTED_CALLEE}"),
+        "lending",
+        "ReindexSymbols",
+    );
+    assert_eq!(
+        input,
+        Ok((
+            "box-borrow-view-to-raw".to_owned(),
+            super::bridge_receipt::BridgeRetentionTier::T1
+        )),
+        "{source}"
+    );
+    let text = compact(&source);
+    assert!(text.contains("letmutlent:Box<[u32]>="), "{source}");
+    assert!(
+        text.contains("*split=ReindexSymbols(lent.as_mut_ptr(),n);"),
+        "{source}"
+    );
+    assert!(
+        text.contains("fnReindexSymbols(mutsymbols:*mutu32,"),
+        "{source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+/// Control: an OPTIONAL owner (the conditional allocation) lends the R130
+/// optional view — `None` is the null the raw formal already accepts.
+#[test]
+fn w6a_r551_an_optional_owner_lends_the_optional_raw_view() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = if n > 0 as usize {{\n\
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32\n\
+    }} else {{ 0 as *mut u32 }};\n\
+    if n > 0 as usize {{ *syms.offset(0 as isize) = 1 as u32; }}\n\
+    *split = ReindexSymbols(syms, n);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+}}\n"
+    );
+    let (source, input) =
+        box_source_at_reverted_callee("r551-optional-source", &src, "optional", "ReindexSymbols");
+    assert_eq!(
+        input,
+        Ok((
+            "optional-box-borrow-view-to-raw".to_owned(),
+            super::bridge_receipt::BridgeRetentionTier::T1
+        )),
+        "{source}"
+    );
+    let text = compact(&source);
+    assert!(text.contains("letmutsyms:Option<Box<[u32]>>="), "{source}");
+    assert!(
+        text.contains(
+            "ReindexSymbols(syms.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr()),n)"
+        ),
+        "{source}"
+    );
+    assert!(super::verify::type_checks_str(&source), "{source}");
+}
+
+const ELEMENTS: &str = r#"
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct Hist { pub data_: [u32; 4], pub total_count_: usize }
+pub unsafe extern "C" fn HistogramAdd(mut self_0: *mut Hist, mut val: usize) {
+    (*self_0).data_[val] = ((*self_0).data_[val]).wrapping_add(1 as u32);
+    (*self_0).total_count_ = ((*self_0).total_count_).wrapping_add(1 as usize);
+}
+pub unsafe extern "C" fn BitsEntropy(mut population: *const u32, mut size: usize) -> u32 {
+    let mut sum = 0 as u32;
+    let mut i = 0 as usize;
+    while i < size { sum = sum.wrapping_add(*population.offset(i as isize)); i = i.wrapping_add(1); }
+    return sum;
+}
+pub unsafe extern "C" fn adding(mut m: *mut MemoryManager, n: usize, mut out: *mut usize) {
+    let mut histograms = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<Hist>())) as *mut Hist
+    } else { 0 as *mut Hist };
+    let mut j = 0 as usize;
+    while j < n {
+        (*histograms.offset(j as isize)).total_count_ = 0 as usize;
+        HistogramAdd(&mut *histograms.offset(j as isize), j & 3 as usize);
+        j = j.wrapping_add(1);
+    }
+    if n > 0 as usize { *out = (*histograms.offset(0 as isize)).total_count_; }
+    BrotliFree(m, histograms as *mut std::os::raw::c_void);
+}
+pub unsafe extern "C" fn entropy(mut m: *mut MemoryManager, n: usize, mut out: *mut u32) {
+    let mut combined = if n > 0 as usize {
+        BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<Hist>())) as *mut Hist
+    } else { 0 as *mut Hist };
+    if n > 0 as usize {
+    (*combined.offset(0 as isize)).total_count_ = 0 as usize;
+    *out = BitsEntropy(&mut *((*combined.offset(0 as isize)).data_).as_mut_ptr().offset(0 as isize), 4 as usize);
+    }
+    BrotliFree(m, combined as *mut std::os::raw::c_void);
+}
+"#;
+
+/// **R555-1 joint (d).** An element address of a Box owner —
+/// `&mut *histograms.offset(j)` at a `&mut Hist` formal — is `&mut T` once the
+/// Box plan renders the element (`histograms.as_deref_mut().unwrap()[j]`).
+/// The owner-view glue (R422-5) is the OWNER's view and applies to the owner
+/// passed bare; keyed on the place root it also wrapped this element as
+/// `&mut (&mut ..[j]).as_mut().unwrap()[0]` (E0599 — brotli `ClusterBlocks*`'s
+/// fifteen, `ContextBlockSplitterFinishBlock`).
+#[test]
+fn w6a_r555_an_element_address_of_a_box_owner_passes_as_written() {
+    let out = emitted("r555-element", &format!("{PRELUDE}{ELEMENTS}"));
+    let text = compact(&out.source);
+    for subject in [
+        "adding::histograms",
+        "HistogramAdd::self_0",
+        "entropy::combined",
+        "BitsEntropy::population",
+    ] {
+        assert_eq!(
+            reason_of(&out.degradations, subject),
+            None,
+            "{subject}\n{:#?}\n{}",
+            out.degradations,
+            out.source
+        );
+    }
+    assert!(!text.contains(".as_mut().unwrap()[0]"), "{}", out.source);
+    assert!(
+        text.contains("HistogramAdd(&muthistograms.as_deref_mut().unwrap()[(j)asusize],"),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains("fnHistogramAdd(mutself_0:&mutHist,"),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains("fnBitsEntropy(mutpopulation:&[u32],"),
+        "{}",
+        out.source
+    );
+    // A write through the element's projection opens the owner mutably.
+    assert!(
+        text.contains("histograms.as_deref_mut().unwrap()[(j)asusize].total_count_=0asusize;"),
+        "{}",
+        out.source
+    );
+    // The array start of an element's array field is the array-start seam's
+    // own rendering (W-C6: `from_raw_parts(A.as_mut_ptr(), LEN)`, here at the
+    // array field's own length, `data_: [u32; 4]`), not a one-element slice;
+    // the `&mut self` `as_mut_ptr` opens the owner mutably. The length is 4,
+    // spelled by R625's array arm (`(4) as usize`) or, where wave-6l's extent
+    // prover licenses the companion `size`, as its proven `(4 as usize) as
+    // usize` (wave-6l 067 / 073 STOP 1; R776-5).
+    assert!(
+        ["(4)asusize", "(4asusize)asusize"].iter().any(|len| text.contains(&format!(
+            "BitsEntropy(core::slice::from_raw_parts((combined.as_deref_mut().unwrap()[(0)asusize].data_).as_mut_ptr(),{len}),4asusize);"
+        ))),
+        "{}",
+        out.source
+    );
+    assert_eq!(out.reverted, 0, "{}", out.source);
+}
+
+/// Joint (a)'s owner view is likewise the owner's: an element address of a Box
+/// owner at a callee formal that falls back to raw keeps the refusal (it is a
+/// reference to one element, not the owner, and has no raw-view rendering of
+/// the owner's).
+#[test]
+fn w6a_r555_an_element_address_does_not_take_the_owner_raw_view() {
+    let (source, input) = box_source_at_reverted_callee(
+        "r555-element-reverted",
+        &format!("{PRELUDE}{ELEMENTS}"),
+        "adding",
+        "HistogramAdd",
+    );
+    assert_eq!(
+        input,
+        Err("callee-parameter-input-owned-or-inferred-source-unbuilt"),
+        "{source}"
+    );
+}
+
+/// **R557-4: the element-address classifier's home.** `&mut *X.offset(i)` /
+/// `&*X.offset(i)` over a bare local `X` is the address of one element of
+/// `X`: `box_facts::box_element_address` names the owner, the index and the
+/// mutability — the owner walk's offset arm, the 089 seam restriction and
+/// wave-5d's joint (c) call this one function. A bare owner, a field place and
+/// an offset that is not dereferenced are not element addresses.
+#[test]
+fn w6a_r557_the_element_address_classifier_names_owner_index_and_mutability() {
+    let src = format!("{PRELUDE}{ELEMENTS}");
+    let rows = ::utils::compilation::run_compiler_on_str(&src, |tcx| {
+        struct V<'tcx> {
+            tcx: rustc_middle::ty::TyCtxt<'tcx>,
+            rows: Vec<String>,
+        }
+        impl<'tcx> rustc_hir::intravisit::Visitor<'tcx> for V<'tcx> {
+            fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+                if matches!(
+                    expr.kind,
+                    rustc_hir::ExprKind::AddrOf(..) | rustc_hir::ExprKind::Path(..)
+                ) {
+                    let sm = self.tcx.sess.source_map();
+                    let text = sm.span_to_snippet(expr.span).unwrap_or_default();
+                    let got = super::decision::box_facts::box_element_address(expr).map(
+                        |(owner, index, mutable)| {
+                            format!(
+                                "{}|{}|{mutable}",
+                                self.tcx.hir_name(owner),
+                                sm.span_to_snippet(index.span).unwrap_or_default()
+                            )
+                        },
+                    );
+                    self.rows.push(format!("{text} => {got:?}"));
+                }
+                rustc_hir::intravisit::walk_expr(self, expr);
+            }
+        }
+        let mut v = V {
+            tcx,
+            rows: Vec::new(),
+        };
+        for owner in tcx.hir_body_owners() {
+            rustc_hir::intravisit::Visitor::visit_body(&mut v, tcx.hir_body_owned_by(owner));
+        }
+        v.rows
+    })
+    .expect("the fixture compiles");
+    let find = |text: &str| {
+        rows.iter()
+            .find(|row| row.starts_with(&format!("{text} => ")))
+            .unwrap_or_else(|| panic!("{text}\n{rows:#?}"))
+            .clone()
+    };
+    assert_eq!(
+        find("&mut *histograms.offset(j as isize)"),
+        "&mut *histograms.offset(j as isize) => Some(\"histograms|j as isize|true\")"
+    );
+    assert_eq!(
+        find("&mut *((*combined.offset(0 as isize)).data_).as_mut_ptr().offset(0 as isize)"),
+        "&mut *((*combined.offset(0 as isize)).data_).as_mut_ptr().offset(0 as isize) => None",
+        "the element's field array is not an element address of `combined`"
+    );
+    assert_eq!(find("histograms"), "histograms => None");
+}
+
+/// brotli's ensure-capacity shape (`RingBufferInitBuffer`,
+/// `InitBlockSplitter*`, `SplitByteVector*`, `EncodeData::new_commands`):
+/// the new buffer is allocated, the old one copied in and freed, and the new
+/// one STORED into the struct's raw field, which C frees later.
+const STORED_OWNERS: &str = r#"
+extern "C" {
+    fn memcpy(d: *mut std::os::raw::c_void, s: *const std::os::raw::c_void, n: usize) -> *mut std::os::raw::c_void;
+}
+#[repr(C)]
+pub struct RingBuffer {
+    pub cur_size_: u32,
+    pub data_: *mut u8,
+}
+pub unsafe extern "C" fn ring(mut m: *mut MemoryManager, buflen: u32, mut rb: *mut RingBuffer) {
+    let mut new_data = if (2 as u32).wrapping_add(buflen) as usize > 0 as usize {
+        BrotliAllocate(m, ((2 as u32).wrapping_add(buflen) as usize).wrapping_mul(::core::mem::size_of::<u8>())) as *mut u8
+    } else { 0 as *mut u8 };
+    if !((*rb).data_).is_null() {
+        memcpy(new_data as *mut std::os::raw::c_void, (*rb).data_ as *const std::os::raw::c_void, (*rb).cur_size_ as usize);
+        BrotliFree(m, (*rb).data_ as *mut std::os::raw::c_void);
+        (*rb).data_ = 0 as *mut u8;
+    }
+    (*rb).data_ = new_data;
+    (*rb).cur_size_ = buflen;
+}
+pub unsafe extern "C" fn store_only(mut m: *mut MemoryManager, n: usize, mut rb: *mut RingBuffer) {
+    let mut new_data = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u8>())) as *mut u8;
+    (*rb).data_ = new_data;
+}
+pub unsafe extern "C" fn one_branch(mut m: *mut MemoryManager, n: usize, c: bool, mut rb: *mut RingBuffer) {
+    let mut new_data = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u8>())) as *mut u8;
+    if c { (*rb).data_ = new_data; }
+}
+"#;
+
+/// **R607-1 (relay 115 item 2)** — an owner STORED into a raw field moves out
+/// there: the store is the generation's release (`Box::into_raw`, the
+/// element pointer for a slice owner), and C frees the field later. Before,
+/// the store was never an event of the simulation, so every such owner read
+/// `contract-allocation:implicit-close:live-at-exit` (brotli's 21).
+#[test]
+fn w6a_r607_an_owner_stored_into_a_raw_field_moves_out_there() {
+    let out = emitted("r607-stored", &format!("{PRELUDE}{STORED_OWNERS}"));
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    let context = format!("{receipts}\n{:#?}\n{}", out.degradations, out.source);
+    for owner in ["ring::new_data", "store_only::new_data"] {
+        assert!(
+            receipts.contains(&format!("{owner}\tadmitted\t")),
+            "{context}"
+        );
+        assert_eq!(reason_of(&out.degradations, owner), None, "{context}");
+    }
+    for expected in [
+        "letmutnew_data:Option<Box<[u8]>>=",
+        "(*rb).data_=new_data.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutu8);",
+        "letmutnew_data:Box<[u8]>=Box::from_raw(",
+        "(*rb).data_=Box::into_raw(new_data)as*mutu8;",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}`\n{context}");
+    }
+    assert!(!text.contains("drop("), "{context}");
+    assert_eq!(receipts.matches("waiver-drop").count(), 0, "{context}");
+}
+
+/// Control: a store on ONE branch leaves the generation live on the other,
+/// where Rust would close it (R409-3) — the release counts in the store's
+/// own block, so the owner stays a typed hold.
+#[test]
+fn w6a_r607_a_store_on_one_branch_keeps_its_hold() {
+    let out = emitted("r607-one-branch", &format!("{PRELUDE}{STORED_OWNERS}"));
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert!(
+        receipts.contains(
+            "one_branch::new_data\theld\tcontract-allocation:implicit-close:block-unbalanced"
+        ),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        compact(&out.source).contains(
+            "letmutnew_data=BrotliAllocate(m,n.wrapping_mul(::core::mem::size_of::<u8>()))as*mutu8;"
+        ),
+        "{}",
+        out.source
+    );
+}
+
+/// brotli's `BrotliBuildMetaBlock::literal_context_modes`: null-initialised,
+/// allocated only inside one `if`, lent after the join, freed unconditionally
+/// (`BrotliFree` of the null the other path carries is C's own no-op).
+const JOIN_OWNERS: &str = r#"
+pub unsafe extern "C" fn read_modes(mut modes: *const u32, n: usize) -> u32 {
+    if modes.is_null() {
+        return 0 as u32;
+    }
+    return *modes.offset(0 as isize);
+}
+pub unsafe extern "C" fn meta(mut m: *mut MemoryManager, n: usize, flag: bool, mut out: *mut u32) {
+    let mut modes = 0 as *mut u32;
+    if flag {
+        modes = if n > 0 as usize {
+            BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32
+        } else {
+            0 as *mut u32
+        };
+        let mut i = 0 as usize;
+        while i < n {
+            *modes.offset(i as isize) = 3 as u32;
+            i = i.wrapping_add(1);
+        }
+    }
+    *out = read_modes(modes, n);
+    BrotliFree(m, modes as *mut std::os::raw::c_void);
+    modes = 0 as *mut u32;
+}
+pub unsafe extern "C" fn in_a_loop(mut m: *mut MemoryManager, n: usize, mut out: *mut u32) {
+    let mut modes = 0 as *mut u32;
+    let mut k = 0 as usize;
+    while k < n {
+        if k > 1 as usize {
+            modes = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+        }
+        k = k.wrapping_add(1);
+    }
+    BrotliFree(m, modes as *mut std::os::raw::c_void);
+    modes = 0 as *mut u32;
+}
+pub unsafe extern "C" fn both_arms(mut m: *mut MemoryManager, n: usize, flag: bool, mut out: *mut u32) {
+    let mut modes = 0 as *mut u32;
+    if flag {
+        modes = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    } else {
+        modes = BrotliAllocate(m, (2 as usize).wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    }
+    *out = read_modes(modes, n);
+    BrotliFree(m, modes as *mut std::os::raw::c_void);
+    modes = 0 as *mut u32;
+}
+pub unsafe extern "C" fn branch_frees(mut m: *mut MemoryManager, n: usize, flag: bool, other: bool, mut out: *mut u32) {
+    let mut modes = 0 as *mut u32;
+    if flag {
+        modes = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    }
+    *out = read_modes(modes, n);
+    if other {
+        BrotliFree(m, modes as *mut std::os::raw::c_void);
+        modes = 0 as *mut u32;
+    }
+}
+pub unsafe extern "C" fn never_freed(mut m: *mut MemoryManager, n: usize, flag: bool, mut out: *mut u32) {
+    let mut modes = 0 as *mut u32;
+    if flag {
+        modes = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    }
+    *out = read_modes(modes, n);
+}
+"#;
+
+/// **R608-1 (the 22nd owner)** — an optional owner created inside one `if`
+/// and released after the join is balanced AT the join: the other path
+/// carries `None`, the release takes both. Before, the creating branch read
+/// `contract-allocation:implicit-close:block-unbalanced:false->true`.
+#[test]
+fn w6a_r608_an_owner_created_in_one_branch_is_released_after_the_join() {
+    let out = emitted("r608-join", &format!("{PRELUDE}{JOIN_OWNERS}"));
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    let context = format!("{receipts}\n{:#?}\n{}", out.degradations, out.source);
+    assert!(receipts.contains("meta::modes\tadmitted\t"), "{context}");
+    assert_eq!(
+        reason_of(&out.degradations, "meta::modes"),
+        None,
+        "{context}"
+    );
+    for expected in [
+        "letmutmodes:Option<Box<[u32]>>=None;",
+        "modes=ifn>0asusize{Some(Box::from_raw(",
+        "BrotliFree(m,modes.map_or(core::ptr::null_mut(),|b|Box::into_raw(b)as*mutstd::os::raw::c_void));",
+        "modes=None;",
+    ] {
+        assert!(text.contains(expected), "missing `{expected}`\n{context}");
+    }
+    assert!(!text.contains("drop("), "{context}");
+}
+
+/// Controls, one per condition of the refinement: a branch inside a LOOP may
+/// create again over a live generation (an overwrite the simulation never
+/// sees); an `if` whose two arms both create reads as an overwrite to the
+/// linear simulation; a branch that RELEASES (live on entry, dead on exit)
+/// leaves the other path's generation for Rust to close; and a generation created in a branch with no release
+/// after the join is live at exit. Each keeps its hold.
+#[test]
+fn w6a_r608_a_branch_in_a_loop_or_without_a_release_keeps_its_hold() {
+    let out = emitted("r608-join-controls", &format!("{PRELUDE}{JOIN_OWNERS}"));
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    // Two creating arms are an overwrite of a live generation to the linear
+    // simulation: refused (R619-5 (3), P5).
+    assert!(
+        receipts.contains("both_arms::modes\theld\tcontract-allocation:overwrite:"),
+        "both_arms::modes\n{receipts}\n{}",
+        out.source
+    );
+    for owner in ["branch_frees::modes"] {
+        assert!(
+            receipts.contains(&format!(
+                "{owner}\theld\tcontract-allocation:implicit-close:block-unbalanced"
+            )),
+            "{owner}\n{receipts}\n{}",
+            out.source
+        );
+    }
+    assert!(
+        receipts.contains(
+            "in_a_loop::modes\theld\tcontract-allocation:implicit-close:block-unbalanced"
+        ),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        receipts
+            .contains("never_freed::modes\theld\tcontract-allocation:implicit-close:live-at-exit"),
+        "{receipts}\n{}",
+        out.source
+    );
+}
+
+/// brotli's `ClearHistograms*` / `CopyLiteralsToByteArray` lends: the callee's
+/// formal hands an ELEMENT pointer on (`clear_one(array.offset(i))`,
+/// `memcpy(literals.offset(pos) as *mut c_void, ..)`).
+const ELEMENT_PASS_ON: &str = r#"
+extern "C" {
+    fn memcpy(d: *mut std::os::raw::c_void, s: *const std::os::raw::c_void, n: usize) -> *mut std::os::raw::c_void;
+    fn keep_elsewhere(p: *mut u32);
+}
+#[repr(C)]
+pub struct Keeper {
+    pub kept: *mut u32,
+}
+pub unsafe extern "C" fn clear_one(mut p: *mut u32) {
+    *p = 0 as u32;
+}
+pub unsafe extern "C" fn clear_all(mut array: *mut u32, n: usize) {
+    let mut i = 0 as usize;
+    while i < n {
+        clear_one(array.offset(i as isize));
+        i = i.wrapping_add(1);
+    }
+}
+pub unsafe extern "C" fn copy_into(mut literals: *mut u8, n: usize, mut src: *const u8) {
+    memcpy(literals.offset(1 as isize) as *mut std::os::raw::c_void, src as *const std::os::raw::c_void, n);
+}
+pub unsafe extern "C" fn keep_one(mut k: *mut Keeper, mut p: *mut u32) {
+    (*k).kept = p;
+}
+pub unsafe extern "C" fn keeps_an_element(mut array: *mut u32, mut k: *mut Keeper) {
+    keep_one(k, array.offset(1 as isize));
+}
+pub unsafe extern "C" fn hands_off_an_element(mut array: *mut u32) {
+    keep_elsewhere(array.offset(1 as isize));
+}
+pub unsafe extern "C" fn lends(mut m: *mut MemoryManager, n: usize, mut src: *const u8) {
+    let mut hist = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    clear_all(hist, n);
+    BrotliFree(m, hist as *mut std::os::raw::c_void);
+    let mut literals = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u8>())) as *mut u8;
+    copy_into(literals, n, src);
+    BrotliFree(m, literals as *mut std::os::raw::c_void);
+}
+pub unsafe extern "C" fn kept(mut m: *mut MemoryManager, n: usize, mut k: *mut Keeper) {
+    let mut hist = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    keeps_an_element(hist, k);
+    BrotliFree(m, hist as *mut std::os::raw::c_void);
+}
+pub unsafe extern "C" fn handed_off(mut m: *mut MemoryManager, n: usize) {
+    let mut hist = BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32;
+    hands_off_an_element(hist);
+    BrotliFree(m, hist as *mut std::os::raw::c_void);
+}
+"#;
+
+/// **R608-1 (the 8 held `call-argument-not-a-lend` rows)** — a callee's
+/// formal that hands an ELEMENT pointer on (`p.offset(e)` as a call
+/// argument) is a lend when the callee it reaches is: the same nested proof
+/// a bare pass-on takes (a local callee's body, or the contract table's
+/// no-retain borrow-view row for a foreign one). Before, only an `offset`
+/// directly under a deref counted, and both owners here read
+/// `contract-allocation:use:call-argument-not-a-lend`.
+#[test]
+fn w6a_r608_an_element_handed_to_a_lending_callee_is_a_lend() {
+    let out = emitted("r608-element-lend", &format!("{PRELUDE}{ELEMENT_PASS_ON}"));
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    let context = format!("{receipts}\n{:#?}\n{}", out.degradations, out.source);
+    for owner in ["lends::hist", "lends::literals"] {
+        assert!(
+            receipts.contains(&format!("{owner}\tadmitted\t")),
+            "{context}"
+        );
+        assert_eq!(reason_of(&out.degradations, owner), None, "{context}");
+    }
+    let text = compact(&out.source);
+    assert!(
+        text.contains("letmuthist:Box<[u32]>=Box::from_raw("),
+        "{context}"
+    );
+    assert!(
+        text.contains("letmutliterals:Box<[u8]>=Box::from_raw("),
+        "{context}"
+    );
+    assert!(!text.contains("drop("), "{context}");
+}
+
+/// Controls: an element pointer that reaches a callee which KEEPS it (a
+/// store into a struct), and one handed to a foreign function with no
+/// no-retain row, are not lends — the owners keep their holds.
+#[test]
+fn w6a_r608_an_element_kept_or_handed_to_an_unknown_callee_is_not_a_lend() {
+    let out = emitted(
+        "r608-element-lend-controls",
+        &format!("{PRELUDE}{ELEMENT_PASS_ON}"),
+    );
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    for owner in ["kept::hist", "handed_off::hist"] {
+        assert!(
+            receipts.contains(&format!(
+                "{owner}\theld\tcontract-allocation:use:call-argument-not-a-lend"
+            )),
+            "{owner}\n{receipts}\n{}",
+            out.source
+        );
+    }
+}
+
+/// **R641-11 (a)** — urlparser's `url_parse` reduced: sized and counted
+/// `libc/v1` owners, each guarded (`if x.is_null() { return 0; }`) and moved
+/// into a raw field of the caller's record. `malloc` returns null on failure,
+/// where C returns 0 (defined), so the guard is kept on the raw result before
+/// `Box::from_raw` exists; the owners stay delivered. CONTROL: a guard that is
+/// not the statement right after its allocation cannot be moved there
+/// without reordering, so the owner yields.
+#[test]
+fn w6a_r641_a_libc_null_guard_is_kept_on_the_raw_result() {
+    const URL: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+}
+#[repr(C)]
+pub struct url_data_t {
+    pub host: *mut std::os::raw::c_char,
+    pub port: *mut std::os::raw::c_char,
+}
+pub unsafe extern "C" fn url_parse(mut n: usize, mut data: *mut url_data_t) -> i32 {
+    let mut host = malloc((n as std::os::raw::c_ulong).wrapping_mul(::std::mem::size_of::<std::os::raw::c_char>() as std::os::raw::c_ulong)) as *mut std::os::raw::c_char;
+    if host.is_null() {
+        return 0 as i32;
+    }
+    *host.offset(0 as isize) = 0 as std::os::raw::c_char;
+    (*data).host = host;
+    let mut port = malloc(::std::mem::size_of::<std::os::raw::c_char>() as std::os::raw::c_ulong) as *mut std::os::raw::c_char;
+    if port.is_null() {
+        return 0 as i32;
+    }
+    *port = 0 as std::os::raw::c_char;
+    (*data).port = port;
+    return 1 as i32;
+}
+"#;
+    let out = emitted("r641-url", URL);
+    let text = compact(&out.source);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+    for expected in [
+        "letmuthost:Box<[i8]>={let__crat_raw=malloc(",
+        ";if__crat_raw.is_null(){return0asi32;}Box::from_raw(core::ptr::slice_from_raw_parts_mut(__crat_raw,",
+        "letmutport:Box<i8>={let__crat_raw=malloc(",
+        ";if__crat_raw.is_null(){return0asi32;}Box::from_raw(__crat_raw)};{}",
+        "(*data).port=Box::into_raw(port);",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing `{expected}`\n{}\n{receipts}",
+            out.source
+        );
+    }
+    for subject in ["url_parse::host", "url_parse::port"] {
+        assert!(
+            receipts.contains(&format!("{subject}\tadmitted\tnull-guard-before-box site=")),
+            "{subject}\n{receipts}"
+        );
+    }
+
+    let apart = URL.replace(
+        "    if port.is_null() {\n        return 0 as i32;\n    }\n",
+        "    let mut seen = n;\n    if port.is_null() {\n        return 0 as i32;\n    }\n",
+    );
+    assert_ne!(apart, URL);
+    let out = emitted("r641-url-apart", &apart);
+    let receipts = &out.artifacts.allocator_contract_receipts;
+    assert!(
+        receipts
+            .contains("url_parse::port\tyielded\tcontract-allocation:use:null-guard-not-adjacent:"),
+        "{receipts}\n{}",
+        out.source
+    );
+    assert!(
+        !compact(&out.source).contains("letmutport:Box<"),
+        "{}",
+        out.source
+    );
+    assert_eq!(out.reverted, 0, "{}\n{receipts}", out.source);
+}
+
+/// **R641-11 (a), from the review of `38dccedfd`.** A kept guard's return is
+/// copied in the enclosing function's own spelling (`return 0 as *mut rec;`).
+/// Where the allocation-return certificate converts THAT function's return
+/// (`make`'s owner `r`), the copy would no longer type — so the libc row
+/// yields the scratch owner, and the certificate renders the original guard's
+/// return as its own `None`.
+#[test]
+fn w6a_r641_a_kept_guard_in_a_certified_function_yields() {
+    const MAKE: &str = r#"
+// w6a-r641-certified-scratch
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, unused_assignments, non_camel_case_types)]
+extern "C" {
+    fn malloc(size: std::os::raw::c_ulong) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+#[repr(C)]
+pub struct rec {
+    pub n: usize,
+    pub first: u32,
+}
+pub unsafe extern "C" fn make(mut n: usize) -> *mut rec {
+    let mut r = malloc(::std::mem::size_of::<rec>() as std::os::raw::c_ulong) as *mut rec;
+    (*r).n = n;
+    (*r).first = 0 as u32;
+    let mut buf = malloc((n as std::os::raw::c_ulong).wrapping_mul(::std::mem::size_of::<u32>() as std::os::raw::c_ulong)) as *mut u32;
+    if buf.is_null() {
+        return 0 as *mut rec;
+    }
+    *buf.offset(0 as isize) = 7 as u32;
+    free(buf as *mut core::ffi::c_void);
+    return r;
+}
+pub unsafe extern "C" fn use_make(mut n: usize) -> usize {
+    let mut r = make(n);
+    if r.is_null() {
+        return 0 as usize;
+    }
+    let mut k = (*r).n;
+    free(r as *mut core::ffi::c_void);
+    return k;
+}
+"#;
+    use crate::analyses::borrow_ownership::SlotKind;
+    super::test_model_override::set(
+        "w6a-r641-certified-scratch",
+        Vec::new(),
+        vec![
+            ("make::r".to_owned(), SlotKind::Owning),
+            ("use_make::r".to_owned(), SlotKind::Owning),
+        ],
+    );
+    let out = emitted("r641-certified-scratch", MAKE);
+    super::test_model_override::clear();
+    let text = compact(&out.source);
+    let context = format!(
+        "{}\n{}\n{:#?}\n{}",
+        out.artifacts.return_certificate_receipts,
+        out.artifacts.allocator_contract_receipts,
+        out.degradations,
+        out.source
+    );
+    assert!(
+        out.artifacts
+            .return_certificate_receipts
+            .contains("return-certificate callee=make output=Option<Box<"),
+        "{context}"
+    );
+    assert!(!text.contains("letmutbuf:Box<"), "{context}");
+    assert!(text.contains("ifbuf.is_null(){returnNone;}"), "{context}");
+    assert_eq!(out.reverted, 0, "{context}");
+}
+
+/// **main 202 (the hold census of 57): an owner lent to a formal a settled
+/// hold makes raw.** brotli's `BrotliCreateZopfliBackwardReferences` lends its
+/// contract owner `nodes` (`Option<Box<[ZopfliNode]>>`) to
+/// `BrotliZopfliComputeShortestPath`, whose `nodes` R864-1 holds raw
+/// (`ref-beside-ref` at another caller). The raw boundary planned on the
+/// hypothesis (the formal converting) and the owner-view glue serves only a
+/// converted formal, so the owner reached the raw formal bare (`E0308`, the
+/// whole program degraded). Here `Scan::symbols` is held by the pair at
+/// `aliased`'s call; the lend at `optional` takes the owner's raw view, the
+/// raw boundary's own optional-box template.
+#[test]
+fn main202_an_owner_lent_to_a_formal_a_settled_hold_makes_raw_takes_its_raw_view() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn Scan(mut symbols: *mut u32, mut other: *mut u32, mut n: usize) -> u32 {{\n\
+    let _k = other.offset(0 as isize);\n\
+    let mut i = 0 as usize;\n\
+    let mut max = 0 as u32;\n\
+    while i < n {{\n\
+        if *symbols.offset(i as isize) > max {{ max = *symbols.offset(i as isize); }}\n\
+        i = i.wrapping_add(1);\n\
+    }}\n\
+    *other = max;\n\
+    return max;\n\
+}}\n\
+pub static mut LOW: [u32; 4] = [0 as u32; 4];\n\
+pub unsafe extern \"C\" fn aliased() -> u32 {{\n\
+    return Scan(LOW.as_mut_ptr(), LOW.as_mut_ptr(), 4 as usize);\n\
+}}\n\
+pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    *syms.offset(0 as isize) = 7 as u32;\n\
+    let mut out = 0 as u32;\n\
+    *split = Scan(syms, &mut out, n);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("main202-held-lend", &src);
+    let text = compact(&out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "Scan::symbols").as_deref(),
+        Some("held:pair-not-shown-disjoint"),
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "optional::syms"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert!(
+        text.contains("letmutsyms:Option<Box<[u32]>>="),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains(
+            "*split=Scan(syms.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr()),"
+        ),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+}
+
+/// **The stand-in review of main 202, HIGH-1: one owner at two positions of
+/// one call.** `Add(syms, syms, n)` with an in-place callee: the formals end
+/// raw late (the pair at the same subject), and a raw view per position takes
+/// two sibling reborrows of the one Box — the second invalidates the first
+/// (Stacked Borrows pops it; under Tree Borrows a write through one disables the
+/// other), so the callee's accesses through the first are UB the input does not
+/// have. `Add::a` is held by the pair at `aliased2`'s call (one static at both
+/// positions, R864-1); `Add::b` stays raw on its own evidence, so the raw
+/// boundary's arm A views the owner there. No late view is rendered where
+/// another argument of the call is rooted at the owner: the call keeps its input
+/// text, and the compile gate takes the caller back.
+#[test]
+fn main202_h1_one_owner_at_two_positions_of_a_call_takes_no_view() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn Add(mut a: *mut u32, mut b: *mut u32, mut n: usize) {{\n\
+    let _k = b as usize;\n\
+    let mut i = 0 as usize;\n\
+    while i < n {{\n\
+        *a.offset(i as isize) = (*a.offset(i as isize)).wrapping_add(*b.offset(i as isize));\n\
+        i = i.wrapping_add(1);\n\
+    }}\n\
+}}\n\
+pub static mut LOW2: [u32; 4] = [0 as u32; 4];\n\
+pub unsafe extern \"C\" fn aliased2() {{\n\
+    Add(LOW2.as_mut_ptr(), LOW2.as_mut_ptr(), 4 as usize);\n\
+}}\n\
+pub unsafe extern \"C\" fn twice(mut m: *mut MemoryManager, n: usize) {{\n\
+    let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    *syms.offset(0 as isize) = 7 as u32;\n\
+    Add(syms, syms, n);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("main202-h1-twice", &src);
+    let text = compact(&out.source);
+    let call = text
+        .find("Add(syms")
+        .map(|at| &text[at..at + text[at..].find(';').unwrap_or(0)])
+        .unwrap_or_default();
+    assert!(
+        call.matches("syms.as_deref_mut()").count() < 2
+            && call.matches("syms.as_mut_ptr()").count() < 2,
+        "two views of one owner in one call: {call}\n{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+}
+
+/// **Relay 321 (main 213 §5): an owner lent to a formal the cascade of a pair
+/// hold makes raw.** At 58, R934-1 (i) holds quadtree's `insert_::tree` (a pair at
+/// `split_node_`'s calls); `quadtree_insert` hands its `tree` whole to `insert_`, so
+/// the cascade holds `quadtree_insert::tree` (`into-held-formal`); the test's
+/// `Option<Box<quadtree>>` lent to `quadtree_insert(tree, …)` then reached the raw
+/// formal bare (7 × `E0308`), and the compile gate's reverts took the Box classes
+/// with CROWN's eight units. Main 202's argument carries over: the pair hold at the
+/// root claims nothing about what the callee does with the pointer it is lent.
+/// Here `Scan::symbols` is held by the pair at `aliased`'s call, `Outer` hands
+/// `symbols` whole to `Scan` beside a fresh local (no pair at its own call), so
+/// the cascade holds `Outer::symbols`, and the lend at `optional` into `Outer`
+/// takes the owner's raw view.
+#[test]
+fn main321_an_owner_lent_to_a_cascade_of_a_pair_hold_takes_its_raw_view() {
+    let src = format!(
+        "{PRELUDE}\
+pub unsafe extern \"C\" fn Scan(mut symbols: *mut u32, mut other: *mut u32, mut n: usize) -> u32 {{\n\
+    let _k = other.offset(0 as isize);\n\
+    let mut i = 0 as usize;\n\
+    let mut max = 0 as u32;\n\
+    while i < n {{\n\
+        if *symbols.offset(i as isize) > max {{ max = *symbols.offset(i as isize); }}\n\
+        i = i.wrapping_add(1);\n\
+    }}\n\
+    *other = max;\n\
+    return max;\n\
+}}\n\
+pub static mut LOW: [u32; 4] = [0 as u32; 4];\n\
+pub unsafe extern \"C\" fn aliased() -> u32 {{\n\
+    return Scan(LOW.as_mut_ptr(), LOW.as_mut_ptr(), 4 as usize);\n\
+}}\n\
+pub unsafe extern \"C\" fn Outer(mut symbols: *mut u32, mut n: usize) -> u32 {{\n\
+    let mut tmp = 0 as u32;\n\
+    return Scan(symbols, &mut tmp, n);\n\
+}}\n\
+pub unsafe extern \"C\" fn optional(mut m: *mut MemoryManager, n: usize, mut split: *mut u32) {{\n\
+    let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    *syms.offset(0 as isize) = 7 as u32;\n\
+    *split = Outer(syms, n);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("main321-cascade-lend", &src);
+    let text = compact(&out.source);
+    assert_eq!(
+        reason_of(&out.degradations, "Scan::symbols").as_deref(),
+        Some("held:pair-not-shown-disjoint"),
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "Outer::symbols").as_deref(),
+        Some("held:into-held-formal"),
+        "{:#?}",
+        out.degradations
+    );
+    assert_eq!(
+        reason_of(&out.degradations, "optional::syms"),
+        None,
+        "{:#?}",
+        out.degradations
+    );
+    assert!(
+        text.contains("letmutsyms:Option<Box<[u32]>>="),
+        "{}",
+        out.source
+    );
+    assert!(
+        text.contains(
+            "*split=Outer(syms.as_deref_mut().map_or(core::ptr::null_mut(),|s|s.as_mut_ptr()),n"
+        ),
+        "{}\n{:#?}",
+        out.source,
+        out.degradations
+    );
+    assert_eq!(out.reverted, 0, "{}\n{:#?}", out.source, out.degradations);
+}
+
+/// **Relay 321's controls: the cascade's root decides.** A cascade rooted in a pair
+/// hold (directly or through a further cascade) takes the late view; one rooted in
+/// a retained-access hold or a release through an indirect call does not, nor a
+/// binding's cascade, a formal the resolver withholds (a retained or released
+/// predicate names it), or a cycle.
+#[test]
+fn main321_only_a_pair_rooted_cascade_takes_the_late_view() {
+    use super::decision::{Decision, Degradation, DegradeReason, seam::into_held_rooted_in_a_pair};
+    let held = |reason: DegradeReason| {
+        Decision::Degraded(Degradation {
+            subject: "-".to_owned(),
+            site: "-".to_owned(),
+            reason,
+        })
+    };
+    let cascade_to = |path: &str, k: usize| {
+        held(DegradeReason::IntoHeldFormal {
+            detail: format!("into-held-formal:{path}#{k}"),
+        })
+    };
+    let pair = held(DegradeReason::PairNotShownDisjoint {
+        detail: "pair-not-shown-disjoint:ref-beside-raw:m::Scan#1:peer#2".to_owned(),
+    });
+    let retained = held(DegradeReason::RetainedAlias {
+        detail: "evident:self-reference:v".to_owned(),
+    });
+    let released = held(DegradeReason::ReleasedThroughIndirectCall {
+        detail: "m::Free#1".to_owned(),
+    });
+    let mid = cascade_to("m::Scan", 1);
+    let looped = cascade_to("m::Loop", 1);
+    let lookup = |path: &str, index: usize| match (path, index) {
+        ("m::Scan", 0) => Some(&pair),
+        ("m::Keep", 0) => Some(&retained),
+        ("m::Free", 0) => Some(&released),
+        ("m::Mid", 0) => Some(&mid),
+        ("m::Loop", 0) => Some(&looped),
+        _ => None,
+    };
+    assert!(into_held_rooted_in_a_pair(
+        "into-held-formal:m::Scan#1",
+        &lookup
+    ));
+    assert!(into_held_rooted_in_a_pair(
+        "into-held-formal:m::Mid#1",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-formal:m::Keep#1",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-formal:m::Free#1",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-binding:m::f::x",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-formal:m::Loop#1",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-formal:m::Withheld#1",
+        &lookup
+    ));
+    assert!(!into_held_rooted_in_a_pair(
+        "into-held-formal:m::Scan#0",
+        &lookup
+    ));
+}
+
+/// **The stand-in review of relay 321 (F1, round 2): the cascade's view is a
+/// certified owner's only** — a unit control. No uncertified owner that reaches
+/// this path was found (a plain `malloc` local lent to a local callee is held at
+/// the boundary and takes no `box_facts` plan), so the narrowing is defence in
+/// depth and is pinned here on the predicate itself. Main 202's direct pair path
+/// does not ask for a certificate.
+#[test]
+fn main321_f1_an_uncertified_owner_takes_no_cascade_view() {
+    use super::decision::{Decision, Degradation, DegradeReason, seam::late_raw_formal};
+    let held = |reason: DegradeReason| {
+        Decision::Degraded(Degradation {
+            subject: "-".to_owned(),
+            site: "-".to_owned(),
+            reason,
+        })
+    };
+    let pair = held(DegradeReason::PairNotShownDisjoint {
+        detail: "pair-not-shown-disjoint:ref-beside-raw:m::Scan#1:peer#2".to_owned(),
+    });
+    let cascade = held(DegradeReason::IntoHeldFormal {
+        detail: "into-held-formal:m::Scan#1".to_owned(),
+    });
+    let lookup = |path: &str, index: usize| match (path, index) {
+        ("m::Scan", 0) => Some(&pair),
+        _ => None,
+    };
+    assert!(late_raw_formal(&cascade, false, true, &lookup));
+    assert!(!late_raw_formal(&cascade, false, false, &lookup));
+    assert!(!late_raw_formal(&cascade, true, true, &lookup));
+    assert!(late_raw_formal(&pair, false, false, &lookup));
+}
+
+/// **wave-6a 160 (relay 160; wave-5d 150o §2): the bracketed construction keeps
+/// the manager's bridge.** brotli's `BrotliCreateZopfliBackwardReferences` at 58:
+/// the caller's `m` is raw (there R934-1 (i) holds it; here a foreign call
+/// sources it, as in `w6a_ac_the_construction_contains_no_edit_of_the_allocator_call`),
+/// `BrotliAllocate::m` is `&mut MemoryManager`, and the C arm bridges the argument
+/// `&mut *m` INSIDE the allocation this rule brackets. The use pass's bracket
+/// re-parsed the walked node's text, so the seam pass met no node at the
+/// argument's span: the bridge was dropped, `BrotliAllocate(m, ..)` stayed raw
+/// (`E0308`), and the compile gate reverted the function.
+#[test]
+fn w6a_160_the_bracketed_allocation_keeps_the_managers_bridge() {
+    let src = format!(
+        "{PRELUDE}\
+extern \"C\" {{\n\
+    fn get_manager() -> *mut MemoryManager;\n\
+}}\n\
+pub unsafe extern \"C\" fn raw_manager(mut n: usize, mut split: *mut u32) {{\n\
+    let mut m = get_manager();\n\
+    let mut syms = if n > 0 as usize {{ BrotliAllocate(m, n.wrapping_mul(::core::mem::size_of::<u32>())) as *mut u32 }} else {{ 0 as *mut u32 }};\n\
+    *syms.offset(0 as isize) = 3 as u32;\n\
+    *split = *syms.offset(0 as isize);\n\
+    BrotliFree(m, syms as *mut std::os::raw::c_void);\n\
+    syms = 0 as *mut u32;\n\
+}}\n"
+    );
+    let out = emitted("w6a-160-raw-manager", &src);
+    let text = compact(&out.source);
+    assert!(
+        text.contains(
+            "Box::from_raw(core::ptr::slice_from_raw_parts_mut(BrotliAllocate(m.as_mut().unwrap(),"
+        ),
+        "the manager's bridge renders inside the bracketed construction:\n{}",
+        out.source
+    );
+    assert_eq!(out.reverted, 0, "{}", out.source);
+}

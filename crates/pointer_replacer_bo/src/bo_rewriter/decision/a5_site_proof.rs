@@ -1,0 +1,515 @@
+//! Attested, site-local A5 proofs consumed by call-seam overlap gates.
+//!
+//! This module interprets the existing [`audit_overlap_site_branches`] output; it
+//! does not classify aliasing itself. Production may derive the index only in
+//! precise mode with the frozen-graph attestation. Every lookup failure is a
+//! typed conservative result.
+
+use std::collections::BTreeMap;
+
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_middle::{mir::BasicBlock, ty::TyCtxt};
+use rustc_span::Span;
+
+use crate::{
+    analyses::borrow_ownership::{
+        crate_slots::CrateSlots,
+        guarded_repair::MirLocationKey,
+        origin_summary::OriginSummaries,
+        overlap_producer::{OverlapSiteBranchAudit, audit_overlap_site_branches},
+        param_overlap::{OverlapMode, PairClass, WholeProgramAttestation},
+    },
+    utils::rustc::RustProgram,
+};
+
+pub(crate) const ATTESTED_WORLD: &str = "closed_world_frozen_graph";
+pub(crate) const ATTESTED_GUARD: &str = "permitted:measurement-frozen-graph-attested";
+
+/// Compiler identity of one argument position covered by an A5 site proof.
+/// Source spans are deliberately absent: the same MIR operand can have
+/// distinct HIR spans in the co-conversion and seam inventories.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct A5ProofSiteKey {
+    pub(crate) caller: LocalDefId,
+    pub(crate) location: MirLocationKey,
+    pub(crate) callee: DefId,
+    pub(crate) argument_index: usize,
+    pub(crate) slot_depth: usize,
+}
+
+impl A5ProofSiteKey {
+    fn new(
+        caller: LocalDefId,
+        location: MirLocationKey,
+        callee: DefId,
+        argument_index: usize,
+        slot_depth: usize,
+    ) -> Self {
+        Self {
+            caller,
+            location,
+            callee,
+            argument_index,
+            slot_depth,
+        }
+    }
+
+    pub(crate) fn receipt_key(self) -> String {
+        format!(
+            "caller={}:bb={}:stmt={}:terminator=1:callee={:?}:arg={}:depth={}",
+            self.caller.local_def_index.as_u32(),
+            self.location.block,
+            self.location.statement_index,
+            self.callee,
+            self.argument_index,
+            self.slot_depth,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum A5SiteProofVerdict {
+    Clear,
+    Overlapping,
+    Undeterminable,
+}
+
+impl A5SiteProofVerdict {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Clear => "clear",
+            Self::Overlapping => "overlapping",
+            Self::Undeterminable => "undeterminable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct A5PeerProof {
+    pub(crate) verdict: A5SiteProofVerdict,
+    pub(crate) reason: &'static str,
+    pub(crate) family: &'static str,
+    pub(crate) location: Option<MirLocationKey>,
+    pub(crate) left_site: Option<A5ProofSiteKey>,
+    pub(crate) right_site: Option<A5ProofSiteKey>,
+}
+
+impl A5PeerProof {
+    fn undeterminable(reason: &'static str) -> Self {
+        Self {
+            verdict: A5SiteProofVerdict::Undeterminable,
+            reason,
+            family: reason,
+            location: None,
+            left_site: None,
+            right_site: None,
+        }
+    }
+
+    pub(crate) fn site_key(&self, argument_index: usize) -> Option<A5ProofSiteKey> {
+        [self.left_site, self.right_site]
+            .into_iter()
+            .flatten()
+            .find(|key| key.argument_index == argument_index)
+    }
+
+    pub(crate) fn receipt(&self, left: usize, right: usize) -> String {
+        let (left, right) = canonical_zero_pair(left, right);
+        format!(
+            "{left}/{right}->{}/{}:{}:{}:{}",
+            left + 1,
+            right + 1,
+            self.verdict.key(),
+            self.reason,
+            self.family,
+        )
+    }
+
+    pub(crate) fn location_key(&self) -> String {
+        self.location.map_or_else(
+            || "-".to_owned(),
+            |location| format!("bb{}:s{}", location.block, location.statement_index),
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedAudit {
+    call_span: Span,
+    proof: A5PeerProof,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct A5SeamProofIndex {
+    rows: BTreeMap<(u32, u32, u32, u32), Vec<ResolvedAudit>>,
+    unavailable: Option<&'static str>,
+    world: &'static str,
+    guard: &'static str,
+    /// wave-6p (R400-4): disjointness certificates consulted when the audited
+    /// verdict is not `Clear`. Absent until attached; never attached to an
+    /// unavailable index, so the certificates ride only the attested world.
+    certificates: Option<super::pair_disjointness::PairDisjointnessIndex>,
+}
+
+impl A5SeamProofIndex {
+    pub(crate) fn derive(
+        program: &RustProgram<'_>,
+        slots: &CrateSlots,
+        origins: Option<&OriginSummaries>,
+        mode: OverlapMode,
+        attestation: Option<WholeProgramAttestation>,
+    ) -> Self {
+        if mode != OverlapMode::PreciseReplay {
+            return Self::unavailable(
+                "seam-a5-mode-not-precise",
+                "-",
+                "refused:a5-mode-not-precise",
+            );
+        }
+        if attestation != Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
+            return Self::unavailable(
+                "seam-a5-attestation-absent",
+                "-",
+                "refused:measurement-frozen-graph-unattested",
+            );
+        }
+        let Some(origins) = origins else {
+            return Self::unavailable(
+                "seam-a5-origins-unavailable",
+                ATTESTED_WORLD,
+                ATTESTED_GUARD,
+            );
+        };
+
+        let audits = audit_overlap_site_branches(program, slots, origins.native_flows());
+        Self::from_audits(program.tcx, program, audits)
+    }
+
+    fn unavailable(reason: &'static str, world: &'static str, guard: &'static str) -> Self {
+        Self {
+            rows: BTreeMap::new(),
+            unavailable: Some(reason),
+            world,
+            guard,
+            certificates: None,
+        }
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.unavailable.is_none()
+    }
+
+    /// Attach the pair-disjointness certificates (wave-6p). A certificate can
+    /// only turn a non-`Clear` audited verdict into `Clear`; it never touches a
+    /// verdict the audit already cleared, and an unavailable index (mode not
+    /// precise, world unattested) keeps every lookup undeterminable exactly as
+    /// before.
+    pub(crate) fn with_pair_certificates(
+        mut self,
+        certificates: super::pair_disjointness::PairDisjointnessIndex,
+    ) -> Self {
+        if self.is_available() {
+            self.certificates = Some(certificates);
+        }
+        self
+    }
+
+    pub(crate) fn pair_certificates(
+        &self,
+    ) -> Option<&super::pair_disjointness::PairDisjointnessIndex> {
+        self.certificates.as_ref()
+    }
+
+    /// **wave-5d 149.** A classifier clear the rewriter refused (R864-1 (b)
+    /// (ii)'s array decay, R838's loaded operand) is asked of the certificates
+    /// again: `lookup` returned the audited clear before asking them, and a
+    /// certificate's proof does not rest on the classifier's origin sets. Two
+    /// decays of ONE array (rule (i)) are never re-asked.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn certify_refused(
+        &self,
+        proof: &mut A5PeerProof,
+        caller: u32,
+        callee: u32,
+        left: usize,
+        right: usize,
+        left_span: Span,
+        right_span: Span,
+    ) {
+        if proof.reason != super::array_decay::OVER_A_DECAY
+            && proof.reason != super::loaded_operand::REASON
+        {
+            return;
+        }
+        let Some(certificates) = &self.certificates else {
+            return;
+        };
+        if let Ok(kind) = certificates.certify(caller, callee, left, right, left_span, right_span) {
+            proof.verdict = A5SiteProofVerdict::Clear;
+            proof.reason = kind.key();
+            proof.family = family_of(
+                certificates,
+                kind,
+                caller,
+                callee,
+                left,
+                right,
+                left_span,
+                right_span,
+            );
+        }
+    }
+
+    fn from_audits(
+        tcx: TyCtxt<'_>,
+        program: &RustProgram<'_>,
+        audits: Vec<OverlapSiteBranchAudit>,
+    ) -> Self {
+        let functions = program
+            .functions
+            .iter()
+            .copied()
+            .map(|did| (did.local_def_index.as_u32(), did))
+            .collect::<BTreeMap<_, _>>();
+        let mut rows = BTreeMap::<(u32, u32, u32, u32), Vec<ResolvedAudit>>::new();
+        for audit in audits {
+            let caller = functions[&audit.caller];
+            let body = tcx.mir_drops_elaborated_and_const_checked(caller).borrow();
+            let block = BasicBlock::from_u32(audit.block);
+            let data = &body.basic_blocks[block];
+            let call_span = data.terminator().source_info.span.source_callsite();
+            let location = MirLocationKey::new(audit.block, data.statements.len());
+            let callee = functions[&audit.target];
+            let proof = proof_from_audit(&audit, caller, callee.to_def_id(), location);
+            rows.entry((
+                audit.caller,
+                audit.target,
+                audit.left_parameter,
+                audit.right_parameter,
+            ))
+            .or_default()
+            .push(ResolvedAudit { call_span, proof });
+        }
+        for bucket in rows.values_mut() {
+            bucket.sort_by_key(|row| (row.call_span.lo(), row.call_span.hi(), row.proof.location));
+        }
+        Self {
+            rows,
+            unavailable: None,
+            world: ATTESTED_WORLD,
+            guard: ATTESTED_GUARD,
+            certificates: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lookup(
+        &self,
+        caller: u32,
+        callee: u32,
+        left: usize,
+        right: usize,
+        left_span: Span,
+        right_span: Span,
+    ) -> A5PeerProof {
+        if let Some(reason) = self.unavailable {
+            return A5PeerProof::undeterminable(reason);
+        }
+        let audited = self.audited(caller, callee, left, right, left_span, right_span);
+        if audited.verdict == A5SiteProofVerdict::Clear {
+            return audited;
+        }
+        let Some(certificates) = &self.certificates else {
+            return audited;
+        };
+        match certificates.certify(caller, callee, left, right, left_span, right_span) {
+            Ok(kind) => A5PeerProof {
+                verdict: A5SiteProofVerdict::Clear,
+                reason: kind.key(),
+                // R619-4: the family names each side's root class; P11's
+                // names the premise.
+                family: family_of(
+                    certificates,
+                    kind,
+                    caller,
+                    callee,
+                    left,
+                    right,
+                    left_span,
+                    right_span,
+                ),
+                location: audited.location,
+                left_site: audited.left_site,
+                right_site: audited.right_site,
+            },
+            // The audited verdict and its reason stay byte-identical for an
+            // unproved pair; the `why` lives in the certificate ledger.
+            Err(_) => audited,
+        }
+    }
+
+    fn audited(
+        &self,
+        caller: u32,
+        callee: u32,
+        left: usize,
+        right: usize,
+        left_span: Span,
+        right_span: Span,
+    ) -> A5PeerProof {
+        let (left, right) = canonical_one_pair(left, right);
+        let Some(candidates) = self.rows.get(&(caller, callee, left, right)) else {
+            return A5PeerProof::undeterminable("seam-a5-site-unresolved");
+        };
+        let left_span = left_span.source_callsite();
+        let right_span = right_span.source_callsite();
+        let matched = candidates
+            .iter()
+            .filter(|row| row.call_span.contains(left_span) && row.call_span.contains(right_span))
+            .collect::<Vec<_>>();
+        match matched.as_slice() {
+            [row] => row.proof.clone(),
+            [] => A5PeerProof::undeterminable("seam-a5-site-unresolved"),
+            _ => A5PeerProof::undeterminable("seam-a5-site-ambiguous"),
+        }
+    }
+
+    pub(crate) fn world(&self) -> &'static str {
+        self.world
+    }
+
+    pub(crate) fn guard(&self) -> &'static str {
+        self.guard
+    }
+}
+
+fn proof_from_audit(
+    audit: &OverlapSiteBranchAudit,
+    caller: LocalDefId,
+    callee: DefId,
+    location: MirLocationKey,
+) -> A5PeerProof {
+    let (verdict, reason) = if audit.family == "projection-disjoint" {
+        (A5SiteProofVerdict::Clear, "projection-disjoint")
+    } else {
+        match audit.classifier {
+            Some(PairClass::ProvenDisjoint) => (A5SiteProofVerdict::Clear, "a5-proven-disjoint"),
+            Some(PairClass::NotProvenDisjoint) => {
+                (A5SiteProofVerdict::Overlapping, "a5-not-proven-disjoint")
+            }
+            None => (A5SiteProofVerdict::Undeterminable, audit.family),
+        }
+    };
+    A5PeerProof {
+        verdict,
+        reason,
+        family: audit.family,
+        location: Some(location),
+        left_site: Some(A5ProofSiteKey::new(
+            caller,
+            location,
+            callee,
+            audit.left_parameter.saturating_sub(1) as usize,
+            0,
+        )),
+        right_site: Some(A5ProofSiteKey::new(
+            caller,
+            location,
+            callee,
+            audit.right_parameter.saturating_sub(1) as usize,
+            0,
+        )),
+    }
+}
+
+fn canonical_zero_pair(left: usize, right: usize) -> (usize, usize) {
+    (left.min(right), left.max(right))
+}
+
+fn canonical_one_pair(left: usize, right: usize) -> (u32, u32) {
+    let (left, right) = canonical_zero_pair(left, right);
+    ((left + 1) as u32, (right + 1) as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn n5_zero_based_seam_pair_maps_once_to_one_based_a5_pair() {
+        assert_eq!(canonical_zero_pair(1, 0), (0, 1));
+        assert_eq!(canonical_one_pair(0, 1), (1, 2));
+        let proof = A5PeerProof {
+            verdict: A5SiteProofVerdict::Clear,
+            reason: "a5-proven-disjoint",
+            family: "excluded-proven-disjoint",
+            location: Some(MirLocationKey::new(4, 7)),
+            left_site: None,
+            right_site: None,
+        };
+        assert_eq!(
+            proof.receipt(1, 0),
+            "0/1->1/2:clear:a5-proven-disjoint:excluded-proven-disjoint"
+        );
+    }
+
+    #[test]
+    fn a5_proof_site_key_uses_compiler_identity_not_source_spans() {
+        let caller = rustc_hir::def_id::CRATE_DEF_ID;
+        let key = A5ProofSiteKey::new(caller, MirLocationKey::new(4, 7), caller.to_def_id(), 1, 0);
+        assert_eq!(key, key);
+        let receipt = key.receipt_key();
+        assert!(
+            receipt.starts_with("caller=0:bb=4:stmt=7:terminator=1:callee=DefId(0:0"),
+            "{receipt}"
+        );
+        assert!(receipt.ends_with(":arg=1:depth=0"), "{receipt}");
+        let later =
+            A5ProofSiteKey::new(caller, MirLocationKey::new(4, 7), caller.to_def_id(), 2, 0);
+        assert_ne!(key, later);
+        assert!(key.receipt_key() < later.receipt_key());
+        let proof = A5PeerProof {
+            verdict: A5SiteProofVerdict::Overlapping,
+            reason: "a5-not-proven-disjoint",
+            family: "recorded-risky",
+            location: Some(key.location),
+            left_site: Some(key),
+            right_site: Some(later),
+        };
+        assert_eq!(proof.site_key(1), Some(key));
+        assert_eq!(proof.site_key(2), Some(later));
+        assert_eq!(proof.site_key(3), None);
+    }
+
+    #[test]
+    fn n4_missing_peer_fact_is_undeterminable_not_clear() {
+        let index = A5SeamProofIndex::unavailable(
+            "seam-a5-site-unresolved",
+            ATTESTED_WORLD,
+            ATTESTED_GUARD,
+        );
+        let proof = index.lookup(1, 2, 0, 1, Span::default(), Span::default());
+        assert_eq!(proof.verdict, A5SiteProofVerdict::Undeterminable);
+        assert_eq!(proof.reason, "seam-a5-site-unresolved");
+    }
+}
+
+/// The certificate's family: the roots of each side, or P11's premise.
+#[allow(clippy::too_many_arguments)]
+fn family_of(
+    certificates: &super::pair_disjointness::PairDisjointnessIndex,
+    kind: super::pair_disjointness::CertificateKind,
+    caller: u32,
+    callee: u32,
+    left: usize,
+    right: usize,
+    left_span: Span,
+    right_span: Span,
+) -> &'static str {
+    match kind {
+        super::pair_disjointness::CertificateKind::GlobalOrIntegerPremise(_) => {
+            super::pair_disjointness::PREMISE_FAMILY
+        }
+        _ => certificates.certificate_family(caller, callee, left, right, left_span, right_span),
+    }
+}

@@ -1,0 +1,129 @@
+//! Wave-6o (relay 121, R738-1): an optional reference (`Option<&T>` /
+//! `Option<&mut T>`) passed to a formal that stays raw needs the optional
+//! form's bridge, `x.map_or(core::ptr::null(), |r| r as *const T)` (resp.
+//! `null_mut()` / `*mut T`), as a plain `&T` takes `ptr::from_ref`. brotli's
+//! `CopyStat` (L01¹² diagnostic, lib.rs:493854): `input_path` / `output_path`
+//! are null-tested, so optional, and handed to libc's `stat` / `utime`, whose
+//! formals are `*const c_char`.
+use super::{emit_tests::ast_emitted_source_of, verify};
+
+const FOREIGN: &str = r#"
+#![allow(dead_code, unused_mut, non_snake_case, non_camel_case_types)]
+#[repr(C)] pub struct stat_t { pub st_dev: u64, pub st_mode: u32 }
+#[repr(C)] pub struct utimbuf { pub actime: i64 }
+extern "C" {
+    fn __xstat(__ver: i32, __filename: *const i8, __stat_buf: *mut stat_t) -> i32;
+    fn utime(__file: *const i8, __file_times: *const utimbuf) -> i32;
+}
+#[inline]
+unsafe extern "C" fn stat(mut __path: *const i8, mut __statbuf: *mut stat_t) -> i32 {
+    return __xstat(1 as i32, __path, __statbuf);
+}
+unsafe extern "C" fn CopyStat(mut input_path: *const i8, mut output_path: *const i8) {
+    let mut statbuf = stat_t { st_dev: 0, st_mode: 0 };
+    let mut times = utimbuf { actime: 0 };
+    if input_path.is_null() || output_path.is_null() { return; }
+    if stat(input_path, &mut statbuf) != 0 as i32 { return; }
+    utime(output_path, &mut times);
+}
+unsafe fn CloseFiles(mut a: *const i8, mut b: *const i8) {
+    CopyStat(a, b);
+}
+"#;
+
+/// The control: the same path argument also reaches libc `chmod`, whose path
+/// the fatness table already types as a C string, and is indexed once (op facts
+/// govern the slice form, fatness corroborates: S3.2′-2), so `input_path` is
+/// FAT (`Option<&[i8]>`) and carries its extent: the bridge into the raw formal
+/// was built (`OptSliceToRaw`, `.as_ptr()`).
+///
+/// Under R829-1 / R861-1 (relay 297, main 188) no bridge is planned here:
+/// `stat::__path` is held raw beside the written `__statbuf` formal at `__xstat`
+/// (`held:pair-not-shown-disjoint`), and `CopyStat::input_path`, handed whole
+/// to that held formal, is decided raw too (`held:into-held-formal`). No bridge
+/// is planned into a formal that was safe in the raw boundary's hypothesis; the
+/// frame's `OptSliceToRaw` bridge came from the class revert's outbound input
+/// form. `input_path` keeps its raw `*const i8` and reaches `stat` and `chmod`
+/// bare. The name is kept.
+#[test]
+fn wave6o_fat_optional_into_a_local_raw_formal_is_bridged() {
+    let input = FOREIGN
+        .replace(
+            "    fn utime(__file: *const i8, __file_times: *const utimbuf) -> i32;\n",
+            "    fn utime(__file: *const i8, __file_times: *const utimbuf) -> i32;\n    fn chmod(__file: *const i8, __mode: u32) -> i32;\n",
+        )
+        .replace(
+            "    if stat(input_path, &mut statbuf) != 0 as i32 { return; }\n",
+            "    if *input_path.offset(1 as isize) == 0 as i8 { return; }\n    if stat(input_path, &mut statbuf) != 0 as i32 { return; }\n    chmod(input_path, statbuf.st_mode);\n",
+        );
+    assert!(verify::type_checks_str(&input));
+    let output = ast_emitted_source_of(&input).expect("native emission");
+    let flat = output.split_whitespace().collect::<String>();
+    // R829-1 (relay 297, main 188): stat::__path is held beside the written
+    // __statbuf at __xstat, and CopyStat::input_path is held into that formal
+    // (held:into-held-formal); `input_path: Option<&[i8]>` bridged by
+    // `.as_ptr()` -> the raw `input_path: *const i8` passed bare.
+    assert!(
+        flat.contains("fnCopyStat(mutinput_path:*consti8"),
+        "{output}"
+    );
+    assert!(flat.contains("fnstat(mut__path:*consti8"), "{output}");
+    assert!(flat.contains("stat(input_path,&mutstatbuf)"), "{output}");
+    assert!(
+        flat.contains("chmod(input_path,statbuf.st_mode)"),
+        "{output}"
+    );
+    assert!(!flat.contains("input_path:Option<&[i8]>"), "{output}");
+    assert!(!flat.contains("as_ptr()"), "{output}");
+    assert!(verify::type_checks_str(&output), "{output}");
+}
+
+const MUT_FORMAL: &str = r#"
+#![allow(dead_code, unused_mut)]
+unsafe fn fill(mut p: *mut i32, mut q: *const i32, mut path: *const i8) -> i32 { 0 }
+"#;
+
+/// The arm's selection, both directions: a THIN optional at a raw formal is
+/// held (`held:thin-cstring-to-libc` at a `c_char` pointee,
+/// `held:thin-optional-to-raw-formal` otherwise); a FAT optional is bridged by
+/// the raw boundary's slice template, `*mut` and `*const`; a shared fat
+/// optional at `*mut` is refused shared-to-mut.
+#[test]
+fn wave6o_optional_into_a_raw_formal_selects_by_the_formal_type() {
+    use super::decision::seam::{Form, optional_into_raw_formal_for_tests as bridge};
+    ::utils::compilation::run_compiler_on_str(MUT_FORMAL, |tcx| {
+        let fill = tcx
+            .hir_body_owners()
+            .find(|d| tcx.item_name(d.to_def_id()).as_str() == "fill")
+            .expect("fill");
+        let thin = |mutable| Form::Opt {
+            mutable,
+            slice: false,
+        };
+        let fat = |mutable| Form::Opt {
+            mutable,
+            slice: true,
+        };
+        assert_eq!(
+            bridge(tcx, fill, 0, thin(true), "q").as_deref(),
+            Err(&"held:thin-optional-to-raw-formal")
+        );
+        assert_eq!(
+            bridge(tcx, fill, 2, thin(false), "q").as_deref(),
+            Err(&"held:thin-cstring-to-libc")
+        );
+        assert_eq!(
+            bridge(tcx, fill, 0, fat(true), "q").as_deref(),
+            Ok("q.as_deref_mut().map_or(core::ptr::null_mut::<i32>(), |slice| slice.as_mut_ptr())")
+        );
+        assert_eq!(
+            bridge(tcx, fill, 2, fat(false), "q").as_deref(),
+            Ok("q.as_deref().map_or(core::ptr::null::<i8>(), |slice| slice.as_ptr())")
+        );
+        assert_eq!(
+            bridge(tcx, fill, 0, fat(false), "q").as_deref(),
+            Err(&"seam-shared-to-mut")
+        );
+    })
+    .expect("fixture compiler context");
+}

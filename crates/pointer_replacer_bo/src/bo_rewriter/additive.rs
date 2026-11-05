@@ -1,0 +1,1913 @@
+//! R220: family transactions retain a terminal predecessor before expansion.
+//! Policies and snapshots are derived from compiler state, never a corpus ledger.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use rustc_hir::{HirId, def_id::LocalDefId};
+use rustc_span::Span;
+
+use super::{bridge_receipt::SignatureClassId, decision, plan};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum FamilyStage {
+    Core,
+    SliceConstruction,
+    SliceUse,
+    Option,
+    Declaration,
+    Return,
+    Ownership,
+}
+
+impl FamilyStage {
+    pub(crate) fn previous(self) -> Option<Self> {
+        match self {
+            Self::Core => None,
+            Self::SliceConstruction => Some(Self::Core),
+            Self::SliceUse => Some(Self::SliceConstruction),
+            Self::Option => Some(Self::SliceUse),
+            Self::Declaration => Some(Self::Option),
+            Self::Return => Some(Self::Declaration),
+            Self::Ownership => Some(Self::Return),
+        }
+    }
+
+    pub(crate) fn next(self) -> Option<Self> {
+        match self {
+            Self::Core => Some(Self::SliceConstruction),
+            Self::SliceConstruction => Some(Self::SliceUse),
+            Self::SliceUse => Some(Self::Option),
+            Self::Option => Some(Self::Declaration),
+            Self::Declaration => Some(Self::Return),
+            Self::Return => Some(Self::Ownership),
+            Self::Ownership => None,
+        }
+    }
+}
+
+pub(crate) type SubjectKey = (LocalDefId, HirId);
+
+pub(crate) struct FamilyPolicy {
+    pub(crate) stage: FamilyStage,
+    pub(crate) withdrawn: BTreeSet<(FamilyStage, SignatureClassId)>,
+    /// R397-6(a): a candidate that failed terminally is excluded at the
+    /// selection input for exactly its own identity. Its owner and every
+    /// sibling keep the stage, so the deterministic pipeline re-derives their
+    /// prior result instead of the whole family falling back.
+    /// Keyed by the binding's item-local id: the owner fixes the `HirId` owner.
+    pub(crate) withdrawn_subjects: BTreeSet<(FamilyStage, SignatureClassId, u32)>,
+    /// **R500-4.** Which anchor asked for each subject-scoped withdrawal. Kept
+    /// BESIDE `withdrawn_subjects` rather than inside its key so that
+    /// `enabled`, `enabled_for` and `exclusions` — which the whole family loop
+    /// reads — keep their exact meaning and their exact arithmetic.
+    pub(crate) withdrawal_anchors: BTreeMap<(FamilyStage, SignatureClassId, u32), SignatureClassId>,
+    /// **R500-4.** Owners that recorded `interface-path-unresolved:` at a stage:
+    /// a restore anchor with nothing of its own to retire, which reached a
+    /// neighbour instead. Its later re-asks are guesses, not new evidence.
+    pub(crate) unresolved_anchors: BTreeSet<(FamilyStage, SignatureClassId)>,
+}
+
+impl FamilyPolicy {
+    pub(crate) fn at(stage: FamilyStage) -> Self {
+        Self {
+            stage,
+            withdrawn: BTreeSet::new(),
+            withdrawn_subjects: BTreeSet::new(),
+            withdrawal_anchors: BTreeMap::new(),
+            unresolved_anchors: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn enabled(&self, owner: LocalDefId, family: FamilyStage) -> bool {
+        // Each later stage may retry older mechanics with the newly available
+        // carrier. Withdrawing that transaction restores the exact predecessor
+        // profile, including its earlier withdrawals, rather than permanently
+        // banning a family that a later construction/composition can support.
+        let owner = SignatureClassId::of(owner);
+        let mut stage = self.stage;
+        while self.withdrawn.contains(&(stage, owner)) {
+            let Some(previous) = stage.previous() else { return false };
+            stage = previous;
+        }
+        family <= stage
+    }
+
+    /// The (owner, subject)-scoped gate: an owner-level withdrawal or this
+    /// subject's own exclusion at a stage both drop the subject to that stage's
+    /// predecessor profile; a sibling's exclusion never does.
+    pub(crate) fn enabled_for(&self, subject: SubjectKey, family: FamilyStage) -> bool {
+        let owner = SignatureClassId::of(subject.0);
+        let mut stage = self.stage;
+        while self.withdrawn.contains(&(stage, owner))
+            || self
+                .withdrawn_subjects
+                .contains(&(stage, owner, subject.1.local_id.as_u32()))
+        {
+            let Some(previous) = stage.previous() else { return false };
+            stage = previous;
+        }
+        family <= stage
+    }
+
+    /// Strict transaction progress counts both scopes.
+    pub(crate) fn exclusions(&self) -> usize {
+        self.withdrawn.len() + self.withdrawn_subjects.len()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StageSnapshot {
+    pub(crate) table: decision::DecisionTable,
+    pub(crate) plan: plan::Plan,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FamilyWithdrawal {
+    /// **035 clause (3).** A row the loop RECORDS and does not act on: the
+    /// terminal named no participant, so there is nothing this rule may
+    /// retire. It carries `interface-path-unresolved:<terminal>` and excludes
+    /// nothing; the per-function verify gate bounds the residual risk of the
+    /// interface it leaves standing.
+    pub(crate) unresolved: bool,
+    pub(crate) owner: SignatureClassId,
+    pub(crate) cause: String,
+    /// Empty: the owner falls back (R220). Otherwise exactly these candidates
+    /// of `owner` are excluded at the selection input (R397-6(a)).
+    pub(crate) subjects: Vec<HirId>,
+    /// **R500-4.** The anchor whose loss this request answers, when one asked.
+    pub(crate) anchor: Option<SignatureClassId>,
+}
+
+/// A concrete old rendering error, tied to one binding and its actual site.
+/// The ordinary production path registers none: refusal labels are not proof.
+pub(crate) struct SoundnessWithdrawal {
+    subject: (LocalDefId, HirId),
+    null_construction: Span,
+}
+
+impl SoundnessWithdrawal {
+    #[cfg(test)]
+    pub(crate) fn null_required_reference(
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        constructions: &decision::construction::ConstructionFacts,
+        prior: &StageSnapshot,
+        subject: (LocalDefId, HirId),
+    ) -> Option<Self> {
+        let (old, form) = prior
+            .table
+            .entries
+            .iter()
+            .find(|(s, _)| (s.fn_did, s.hir_id) == subject)?;
+        let required = match form {
+            decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => true,
+            decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_)
+            | decision::Decision::NestedSlice { .. }
+            | decision::Decision::Cursor { .. }
+            | decision::Decision::Degraded(_) => false,
+        };
+        if !required || !old.null_init {
+            return None;
+        }
+        let initializer = *constructions.init_hirs.get(&subject)?;
+        if !decision::emitability::is_zero_literal(tcx.hir_node(initializer).expect_expr()) {
+            return None;
+        }
+        Some(Self {
+            subject,
+            null_construction: *constructions.init_spans.get(&subject)?,
+        })
+    }
+}
+
+fn safe(decision: &decision::Decision) -> bool {
+    match decision {
+        decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Box(_)
+        | decision::Decision::NestedSlice { .. }
+        | decision::Decision::Cursor { .. } => true,
+        decision::Decision::Degraded(_) => false,
+    }
+}
+
+fn applied(
+    snapshot: &StageSnapshot,
+    subject: &decision::Subject,
+    decision: &decision::Decision,
+) -> bool {
+    safe(decision)
+        && snapshot
+            .plan
+            .class_finalization
+            .classes
+            .get(&SignatureClassId::of(subject.fn_did))
+            .is_some_and(plan::SignatureClassPlan::is_ready)
+}
+
+/// Protection uses a conservative superset of delivery: prior terminally
+/// prepared safe declarations. Only the emitted-tree custody instrument counts
+/// delivery; this planner never substitutes a Ready bit for that measurement.
+fn losses<'a>(
+    prior: &'a StageSnapshot,
+    candidate: &StageSnapshot,
+    soundness: &[SoundnessWithdrawal],
+    policy: &FamilyPolicy,
+) -> Vec<&'a decision::Subject> {
+    // The candidate's degrade reason for a subject, if degraded.
+    fn reason_of(
+        candidate: &StageSnapshot,
+        key: (LocalDefId, HirId),
+    ) -> Option<decision::DegradeReason> {
+        candidate
+            .table
+            .entries
+            .iter()
+            .find(|(s, _)| (s.fn_did, s.hir_id) == key)
+            .and_then(|(_, d)| match d {
+                decision::Decision::Degraded(record) => Some(record.reason.clone()),
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_)
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Cursor { .. } => None,
+            })
+    }
+    // R819-1 / R824-2: the candidate's stage withdrew this subject's Option
+    // stage and it fell back to raw on its own null evidence.
+    let withdrawn_by_null = |subject: &decision::Subject| {
+        decision::option_stage_withdrawn(policy, subject)
+            && reason_of(candidate, (subject.fn_did, subject.hir_id))
+                == Some(decision::DegradeReason::NullInit)
+    };
+    prior
+        .table
+        .entries
+        .iter()
+        .filter_map(|(subject, old)| {
+            if !applied(prior, subject, old) {
+                return None;
+            }
+            let key = (subject.fn_did, subject.hir_id);
+            let now = candidate
+                .table
+                .entries
+                .iter()
+                .find(|(s, _)| (s.fn_did, s.hir_id) == key);
+            // **Relay 297 (main 187, D5 (a)).** A subject a settled-table hold
+            // decides raw is a ruled loss, never a family regression to restore:
+            // the pending hold reads the emitted program's forms only from the
+            // Declaration stage on, so its first holds there are not losses of
+            // the earlier stages' deliveries.
+            let held = now.is_some_and(|(_, d)| decision::settled_holds::is_settled_hold(d));
+            let survives = held || now.is_some_and(|(s, d)| applied(candidate, s, d));
+            let required_null = subject.null_init
+                && match old {
+                    decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => true,
+                    decision::Decision::Slice { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Box(_)
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Cursor { .. }
+                    | decision::Decision::Degraded(_) => false,
+                };
+            let witnessed = required_null
+                && soundness
+                    .iter()
+                    .any(|proof| proof.subject == key && !proof.null_construction.is_dummy());
+            // R819-1 / R824-2 (§29): with its Option stage withdrawn, a subject
+            // with its own null evidence falls back to raw rather than keep a
+            // NON-OPTIONAL form; that withdrawal is the soundness rule, not a
+            // lost delivery. A valid optional prior stays protected (R220).
+            let non_optional_prior = match old {
+                decision::Decision::Opt { .. } | decision::Decision::Degraded(_) => false,
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Box(_)
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Cursor { .. } => true,
+            };
+            // ... and only where the candidate's stage did withdraw the
+            // subject's Option stage (the review's MED 5): the label alone is
+            // not the rule.
+            let null_withdrawn = non_optional_prior && withdrawn_by_null(subject);
+            // The knock-on, anchored (relay 182 item 4, the attach::r abort):
+            // a raw view at a call where a subject of the caller, or a formal
+            // of the callee, was null-withdrawn at this stage is R833-1's
+            // consequence of that withdrawal (its peer went raw), not a lost
+            // delivery.
+            let pair_knock_on = non_optional_prior
+                && reason_of(candidate, key) == Some(decision::DegradeReason::PairRawView)
+                && candidate
+                    .table
+                    .seams
+                    .pair_raw_calls
+                    .iter()
+                    .map(|call| (call.caller, call.callee))
+                    .chain(
+                        candidate
+                            .table
+                            .seams
+                            .a5_raw_calls
+                            .iter()
+                            .map(|call| (call.caller, call.callee)),
+                    )
+                    .any(|(caller, callee)| {
+                        callee == subject.fn_did
+                            && candidate.table.entries.iter().any(|(other, _)| {
+                                (other.fn_did == caller
+                                    || (other.fn_did == callee
+                                        && matches!(
+                                            other.kind,
+                                            decision::SubjectKind::Param { .. }
+                                        )))
+                                    && withdrawn_by_null(other)
+                            })
+                    });
+            (!survives && !witnessed && !null_withdrawn && !pair_knock_on).then_some(subject)
+        })
+        .collect()
+}
+
+pub(crate) fn preservation_error(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    soundness: &[SoundnessWithdrawal],
+    policy: &FamilyPolicy,
+) -> Option<String> {
+    let lost = losses(prior, candidate, soundness, policy);
+    (!lost.is_empty()).then(|| {
+        format!(
+            "additive-family-preservation-invariant:unrestored:{:?}",
+            lost.iter()
+                .map(|s| (s.fn_did.local_def_index.as_u32(), s.local.as_u32()))
+                .collect::<Vec<_>>()
+        )
+    })
+}
+
+fn class_changed(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    owner: SignatureClassId,
+) -> bool {
+    let sites = |snapshot: &StageSnapshot| {
+        snapshot
+            .plan
+            .class_finalization
+            .classes
+            .get(&owner)
+            .map(|class| {
+                class
+                    .sites
+                    .iter()
+                    .map(|site| (site.key.clone(), site.edit_key.clone(), site.state.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    sites(prior) != sites(candidate)
+        || prior
+            .plan
+            .class_finalization
+            .classes
+            .get(&owner)
+            .map(|c| &c.depends_on)
+            != candidate
+                .plan
+                .class_finalization
+                .classes
+                .get(&owner)
+                .map(|c| &c.depends_on)
+        || prior
+            .table
+            .entries
+            .iter()
+            .filter(|(s, _)| s.fn_did == owner.local_def_id())
+            .ne(candidate
+                .table
+                .entries
+                .iter()
+                .filter(|(s, _)| s.fn_did == owner.local_def_id()))
+}
+
+/// Which owners the R220 generator would have withdrawn, before R397-6(a)
+/// scopes each of them to the candidates that actually moved.
+enum Anchor {
+    /// The owner carries a new terminal of its own (a collision, a dropped
+    /// site, an unwitnessed refusal, a new dependency, a changed disposition).
+    /// The terminal sites are carried so the exclusion can be attributed to
+    /// exactly the candidates they name — ALL new terminal sites of the owner,
+    /// never the first alone: a call that drops one site per contracted
+    /// position (wave-6v's `seam-site-overlap`) names every position, and
+    /// excluding one of them would leave a live view beside a raw access.
+    Direct(Vec<super::bridge_receipt::BridgeSiteKey>),
+    /// **R798-3.** An unwitnessed `blocked-subject:<reason>` refusal, carrying
+    /// the class's subjects degraded for that reason that still require an
+    /// arm. The refusal names no site, and the class used to be the
+    /// participant whole; the blockers let the re-derivation retire only the
+    /// candidates whose own edits touch them.
+    Blocked(Vec<HirId>),
+    /// A prior delivery of this owner is lost and the owner itself has no
+    /// transaction left to withdraw: the cause is elsewhere in its interface
+    /// component.
+    Restore,
+}
+
+type RelatedGraph = BTreeMap<SignatureClassId, BTreeSet<SignatureClassId>>;
+
+fn related_graph(candidate: &StageSnapshot) -> RelatedGraph {
+    use super::bridge_receipt::BridgeCalleeId;
+    let mut related_graph = RelatedGraph::new();
+    let mut connect = |left, right| {
+        if left != right {
+            related_graph.entry(left).or_default().insert(right);
+            related_graph.entry(right).or_default().insert(left);
+        }
+    };
+    for edit in &candidate.table.seams.edits {
+        connect(SignatureClassId::of(edit.bridge.caller), edit.owner_class);
+    }
+    for &(left, right) in candidate
+        .table
+        .seams
+        .interface_dependencies
+        .iter()
+        .chain(&candidate.table.seams.generated_item_dependencies)
+    {
+        connect(left, right);
+    }
+    for class in candidate.plan.class_finalization.classes.values() {
+        for &dependency in &class.depends_on {
+            connect(class.id, dependency);
+        }
+        for site in &class.sites {
+            connect(class.id, SignatureClassId::of(site.key.caller));
+            if let BridgeCalleeId::Local(callee) = site.key.callee {
+                connect(class.id, SignatureClassId::of(callee));
+            }
+        }
+    }
+    related_graph
+}
+
+/// The candidates of `owner` at this stage: subjects whose candidate decision
+/// is a safe form that differs from the predecessor's (or is new), and that are
+/// not already excluded at this stage. A loss is a symptom, never a candidate.
+fn moved(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    policy: &FamilyPolicy,
+    owner: SignatureClassId,
+) -> Vec<HirId> {
+    candidate
+        .table
+        .entries
+        .iter()
+        .filter(|(subject, decision)| {
+            subject.fn_did == owner.local_def_id()
+                && safe(decision)
+                && policy.enabled_for((subject.fn_did, subject.hir_id), policy.stage)
+                && prior
+                    .table
+                    .entries
+                    .iter()
+                    .find(|(s, _)| (s.fn_did, s.hir_id) == (subject.fn_did, subject.hir_id))
+                    .is_none_or(|(_, old)| old != decision)
+        })
+        .map(|(subject, _)| subject.hir_id)
+        .collect()
+}
+
+/// **R500-4 — a guess re-asked is not new evidence; a guess that worked is.**
+///
+/// Report 061 traced the withdrawal channel to a self-feeding loop: `moved`
+/// compares the candidate against the PRIOR snapshot, and the prior snapshot is
+/// the previous stage's OUTPUT, so a subject this loop withdrew at stage S
+/// reads `raw` in the prior at S+1 and `safe` in the candidate — the shape
+/// `moved` calls a move. `enabled_for` is keyed on the CURRENT stage only, so
+/// nothing suppresses the repeat, and its walk-back is chained, so four
+/// consecutive steps roll the subject back past `SliceConstruction` to raw.
+/// brotli's `HashBytesH10::data#1` is taken back four times by ONE anchor
+/// (1244) whose own interface path never resolves at any stage of any frame.
+///
+/// Suppressing EVERY repeat was built and refuted three ways (report 061): two
+/// standing pins go red — `binn_emits_the_prior_deliveries_with_the_candidate_excluded`,
+/// whose delivery the restore arm's own comment says only that step recovers,
+/// and `r424_typed_view_pending_source` — and brotli loses 37 realized subjects
+/// with two new `E0596`s. A repeat is sometimes the step that does the work.
+///
+/// So the condition is the one the evidence separates them by: suppress only
+/// when the SAME anchor re-asks AND that anchor has itself recorded
+/// `interface-path-unresolved:` — it had nothing of its own to retire and
+/// reached for a neighbour's candidate on a hypothesis. That is hq exactly. An
+/// anchor that resolved its own path, or a different anchor arriving at the
+/// same subject with its own reason, is untouched.
+fn unwithdrawn(
+    policy: &FamilyPolicy,
+    anchor: SignatureClassId,
+    owner: SignatureClassId,
+    subjects: Vec<HirId>,
+) -> Vec<HirId> {
+    subjects
+        .into_iter()
+        .filter(|hir_id| {
+            !policy
+                .withdrawal_anchors
+                .iter()
+                .any(|((stage, class, local), asked_by)| {
+                    *class == owner
+                        && *local == hir_id.local_id.as_u32()
+                        && *stage < policy.stage
+                        && *asked_by == anchor
+                        && policy
+                            .unresolved_anchors
+                            .iter()
+                            .any(|(seen, unresolved)| *unresolved == anchor && seen <= stage)
+                })
+        })
+        .collect()
+}
+
+/// The candidates of `anchor` a terminal site names: a call INTO the anchor
+/// dropped or collided at `arg{N}` names the anchor's parameter `N` (wave-4's
+/// `copyFileName::from` at the caller's `arg1`, while `to` at `arg0` is
+/// untouched); a surface / address site names its subject outright. Empty
+/// when the site names no candidate of the anchor's own.
+fn named_by(
+    candidate: &StageSnapshot,
+    anchor: SignatureClassId,
+    site: &super::bridge_receipt::BridgeSiteKey,
+) -> Vec<HirId> {
+    use super::bridge_receipt::BridgeCalleeId;
+    let subjects = candidate
+        .table
+        .entries
+        .iter()
+        .filter(|(subject, _)| subject.fn_did == anchor.local_def_id());
+    if site.callee == BridgeCalleeId::Local(anchor.local_def_id())
+        && let Some(index) = site.position.strip_prefix("arg")
+        && let Ok(index) = index.parse::<usize>()
+    {
+        return subjects
+            .filter(|(subject, _)| {
+                matches!(subject.kind, decision::SubjectKind::Param { hir_index } if hir_index == index)
+            })
+            .map(|(subject, _)| subject.hir_id)
+            .collect();
+    }
+    if site.caller == anchor.local_def_id() && matches!(site.arm.as_str(), "surface" | "addr") {
+        let named = site.position.split('@').next().unwrap_or_default();
+        return subjects
+            .filter(|(subject, _)| format!("{}#{}", subject.label, subject.local.as_u32()) == named)
+            .map(|(subject, _)| subject.hir_id)
+            .collect();
+    }
+    Vec::new()
+}
+
+/// **Relay 043 (wave-6o 016 STOP 1, R397-6(a)).** Is this dropped site
+/// SUPERSEDED rather than unsatisfied?
+///
+/// wave-6s2's source-side raw view (`computed-suffix-raw-view`) carries the
+/// evidence `body-local-raw-alias-schedule-unproved`, which is premised on the
+/// **destination staying raw**. When the Option family then takes that
+/// destination, the adapter is not a family site that failed — it is one the
+/// newer family replaced, and the receipt layer drops it as
+/// `slice-use-evidence-held`. Reading that drop as an unsatisfied family site
+/// falls the WHOLE owner back to the predecessor's mechanics, which is how
+/// wave-6o's five rows die one stage before their own arm runs (their report
+/// 016 claims 3–5).
+///
+/// The invariant this restores is R397-6(a)'s own: a request means *a
+/// candidate of mine failed and must be excluded*, never *a site of mine was
+/// replaced by a later family*. Nothing here decides a form; it only stops one
+/// class of drop from being counted as a failure.
+///
+/// The supersession predicate is the one wave-6s2's relay 010 names — **the
+/// destination is typed by the Option family** — read here as: a subject of
+/// this owner carries an `Opt` decision in the candidate that it did not carry
+/// in the predecessor. A drop with no such move is untouched and still
+/// requests, which is what keeps this an exception rather than a loosening.
+fn superseded_by_an_option_destination(
+    site: &plan::ClassSite,
+    owner: SignatureClassId,
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+) -> bool {
+    if site.key.bridge_kind != "slice-use-adapter" {
+        return false;
+    }
+    if !matches!(
+        &site.state,
+        plan::ClassSiteState::Dropped(reason) if reason == "slice-use-evidence-held"
+    ) {
+        return false;
+    }
+    // Conjunct 3 (wave-6s2 013 §1): the Option VALUE planner owns an RHS edit
+    // at this site's span. Without it the two renderings do not occupy one
+    // span and there is nothing to supersede — which is what narrows the arm
+    // from "this owner gained an `Opt`" to "this site was replaced".
+    let value_edit_here = candidate
+        .plan
+        .class_finalization
+        .classes
+        .get(&owner)
+        .is_some_and(|class| {
+            class.sites.iter().any(|other| {
+                matches!(other.state, plan::ClassSiteState::EditReady)
+                    && other.key.file == site.key.file
+                    && other.key.lo == site.key.lo
+                    && other.key.hi == site.key.hi
+                    && (other.key.bridge_kind.contains("option")
+                        || other.key.bridge_kind.contains("nullable"))
+            })
+        });
+    // Conjunct 3 is a SPAN test, so it applies to a site that has a span. A
+    // dropped site with no text interval (`ClassSite::zero`) cannot be
+    // span-matched and is decided by conjuncts 1 and 2 alone.
+    let has_interval = site.edit_key != "-" && site.key.file != "-";
+    if has_interval && !value_edit_here {
+        return false;
+    }
+    let optional = |snapshot: &StageSnapshot| -> BTreeSet<String> {
+        snapshot
+            .table
+            .entries
+            .iter()
+            .filter(|(subject, decided)| {
+                // Exhaustive by the import-denylist rule: a new `Decision`
+                // variant is classified here, never swept into a wildcard.
+                let optional = match decided {
+                    decision::Decision::Opt { .. } => true,
+                    decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Slice { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Cursor { .. }
+                    | decision::Decision::Box(_)
+                    | decision::Decision::Degraded(_) => false,
+                };
+                optional && SignatureClassId::of(subject.fn_did) == owner
+            })
+            .map(|(subject, _)| subject.label.clone())
+            .collect()
+    };
+    optional(candidate)
+        .difference(&optional(prior))
+        .next()
+        .is_some()
+}
+
+/// **R497-6.** The same supersession, for a CURSOR destination.
+///
+/// lodepng `countZeros` is the shape: the slice family delivers the shared root
+/// (`start = data.offset(pos)`), and the adapter it plants for that root
+/// carries evidence premised on the destinations staying raw. The cursor family
+/// then takes those destinations (`data`, `end` — every operand of
+/// `while data != end` is a view of the one parameter, so the comparison is a
+/// position question the family renders with `addr()`), the adapter is dropped
+/// `slice-use-evidence-held`, and reading that drop as an unsatisfied family
+/// site withdraws the owner's WHOLE `Return` family. Both destinations revert
+/// to raw, the census records them `ptr-comparison` with `sole_blocker = 1`,
+/// and the cursor family's receipt list is empty — the archive's
+/// `native_outcome = None`.
+///
+/// This is R397-6(a)'s invariant exactly as the Option arm above states it: a
+/// request means *a candidate of mine failed*, never *a site of mine was
+/// replaced by a later family*. Nothing here decides a form; the conjuncts are
+/// the Option arm's with `Cursor` in place of `Opt`, so a drop with no cursor
+/// destination is untouched and still requests.
+fn superseded_by_a_cursor_destination(
+    site: &plan::ClassSite,
+    owner: SignatureClassId,
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+) -> bool {
+    if site.key.bridge_kind != "slice-use-adapter" {
+        return false;
+    }
+    if !matches!(
+        &site.state,
+        plan::ClassSiteState::Dropped(reason) if reason == "slice-use-evidence-held"
+    ) {
+        return false;
+    }
+    // Conjunct 3, the Option arm's: where the drop HAS a text interval, the
+    // cursor planner must own an edit at it, so that the two renderings occupy
+    // one span and there is something to supersede. `countZeros`' own drop is
+    // `<unplaceable>` and is decided by conjuncts 1, 2 and 4.
+    let value_edit_here = candidate
+        .plan
+        .class_finalization
+        .classes
+        .get(&owner)
+        .is_some_and(|class| {
+            class.sites.iter().any(|other| {
+                matches!(other.state, plan::ClassSiteState::EditReady)
+                    && other.key.file == site.key.file
+                    && other.key.lo == site.key.lo
+                    && other.key.hi == site.key.hi
+                    && other.key.bridge_kind.contains("cursor")
+            })
+        });
+    let has_interval = site.edit_key != "-" && site.key.file != "-";
+    if has_interval && !value_edit_here {
+        return false;
+    }
+    let cursors = |snapshot: &StageSnapshot| -> BTreeSet<String> {
+        snapshot
+            .table
+            .entries
+            .iter()
+            .filter(|(subject, decided)| {
+                // Exhaustive by the import-denylist rule: a new `Decision`
+                // variant is classified here, never swept into a wildcard.
+                let cursor = match decided {
+                    decision::Decision::Cursor { .. } => true,
+                    decision::Decision::Opt { .. }
+                    | decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Slice { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Box(_)
+                    | decision::Decision::Degraded(_) => false,
+                };
+                cursor && SignatureClassId::of(subject.fn_did) == owner
+            })
+            .map(|(subject, _)| subject.label.clone())
+            .collect()
+    };
+    cursors(candidate)
+        .difference(&cursors(prior))
+        .next()
+        .is_some()
+}
+
+/// Was this dropped site replaced by a LATER family of either kind? The three
+/// readers below must ask one question, which is the discipline relay 045 §2
+/// already fixed for the Option arm alone.
+fn superseded_by_a_later_destination(
+    site: &plan::ClassSite,
+    owner: SignatureClassId,
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+) -> bool {
+    superseded_by_an_option_destination(site, owner, prior, candidate)
+        || superseded_by_a_cursor_destination(site, owner, prior, candidate)
+}
+
+/// Is every change this class carries a site the Option family superseded?
+///
+/// Relay 045 §2. `class_changed` sees the superseded site as an ordinary new
+/// dropped site and its derived hold, so the restore step re-requests the owner
+/// one stage after the dropped-site path let it through. Both paths must ask the
+/// same question.
+fn only_change_is_superseded(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    owner: SignatureClassId,
+) -> bool {
+    let Some(class) = candidate.plan.class_finalization.classes.get(&owner) else {
+        return false;
+    };
+    let old = prior.plan.class_finalization.classes.get(&owner);
+    let new_sites = class
+        .sites
+        .iter()
+        .filter(|site| !old.is_some_and(|old| old.sites.contains(site)))
+        .collect::<Vec<_>>();
+    if new_sites.is_empty() {
+        return false;
+    }
+    if !new_sites
+        .iter()
+        .all(|site| superseded_by_a_later_destination(site, owner, prior, candidate))
+    {
+        return false;
+    }
+    let superseded: BTreeSet<String> = new_sites
+        .iter()
+        .filter_map(|site| match &site.state {
+            plan::ClassSiteState::Dropped(reason) => {
+                Some(format!("dropped-site:{}:{}", site.key.bridge_kind, reason))
+            }
+            _ => None,
+        })
+        .collect();
+    class
+        .hold_reasons()
+        .iter()
+        .filter(|reason| !old.is_some_and(|old| old.hold_reasons().contains(reason)))
+        .all(|reason| superseded.contains(reason))
+}
+
+/// **035 clause (2) — the two absolute protections (R453-2).**
+///
+/// Neither is a soundness device: the exclusion re-derivation decides no form,
+/// so over-retirement is a completeness cost only (report 034 §2). What
+/// retirement buys is interface consistency, which is a property of sites at
+/// intervals — so a candidate whose own sites do not participate in the
+/// terminal cannot be making the interface inconsistent, and retiring it buys
+/// nothing at all. These two classes of candidate are the measured cost of
+/// retiring them anyway, and they are retirable ONLY under clause (1).
+///
+/// * **placed at the predecessor frame** — placement IS the statement that the
+///   previous frame's interface was consistent with this candidate. A
+///   neighbour's change that does not touch its interval cannot have made it
+///   inconsistent (wave-6s 020: twelve placements lost at zero rule change;
+///   slicecursor 030: heman's four `edt` cursor rows).
+/// * **the sole candidate its owner has at this stage** — the loop's reading of
+///   the instrument's owner-function-scoped `sole_blocker`: retiring it does not
+///   remove an inconsistency, it removes the attribution, turning "blocked by
+///   exactly one thing" into "no candidate at all" (wave-6s's 34 sole-blocker
+///   rows among 114 stage-withdrawn; slicecursor 029's ten bzip2 walkers).
+fn protected_from_retirement(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    _policy: &FamilyPolicy,
+    owner: SignatureClassId,
+    hir: HirId,
+) -> bool {
+    let placed_at_predecessor = candidate
+        .table
+        .entries
+        .iter()
+        .find(|(subject, _)| subject.fn_did == owner.local_def_id() && subject.hir_id == hir)
+        .is_some_and(|(subject, _)| {
+            // `Edit::subject_id` is `identity_key(<owner path>)`, i.e.
+            // `<owner>::<param>#<local>`; matching on the tail keeps this
+            // independent of how the owner path is spelled at this stage.
+            let tail = format!(
+                "::{}#{}",
+                subject.param_name.as_deref().unwrap_or("<unnamed>"),
+                subject.local.as_u32()
+            );
+            prior
+                .plan
+                .by_file
+                .values()
+                .flatten()
+                .any(|edit| edit.owner_class == Some(owner) && edit.subject_id.ends_with(&tail))
+        });
+    if placed_at_predecessor {
+        return true;
+    }
+    // The instrument's `sole_blocker` is owner-function-scoped: a degraded row
+    // is a sole blocker when its owner has exactly one DISTINCT degraded
+    // reason. Read on the PREDECESSOR frame, that is the candidate whose
+    // subject was the one thing standing between this owner and delivery; if
+    // the loop retires it now, the attribution the forecast rule reads
+    // (R452-2: sole-blocker ∧ stage-enabled) is gone, and the subject reads as
+    // having had no candidate at all rather than one blocked thing.
+    let mut reasons = BTreeSet::new();
+    let mut carried_the_only_reason = false;
+    for (subject, decided) in &prior.table.entries {
+        if subject.fn_did != owner.local_def_id() {
+            continue;
+        }
+        // Exhaustive by the import-denylist rule.
+        match decided {
+            decision::Decision::Degraded(degradation) => {
+                reasons.insert(degradation.reason.key().to_owned());
+                if subject.hir_id == hir {
+                    carried_the_only_reason = true;
+                }
+            }
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::NestedSlice { .. }
+            | decision::Decision::Cursor { .. }
+            | decision::Decision::Box(_) => {}
+        }
+    }
+    carried_the_only_reason && reasons.len() == 1
+}
+
+#[cfg(test)]
+pub(crate) fn withdrawals(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    policy: &FamilyPolicy,
+    soundness: &[SoundnessWithdrawal],
+) -> Vec<FamilyWithdrawal> {
+    withdrawals_narrowed(prior, candidate, policy, soundness, &|_, _| Vec::new())
+}
+
+/// [`withdrawals`], with the source footprint of a subject (its initializer and
+/// its uses) for R798-3's narrowing of a blocked-subject refusal. A subject
+/// with no footprint is never shown independent of anything, so an empty
+/// footprint is exactly [`withdrawals`].
+pub(crate) fn withdrawals_narrowed(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    policy: &FamilyPolicy,
+    soundness: &[SoundnessWithdrawal],
+    footprint: &dyn Fn(LocalDefId, HirId) -> Vec<Span>,
+) -> Vec<FamilyWithdrawal> {
+    if policy.stage == FamilyStage::Core {
+        return Vec::new();
+    }
+    let related_graph = related_graph(candidate);
+    let enabled = |owner: SignatureClassId| policy.enabled(owner.local_def_id(), policy.stage);
+    let (anchors, waiting_for_a_root) = anchors(prior, candidate, policy, soundness, &enabled);
+
+    // R397-6(a): resolve each anchor to the candidates that moved. A direct
+    // anchor excludes its own moved candidates, narrowed to those its terminal
+    // sites name; an anchor that moved nothing falls back as a whole (the R220
+    // floor — its own non-decision mechanics are the cheapest thing to drop). A
+    // restore anchor searches its interface component nearest-first and stops
+    // at the first distance carrying a changed owner, instead of withdrawing
+    // every changed owner the component can reach.
+    let mut requested =
+        BTreeMap::<SignatureClassId, (String, Vec<HirId>, Option<SignatureClassId>)>::new();
+    let mut unresolved_rows = BTreeMap::<SignatureClassId, String>::new();
+    let retired_any = std::cell::Cell::new(false);
+    let mut request = |owner: SignatureClassId,
+                       cause: String,
+                       subjects: Vec<HirId>,
+                       anchor: Option<SignatureClassId>| {
+        retired_any.set(true);
+        requested.entry(owner).or_insert((cause, subjects, anchor));
+    };
+    let mut unresolved = |anchor: SignatureClassId, cause: String| {
+        unresolved_rows.entry(anchor).or_insert(cause);
+    };
+    let scoped_cause = |anchor: SignatureClassId, cause: &str| {
+        format!(
+            "exclusion-rederivation:anchor={}:{cause}",
+            anchor.order_key()
+        )
+    };
+    // **R650-4 — v3's strict progress.** The owners that wait for a root their
+    // walks reached restore after all when the round retires nothing else:
+    // decided once, when every other anchor has run, and then all of them.
+    // v1's "a round with no root issues them all", applied to v3. Without it
+    // a round of unresolved rows would accept the waiting owners' losses
+    // unrecorded, and a round with no rows fails on `preservation_error`.
+    let restore_anchor = ("lost-prior-delivery".to_owned(), Anchor::Restore);
+    let late = std::iter::once(()).flat_map(|()| {
+        let nothing_retired = !retired_any.get();
+        waiting_for_a_root
+            .iter()
+            .filter(move |_| nothing_retired)
+            .map(|owner| (owner, &restore_anchor))
+    });
+    for (anchor, (cause, kind)) in anchors.iter().chain(late) {
+        match kind {
+            Anchor::Direct(sites) => {
+                let mut own = moved(prior, candidate, policy, *anchor);
+                let named = sites
+                    .iter()
+                    .flat_map(|site| named_by(candidate, *anchor, site))
+                    .collect::<Vec<_>>();
+                // **035 clause (1) — participation, not proximity.** A
+                // candidate is retirable at this terminal iff one of its own
+                // sites is named by it. Where the terminal names participants
+                // the set is exactly those; where it names none, clause (2)
+                // still protects the placed and the sole candidate, and what
+                // is left may yield so the round can make progress.
+                if own.iter().any(|hir| named.contains(hir)) {
+                    own.retain(|hir| named.contains(hir));
+                } else if !sites.is_empty() {
+                    // The terminal names sites and none of them is this
+                    // candidate's: clause (2) keeps the placed and the sole
+                    // blocker out of a retirement they do not participate in.
+                    own.retain(|hir| {
+                        !protected_from_retirement(prior, candidate, policy, *anchor, *hir)
+                    });
+                }
+                // A terminal with NO sites is a refusal or a new dependency of
+                // this class's own subjects, so the class IS the participant
+                // and every moved candidate of it satisfies clause (1).
+                if !own.is_empty() {
+                    request(*anchor, scoped_cause(*anchor, cause), own, Some(*anchor));
+                    continue;
+                }
+                // The anchor moved no decision of its own: R220's owner
+                // fallback drops only its non-decision mechanics at this stage
+                // (the seam / interface edges it generated) and is the cheapest
+                // input change that can dissolve its terminal — tulipindicators
+                // `ti_sma_start`'s new dependency on a held caller dissolves
+                // this way while the caller keeps both of its slices. If the
+                // loss persists, the next round treats the anchor as a restore
+                // root and asks its nearest changed neighbour for the moved
+                // candidate that induced the terminal (binn `binn_get_bool`).
+                // **035 clause (1) at SITE granularity.** The anchor moved no
+                // decision of its own, so there is no candidate to narrow — but
+                // the terminal may still name a site of THIS class, and then the
+                // participant is the class's own mechanics (the seam / interface
+                // edge it generated). Dropping those is retiring the
+                // participant, not a neighbour, and it is R220's owner fallback
+                // in its justified form.
+                //
+                // **Clause (3)** is what happens otherwise: the terminal names
+                // nothing of this class, so the loop records it and retires
+                // nothing. That is the mechanism report 034 priced at 506
+                // owner-scoped transactions naming 2,522 subjects.
+                // A terminal with NO sites is a refusal of this class's own
+                // subjects, so the class is the participant; otherwise the
+                // participant is whoever owns a named site.
+                let own_site = sites.is_empty()
+                    || sites.iter().any(|site| {
+                        site.owner_class == *anchor || site.caller == anchor.local_def_id()
+                    });
+                if own_site {
+                    request(*anchor, cause.clone(), Vec::new(), Some(*anchor));
+                } else {
+                    unresolved(*anchor, format!("interface-path-unresolved:{cause}"));
+                }
+            }
+            Anchor::Blocked(blockers) => {
+                // **R798-3 — one blocked subject withholds only what depends on
+                // it.** The class is still the participant (a refusal names no
+                // site), but a moved candidate none of whose edits touch a
+                // blocker is not what made the class newly held: heman's
+                // `transform_to_coordfield` held every owner because the views
+                // `z`/`w` of two of them could not pay the arm the owners' Box
+                // plans put on them. Where no candidate can be shown
+                // independent, or none dependent, the class yields whole, as
+                // before.
+                let own = moved(prior, candidate, policy, *anchor);
+                let dependent = own
+                    .iter()
+                    .copied()
+                    .filter(|hir| touches_a_blocker(candidate, *anchor, *hir, blockers, footprint))
+                    .collect::<Vec<_>>();
+                if !dependent.is_empty() && dependent.len() < own.len() {
+                    request(
+                        *anchor,
+                        scoped_cause(*anchor, &format!("{cause}:blocked-dependents")),
+                        dependent,
+                        Some(*anchor),
+                    );
+                } else if !own.is_empty() {
+                    request(*anchor, scoped_cause(*anchor, cause), own, Some(*anchor));
+                } else {
+                    request(*anchor, cause.clone(), Vec::new(), Some(*anchor));
+                }
+            }
+            Anchor::Restore => {
+                let mut frontier = vec![(*anchor, vec![*anchor])];
+                let mut seen = BTreeSet::from([*anchor]);
+                let mut resolved = false;
+                while !frontier.is_empty() {
+                    let mut next = Vec::new();
+                    let mut layer = Vec::new();
+                    for (owner, path) in frontier {
+                        for &neighbour in related_graph.get(&owner).into_iter().flatten() {
+                            if !seen.insert(neighbour) {
+                                continue;
+                            }
+                            let mut next_path = path.clone();
+                            next_path.push(neighbour);
+                            if enabled(neighbour) && class_changed(prior, candidate, neighbour) {
+                                layer.push((neighbour, next_path.clone()));
+                            }
+                            next.push((neighbour, next_path));
+                        }
+                    }
+                    if !layer.is_empty() {
+                        for (owner, path) in layer {
+                            let path = path
+                                .iter()
+                                .map(|owner| owner.order_key())
+                                .collect::<Vec<_>>();
+                            let cause = format!("restore-family-interface-path:{path:?}");
+                            // **035 clauses (2)+(3), amended by measurement.**
+                            // The nearest-first restore stays — report 009's
+                            // binn case is a delivery only this step recovers —
+                            // but it may no longer retire a candidate that was
+                            // PLACED at the predecessor frame or is its
+                            // owner's sole blocker. Where every candidate it
+                            // can reach is protected, the loop records
+                            // `interface-path-unresolved:` and retires nothing,
+                            // which is the 506 owner-scoped transactions report
+                            // 034 priced.
+                            let subjects = unwithdrawn(
+                                policy,
+                                *anchor,
+                                owner,
+                                moved(prior, candidate, policy, owner),
+                            );
+                            if subjects.is_empty() {
+                                unresolved(owner, format!("interface-path-unresolved:{cause}"));
+                            } else {
+                                request(
+                                    owner,
+                                    scoped_cause(*anchor, &cause),
+                                    subjects,
+                                    Some(*anchor),
+                                );
+                            }
+                        }
+                        resolved = true;
+                        break;
+                    }
+                    frontier = next;
+                }
+                // The component held no changed owner: the edge that would
+                // have joined the root to its cause is the very site that is
+                // missing (a cursor handed to a slice callee with no C bridge
+                // to render leaves the callee's class held and the two classes
+                // unconnected). The last resort before the whole program fails
+                // `unrestored` is the program-wide layer — every enabled
+                // changed owner yields, its moved candidates per subject.
+                if !resolved {
+                    for owner in candidate.plan.class_finalization.classes.keys() {
+                        if *owner == *anchor
+                            || !enabled(*owner)
+                            || !class_changed(prior, candidate, *owner)
+                        {
+                            continue;
+                        }
+                        let cause =
+                            format!("restore-family-unconnected-root:{}", anchor.order_key());
+                        let subjects = unwithdrawn(
+                            policy,
+                            *anchor,
+                            *owner,
+                            moved(prior, candidate, policy, *owner),
+                        );
+                        if subjects.is_empty() {
+                            unresolved(*owner, format!("interface-path-unresolved:{cause}"));
+                        } else {
+                            request(
+                                *owner,
+                                scoped_cause(*anchor, &cause),
+                                subjects,
+                                Some(*anchor),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = requested
+        .into_iter()
+        .map(|(owner, (cause, subjects, anchor))| FamilyWithdrawal {
+            unresolved: false,
+            owner,
+            cause,
+            subjects,
+            anchor,
+        })
+        .collect::<Vec<_>>();
+    let retired_owners = out.iter().map(|w| w.owner).collect::<BTreeSet<_>>();
+    out.extend(
+        unresolved_rows
+            .into_iter()
+            .filter(|(owner, _)| !retired_owners.contains(owner))
+            .map(|(owner, cause)| FamilyWithdrawal {
+                unresolved: true,
+                owner,
+                cause,
+                subjects: Vec::new(),
+                anchor: None,
+            }),
+    );
+    out
+}
+
+/// **R798-3.** The subjects of `owner` degraded for `key` that still require
+/// an arm — the population `plan::finalize_signature_classes` spells
+/// `blocked-subject:<key>` (read before its two discharges, so a discharged
+/// subject is over-counted: that only widens what the narrowing retires).
+fn blocking_subjects(candidate: &StageSnapshot, owner: SignatureClassId, key: &str) -> Vec<HirId> {
+    candidate
+        .table
+        .entries
+        .iter()
+        .filter(|(subject, decided)| {
+            subject.fn_did == owner.local_def_id()
+                // Exhaustive by the import-denylist rule: a new `Decision`
+                // variant is classified here, never swept into a wildcard.
+                && match decided {
+                    decision::Decision::Degraded(degradation) => degradation.reason.key() == key,
+                    decision::Decision::Cursor { .. }
+                    | decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Slice { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Box(_) => false,
+                }
+                && candidate
+                    .table
+                    .arm_requirements
+                    .get(&(subject.fn_did, subject.hir_id))
+                    .is_some_and(|required| !required.is_empty())
+        })
+        .map(|(subject, _)| subject.hir_id)
+        .collect()
+}
+
+/// **R798-3 — the dependency test.** Whether the candidate `hir` of `owner`
+/// touches one of `blockers`: it IS one, or one of its edits overlaps a
+/// blocker's initializer or a use of it (heman's `zz` renders `z`'s
+/// initializer as its view and lends `z` at the call). Only a Box plan's edits
+/// are read; any other candidate, and a blocker with no footprint, count as
+/// touching, so the test fails closed to the class-wide withdrawal.
+fn touches_a_blocker(
+    candidate: &StageSnapshot,
+    owner: SignatureClassId,
+    hir: HirId,
+    blockers: &[HirId],
+    footprint: &dyn Fn(LocalDefId, HirId) -> Vec<Span>,
+) -> bool {
+    if blockers.contains(&hir) {
+        return true;
+    }
+    let Some((_, decided)) = candidate
+        .table
+        .entries
+        .iter()
+        .find(|(subject, _)| subject.fn_did == owner.local_def_id() && subject.hir_id == hir)
+    else {
+        return true;
+    };
+    // Exhaustive by the import-denylist rule.
+    let plan = match decided {
+        decision::Decision::Box(plan) => plan,
+        decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::NestedSlice { .. }
+        | decision::Decision::Cursor { .. }
+        | decision::Decision::Degraded(_) => return true,
+    };
+    let mut footprints = Vec::new();
+    for blocker in blockers {
+        let spans = footprint(owner.local_def_id(), *blocker);
+        if spans.is_empty() {
+            return true;
+        }
+        footprints.extend(spans);
+    }
+    let overlaps = |edit: Span| {
+        let edit = edit.source_callsite();
+        footprints.iter().any(|span| {
+            let span = span.source_callsite();
+            edit.lo() <= span.hi() && span.lo() <= edit.hi()
+        })
+    };
+    plan.expr_edits.iter().any(|edit| overlaps(edit.span))
+        || plan.delete_statements.iter().any(|span| overlaps(*span))
+}
+
+/// The R220 generator, unchanged in what it observes: which owners carry a new
+/// terminal, and which prior deliveries are lost with no transaction of their
+/// own left to withdraw. Scoping is `withdrawals`' job. Beside the anchors, the
+/// owners whose loss waits for a root their walk reached (R645-4).
+fn anchors(
+    prior: &StageSnapshot,
+    candidate: &StageSnapshot,
+    policy: &FamilyPolicy,
+    soundness: &[SoundnessWithdrawal],
+    enabled: &impl Fn(SignatureClassId) -> bool,
+) -> (
+    BTreeMap<SignatureClassId, (String, Anchor)>,
+    BTreeSet<SignatureClassId>,
+) {
+    let protected = losses(prior, candidate, soundness, policy)
+        .into_iter()
+        .map(|s| SignatureClassId::of(s.fn_did))
+        .collect::<BTreeSet<_>>();
+    let witnessed_owners = soundness
+        .iter()
+        .map(|s| SignatureClassId::of(s.subject.0))
+        .filter(|owner| !protected.contains(owner))
+        .collect::<BTreeSet<_>>();
+    let prior_sites = prior
+        .plan
+        .class_finalization
+        .classes
+        .values()
+        .filter(|c| c.is_ready())
+        .flat_map(|c| c.sites.iter())
+        .filter(|s| s.edit_key != "-")
+        .map(|s| s.edit_key.clone())
+        .collect::<BTreeSet<_>>();
+    let mut requested = BTreeMap::<SignatureClassId, (String, Anchor)>::new();
+    // Restore anchors are kept apart so they never count as a covering request
+    // for a collision partner or a later protected owner (R220 parity).
+    let mut restore = BTreeSet::<SignatureClassId>::new();
+    // **R606-3 — roots first.** A request triggered by a class held on its own
+    // reason (a collision, a dropped site, a refusal, or a new dependency on a
+    // class held on its own reason) is a root. A new dependency on a class held
+    // only through `dependency-class-held:*` waits while the round has a root: it
+    // may be ready once the root is retired (brotli's fourteen
+    // `StitchToPreviousBlockH*` behind 2337, held only through 2440's collision at
+    // each stage's first candidate and ready at the next). A round with no root
+    // issues them all, so strict progress stands.
+    let mut root_seen = false;
+    let mut waiting = BTreeSet::<SignatureClassId>::new();
+    let mut wait_for_root = BTreeSet::<SignatureClassId>::new();
+    // Exact predecessor edit identity (including replacement digest) establishes
+    // age. Generated A5/C sites keep the stage that introduced the transaction;
+    // their generic bridge-kind strings do not establish precedence.
+    for collision in &candidate.plan.class_finalization.collisions {
+        let old_left = prior_sites.contains(&collision.left_edit_key);
+        let old_right = prior_sites.contains(&collision.right_edit_key);
+        let newer = match (old_left, old_right) {
+            (true, false) => Some(collision.right_class),
+            (false, true) => Some(collision.left_class),
+            (true, true) | (false, false) => None,
+        };
+        if let Some(owner) = newer.filter(|owner| enabled(*owner)) {
+            let newer_edit_key = if old_left {
+                &collision.right_edit_key
+            } else {
+                &collision.left_edit_key
+            };
+            let site = candidate
+                .plan
+                .class_finalization
+                .classes
+                .get(&owner)
+                .and_then(|class| {
+                    class
+                        .sites
+                        .iter()
+                        .find(|site| site.edit_key == *newer_edit_key)
+                })
+                .map(|site| site.key.clone());
+            requested.insert(
+                owner,
+                (
+                    format!(
+                        "newer-family-collision:{}|{}",
+                        collision.left_edit_key, collision.right_edit_key
+                    ),
+                    Anchor::Direct(site.into_iter().collect()),
+                ),
+            );
+            root_seen = true;
+        }
+    }
+    for (owner, class) in &candidate.plan.class_finalization.classes {
+        if !enabled(*owner) || witnessed_owners.contains(owner) {
+            continue;
+        }
+        let old = prior.plan.class_finalization.classes.get(owner);
+        let new_dropped = class
+            .sites
+            .iter()
+            .filter(|site| {
+                matches!(site.state, plan::ClassSiteState::Dropped(_))
+                    && !old.is_some_and(|old| old.sites.contains(site))
+                    && site.key.bridge_kind != "missing-required-site"
+                    && !superseded_by_a_later_destination(site, *owner, prior, candidate)
+            })
+            .collect::<Vec<_>>();
+        if let Some(site) = new_dropped.first() {
+            root_seen = true;
+            requested.entry(*owner).or_insert_with(|| {
+                (
+                    format!(
+                        "unsatisfied-family-site:{}:{:?}",
+                        site.key.receipt_key(),
+                        site.state
+                    ),
+                    Anchor::Direct(new_dropped.iter().map(|site| site.key.clone()).collect()),
+                )
+            });
+            continue;
+        }
+        // Relay 043: the same supersession, on the hold the finalizer derives
+        // from that site (`plan::finalize_class_inputs` spells it
+        // `dropped-site:<kind>:<reason>`). Filtering only the site list would
+        // leave the refusal branch requesting for the very drop the arm has
+        // just ruled superseded.
+        let superseded: BTreeSet<String> = class
+            .sites
+            .iter()
+            .filter(|site| superseded_by_a_later_destination(site, *owner, prior, candidate))
+            .filter_map(|site| match &site.state {
+                plan::ClassSiteState::Dropped(reason) => {
+                    Some(format!("dropped-site:{}:{}", site.key.bridge_kind, reason))
+                }
+                _ => None,
+            })
+            .collect();
+        // **R456-7 (wave-6o 021 claim 3), MEASURED AND NOT APPLIED.** The
+        // ruling is that a composed pair the final plan accepts is not a
+        // refusal at any stage. Exempting `intra-class-interval-overlap` here
+        // unconditionally is NOT that rule: it also exempts the pairs the final
+        // plan still holds, and report 037 measures what that costs — wave-6o's
+        // own `wave6o_null_init_local_with_no_pending_row_still_receives_its_
+        // declaration` stops delivering, and one wave-5c `thin_counted` row
+        // moves. The stage cannot ask "does the final plan accept it?" as the
+        // code stands, because the composing edit is not kinded
+        // (`option-value-composed`) until after this stage runs. See report 037
+        // §1 for what would make it decidable.
+        let new_refusal = class.hold_reasons().iter().find(|reason| {
+            !reason.starts_with("dependency-class-held:")
+                && *reason != "cross-class-interval-collision"
+                && !superseded.contains(*reason)
+                && !old.is_some_and(|old| old.hold_reasons().contains(reason))
+        });
+        if let Some(reason) = new_refusal {
+            root_seen = true;
+            let blockers = reason
+                .strip_prefix("blocked-subject:")
+                .map(|key| blocking_subjects(candidate, *owner, key))
+                .unwrap_or_default();
+            requested.entry(*owner).or_insert_with(|| {
+                (
+                    format!("unwitnessed-family-refusal:{reason}"),
+                    if blockers.is_empty() {
+                        Anchor::Direct(Vec::new())
+                    } else {
+                        Anchor::Blocked(blockers)
+                    },
+                )
+            });
+        }
+    }
+    // A dependency casualty yields at the changed root transaction. Do not
+    // disable the old dependent just because the finalizer propagated a hold.
+    for owner in protected {
+        let mut pending = vec![owner];
+        let mut seen = BTreeSet::new();
+        let before = (requested.len(), restore.len());
+        // **R615-2 — roots first, v2.** Whether the walk reached a class the
+        // round is already retiring: a collision a root request covers, or a
+        // class requested on its own reason. The loss is then that root's, and
+        // the owner is not made a restore anchor this round (below).
+        let mut reached_root = false;
+        // **R645-4 — roots first, v3.** Whether the walk reached a class held on
+        // its OWN reason (not only `dependency-class-held:*`): a root whether or
+        // not the round has requested it yet. v2's question depends on walk
+        // order — the first walk to reach brotli's 2440 (held on its collision
+        // with 1293) made it a restore anchor, and every later `Stitch*` walk
+        // then found nothing to add and restored its own neighbours.
+        let mut reached_own_root = false;
+        while let Some(current) = pending.pop() {
+            if !seen.insert(current) {
+                continue;
+            }
+            if requested.contains_key(&current) {
+                reached_root |= current != owner && !waiting.contains(&current);
+                continue;
+            }
+            let Some(class) = candidate.plan.class_finalization.classes.get(&current) else {
+                if enabled(current) {
+                    requested.insert(
+                        current,
+                        (
+                            "missing-prior-family-class".to_owned(),
+                            Anchor::Direct(Vec::new()),
+                        ),
+                    );
+                } else {
+                    restore.insert(current);
+                }
+                continue;
+            };
+            let held_dependencies = class
+                .depends_on
+                .iter()
+                .copied()
+                .filter(|dependency| {
+                    candidate
+                        .plan
+                        .class_finalization
+                        .classes
+                        .get(dependency)
+                        .is_some_and(|c| !c.is_ready())
+                })
+                .collect::<Vec<_>>();
+            let new_dependency = held_dependencies.iter().find(|dependency| {
+                !prior
+                    .plan
+                    .class_finalization
+                    .classes
+                    .get(&current)
+                    .is_some_and(|old| old.depends_on.contains(dependency))
+            });
+            if let Some(dependency) = new_dependency.filter(|_| enabled(current)) {
+                let dependency_only = candidate
+                    .plan
+                    .class_finalization
+                    .classes
+                    .get(dependency)
+                    .is_some_and(|held| {
+                        held.hold_reasons()
+                            .iter()
+                            .all(|reason| reason.starts_with("dependency-class-held:"))
+                    });
+                if dependency_only {
+                    waiting.insert(current);
+                } else {
+                    root_seen = true;
+                }
+                requested.insert(
+                    current,
+                    (
+                        format!("new-family-dependency:{}", dependency.order_key()),
+                        Anchor::Direct(Vec::new()),
+                    ),
+                );
+                continue;
+            }
+            if !held_dependencies.is_empty() {
+                reached_own_root |= held_dependencies.iter().any(|dependency| {
+                    candidate
+                        .plan
+                        .class_finalization
+                        .classes
+                        .get(dependency)
+                        .is_some_and(|held| {
+                            held.hold_reasons()
+                                .iter()
+                                .any(|reason| !reason.starts_with("dependency-class-held:"))
+                        })
+                });
+                pending.extend(held_dependencies);
+                continue;
+            }
+            let collision_covered = candidate
+                .plan
+                .class_finalization
+                .collisions
+                .iter()
+                .any(|c| {
+                    (c.left_class == current && requested.contains_key(&c.right_class))
+                        || (c.right_class == current && requested.contains_key(&c.left_class))
+                });
+            if collision_covered {
+                reached_root |= candidate
+                    .plan
+                    .class_finalization
+                    .collisions
+                    .iter()
+                    .any(|c| {
+                        let partner = if c.left_class == current {
+                            Some(c.right_class)
+                        } else if c.right_class == current {
+                            Some(c.left_class)
+                        } else {
+                            None
+                        };
+                        partner.is_some_and(|p| requested.contains_key(&p) && !waiting.contains(&p))
+                    });
+                continue;
+            }
+            // Relay 045 §2 (wave-6o 018 STOP 1): the supersession is evaluated
+            // BEFORE the restore step, or the same owner withdraws one step
+            // later for the same superseded site — which is exactly what
+            // wave-6o measured once `fe931479f` removed the earlier path
+            // (`…:anchor=3:restore-prior-family-disposition`). A class whose
+            // only change is a superseded site has not changed for this
+            // purpose.
+            if enabled(current)
+                && class_changed(prior, candidate, current)
+                && !only_change_is_superseded(prior, candidate, current)
+            {
+                requested.insert(
+                    current,
+                    (
+                        "restore-prior-family-disposition".to_owned(),
+                        Anchor::Direct(Vec::new()),
+                    ),
+                );
+                continue;
+            }
+            restore.insert(current);
+        }
+        // Mutually dependent held classes (binn `is_bool_str` ↔ `binn_get_bool`)
+        // walk each other's held dependency and request nothing; the lost root
+        // is then a restore anchor, not an `unrestored` failure.
+        if (requested.len(), restore.len()) == before {
+            // R615-2: a loss the walk explains by a root this round retires
+            // waits; its restore, if still owed, is derived after the root.
+            // Otherwise the owner is a restore anchor (brotli's 2337 restored
+            // its nearest changed neighbours, the Stitch*, which 2440's
+            // collision with 1293 never involved).
+            // R645-4: a loss the walk explains by an own-reason root waits in
+            // any walk order; `withdrawals` restores it if nothing else retires.
+            if reached_own_root && !reached_root {
+                wait_for_root.insert(owner);
+            } else if !reached_root {
+                restore.insert(owner);
+            }
+        }
+    }
+    if root_seen {
+        for owner in &waiting {
+            requested.remove(owner);
+        }
+    }
+    for owner in restore {
+        requested
+            .entry(owner)
+            .or_insert(("lost-prior-delivery".to_owned(), Anchor::Restore));
+    }
+    (requested, wait_for_root)
+}
+
+pub(crate) fn select_uses<T: Clone>(
+    current: &rustc_hash::FxHashMap<(LocalDefId, HirId), T>,
+    predecessor: &rustc_hash::FxHashMap<(LocalDefId, HirId), T>,
+    policy: &FamilyPolicy,
+    family: FamilyStage,
+) -> rustc_hash::FxHashMap<(LocalDefId, HirId), T> {
+    current
+        .keys()
+        .chain(predecessor.keys())
+        .filter_map(|key| {
+            let source = if policy.enabled_for(*key, family) {
+                current
+            } else {
+                predecessor
+            };
+            source.get(key).cloned().map(|value| (*key, value))
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct FamilyFallbackReceipt {
+    /// `owner`: the whole owner fell back to its predecessor stage (the R220
+    /// transaction). `subject`: R397-6(a) — only the named candidate rows are
+    /// excluded at the selection input; the owner and its siblings keep the
+    /// stage.
+    pub(crate) scope: String,
+    pub(crate) family: String,
+    pub(crate) owner_local_def_id: u32,
+    pub(crate) owner_path: String,
+    pub(crate) cause: String,
+    pub(crate) subjects: Vec<(String, String, String)>,
+}
+
+#[derive(Default)]
+pub(crate) struct RetiredReceipts {
+    options: rustc_hash::FxHashMap<
+        super::mechanical_receipt::MechanicalObligationKey,
+        super::mechanical_receipt::OptionPresentationReceiptPlan,
+    >,
+    uses: rustc_hash::FxHashMap<
+        super::mechanical_receipt::MechanicalObligationKey,
+        super::mechanical_receipt::SliceUseReceiptPlan,
+    >,
+    constructions: rustc_hash::FxHashMap<
+        super::mechanical_receipt::MechanicalObligationKey,
+        super::mechanical_receipt::SliceConstructionReceiptPlan,
+    >,
+}
+
+impl RetiredReceipts {
+    pub(crate) fn capture(
+        &mut self,
+        prior: &StageSnapshot,
+        candidate: &StageSnapshot,
+        withdrawal: &FamilyWithdrawal,
+        stage: FamilyStage,
+    ) {
+        use super::mechanical_receipt::{
+            MechanicalObligationPlan, MechanicalState, MechanicalTerminalReason,
+        };
+        let retire = |obligation: &mut MechanicalObligationPlan| {
+            if let super::mechanical_receipt::MechanicalSubjectKey::Local {
+                owner, mir_local, ..
+            } = obligation.planned.key.subject
+                && let Some((_, old)) = prior
+                    .table
+                    .entries
+                    .iter()
+                    .find(|(s, _)| s.fn_did == owner && s.local.as_u32() == mir_local)
+            {
+                obligation.planned.found_form = decision::seam::form_of(old).key().to_owned();
+            }
+            let site_cause = obligation.intended_terminal_reason.as_ref().map_or_else(
+                || format!("owner-cause:{}", withdrawal.cause),
+                MechanicalTerminalReason::key,
+            );
+            obligation.intended_terminal_state = MechanicalState::Reclassified;
+            obligation.intended_terminal_reason =
+                Some(MechanicalTerminalReason::EvidenceMissing(format!(
+                    "additive-family-fallback:{};site-cause={site_cause}",
+                    obligation.planned.prior_reason
+                )));
+        };
+        let prior_keys = prior
+            .plan
+            .mechanical_receipts(&BTreeSet::new())
+            .0
+            .into_iter()
+            .map(|event| event.key)
+            .collect::<rustc_hash::FxHashSet<_>>();
+        for receipt in &candidate.plan.option_receipt_plans {
+            if receipt.owner_class != withdrawal.owner
+                || prior_keys.contains(&receipt.obligation.planned.key)
+            {
+                continue;
+            }
+            let mut receipt = receipt.clone();
+            retire(&mut receipt.obligation);
+            receipt.source_form = receipt.obligation.planned.found_form.clone();
+            receipt.adapter = format!("prior-family-rendering:{stage:?}");
+            self.options
+                .insert(receipt.obligation.planned.key.clone(), receipt);
+        }
+        for receipt in &candidate.plan.slice_use_receipt_plans {
+            if receipt.owner_class != withdrawal.owner
+                || prior_keys.contains(&receipt.obligation.planned.key)
+            {
+                continue;
+            }
+            let mut receipt = receipt.clone();
+            retire(&mut receipt.obligation);
+            receipt.source_form = receipt.obligation.planned.found_form.clone();
+            receipt.adapter = format!("prior-family-rendering:{stage:?}");
+            self.uses
+                .insert(receipt.obligation.planned.key.clone(), receipt);
+        }
+        for receipt in &candidate.plan.slice_construction_receipt_plans {
+            if receipt.owner_class != withdrawal.owner
+                || prior_keys.contains(&receipt.obligation.planned.key)
+            {
+                continue;
+            }
+            let mut receipt = receipt.clone();
+            retire(&mut receipt.obligation);
+            self.constructions
+                .insert(receipt.obligation.planned.key.clone(), receipt);
+        }
+    }
+
+    pub(crate) fn append(self, table: &mut decision::DecisionTable, planned: &plan::Plan) {
+        let active = planned
+            .mechanical_receipts(&BTreeSet::new())
+            .0
+            .into_iter()
+            .map(|event| event.key)
+            .collect::<rustc_hash::FxHashSet<_>>();
+        table.option_receipts.extend(
+            self.options
+                .into_iter()
+                .filter_map(|(key, receipt)| (!active.contains(&key)).then_some(receipt)),
+        );
+        table.slice_use_receipts.extend(
+            self.uses
+                .into_iter()
+                .filter_map(|(key, receipt)| (!active.contains(&key)).then_some(receipt)),
+        );
+        table.retired_slice_constructions.extend(
+            self.constructions
+                .into_iter()
+                .filter_map(|(key, receipt)| (!active.contains(&key)).then_some(receipt)),
+        );
+    }
+}
+
+#[cfg(test)]
+mod r500_tests {
+    use rustc_hir::{
+        HirId, ItemLocalId,
+        def_id::{DefIndex, LocalDefId},
+    };
+
+    use super::*;
+
+    fn class(index: u32) -> SignatureClassId {
+        SignatureClassId::of(LocalDefId {
+            local_def_index: DefIndex::from_u32(index),
+        })
+    }
+
+    fn subject(local: u32) -> HirId {
+        HirId {
+            owner: rustc_hir::OwnerId {
+                def_id: LocalDefId {
+                    local_def_index: DefIndex::from_u32(0),
+                },
+            },
+            local_id: ItemLocalId::from_u32(local),
+        }
+    }
+
+    /// The hq shape: anchor 1244 withdrew owner 1241's `data#1` at `SliceUse`
+    /// and has itself recorded `interface-path-unresolved:` there, so its
+    /// `Option`-stage re-ask is the same guess and finds nothing.
+    fn hq(stage: FamilyStage) -> FamilyPolicy {
+        let mut policy = FamilyPolicy::at(stage);
+        policy
+            .withdrawn_subjects
+            .insert((FamilyStage::SliceUse, class(1241), 1));
+        policy
+            .withdrawal_anchors
+            .insert((FamilyStage::SliceUse, class(1241), 1), class(1244));
+        policy
+            .unresolved_anchors
+            .insert((FamilyStage::SliceUse, class(1244)));
+        policy
+    }
+
+    #[test]
+    fn r500_4_an_unresolved_anchor_re_asking_for_its_own_earlier_withdrawal_finds_nothing() {
+        assert!(
+            unwithdrawn(
+                &hq(FamilyStage::Option),
+                class(1244),
+                class(1241),
+                vec![subject(1)]
+            )
+            .is_empty(),
+            "the same guess, re-asked, is not new evidence"
+        );
+    }
+
+    /// Control 1 — **this is why the global rule was refused.** An anchor that
+    /// RESOLVED its own path is not guessing: it named a participant and asked
+    /// for it. Report 009's binn delivery is recovered by exactly such a step,
+    /// and the pin that protects it stays green because this clause never
+    /// fires for it.
+    #[test]
+    fn r500_4_an_anchor_that_resolved_its_own_path_is_never_suppressed() {
+        let mut policy = hq(FamilyStage::Option);
+        policy.unresolved_anchors.clear();
+        assert_eq!(
+            unwithdrawn(&policy, class(1244), class(1241), vec![subject(1)]),
+            vec![subject(1)]
+        );
+    }
+
+    /// Control 2 — a DIFFERENT anchor arriving at the same subject brings its
+    /// own reason, so it is untouched however unresolved the first one was.
+    ///
+    /// The other anchor is made unresolved here TOO, deliberately: with only
+    /// 1244 unresolved the case is refused by the unresolved clause and this
+    /// control proves nothing about identity. Both unresolved, only
+    /// `asked_by == anchor` can decide it, and dropping that clause turns this
+    /// red.
+    #[test]
+    fn r500_4_a_different_anchor_is_never_suppressed() {
+        let mut policy = hq(FamilyStage::Option);
+        policy
+            .unresolved_anchors
+            .insert((FamilyStage::SliceUse, class(1243)));
+        assert_eq!(
+            unwithdrawn(&policy, class(1243), class(1241), vec![subject(1)]),
+            vec![subject(1)]
+        );
+    }
+
+    /// Control 3 — the anchor's unresolved row must be no LATER than the
+    /// withdrawal it is meant to explain; an anchor that only failed afterwards
+    /// did not guess when it asked.
+    #[test]
+    fn r500_4_an_unresolved_row_after_the_withdrawal_does_not_suppress() {
+        let mut policy = hq(FamilyStage::Return);
+        policy.unresolved_anchors.clear();
+        policy
+            .unresolved_anchors
+            .insert((FamilyStage::Declaration, class(1244)));
+        assert_eq!(
+            unwithdrawn(&policy, class(1244), class(1241), vec![subject(1)]),
+            vec![subject(1)]
+        );
+    }
+
+    /// Control 4 — within a stage the loop iterates to a fixed point, so a
+    /// withdrawal at the CURRENT stage is not an earlier one.
+    #[test]
+    fn r500_4_a_withdrawal_at_the_current_stage_does_not_suppress() {
+        assert_eq!(
+            unwithdrawn(
+                &hq(FamilyStage::SliceUse),
+                class(1244),
+                class(1241),
+                vec![subject(1)]
+            ),
+            vec![subject(1)]
+        );
+    }
+
+    /// Control 5 — a sibling's withdrawal, and another owner's withdrawal of
+    /// the same local index, leave this subject offerable: the rule's key is
+    /// (owner, subject), which is R397-6(a)'s own granularity.
+    #[test]
+    fn r500_4_a_siblings_withdrawal_never_suppresses() {
+        let policy = hq(FamilyStage::Return);
+        assert_eq!(
+            unwithdrawn(&policy, class(1244), class(1241), vec![subject(2)]),
+            vec![subject(2)]
+        );
+        assert_eq!(
+            unwithdrawn(&policy, class(1244), class(9999), vec![subject(1)]),
+            vec![subject(1)]
+        );
+    }
+}

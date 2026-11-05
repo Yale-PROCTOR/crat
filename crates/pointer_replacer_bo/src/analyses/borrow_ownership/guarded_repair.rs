@@ -1,0 +1,2631 @@
+//! Guarded-repair planning: context-conditioned single-literal commits.
+//!
+//! The planner is pure bookkeeping over one solved model. The production
+//! borrow-verification path translates residual conflicts into observations,
+//! asks the planner for a same-round batch, then emits the returned forbid-only
+//! clauses through the solver's tracked hard-assertion choke point.
+
+use rustc_hash::FxHashMap;
+
+use super::{SlotKind, solver::SlotRef};
+
+pub(crate) const GUARDED_COMMIT_CORE_FAMILY: &str = "l2-guarded-commit";
+pub(crate) const RECURRENCE_ESCALATION_CORE_FAMILY: &str = "l2-recurrence-escalation";
+
+/// Stable owning-function identity (`LocalDefId::local_def_index`) captured by
+/// the read-only conflict adapter.
+pub(crate) type FnKey = u32;
+
+/// Model-independent MIR identity of one borrow-issuing location.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct MirLocationKey {
+    pub(crate) block: u32,
+    pub(crate) statement_index: usize,
+}
+
+impl MirLocationKey {
+    pub(crate) fn new(block: u32, statement_index: usize) -> Self {
+        Self {
+            block,
+            statement_index,
+        }
+    }
+}
+
+/// Model-independent loan identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct StableLoanKey {
+    pub(crate) fn_key: FnKey,
+    pub(crate) issuer: SlotKey,
+    pub(crate) location: MirLocationKey,
+}
+
+impl StableLoanKey {
+    pub(crate) fn new(fn_key: FnKey, issuer: SlotRef, location: MirLocationKey) -> Self {
+        Self {
+            fn_key,
+            issuer: SlotKey::of(issuer),
+            location,
+        }
+    }
+
+    fn diagnostic(self) -> String {
+        format!(
+            "{}@{}@{}:{}",
+            self.fn_key,
+            self.issuer.diagnostic(),
+            self.location.block,
+            self.location.statement_index
+        )
+    }
+}
+
+/// Model-independent recurrence identity: issuing site plus the complete
+/// canonical mapped invalidator set. The target scopes this key in `Planner`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct HazardKey {
+    pub(crate) loan: StableLoanKey,
+    pub(crate) invalidators: Vec<SlotKey>,
+    /// The invalidators met through a parameter-overlap partner (`via_overlap_partner`), so a
+    /// hazard is not merged across the two ways of meeting it. Empty outside the overlap context,
+    /// where the key, its order and its diagnostic are unchanged.
+    pub(crate) via_overlap_partner: Vec<SlotKey>,
+}
+
+impl HazardKey {
+    fn diagnostic(&self) -> String {
+        let mut out = format!(
+            "{}@{}",
+            self.loan.diagnostic(),
+            self.invalidators
+                .iter()
+                .map(|slot| slot.diagnostic())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        if !self.via_overlap_partner.is_empty() {
+            out.push_str("~partner:");
+            out.push_str(
+                &self
+                    .via_overlap_partner
+                    .iter()
+                    .map(|slot| slot.diagnostic())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        out
+    }
+}
+
+/// A residual borrow-conflict edge translated wholly into BO slots.
+///
+/// `target` is the plain repair's unchanged live-requirer representative. `issuer`,
+/// `requirers`, and `invalidators` retain the complete mapped edge
+/// attribution; the planner records each participant's kind in `model`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConflictObservation {
+    pub(crate) fn_key: FnKey,
+    pub(crate) target: SlotRef,
+    pub(crate) issuer: Option<SlotRef>,
+    pub(crate) requirers: Vec<SlotRef>,
+    pub(crate) invalidators: Vec<SlotRef>,
+    /// The subset of `invalidators` met through a parameter-overlap partner.
+    pub(crate) overlap_invalidators: Vec<SlotRef>,
+    /// Diagnostic-only per-model ordinal. Recurrence identity must never use
+    /// it.
+    loan_ordinal: usize,
+    stable_loan_key: Option<StableLoanKey>,
+    explicit_loan_identity: bool,
+}
+
+impl ConflictObservation {
+    pub(crate) fn new(
+        fn_key: FnKey,
+        target: SlotRef,
+        issuer: Option<SlotRef>,
+        requirers: Vec<SlotRef>,
+    ) -> Self {
+        Self {
+            fn_key,
+            target,
+            issuer,
+            requirers,
+            invalidators: Vec::new(),
+            overlap_invalidators: Vec::new(),
+            loan_ordinal: 0,
+            stable_loan_key: issuer
+                .map(|issuer| StableLoanKey::new(fn_key, issuer, MirLocationKey::new(fn_key, 0))),
+            explicit_loan_identity: false,
+        }
+    }
+
+    pub(crate) fn with_invalidators(mut self, invalidators: Vec<SlotRef>) -> Self {
+        self.invalidators = invalidators;
+        self
+    }
+
+    /// Mark the invalidators met through a parameter-overlap partner.
+    pub(crate) fn with_overlap_invalidators(mut self, overlap_invalidators: Vec<SlotRef>) -> Self {
+        self.overlap_invalidators = overlap_invalidators;
+        self
+    }
+
+    fn via_overlap_partner(&self) -> Vec<SlotKey> {
+        let mut keys = self
+            .overlap_invalidators
+            .iter()
+            .copied()
+            .map(SlotKey::of)
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    pub(crate) fn with_loan_identity(
+        mut self,
+        loan_ordinal: usize,
+        stable_loan_key: StableLoanKey,
+    ) -> Self {
+        self.loan_ordinal = loan_ordinal;
+        self.stable_loan_key = Some(stable_loan_key);
+        self.explicit_loan_identity = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hazard_key_diagnostic(&self) -> String {
+        let loan = self
+            .stable_loan_key
+            .expect("a mapped issuing site must have a stable loan key");
+        let mut invalidators = self
+            .invalidators
+            .iter()
+            .copied()
+            .map(SlotKey::of)
+            .collect::<Vec<_>>();
+        invalidators.sort();
+        invalidators.dedup();
+        HazardKey {
+            loan,
+            invalidators,
+            via_overlap_partner: self.via_overlap_partner(),
+        }
+        .diagnostic()
+    }
+}
+
+/// Stable total-order form of `SlotRef`, suitable for action ordering and
+/// machine-parseable diagnostic keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct SlotKey {
+    pub(crate) variant: u8,
+    pub(crate) owner: u32,
+    pub(crate) slot: usize,
+}
+
+impl SlotKey {
+    pub(crate) fn of(slot: SlotRef) -> Self {
+        match slot {
+            SlotRef::Field(slot) => Self {
+                variant: 0,
+                owner: 0,
+                slot: slot.index(),
+            },
+            SlotRef::Local(did, slot) => Self {
+                variant: 1,
+                owner: did.local_def_index.as_u32(),
+                slot: slot.index(),
+            },
+        }
+    }
+
+    fn diagnostic(self) -> String {
+        match self.variant {
+            0 => format!("field:{}", self.slot),
+            1 => format!("local:{}:{}", self.owner, self.slot),
+            variant => panic!("invalid canonical SlotRef variant {variant}"),
+        }
+    }
+}
+
+/// Canonical `SlotRef` encoding shared by guarded-repair action and final-kind diagnostics.
+pub(crate) fn slotref_diagnostic(slot: SlotRef) -> String {
+    SlotKey::of(slot).diagnostic()
+}
+
+/// Diagnostic identity for one validation conflict before commit planning. The loan
+/// index is retained only here; it does not enter clause identity, ordering, or
+/// solver semantics.
+#[cfg(test)]
+pub(crate) fn conflict_witness_diagnostic(
+    validation_round: usize,
+    fn_key: FnKey,
+    loan: usize,
+    target: SlotRef,
+    issuer: Option<SlotRef>,
+    requirers: &[SlotRef],
+    invalidators: &[SlotRef],
+) -> String {
+    let mut requirers = requirers.to_vec();
+    canonicalize_slots(&mut requirers);
+    let mut invalidators = invalidators.to_vec();
+    canonicalize_slots(&mut invalidators);
+    let issuer = issuer.map_or_else(|| "none".to_owned(), slotref_diagnostic);
+    format!(
+        "event=l2_conflict_witness|round={validation_round}|target={}|edge_fn={fn_key}|loan={loan}|\
+         edge_issuer={issuer}|edge_requirers={}|edge_invalidators={}",
+        slotref_diagnostic(target),
+        requirers
+            .into_iter()
+            .map(slotref_diagnostic)
+            .collect::<Vec<_>>()
+            .join(","),
+        invalidators
+            .into_iter()
+            .map(slotref_diagnostic)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// Canonical identity of the conflict edge that spawned a commit.
+///
+/// The function key is required even for field-only fixtures: the same field
+/// edge observed while validating two functions is not the same attribution.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct EdgeKey {
+    pub(crate) fn_key: FnKey,
+    pub(crate) issuer: Option<SlotKey>,
+    pub(crate) requirers: Vec<SlotKey>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct EdgeAttribution {
+    pub(crate) edge: EdgeKey,
+    pub(crate) invalidators: Vec<SlotKey>,
+}
+
+/// Canonical diagnostic identity.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct DiagnosticKey {
+    pub(crate) target: SlotKey,
+    pub(crate) peers: Vec<SlotKey>,
+    pub(crate) edge: EdgeKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum WitnessedKind {
+    Ref,
+    Raw,
+}
+
+impl WitnessedKind {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Ref => "ref",
+            Self::Raw => "raw",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PeerWitness {
+    pub(crate) slot: SlotRef,
+    pub(crate) kind: WitnessedKind,
+}
+
+/// One witnessed-context guarded-repair clause.
+///
+/// `negative_refs` contains Ref-witnessed peers plus the fixed target.
+/// `positive_refs` contains Raw-witnessed peers. The target remains negative
+/// in every shape, so all-Raw always satisfies the clause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForbidClause {
+    pub(crate) negative_refs: Vec<SlotRef>,
+    pub(crate) positive_refs: Vec<SlotRef>,
+}
+
+impl ForbidClause {
+    #[cfg(test)]
+    pub(crate) fn is_satisfied_by(&self, model: &FxHashMap<SlotRef, SlotKind>) -> bool {
+        self.negative_refs.iter().any(|slot| {
+            *model
+                .get(slot)
+                .unwrap_or_else(|| panic!("forbid-clause model is missing {slot:?}"))
+                != SlotKind::Ref
+        }) || self.positive_refs.iter().any(|slot| {
+            *model
+                .get(slot)
+                .unwrap_or_else(|| panic!("forbid-clause model is missing {slot:?}"))
+                == SlotKind::Ref
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lifecycle {
+    Unseen,
+    Guarded,
+    Permanent,
+}
+
+impl Lifecycle {
+    #[cfg(test)]
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::Unseen => "unseen",
+            Self::Guarded => "guarded",
+            Self::Permanent => "permanent",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitActionKind {
+    GuardedCommit,
+    UnconditionalCommit,
+    RecurrenceEscalation,
+}
+
+impl CommitActionKind {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::GuardedCommit => "guarded",
+            Self::UnconditionalCommit => "unconditional",
+            Self::RecurrenceEscalation => "escalation",
+        }
+    }
+}
+
+/// One solver assertion planned after an entire validation round has been
+/// collected and canonicalized.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommitAction {
+    pub(crate) target: SlotRef,
+    /// Canonical edge-local peer set. For escalation this records the
+    /// reappearing context for the diagnostics even though the emitted
+    /// assertion is unconditional.
+    pub(crate) peers: Vec<SlotRef>,
+    pub(crate) peer_witnesses: Vec<PeerWitness>,
+    pub(crate) owning_peers: Vec<SlotRef>,
+    pub(crate) clause: ForbidClause,
+    pub(crate) edge: EdgeKey,
+    pub(crate) edge_attributions: Vec<EdgeAttribution>,
+    pub(crate) kind: CommitActionKind,
+    pub(crate) core_family: &'static str,
+    pub(crate) diagnostic_key: DiagnosticKey,
+    pub(crate) diagnostic_label: String,
+}
+
+/// Diagnostic-only snapshot of one already-asserted guarded-repair clause at a
+/// later validation round. Every literal records its current kind, Boolean
+/// value, transition from the preceding solved model, and whether that slot is
+/// itself governed by a guarded/permanent lifecycle.
+#[cfg(test)]
+pub(crate) fn clause_state_diagnostic(
+    action: &CommitAction,
+    clause_sequence: usize,
+    committed_round: usize,
+    validation_round: usize,
+    previous_model: &FxHashMap<SlotRef, SlotKind>,
+    model: &FxHashMap<SlotRef, SlotKind>,
+    lifecycle: impl Fn(SlotRef) -> Lifecycle,
+) -> String {
+    #[derive(Clone, Copy)]
+    enum Role {
+        TargetNegative,
+        PeerNegative,
+        PeerPositive,
+    }
+
+    impl Role {
+        #[cfg(test)]
+        fn diagnostic(self) -> &'static str {
+            match self {
+                Self::TargetNegative => "target-neg",
+                Self::PeerNegative => "peer-neg",
+                Self::PeerPositive => "peer-pos",
+            }
+        }
+
+        #[cfg(test)]
+        fn literal_value(self, kind: SlotKind) -> bool {
+            match self {
+                Self::TargetNegative | Self::PeerNegative => kind != SlotKind::Ref,
+                Self::PeerPositive => kind == SlotKind::Ref,
+            }
+        }
+    }
+
+    fn kind_diagnostic(kind: SlotKind) -> &'static str {
+        match kind {
+            SlotKind::Ref => "ref",
+            SlotKind::Raw => "raw",
+            SlotKind::Owning => "owning",
+        }
+    }
+
+    let mut literals = action
+        .clause
+        .negative_refs
+        .iter()
+        .copied()
+        .map(|slot| {
+            (
+                slot,
+                if slot == action.target {
+                    Role::TargetNegative
+                } else {
+                    Role::PeerNegative
+                },
+            )
+        })
+        .chain(
+            action
+                .clause
+                .positive_refs
+                .iter()
+                .copied()
+                .map(|slot| (slot, Role::PeerPositive)),
+        )
+        .collect::<Vec<_>>();
+    literals.sort_by_key(|(slot, role)| {
+        let role_order = match role {
+            Role::TargetNegative => 0,
+            Role::PeerNegative => 1,
+            Role::PeerPositive => 2,
+        };
+        (SlotKey::of(*slot), role_order)
+    });
+
+    let literal_records = literals
+        .iter()
+        .map(|&(slot, role)| {
+            let kind = *model
+                .get(&slot)
+                .unwrap_or_else(|| panic!("L2 clause-state model is missing {slot:?}"));
+            format!(
+                "{}@{}@{}@{}@{}",
+                slotref_diagnostic(slot),
+                role.diagnostic(),
+                kind_diagnostic(kind),
+                role.literal_value(kind),
+                lifecycle(slot).diagnostic(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let transition_records = literals
+        .iter()
+        .map(|&(slot, role)| {
+            let before = *previous_model
+                .get(&slot)
+                .unwrap_or_else(|| panic!("previous L2 clause-state model is missing {slot:?}"));
+            let after = *model
+                .get(&slot)
+                .unwrap_or_else(|| panic!("L2 clause-state model is missing {slot:?}"));
+            (
+                before != after,
+                format!(
+                    "{}@{}@{}>{}@{}",
+                    slotref_diagnostic(slot),
+                    role.diagnostic(),
+                    kind_diagnostic(before),
+                    kind_diagnostic(after),
+                    lifecycle(slot).diagnostic(),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let guard_context = if action.kind != CommitActionKind::GuardedCommit {
+        "unconditional"
+    } else if action.peer_witnesses.iter().all(|witness| {
+        model.get(&witness.slot)
+            == Some(&match witness.kind {
+                WitnessedKind::Ref => SlotKind::Ref,
+                WitnessedKind::Raw => SlotKind::Raw,
+            })
+    }) {
+        "held"
+    } else {
+        "departed"
+    };
+
+    format!(
+        "event=l2_clause_state|round={validation_round}|clause={clause_sequence}|\
+         committed_round={committed_round}|commit_kind={}|target={}|target_lifecycle={}|\
+         guard_context={guard_context}|literals={}|transitions={}|changed={}",
+        action.kind.diagnostic(),
+        slotref_diagnostic(action.target),
+        lifecycle(action.target).diagnostic(),
+        literal_records.join(","),
+        transition_records
+            .iter()
+            .map(|(_, record)| record.as_str())
+            .collect::<Vec<_>>()
+            .join(","),
+        transition_records
+            .iter()
+            .filter_map(|(changed, record)| changed.then_some(record.as_str()))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SolverOutcome {
+    Sat,
+    #[cfg(test)]
+    Unsat,
+    #[cfg(test)]
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SolverDecline {
+    Unsat,
+    Unknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeclineReason {
+    Solver(SolverDecline),
+    ValidationCap { cap: usize, attempted_round: usize },
+    ParticipantNotRef { slot: SlotRef },
+    PermanentRetarget { target: SlotRef },
+    NoProgress,
+    ArithmeticOverflow,
+}
+
+impl DeclineReason {
+    pub(crate) fn diagnostic_label(&self, validation_round: usize) -> String {
+        let detail = match self {
+            Self::Solver(SolverDecline::Unsat) => "reason=solver-unsat".to_owned(),
+            Self::Solver(SolverDecline::Unknown) => "reason=solver-unknown".to_owned(),
+            Self::ValidationCap {
+                cap,
+                attempted_round,
+            } => format!("reason=validation-cap|cap={cap}|attempted_round={attempted_round}"),
+            Self::ParticipantNotRef { slot } => format!(
+                "reason=participant-not-ref|slot={}",
+                SlotKey::of(*slot).diagnostic()
+            ),
+            Self::PermanentRetarget { target } => format!(
+                "reason=permanent-retarget|target={}",
+                SlotKey::of(*target).diagnostic()
+            ),
+            Self::NoProgress => "reason=no-potential-progress".to_owned(),
+            Self::ArithmeticOverflow => "reason=arithmetic-overflow".to_owned(),
+        };
+        format!("event=l2_decline|round={validation_round}|{detail}")
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RoundPlan {
+    Accept {
+        validation_round: usize,
+    },
+    Continue {
+        validation_round: usize,
+        actions: Vec<CommitAction>,
+    },
+    Decline {
+        validation_round: usize,
+        reason: DeclineReason,
+    },
+}
+
+/// Per-fixpoint-invocation guarded-repair state. Every selected slot advances monotonically
+/// through `Unseen → Guarded → Permanent`.
+pub(crate) struct Planner {
+    slot_count: usize,
+    validation_rounds: usize,
+    lifecycle: FxHashMap<SlotRef, Lifecycle>,
+    epochs: FxHashMap<SlotRef, Vec<StoredHazard>>,
+    previous_model: Option<FxHashMap<SlotRef, SlotKind>>,
+}
+
+impl Planner {
+    const HAZARD_KEY_BUDGET: usize = 8;
+
+    pub(crate) fn new(slot_count: usize) -> Self {
+        Self {
+            slot_count,
+            validation_rounds: 0,
+            lifecycle: FxHashMap::default(),
+            epochs: FxHashMap::default(),
+            previous_model: None,
+        }
+    }
+
+    pub(crate) fn validation_cap(&self) -> usize {
+        self.try_validation_cap()
+            .expect("guarded-repair validation-round cap overflow")
+    }
+
+    fn try_validation_cap(&self) -> Option<usize> {
+        self.slot_count
+            .checked_mul(2 + Self::HAZARD_KEY_BUDGET)
+            .and_then(|rank_bound| rank_bound.checked_add(1))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validation_rounds(&self) -> usize {
+        self.validation_rounds
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle(&self, slot: SlotRef) -> Lifecycle {
+        self.lifecycle
+            .get(&slot)
+            .copied()
+            .unwrap_or(Lifecycle::Unseen)
+    }
+
+    /// Plan one post-solve validation round.
+    pub(crate) fn plan_round(
+        &mut self,
+        solver_outcome: SolverOutcome,
+        observations: &[ConflictObservation],
+        model: &FxHashMap<SlotRef, SlotKind>,
+    ) -> RoundPlan {
+        match solver_outcome {
+            #[cfg(test)]
+            SolverOutcome::Unsat => {
+                return RoundPlan::Decline {
+                    validation_round: self.validation_rounds,
+                    reason: DeclineReason::Solver(SolverDecline::Unsat),
+                };
+            }
+            #[cfg(test)]
+            SolverOutcome::Unknown => {
+                return RoundPlan::Decline {
+                    validation_round: self.validation_rounds,
+                    reason: DeclineReason::Solver(SolverDecline::Unknown),
+                };
+            }
+            SolverOutcome::Sat => {}
+        }
+
+        self.validation_rounds += 1;
+        let validation_round = self.validation_rounds;
+        let Some(cap) = self.try_validation_cap() else {
+            return RoundPlan::Decline {
+                validation_round,
+                reason: DeclineReason::ArithmeticOverflow,
+            };
+        };
+        if validation_round > cap {
+            return RoundPlan::Decline {
+                validation_round,
+                reason: DeclineReason::ValidationCap {
+                    cap,
+                    attempted_round: validation_round,
+                },
+            };
+        }
+        if observations.is_empty() {
+            self.previous_model = Some(model.clone());
+            return RoundPlan::Accept { validation_round };
+        }
+
+        let mut candidates = Vec::with_capacity(observations.len());
+        for observation in observations {
+            match Candidate::from_observation(observation, model) {
+                Ok(candidate) => candidates.push(candidate),
+                Err(slot) => {
+                    return RoundPlan::Decline {
+                        validation_round,
+                        reason: DeclineReason::ParticipantNotRef { slot },
+                    };
+                }
+            }
+        }
+
+        candidates.sort_by(|a, b| a.key().cmp(&b.key()));
+        let lifecycle_before = self.lifecycle.clone();
+        let epochs_before = self.epochs.clone();
+        let mut additions: FxHashMap<SlotRef, Vec<Candidate>> = FxHashMap::default();
+        let mut permanents: FxHashMap<SlotRef, PermanentIntent> = FxHashMap::default();
+        let mut blame_sources: FxHashMap<SlotRef, Vec<BlameSource>> = FxHashMap::default();
+        let mut cursor = 0;
+        while cursor < candidates.len() {
+            let target = candidates[cursor].target;
+            let target_key = SlotKey::of(target);
+            let end = candidates[cursor..]
+                .iter()
+                .position(|candidate| SlotKey::of(candidate.target) != target_key)
+                .map_or(candidates.len(), |offset| cursor + offset);
+            let mut observed = candidates[cursor..end].to_vec();
+            observed.sort_by(|a, b| a.hazard_sort_key().cmp(&b.hazard_sort_key()));
+            observed.dedup_by(|a, b| a.hazard_sort_key() == b.hazard_sort_key());
+
+            match lifecycle_before
+                .get(&target)
+                .copied()
+                .unwrap_or(Lifecycle::Unseen)
+            {
+                Lifecycle::Unseen => {
+                    if let Some(unconditional) = observed
+                        .iter()
+                        .find(|candidate| candidate.is_unconditional())
+                        .cloned()
+                    {
+                        permanents.insert(
+                            target,
+                            PermanentIntent::new(
+                                unconditional,
+                                CommitActionKind::UnconditionalCommit,
+                                GUARDED_COMMIT_CORE_FAMILY,
+                            ),
+                        );
+                    } else {
+                        additions.entry(target).or_default().extend(observed);
+                    }
+                }
+                Lifecycle::Guarded => {
+                    if let Some(unconditional) = observed
+                        .iter()
+                        .find(|candidate| candidate.is_unconditional())
+                        .cloned()
+                    {
+                        permanents.insert(
+                            target,
+                            PermanentIntent::new(
+                                unconditional,
+                                CommitActionKind::UnconditionalCommit,
+                                GUARDED_COMMIT_CORE_FAMILY,
+                            ),
+                        );
+                        cursor = end;
+                        continue;
+                    }
+
+                    let guarded = epochs_before
+                        .get(&target)
+                        .expect("a guarded-repair target has a stored epoch");
+                    let mut repeated = Vec::new();
+                    for mut candidate in observed {
+                        let key = candidate
+                            .primary_hazard_key()
+                            .expect("a guarded candidate has a stable hazard key")
+                            .clone();
+                        if let Some(stored) = guarded.iter().find(|stored| stored.key == key) {
+                            candidate.disposition = "repeated-key";
+                            repeated.push((candidate, stored.clone()));
+                        } else {
+                            additions.entry(target).or_default().push(candidate);
+                        }
+                    }
+
+                    if !repeated.is_empty() {
+                        let mut blame = repeated
+                            .iter()
+                            .flat_map(|(candidate, stored)| {
+                                stored.invalidator_witnesses.iter().filter_map(
+                                    |&(slot, witnessed)| {
+                                        if slot == target
+                                            || candidate.issuer_slot() == Some(slot)
+                                            || lifecycle_before.get(&slot)
+                                                == Some(&Lifecycle::Permanent)
+                                        {
+                                            return None;
+                                        }
+                                        let current = *model.get(&slot)?;
+                                        (current != witnessed).then(|| BlameSource {
+                                            source_target: target,
+                                            candidate: candidate.clone(),
+                                            blamed: slot,
+                                            witnessed,
+                                            current,
+                                            transition_confirmed: self
+                                                .previous_model
+                                                .as_ref()
+                                                .and_then(|previous| previous.get(&slot))
+                                                == Some(&witnessed),
+                                        })
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        blame.sort_by_key(|source| SlotKey::of(source.blamed));
+                        if let Some(blame) = blame.into_iter().next() {
+                            blame_sources.entry(blame.blamed).or_default().push(blame);
+                        } else {
+                            permanents.insert(
+                                target,
+                                PermanentIntent::new(
+                                    repeated[0].0.clone(),
+                                    CommitActionKind::RecurrenceEscalation,
+                                    RECURRENCE_ESCALATION_CORE_FAMILY,
+                                ),
+                            );
+                        }
+                    }
+                }
+                Lifecycle::Permanent => {
+                    return RoundPlan::Decline {
+                        validation_round,
+                        reason: DeclineReason::PermanentRetarget { target },
+                    };
+                }
+            }
+            cursor = end;
+        }
+
+        let mut blamed_slots = blame_sources.keys().copied().collect::<Vec<_>>();
+        blamed_slots.sort_by_key(|slot| SlotKey::of(*slot));
+        for blamed in blamed_slots {
+            if permanents.contains_key(&blamed) {
+                continue;
+            }
+            let mut sources = blame_sources.remove(&blamed).unwrap_or_default();
+            sources.sort_by_key(|a| a.key());
+            match lifecycle_before
+                .get(&blamed)
+                .copied()
+                .unwrap_or(Lifecycle::Unseen)
+            {
+                Lifecycle::Guarded => {
+                    let candidate = sources[0].retargeted_candidate();
+                    permanents.insert(
+                        blamed,
+                        PermanentIntent::new(
+                            candidate,
+                            CommitActionKind::RecurrenceEscalation,
+                            RECURRENCE_ESCALATION_CORE_FAMILY,
+                        ),
+                    );
+                }
+                Lifecycle::Unseen => {
+                    additions
+                        .entry(blamed)
+                        .or_default()
+                        .extend(sources.iter().map(BlameSource::retargeted_candidate));
+                }
+                Lifecycle::Permanent => {}
+            }
+        }
+
+        let mut addition_targets = additions.keys().copied().collect::<Vec<_>>();
+        addition_targets.sort_by_key(|slot| SlotKey::of(*slot));
+        for target in addition_targets {
+            if permanents.contains_key(&target) {
+                continue;
+            }
+            let mut target_additions = additions.remove(&target).unwrap_or_default();
+            target_additions.sort_by(|a, b| a.key().cmp(&b.key()));
+            if let Some(unconditional) = target_additions
+                .iter()
+                .find(|candidate| candidate.is_unconditional())
+                .cloned()
+            {
+                permanents.insert(
+                    target,
+                    PermanentIntent::new(
+                        unconditional,
+                        CommitActionKind::UnconditionalCommit,
+                        GUARDED_COMMIT_CORE_FAMILY,
+                    ),
+                );
+                continue;
+            }
+
+            let existing = epochs_before.get(&target).cloned().unwrap_or_default();
+            target_additions.retain(|candidate| {
+                let key = candidate
+                    .primary_hazard_key()
+                    .expect("a guarded addition has a stable hazard key");
+                !existing.iter().any(|stored| stored.key == *key)
+            });
+            target_additions.dedup_by(|a, b| a.primary_hazard_key() == b.primary_hazard_key());
+            if existing
+                .len()
+                .checked_add(target_additions.len())
+                .is_none_or(|count| count > Self::HAZARD_KEY_BUDGET)
+            {
+                let mut candidate = target_additions
+                    .first()
+                    .cloned()
+                    .or_else(|| existing.first().map(|stored| stored.candidate.clone()))
+                    .expect("key-budget degradation has a spawning edge");
+                candidate.degraded_reason = Some("key_budget");
+                candidate.disposition = "key-budget";
+                permanents.insert(
+                    target,
+                    PermanentIntent::new(
+                        candidate,
+                        CommitActionKind::UnconditionalCommit,
+                        GUARDED_COMMIT_CORE_FAMILY,
+                    ),
+                );
+                continue;
+            }
+            additions.insert(target, target_additions);
+        }
+
+        let mut actions = Vec::new();
+        let mut permanent_targets = permanents.keys().copied().collect::<Vec<_>>();
+        permanent_targets.sort_by_key(|slot| SlotKey::of(*slot));
+        for target in permanent_targets {
+            let intent = permanents.remove(&target).expect("listed permanent intent");
+            actions.push(intent.candidate.action(intent.kind, intent.core_family));
+            self.lifecycle.insert(target, Lifecycle::Permanent);
+            self.epochs.remove(&target);
+            additions.remove(&target);
+        }
+
+        let mut addition_targets = additions.keys().copied().collect::<Vec<_>>();
+        addition_targets.sort_by_key(|slot| SlotKey::of(*slot));
+        for target in addition_targets {
+            let mut new_candidates = additions.remove(&target).unwrap_or_default();
+            if new_candidates.is_empty() {
+                continue;
+            }
+            new_candidates.sort_by(|a, b| a.key().cmp(&b.key()));
+            for candidate in &new_candidates {
+                let key = candidate
+                    .primary_hazard_key()
+                    .expect("a guarded addition has a stable key")
+                    .clone();
+                self.epochs.entry(target).or_default().push(StoredHazard {
+                    key,
+                    invalidator_witnesses: candidate.invalidator_witnesses.clone(),
+                    candidate: candidate.clone(),
+                });
+            }
+            let epoch = self.epochs.get_mut(&target).unwrap();
+            epoch.sort_by(|a, b| a.key.cmp(&b.key));
+            epoch.dedup_by(|a, b| a.key == b.key);
+
+            let mut action_candidates: Vec<Candidate> = Vec::new();
+            for candidate in new_candidates {
+                if let Some(previous) = action_candidates.last_mut()
+                    && previous.same_clause(&candidate)
+                {
+                    previous.merge_attribution(candidate);
+                } else {
+                    action_candidates.push(candidate);
+                }
+            }
+            actions.extend(action_candidates.iter().map(|candidate| {
+                candidate.action(CommitActionKind::GuardedCommit, GUARDED_COMMIT_CORE_FAMILY)
+            }));
+            self.lifecycle.insert(target, Lifecycle::Guarded);
+        }
+
+        let phi = self
+            .lifecycle
+            .values()
+            .map(|lifecycle| match lifecycle {
+                Lifecycle::Unseen => 0,
+                Lifecycle::Guarded => 1,
+                Lifecycle::Permanent => 2,
+            })
+            .sum::<usize>();
+        let h = self.epochs.values().map(Vec::len).sum::<usize>();
+        let psi = phi
+            .checked_add(h)
+            .expect("guarded-repair diagnostic potential overflow");
+        if actions.is_empty() {
+            return RoundPlan::Decline {
+                validation_round,
+                reason: DeclineReason::NoProgress,
+            };
+        }
+        for action in &mut actions {
+            if action.diagnostic_label.contains("|hazard_keys=") {
+                action.diagnostic_label.push_str(&format!(
+                    "|potential_phi={phi}|potential_h={h}|key_budget={}|potential_psi={psi}",
+                    Self::HAZARD_KEY_BUDGET
+                ));
+            }
+        }
+        self.previous_model = Some(model.clone());
+        actions.sort_by(|a, b| a.diagnostic_key.cmp(&b.diagnostic_key));
+        RoundPlan::Continue {
+            validation_round,
+            actions,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StoredHazard {
+    key: HazardKey,
+    invalidator_witnesses: Vec<(SlotRef, SlotKind)>,
+    candidate: Candidate,
+}
+
+struct PermanentIntent {
+    candidate: Candidate,
+    kind: CommitActionKind,
+    core_family: &'static str,
+}
+
+impl PermanentIntent {
+    fn new(candidate: Candidate, kind: CommitActionKind, core_family: &'static str) -> Self {
+        Self {
+            candidate,
+            kind,
+            core_family,
+        }
+    }
+}
+
+struct BlameSource {
+    source_target: SlotRef,
+    candidate: Candidate,
+    blamed: SlotRef,
+    witnessed: SlotKind,
+    current: SlotKind,
+    transition_confirmed: bool,
+}
+
+impl BlameSource {
+    fn key(&self) -> (SlotKey, SlotKey, Option<HazardKey>) {
+        (
+            SlotKey::of(self.blamed),
+            SlotKey::of(self.source_target),
+            self.candidate.primary_hazard_key().cloned(),
+        )
+    }
+
+    fn retargeted_candidate(&self) -> Candidate {
+        let mut candidate = self.candidate.retarget(self.blamed);
+        candidate.blame_diagnostic = Some(format!(
+            "{}@{}>{}@mid_trial={}",
+            slotref_diagnostic(self.source_target),
+            slot_kind_diagnostic(self.witnessed),
+            slot_kind_diagnostic(self.current),
+            self.transition_confirmed,
+        ));
+        candidate
+    }
+}
+
+#[derive(Clone)]
+struct Candidate {
+    target: SlotRef,
+    peers: Vec<SlotRef>,
+    peer_witnesses: Vec<PeerWitness>,
+    owning_peers: Vec<SlotRef>,
+    issuer_witness: Option<(SlotRef, SlotKind)>,
+    invalidator_witnesses: Vec<(SlotRef, SlotKind)>,
+    hazard_keys: Vec<HazardKey>,
+    explicit_loan_identity: bool,
+    degraded_reason: Option<&'static str>,
+    issuer_raw_anomaly: bool,
+    blame_diagnostic: Option<String>,
+    constituent_diagnostic: String,
+    disposition: &'static str,
+    edge_attributions: Vec<EdgeAttribution>,
+}
+
+impl Candidate {
+    fn from_observation(
+        observation: &ConflictObservation,
+        model: &FxHashMap<SlotRef, SlotKind>,
+    ) -> Result<Self, SlotRef> {
+        if model.get(&observation.target) != Some(&SlotKind::Ref) {
+            return Err(observation.target);
+        }
+        if let Some(issuer) = observation.issuer
+            && !model.contains_key(&issuer)
+        {
+            return Err(issuer);
+        }
+
+        let mut requirers = observation.requirers.clone();
+        canonicalize_slots(&mut requirers);
+        for &requirer in &requirers {
+            if !model.contains_key(&requirer) {
+                return Err(requirer);
+            }
+        }
+        let mut invalidators = observation.invalidators.clone();
+        canonicalize_slots(&mut invalidators);
+        let mut invalidator_witnesses = Vec::with_capacity(invalidators.len());
+        for &invalidator in &invalidators {
+            let Some(&kind) = model.get(&invalidator) else {
+                return Err(invalidator);
+            };
+            invalidator_witnesses.push((invalidator, kind));
+        }
+
+        let edge = EdgeKey {
+            fn_key: observation.fn_key,
+            issuer: observation.issuer.map(SlotKey::of),
+            requirers: requirers.into_iter().map(SlotKey::of).collect(),
+        };
+        let edge_attributions = vec![EdgeAttribution {
+            edge,
+            invalidators: invalidators.iter().copied().map(SlotKey::of).collect(),
+        }];
+        let mut candidate = Self {
+            target: observation.target,
+            peers: Vec::new(),
+            peer_witnesses: Vec::new(),
+            owning_peers: Vec::new(),
+            issuer_witness: None,
+            invalidator_witnesses,
+            hazard_keys: observation
+                .stable_loan_key
+                .map(|loan| HazardKey {
+                    loan,
+                    invalidators: invalidators.iter().copied().map(SlotKey::of).collect(),
+                    via_overlap_partner: observation.via_overlap_partner(),
+                })
+                .into_iter()
+                .collect(),
+            explicit_loan_identity: observation.explicit_loan_identity,
+            degraded_reason: None,
+            issuer_raw_anomaly: false,
+            blame_diagnostic: None,
+            constituent_diagnostic: constituent_diagnostic(observation, model),
+            disposition: "new-key",
+            edge_attributions,
+        };
+
+        let Some(issuer) = observation
+            .issuer
+            .filter(|issuer| *issuer != observation.target)
+        else {
+            candidate.degraded_reason = Some("unmappable_issuer");
+            return Ok(candidate);
+        };
+        let Some(&issuer_kind) = model.get(&issuer) else {
+            return Err(issuer);
+        };
+        candidate.issuer_witness = Some((issuer, issuer_kind));
+        match issuer_kind {
+            SlotKind::Ref => candidate.peer_witnesses.push(PeerWitness {
+                slot: issuer,
+                kind: WitnessedKind::Ref,
+            }),
+            SlotKind::Raw => {
+                candidate.issuer_raw_anomaly = true;
+                candidate.peer_witnesses.push(PeerWitness {
+                    slot: issuer,
+                    kind: WitnessedKind::Raw,
+                });
+            }
+            SlotKind::Owning => {
+                candidate.peers.push(issuer);
+                candidate.owning_peers.push(issuer);
+                candidate.degraded_reason = Some("owning_issuer");
+                return Ok(candidate);
+            }
+        }
+
+        for &(invalidator, kind) in &candidate.invalidator_witnesses {
+            if invalidator != observation.target && kind == SlotKind::Raw {
+                candidate.peer_witnesses.push(PeerWitness {
+                    slot: invalidator,
+                    kind: WitnessedKind::Raw,
+                });
+            }
+        }
+        candidate
+            .peer_witnesses
+            .sort_by_key(|witness| SlotKey::of(witness.slot));
+        candidate
+            .peer_witnesses
+            .dedup_by_key(|witness| SlotKey::of(witness.slot));
+        candidate.peers = candidate
+            .peer_witnesses
+            .iter()
+            .map(|witness| witness.slot)
+            .collect();
+        Ok(candidate)
+    }
+
+    fn issuer_slot(&self) -> Option<SlotRef> {
+        self.issuer_witness.map(|(slot, _)| slot)
+    }
+
+    fn primary_hazard_key(&self) -> Option<&HazardKey> {
+        self.hazard_keys.first()
+    }
+
+    fn hazard_sort_key(&self) -> (bool, Option<HazardKey>, &EdgeAttribution) {
+        (
+            self.is_unconditional(),
+            self.primary_hazard_key().cloned(),
+            self.edge_attributions
+                .first()
+                .expect("every guarded-repair candidate retains its spawning edge"),
+        )
+    }
+
+    fn retarget(&self, target: SlotRef) -> Self {
+        let mut retargeted = self.clone();
+        retargeted.target = target;
+        retargeted.peers.clear();
+        retargeted.peer_witnesses.clear();
+        retargeted.owning_peers.clear();
+        retargeted.degraded_reason = None;
+        retargeted.disposition = "repeated-key-blame";
+        let Some((issuer, issuer_kind)) = retargeted
+            .issuer_witness
+            .filter(|(issuer, _)| *issuer != target)
+        else {
+            retargeted.degraded_reason = Some("unmappable_issuer");
+            return retargeted;
+        };
+        match issuer_kind {
+            SlotKind::Ref => retargeted.peer_witnesses.push(PeerWitness {
+                slot: issuer,
+                kind: WitnessedKind::Ref,
+            }),
+            SlotKind::Raw => retargeted.peer_witnesses.push(PeerWitness {
+                slot: issuer,
+                kind: WitnessedKind::Raw,
+            }),
+            SlotKind::Owning => {
+                retargeted.peers.push(issuer);
+                retargeted.owning_peers.push(issuer);
+                retargeted.degraded_reason = Some("owning_issuer");
+                return retargeted;
+            }
+        }
+        for &(invalidator, kind) in &retargeted.invalidator_witnesses {
+            if invalidator != target && kind == SlotKind::Raw {
+                retargeted.peer_witnesses.push(PeerWitness {
+                    slot: invalidator,
+                    kind: WitnessedKind::Raw,
+                });
+            }
+        }
+        retargeted
+            .peer_witnesses
+            .sort_by_key(|witness| SlotKey::of(witness.slot));
+        retargeted
+            .peer_witnesses
+            .dedup_by_key(|witness| SlotKey::of(witness.slot));
+        retargeted.peers = retargeted
+            .peer_witnesses
+            .iter()
+            .map(|witness| witness.slot)
+            .collect();
+        retargeted
+    }
+
+    fn witnessed_keys(&self) -> Vec<(SlotKey, WitnessedKind)> {
+        self.peer_witnesses
+            .iter()
+            .map(|witness| (SlotKey::of(witness.slot), witness.kind))
+            .collect()
+    }
+
+    fn is_unconditional(&self) -> bool {
+        self.degraded_reason.is_some() || self.peers.is_empty() || !self.owning_peers.is_empty()
+    }
+
+    fn clause_key(&self) -> Vec<(SlotKey, WitnessedKind)> {
+        if self.is_unconditional() {
+            Vec::new()
+        } else {
+            self.witnessed_keys()
+        }
+    }
+
+    fn key(&self) -> (SlotKey, Vec<(SlotKey, WitnessedKind)>, &EdgeAttribution) {
+        (
+            SlotKey::of(self.target),
+            self.clause_key(),
+            self.edge_attributions
+                .first()
+                .expect("every guarded-repair candidate retains its spawning edge"),
+        )
+    }
+
+    fn same_clause(&self, other: &Self) -> bool {
+        SlotKey::of(self.target) == SlotKey::of(other.target)
+            && self.clause_key() == other.clause_key()
+            && self.degraded_reason == other.degraded_reason
+    }
+
+    fn merge_attribution(&mut self, other: Self) {
+        self.edge_attributions.extend(other.edge_attributions);
+        self.edge_attributions.sort();
+        self.edge_attributions.dedup();
+        self.hazard_keys.extend(other.hazard_keys);
+        self.hazard_keys.sort();
+        self.hazard_keys.dedup();
+        self.explicit_loan_identity |= other.explicit_loan_identity;
+    }
+
+    fn action(&self, kind: CommitActionKind, core_family: &'static str) -> CommitAction {
+        let primary_attribution = self
+            .edge_attributions
+            .first()
+            .expect("every guarded-repair action retains a canonical spawning edge");
+        let diagnostic_key = DiagnosticKey {
+            target: SlotKey::of(self.target),
+            peers: slot_keys(&self.peers),
+            edge: primary_attribution.edge.clone(),
+        };
+        let mut negative_refs = Vec::new();
+        let mut positive_refs = Vec::new();
+        if kind == CommitActionKind::GuardedCommit && !self.is_unconditional() {
+            for witness in &self.peer_witnesses {
+                match witness.kind {
+                    WitnessedKind::Ref => negative_refs.push(witness.slot),
+                    WitnessedKind::Raw => positive_refs.push(witness.slot),
+                }
+            }
+        }
+        negative_refs.push(self.target);
+        let diagnostic_label = diagnostic_label(
+            kind,
+            &diagnostic_key,
+            &self.peer_witnesses,
+            &self.owning_peers,
+            &self.edge_attributions,
+            self.degraded_reason,
+            self.explicit_loan_identity.then_some(&self.hazard_keys),
+            self.issuer_raw_anomaly,
+            self.blame_diagnostic.as_deref(),
+            self.explicit_loan_identity
+                .then_some(self.constituent_diagnostic.as_str()),
+            self.disposition,
+        );
+        CommitAction {
+            target: self.target,
+            peers: self.peers.clone(),
+            peer_witnesses: self.peer_witnesses.clone(),
+            owning_peers: self.owning_peers.clone(),
+            clause: ForbidClause {
+                negative_refs,
+                positive_refs,
+            },
+            edge: primary_attribution.edge.clone(),
+            edge_attributions: self.edge_attributions.clone(),
+            kind,
+            core_family,
+            diagnostic_key,
+            diagnostic_label,
+        }
+    }
+}
+
+fn slot_kind_diagnostic(kind: SlotKind) -> &'static str {
+    match kind {
+        SlotKind::Ref => "ref",
+        SlotKind::Raw => "raw",
+        SlotKind::Owning => "owning",
+    }
+}
+
+fn constituent_diagnostic(
+    observation: &ConflictObservation,
+    model: &FxHashMap<SlotRef, SlotKind>,
+) -> String {
+    let issuer = match observation.issuer {
+        Some(slot) => format!(
+            "{}:{}:{}",
+            slotref_diagnostic(slot),
+            slot_kind_diagnostic(model[&slot]),
+            if slot == observation.target {
+                "dropped-target"
+            } else {
+                "selected"
+            },
+        ),
+        None => "none".to_owned(),
+    };
+    let mut requirers = observation.requirers.clone();
+    canonicalize_slots(&mut requirers);
+    let requirers = requirers
+        .into_iter()
+        .map(|slot| {
+            format!(
+                "{}:{}:dropped",
+                slotref_diagnostic(slot),
+                slot_kind_diagnostic(model[&slot])
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut invalidators = observation.invalidators.clone();
+    canonicalize_slots(&mut invalidators);
+    let invalidators = invalidators
+        .into_iter()
+        .map(|slot| {
+            let kind = model[&slot];
+            let disposition = if slot != observation.target && kind == SlotKind::Raw {
+                "selected"
+            } else {
+                "dropped"
+            };
+            format!(
+                "{}:{}:{disposition}",
+                slotref_diagnostic(slot),
+                slot_kind_diagnostic(kind)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("issuer={issuer}@co_requirers={requirers}@invalidators={invalidators}")
+}
+
+fn canonicalize_slots(slots: &mut Vec<SlotRef>) {
+    slots.sort_by_key(|slot| SlotKey::of(*slot));
+    slots.dedup();
+}
+
+fn slot_keys(slots: &[SlotRef]) -> Vec<SlotKey> {
+    slots.iter().copied().map(SlotKey::of).collect()
+}
+
+fn diagnostic_label(
+    kind: CommitActionKind,
+    key: &DiagnosticKey,
+    peer_witnesses: &[PeerWitness],
+    owning_peers: &[SlotRef],
+    edge_attributions: &[EdgeAttribution],
+    degraded_reason: Option<&str>,
+    hazard_keys: Option<&Vec<HazardKey>>,
+    issuer_raw_anomaly: bool,
+    blame_diagnostic: Option<&str>,
+    constituent_diagnostic: Option<&str>,
+    disposition: &str,
+) -> String {
+    let explicit_polarity = kind == CommitActionKind::RecurrenceEscalation
+        || !owning_peers.is_empty()
+        || peer_witnesses
+            .iter()
+            .any(|witness| witness.kind == WitnessedKind::Raw);
+    let owning_keys = slot_keys(owning_peers);
+    let peers = key
+        .peers
+        .iter()
+        .map(|slot| {
+            if owning_keys.contains(slot) {
+                return format!("{}:owning", slot.diagnostic());
+            }
+            let witness = peer_witnesses
+                .iter()
+                .find(|witness| SlotKey::of(witness.slot) == *slot)
+                .expect("every non-Owning diagnostic peer has witnessed polarity");
+            if explicit_polarity {
+                format!("{}:{}", slot.diagnostic(), witness.kind.diagnostic())
+            } else {
+                // Legacy all-Ref guarded labels remain byte-identical. In this
+                // compact form an unsuffixed peer is unambiguously Ref.
+                slot.diagnostic()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let edge_issuer = key
+        .edge
+        .issuer
+        .map_or_else(|| "none".to_owned(), SlotKey::diagnostic);
+    let edge_requirers = key
+        .edge
+        .requirers
+        .iter()
+        .map(|slot| slot.diagnostic())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut label = format!(
+        "event=l2_commit|kind={}|target={}|peers={peers}|edge_fn={}|edge_issuer={edge_issuer}|edge_requirers={edge_requirers}",
+        kind.diagnostic(),
+        key.target.diagnostic(),
+        key.edge.fn_key,
+    );
+    let primary_invalidators = edge_attributions
+        .first()
+        .expect("every diagnostic has a primary edge attribution")
+        .invalidators
+        .iter()
+        .map(|slot| slot.diagnostic())
+        .collect::<Vec<_>>()
+        .join(",");
+    if !primary_invalidators.is_empty() {
+        label.push_str("|edge_invalidators=");
+        label.push_str(&primary_invalidators);
+    }
+    if let Some(reason) = degraded_reason {
+        label.push_str("|degraded_reason=");
+        label.push_str(reason);
+    }
+    if !owning_peers.is_empty() {
+        label.push_str("|owning_peers=");
+        label.push_str(
+            &owning_keys
+                .iter()
+                .map(|slot| slot.diagnostic())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+    if edge_attributions.len() > 1 {
+        label.push_str("|edge_attributions=");
+        label.push_str(
+            &edge_attributions
+                .iter()
+                .map(edge_attribution_diagnostic)
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+    }
+    if let Some(hazard_keys) = hazard_keys {
+        label.push_str("|hazard_keys=");
+        label.push_str(
+            &hazard_keys
+                .iter()
+                .map(HazardKey::diagnostic)
+                .collect::<Vec<_>>()
+                .join(";"),
+        );
+        label.push_str("|hazard_disposition=");
+        label.push_str(disposition);
+    }
+    if issuer_raw_anomaly {
+        label.push_str("|engine_anomaly=live_loan_raw_issuer");
+    }
+    if let Some(blame) = blame_diagnostic {
+        label.push_str("|reenabler_blame=");
+        label.push_str(blame);
+    }
+    if let Some(constituents) = constituent_diagnostic {
+        label.push_str("|constituents=");
+        label.push_str(constituents);
+    }
+    label
+}
+
+fn edge_attribution_diagnostic(attribution: &EdgeAttribution) -> String {
+    let issuer = attribution
+        .edge
+        .issuer
+        .map_or_else(|| "none".to_owned(), SlotKey::diagnostic);
+    let requirers = attribution
+        .edge
+        .requirers
+        .iter()
+        .map(|slot| slot.diagnostic())
+        .collect::<Vec<_>>()
+        .join(",");
+    let invalidators = attribution
+        .invalidators
+        .iter()
+        .map(|slot| slot.diagnostic())
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{}@{issuer}@{requirers}@{invalidators}",
+        attribution.edge.fn_key
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_middle::mir::Local;
+    use rustc_span::def_id::{DefIndex, LocalDefId};
+
+    use super::*;
+    use crate::analyses::borrow_ownership::{
+        crate_slots::CrateSlots,
+        slots::{SlotId, SlotUniverse},
+        solver::KindSolver,
+    };
+
+    fn field(index: usize) -> SlotRef {
+        SlotRef::Field(SlotId::from_usize(index))
+    }
+
+    fn local(owner: u32, index: usize) -> SlotRef {
+        SlotRef::Local(
+            LocalDefId {
+                local_def_index: DefIndex::from_u32(owner),
+            },
+            SlotId::from_usize(index),
+        )
+    }
+
+    fn ref_model(slots: &[SlotRef]) -> FxHashMap<SlotRef, SlotKind> {
+        slots
+            .iter()
+            .copied()
+            .map(|slot| (slot, SlotKind::Ref))
+            .collect()
+    }
+
+    fn observation_with_invalidators(
+        fn_key: FnKey,
+        target: SlotRef,
+        issuer: Option<SlotRef>,
+        requirers: Vec<SlotRef>,
+        invalidators: Vec<SlotRef>,
+    ) -> ConflictObservation {
+        ConflictObservation::new(fn_key, target, issuer, requirers).with_invalidators(invalidators)
+    }
+
+    fn observation_with_loan(
+        fn_key: FnKey,
+        target: SlotRef,
+        issuer: SlotRef,
+        requirers: Vec<SlotRef>,
+        invalidators: Vec<SlotRef>,
+        loan_ordinal: usize,
+        block: u32,
+        statement_index: usize,
+    ) -> ConflictObservation {
+        observation_with_invalidators(fn_key, target, Some(issuer), requirers, invalidators)
+            .with_loan_identity(
+                loan_ordinal,
+                StableLoanKey::new(fn_key, issuer, MirLocationKey::new(block, statement_index)),
+            )
+    }
+
+    fn continue_actions(plan: RoundPlan) -> Vec<CommitAction> {
+        match plan {
+            RoundPlan::Continue { actions, .. } => actions,
+            other => panic!("expected L2 to continue with commits, got {other:?}"),
+        }
+    }
+
+    fn assert_accept(plan: RoundPlan) {
+        assert!(
+            matches!(plan, RoundPlan::Accept { .. }),
+            "expected a conflict-free validation round to accept, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn l2_red_guard_uses_exact_edge_peers_and_empty_guard_is_unconditional() {
+        let (target, outside, peer_a, peer_b, peer_c, invalidator, ref_invalidator) = (
+            field(1),
+            field(99),
+            field(4),
+            field(3),
+            field(2),
+            field(5),
+            field(15),
+        );
+        let model = [
+            (target, SlotKind::Ref),
+            (outside, SlotKind::Ref),
+            (peer_a, SlotKind::Ref),
+            (peer_b, SlotKind::Ref),
+            (peer_c, SlotKind::Ref),
+            (invalidator, SlotKind::Raw),
+            (ref_invalidator, SlotKind::Ref),
+        ]
+        .into_iter()
+        .collect();
+        let observation = observation_with_invalidators(
+            17,
+            target,
+            Some(peer_a),
+            vec![target, peer_b, peer_a, target, peer_c, peer_b],
+            vec![invalidator, ref_invalidator],
+        );
+        let mut planner = Planner::new(100);
+
+        let plan = planner.plan_round(SolverOutcome::Sat, &[observation], &model);
+        assert!(
+            matches!(&plan, RoundPlan::Continue { .. }),
+            "a Raw-witnessed invalidator is guard context, not a decline: {plan:?}"
+        );
+        let actions = continue_actions(plan);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].target, target);
+        assert_eq!(
+            actions[0].peers,
+            vec![peer_a, invalidator],
+            "C1 keeps only the issuer and Raw-witnessed invalidators"
+        );
+        assert!(
+            !actions[0].peers.contains(&outside),
+            "model facts outside the spawning edge must never enter the guard"
+        );
+        assert_eq!(actions[0].kind, CommitActionKind::GuardedCommit);
+        assert_eq!(actions[0].core_family, GUARDED_COMMIT_CORE_FAMILY);
+        assert!(
+            !actions[0].clause.is_satisfied_by(&model),
+            "the witnessed context persists, so target=Ref must violate the commit"
+        );
+        let mut raw_departed_to_ref = model.clone();
+        raw_departed_to_ref.insert(invalidator, SlotKind::Ref);
+        assert!(
+            actions[0].clause.is_satisfied_by(&raw_departed_to_ref),
+            "a Raw-witnessed invalidator becoming Ref must deactivate the commit"
+        );
+        let mut dropped_requirer_departed = model.clone();
+        dropped_requirer_departed.insert(peer_b, SlotKind::Raw);
+        assert!(
+            !actions[0]
+                .clause
+                .is_satisfied_by(&dropped_requirer_departed),
+            "a co-requirer departure must not release the target"
+        );
+        let mut dropped_ref_invalidator_departed = model.clone();
+        dropped_ref_invalidator_departed.insert(ref_invalidator, SlotKind::Raw);
+        assert!(
+            !actions[0]
+                .clause
+                .is_satisfied_by(&dropped_ref_invalidator_departed),
+            "a Ref-witnessed invalidator is not load-bearing and must not release the target"
+        );
+        let all_raw = [target, peer_a, peer_b, peer_c, invalidator]
+            .into_iter()
+            .map(|slot| (slot, SlotKind::Raw))
+            .collect();
+        assert!(
+            actions[0].clause.is_satisfied_by(&all_raw),
+            "the target's negative literal keeps mixed-polarity clauses all-Raw satisfiable"
+        );
+        assert!(
+            actions[0]
+                .diagnostic_label
+                .contains("peers=field:4:ref,field:5:raw"),
+            "R7 must record the selected load-bearing peers: {}",
+            actions[0].diagnostic_label
+        );
+        assert!(
+            actions[0]
+                .diagnostic_label
+                .contains("edge_invalidators=field:5"),
+            "R7 must record the mapped invalidating-access witness: {}",
+            actions[0].diagnostic_label
+        );
+        assert_eq!(planner.lifecycle(target), Lifecycle::Guarded);
+
+        let (issuerless_target, issuerless_a, issuerless_b) = (field(7), field(8), field(9));
+        let mut issuerless_planner = Planner::new(100);
+        let issuerless_actions = continue_actions(issuerless_planner.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                18,
+                issuerless_target,
+                None,
+                vec![issuerless_b, issuerless_target, issuerless_a, issuerless_b],
+            )],
+            &ref_model(&[issuerless_target, issuerless_a, issuerless_b]),
+        ));
+        assert_eq!(issuerless_actions.len(), 1);
+        assert!(
+            issuerless_actions[0].peers.is_empty(),
+            "an issuer-less edge has no load-bearing loan literal"
+        );
+        assert_eq!(
+            issuerless_actions[0].kind,
+            CommitActionKind::UnconditionalCommit,
+            "an unmappable issuer degrades exactly to Mode-A"
+        );
+        assert_eq!(
+            issuerless_actions[0].edge,
+            EdgeKey {
+                fn_key: 18,
+                issuer: None,
+                requirers: vec![
+                    SlotKey::of(issuerless_target),
+                    SlotKey::of(issuerless_a),
+                    SlotKey::of(issuerless_b),
+                ],
+            },
+            "issuer absence remains explicit in the canonical edge attribution"
+        );
+
+        let lone_target = field(6);
+        let mut empty_guard_planner = Planner::new(100);
+        let actions = continue_actions(empty_guard_planner.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                17,
+                lone_target,
+                None,
+                vec![lone_target, lone_target],
+            )],
+            &ref_model(&[lone_target]),
+        ));
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].peers.is_empty());
+        assert_eq!(actions[0].kind, CommitActionKind::UnconditionalCommit);
+        assert_eq!(actions[0].core_family, GUARDED_COMMIT_CORE_FAMILY);
+        assert!(
+            !actions[0]
+                .clause
+                .is_satisfied_by(&ref_model(&[lone_target])),
+            "the participant-free commit must forbid target=Ref"
+        );
+        assert!(
+            actions[0]
+                .clause
+                .is_satisfied_by(&[(lone_target, SlotKind::Raw)].into_iter().collect()),
+            "the participant-free commit must retain the all-Raw model"
+        );
+        assert_eq!(
+            empty_guard_planner.lifecycle(lone_target),
+            Lifecycle::Permanent
+        );
+
+        let mut raw_guard = Planner::new(2);
+        let raw_model = [(target, SlotKind::Ref), (peer_a, SlotKind::Raw)]
+            .into_iter()
+            .collect();
+        let raw_plan = raw_guard.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                17,
+                target,
+                Some(peer_a),
+                vec![target],
+            )],
+            &raw_model,
+        );
+        assert!(
+            matches!(&raw_plan, RoundPlan::Continue { .. }),
+            "a mapped Raw peer must produce a witnessed-polarity guard: {raw_plan:?}"
+        );
+        let raw_actions = continue_actions(raw_plan);
+        assert_eq!(raw_actions[0].kind, CommitActionKind::GuardedCommit);
+        assert!(
+            !raw_actions[0].clause.is_satisfied_by(&raw_model),
+            "Raw witness + Ref target keeps the commit active"
+        );
+        assert!(
+            raw_actions[0].clause.is_satisfied_by(
+                &[(target, SlotKind::Ref), (peer_a, SlotKind::Ref)]
+                    .into_iter()
+                    .collect()
+            ),
+            "Raw to Ref departure deactivates the commit"
+        );
+
+        let mut owning_requirer_is_dropped = Planner::new(3);
+        let owning_model = [
+            (target, SlotKind::Ref),
+            (peer_a, SlotKind::Ref),
+            (peer_b, SlotKind::Owning),
+        ]
+        .into_iter()
+        .collect();
+        let owning_plan = owning_requirer_is_dropped.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                17,
+                target,
+                Some(peer_a),
+                vec![target, peer_b],
+            )],
+            &owning_model,
+        );
+        assert!(
+            matches!(&owning_plan, RoundPlan::Continue { .. }),
+            "a dropped Owning co-requirer is not a model-kind failure: {owning_plan:?}"
+        );
+        let owning_actions = continue_actions(owning_plan);
+        assert_eq!(owning_actions.len(), 1);
+        assert_eq!(
+            owning_actions[0].kind,
+            CommitActionKind::GuardedCommit,
+            "only a selected Owning issuer degrades the edge"
+        );
+        assert_eq!(
+            owning_actions[0].peers,
+            vec![peer_a],
+            "the dropped Owning co-requirer does not enter the C1 antecedent"
+        );
+        assert!(
+            !owning_actions[0]
+                .diagnostic_label
+                .contains("degraded_reason=owning"),
+            "a dropped constituent must not trigger Owning degradation: {}",
+            owning_actions[0].diagnostic_label,
+        );
+
+        let mut owning_issuer_degrades = Planner::new(3);
+        let owning_issuer_actions = continue_actions(owning_issuer_degrades.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                17,
+                target,
+                Some(peer_b),
+                vec![target, peer_a],
+            )],
+            &owning_model,
+        ));
+        assert_eq!(
+            owning_issuer_actions[0].kind,
+            CommitActionKind::UnconditionalCommit
+        );
+        assert!(
+            owning_issuer_actions[0]
+                .diagnostic_label
+                .contains("degraded_reason=owning_issuer"),
+            "R7 must identify the selected Owning issuer: {}",
+            owning_issuer_actions[0].diagnostic_label
+        );
+        assert!(
+            !owning_issuer_actions[0]
+                .clause
+                .is_satisfied_by(&owning_model),
+            "the degraded unconditional commit must forbid target=Ref"
+        );
+        assert!(
+            owning_issuer_actions[0].clause.is_satisfied_by(
+                &[
+                    (target, SlotKind::Raw),
+                    (peer_a, SlotKind::Raw),
+                    (peer_b, SlotKind::Raw),
+                ]
+                .into_iter()
+                .collect()
+            ),
+            "the Owning-degraded unconditional form must retain all-Raw"
+        );
+
+        let mut missing_participant = Planner::new(2);
+        assert_eq!(
+            missing_participant.plan_round(
+                SolverOutcome::Sat,
+                &[ConflictObservation::new(
+                    17,
+                    target,
+                    Some(peer_a),
+                    vec![target],
+                )],
+                &ref_model(&[target]),
+            ),
+            RoundPlan::Decline {
+                validation_round: 1,
+                reason: DeclineReason::ParticipantNotRef { slot: peer_a },
+            },
+            "a participant missing from the solved model must fail closed"
+        );
+    }
+
+    #[test]
+    fn l2_red_stable_loan_key_is_byte_identical_across_model_ordinals() {
+        let (target, issuer, invalidator, unrelated) = (field(40), field(41), field(42), field(43));
+        let before = observation_with_loan(
+            12,
+            target,
+            issuer,
+            vec![target],
+            vec![invalidator],
+            3,
+            7,
+            11,
+        );
+        let after = observation_with_loan(
+            12,
+            target,
+            issuer,
+            vec![target],
+            vec![invalidator],
+            19,
+            7,
+            11,
+        );
+        let before_model = [
+            (target, SlotKind::Ref),
+            (issuer, SlotKind::Ref),
+            (invalidator, SlotKind::Raw),
+            (unrelated, SlotKind::Ref),
+        ]
+        .into_iter()
+        .collect::<FxHashMap<_, _>>();
+        let after_model = [
+            (target, SlotKind::Ref),
+            (issuer, SlotKind::Ref),
+            (invalidator, SlotKind::Raw),
+            (unrelated, SlotKind::Raw),
+        ]
+        .into_iter()
+        .collect::<FxHashMap<_, _>>();
+        assert_ne!(before_model[&unrelated], after_model[&unrelated]);
+        assert_eq!(
+            before.hazard_key_diagnostic().as_bytes(),
+            after.hazard_key_diagnostic().as_bytes(),
+            "A1: per-model enumeration shifts and unrelated kind changes must not change key bytes"
+        );
+    }
+
+    #[test]
+    fn l2_red_same_round_batches_one_epoch_and_later_retarget_escalates() {
+        let (target, peer_a, peer_b, peer_c) = (field(10), field(11), field(12), field(13));
+        let model = ref_model(&[target, peer_a, peer_b, peer_c]);
+        let edge_a = ConflictObservation::new(4, target, Some(peer_a), vec![target]);
+        let edge_a_same_clause =
+            ConflictObservation::new(5, target, Some(peer_a), vec![peer_a, target, peer_a]);
+        let edge_b = ConflictObservation::new(4, target, Some(peer_b), vec![target]);
+        let observations = vec![
+            edge_b.clone(),
+            edge_a_same_clause,
+            edge_a.clone(),
+            edge_a.clone(),
+        ];
+        let mut planner = Planner::new(14);
+        let mut reverse_planner = Planner::new(14);
+
+        let first_actions =
+            continue_actions(planner.plan_round(SolverOutcome::Sat, &observations, &model));
+        let reverse_actions = continue_actions(reverse_planner.plan_round(
+            SolverOutcome::Sat,
+            &observations.iter().cloned().rev().collect::<Vec<_>>(),
+            &model,
+        ));
+        assert_eq!(
+            first_actions.len(),
+            2,
+            "distinct peer sets emit separate implications; duplicates are removed"
+        );
+        assert!(
+            first_actions
+                .iter()
+                .all(|action| action.kind == CommitActionKind::GuardedCommit),
+            "same-model conflicts share the first guarded epoch"
+        );
+        assert_eq!(
+            first_actions, reverse_actions,
+            "duplicate-clause attribution must not depend on input order"
+        );
+        assert_eq!(
+            first_actions
+                .iter()
+                .find(|action| action.peers == vec![peer_a])
+                .expect("peer-a guarded clause")
+                .edge
+                .fn_key,
+            4,
+            "deduplication retains the lexicographically smallest edge attribution"
+        );
+        assert_eq!(planner.lifecycle(target), Lifecycle::Guarded);
+
+        let retargeted_model = [
+            (target, SlotKind::Ref),
+            (peer_a, SlotKind::Raw),
+            (peer_b, SlotKind::Raw),
+            (peer_c, SlotKind::Ref),
+        ]
+        .into_iter()
+        .collect();
+        let retargeted =
+            observation_with_loan(6, target, peer_c, vec![target], vec![peer_c], 9, 3, 7);
+        let new_hazard_actions = continue_actions(planner.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&retargeted),
+            &retargeted_model,
+        ));
+        assert_eq!(
+            new_hazard_actions.len(),
+            1,
+            "a new hazard key joins the target's existing epoch"
+        );
+        assert_eq!(
+            new_hazard_actions[0].kind,
+            CommitActionKind::GuardedCommit,
+            "retargeting alone is not recurrence when the hazard key is new"
+        );
+        assert_eq!(planner.lifecycle(target), Lifecycle::Guarded);
+
+        let recurrence_actions = continue_actions(planner.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&retargeted),
+            &retargeted_model,
+        ));
+        assert_eq!(recurrence_actions.len(), 1);
+        assert_eq!(
+            recurrence_actions[0].kind,
+            CommitActionKind::RecurrenceEscalation,
+            "only re-witnessing an already-guarded key escalates without C2 blame"
+        );
+        assert_eq!(planner.lifecycle(target), Lifecycle::Permanent);
+
+        let budget_target = field(50);
+        let budget_issuer = field(51);
+        let budget_model = ref_model(&[budget_target, budget_issuer]);
+        let mut budget_planner = Planner::new(52);
+        for key_index in 0..8 {
+            let actions = continue_actions(budget_planner.plan_round(
+                SolverOutcome::Sat,
+                &[observation_with_loan(
+                    20,
+                    budget_target,
+                    budget_issuer,
+                    vec![budget_target],
+                    vec![],
+                    key_index,
+                    9,
+                    key_index,
+                )],
+                &budget_model,
+            ));
+            assert!(
+                actions
+                    .iter()
+                    .all(|action| action.kind == CommitActionKind::GuardedCommit),
+                "the first B distinct hazards remain guarded"
+            );
+            assert_eq!(budget_planner.lifecycle(budget_target), Lifecycle::Guarded);
+        }
+        let budget_degrade = continue_actions(budget_planner.plan_round(
+            SolverOutcome::Sat,
+            &[observation_with_loan(
+                20,
+                budget_target,
+                budget_issuer,
+                vec![budget_target],
+                vec![],
+                8,
+                9,
+                8,
+            )],
+            &budget_model,
+        ));
+        assert_eq!(
+            budget_degrade[0].kind,
+            CommitActionKind::UnconditionalCommit
+        );
+        assert!(
+            budget_degrade[0]
+                .diagnostic_label
+                .contains("degraded_reason=key_budget")
+        );
+        assert_eq!(
+            budget_planner.lifecycle(budget_target),
+            Lifecycle::Permanent
+        );
+    }
+
+    #[test]
+    fn l2_red_deactivation_accepts_only_when_hazard_disappears_otherwise_escalates() {
+        let (target, issuer, replacement, invalidator) =
+            (field(20), field(21), field(22), field(23));
+        let conflict = ConflictObservation::new(7, target, Some(issuer), vec![target]);
+        let first_model = ref_model(&[target, issuer]);
+
+        let mut discharged = Planner::new(23);
+        let first = continue_actions(discharged.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&conflict),
+            &first_model,
+        ));
+        assert_eq!(first[0].kind, CommitActionKind::GuardedCommit);
+        let discharged_model = [(target, SlotKind::Ref), (issuer, SlotKind::Raw)]
+            .into_iter()
+            .collect();
+        assert_accept(discharged.plan_round(SolverOutcome::Sat, &[], &discharged_model));
+        assert_eq!(
+            discharged.lifecycle(target),
+            Lifecycle::Guarded,
+            "acceptance validates the recovered Ref; it need not pin the slot"
+        );
+
+        let mut raw_witness_discharged = Planner::new(24);
+        let raw_witness_conflict =
+            observation_with_loan(9, target, issuer, vec![target], vec![invalidator], 4, 2, 5);
+        let raw_witness_model = [
+            (target, SlotKind::Ref),
+            (issuer, SlotKind::Ref),
+            (invalidator, SlotKind::Raw),
+        ]
+        .into_iter()
+        .collect();
+        let raw_witness_plan = raw_witness_discharged.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&raw_witness_conflict),
+            &raw_witness_model,
+        );
+        assert!(
+            matches!(&raw_witness_plan, RoundPlan::Continue { .. }),
+            "a Raw invalidation witness must create a guard, not decline: {raw_witness_plan:?}"
+        );
+        let raw_witness_actions = continue_actions(raw_witness_plan);
+        assert_eq!(
+            raw_witness_actions[0].peers,
+            vec![issuer, invalidator],
+            "the guard must retain both the Ref issuer and Raw invalidator"
+        );
+        assert!(
+            !raw_witness_actions[0]
+                .clause
+                .is_satisfied_by(&raw_witness_model),
+            "the exact witnessed context keeps target=Ref forbidden"
+        );
+        assert!(
+            raw_witness_actions[0]
+                .diagnostic_label
+                .contains("peers=field:21:ref,field:23:raw"),
+            "R7 must retain the opposite peer polarities: {}",
+            raw_witness_actions[0].diagnostic_label
+        );
+        assert!(
+            raw_witness_actions[0]
+                .diagnostic_label
+                .contains("edge_invalidators=field:23"),
+            "R7 must retain the mapped invalidator: {}",
+            raw_witness_actions[0].diagnostic_label
+        );
+        let raw_departed_to_ref = [
+            (target, SlotKind::Ref),
+            (issuer, SlotKind::Ref),
+            (invalidator, SlotKind::Ref),
+        ]
+        .into_iter()
+        .collect();
+        assert!(
+            raw_witness_actions[0]
+                .clause
+                .is_satisfied_by(&raw_departed_to_ref),
+            "promoting the Raw-witnessed invalidator to Ref must deactivate the commit"
+        );
+        assert_accept(raw_witness_discharged.plan_round(
+            SolverOutcome::Sat,
+            &[],
+            &raw_departed_to_ref,
+        ));
+        assert_eq!(
+            raw_witness_discharged.lifecycle(target),
+            Lifecycle::Guarded,
+            "joint restoration may recover the target without a permanent pin"
+        );
+
+        let promoted = raw_departed_to_ref.clone();
+        let mut unseen_reenabler = Planner::new(24);
+        continue_actions(unseen_reenabler.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&raw_witness_conflict),
+            &raw_witness_model,
+        ));
+        let unseen_blame = continue_actions(unseen_reenabler.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&raw_witness_conflict),
+            &promoted,
+        ));
+        assert_eq!(
+            unseen_blame[0].target, invalidator,
+            "an Unseen invalidator promoted away from its epoch witness owns the failed trial"
+        );
+        assert_eq!(
+            unseen_blame[0].kind,
+            CommitActionKind::GuardedCommit,
+            "an Unseen candidate opens its first C1 guarded epoch"
+        );
+        assert_eq!(unseen_reenabler.lifecycle(invalidator), Lifecycle::Guarded);
+        assert_eq!(
+            unseen_reenabler.lifecycle(target),
+            Lifecycle::Guarded,
+            "T re-arms without lifecycle advance"
+        );
+
+        let candidate_issuer = replacement;
+        let candidate_conflict =
+            ConflictObservation::new(10, invalidator, Some(candidate_issuer), vec![invalidator]);
+        let candidate_model = ref_model(&[invalidator, candidate_issuer]);
+        let mut guarded_reenabler = Planner::new(24);
+        continue_actions(guarded_reenabler.plan_round(
+            SolverOutcome::Sat,
+            &[candidate_conflict],
+            &candidate_model,
+        ));
+        let raw_candidate_model = [
+            (target, SlotKind::Ref),
+            (issuer, SlotKind::Ref),
+            (invalidator, SlotKind::Raw),
+            (candidate_issuer, SlotKind::Raw),
+        ]
+        .into_iter()
+        .collect();
+        continue_actions(guarded_reenabler.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&raw_witness_conflict),
+            &raw_candidate_model,
+        ));
+        let guarded_repeat_model = [
+            (target, SlotKind::Ref),
+            (issuer, SlotKind::Ref),
+            (invalidator, SlotKind::Ref),
+            (candidate_issuer, SlotKind::Raw),
+        ]
+        .into_iter()
+        .collect();
+        let guarded_blame = continue_actions(guarded_reenabler.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&raw_witness_conflict),
+            &guarded_repeat_model,
+        ));
+        assert_eq!(guarded_blame[0].target, invalidator);
+        assert_eq!(
+            guarded_blame[0].kind,
+            CommitActionKind::RecurrenceEscalation
+        );
+        assert_eq!(
+            guarded_reenabler.lifecycle(invalidator),
+            Lifecycle::Permanent
+        );
+        assert_eq!(
+            guarded_reenabler.lifecycle(target),
+            Lifecycle::Guarded,
+            "blaming a Guarded re-enabler preserves T's trial"
+        );
+
+        let mut no_candidate = Planner::new(24);
+        continue_actions(no_candidate.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&raw_witness_conflict),
+            &raw_witness_model,
+        ));
+        let same_context_repeat = continue_actions(no_candidate.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&raw_witness_conflict),
+            &raw_witness_model,
+        ));
+        assert_eq!(same_context_repeat[0].target, target);
+        assert_eq!(
+            same_context_repeat[0].kind,
+            CommitActionKind::RecurrenceEscalation
+        );
+        assert_eq!(no_candidate.lifecycle(target), Lifecycle::Permanent);
+    }
+
+    #[test]
+    fn l2_transition_diagnostic_records_values_transitions_and_peer_lifecycle() {
+        let (target, peer) = (field(20), field(21));
+        let mut planner = Planner::new(2);
+        let before = ref_model(&[target, peer]);
+        let action = continue_actions(planner.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                7,
+                target,
+                Some(peer),
+                vec![target],
+            )],
+            &before,
+        ))
+        .remove(0);
+        let after = [(target, SlotKind::Raw), (peer, SlotKind::Raw)]
+            .into_iter()
+            .collect();
+
+        assert_eq!(
+            clause_state_diagnostic(&action, 1, 1, 2, &before, &after, |slot| if slot == peer {
+                Lifecycle::Permanent
+            } else {
+                planner.lifecycle(slot)
+            },),
+            "event=l2_clause_state|round=2|clause=1|committed_round=1|commit_kind=guarded|\
+             target=field:20|target_lifecycle=guarded|guard_context=departed|\
+             literals=field:20@target-neg@raw@true@guarded,field:21@peer-neg@raw@true@permanent|\
+             transitions=field:20@target-neg@ref>raw@guarded,field:21@peer-neg@ref>raw@permanent|\
+             changed=field:20@target-neg@ref>raw@guarded,field:21@peer-neg@ref>raw@permanent"
+        );
+    }
+
+    #[test]
+    fn l2_conflict_diagnostic_retains_loan_and_invalidator_identity() {
+        assert_eq!(
+            conflict_witness_diagnostic(
+                4,
+                12,
+                9,
+                field(20),
+                Some(field(21)),
+                &[field(22), field(20)],
+                &[field(23)],
+            ),
+            "event=l2_conflict_witness|round=4|target=field:20|edge_fn=12|loan=9|\
+             edge_issuer=field:21|edge_requirers=field:20,field:22|edge_invalidators=field:23"
+        );
+    }
+
+    #[test]
+    fn l2_red_ten_s_plus_one_cap_and_solver_declines_are_fail_closed() {
+        let (target, peer) = (field(30), field(31));
+        let initial = ConflictObservation::new(30, target, Some(peer), vec![target]);
+        let retargeted = ConflictObservation::new(31, target, Some(target), vec![target]);
+        let first_model = ref_model(&[target, peer]);
+        let retargeted_model = [(target, SlotKind::Ref), (peer, SlotKind::Raw)]
+            .into_iter()
+            .collect();
+        let final_model = [(target, SlotKind::Raw), (peer, SlotKind::Raw)]
+            .into_iter()
+            .collect();
+
+        let mut planner = Planner::new(2);
+        assert_eq!(planner.validation_cap(), 21, "cap is exactly 10S + 1");
+        continue_actions(planner.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&initial),
+            &first_model,
+        ));
+        continue_actions(planner.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&retargeted),
+            &retargeted_model,
+        ));
+        assert_eq!(planner.lifecycle(target), Lifecycle::Permanent);
+        for expected_round in 3..=21 {
+            assert_accept(planner.plan_round(SolverOutcome::Sat, &[], &final_model));
+            assert_eq!(planner.validation_rounds(), expected_round);
+        }
+        assert_eq!(
+            planner.plan_round(SolverOutcome::Sat, &[], &final_model),
+            RoundPlan::Decline {
+                validation_round: 22,
+                reason: DeclineReason::ValidationCap {
+                    cap: 21,
+                    attempted_round: 22,
+                },
+            },
+            "a positive-slot lifecycle must decline beyond exactly 10S + 1 validations"
+        );
+
+        let mut impossible_retarget = Planner::new(2);
+        continue_actions(impossible_retarget.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&initial),
+            &first_model,
+        ));
+        continue_actions(impossible_retarget.plan_round(
+            SolverOutcome::Sat,
+            std::slice::from_ref(&retargeted),
+            &retargeted_model,
+        ));
+        assert_eq!(
+            impossible_retarget.plan_round(
+                SolverOutcome::Sat,
+                std::slice::from_ref(&retargeted),
+                &retargeted_model,
+            ),
+            RoundPlan::Decline {
+                validation_round: 3,
+                reason: DeclineReason::PermanentRetarget { target },
+            },
+            "observing a permanently pinned target is impossible and must fail closed"
+        );
+
+        let no_conflicts = FxHashMap::default();
+        for (outcome, expected) in [
+            (SolverOutcome::Unsat, SolverDecline::Unsat),
+            (SolverOutcome::Unknown, SolverDecline::Unknown),
+        ] {
+            let mut solver_decline = Planner::new(1);
+            assert_eq!(
+                solver_decline.plan_round(outcome, &[], &no_conflicts),
+                RoundPlan::Decline {
+                    validation_round: 0,
+                    reason: DeclineReason::Solver(expected),
+                },
+                "a non-model solver result fails closed without validation"
+            );
+        }
+    }
+
+    #[test]
+    fn l2_red_permuted_conflicts_have_identical_canonical_actions_and_labels() {
+        let observations = vec![
+            ConflictObservation::new(9, field(8), Some(field(3)), vec![field(8), field(7)]),
+            ConflictObservation::new(2, field(1), Some(field(5)), vec![field(1)]),
+            ConflictObservation::new(1, field(1), Some(field(4)), vec![field(1)]),
+        ];
+        let model = ref_model(&[field(1), field(3), field(4), field(5), field(7), field(8)]);
+        let mut forward = Planner::new(9);
+        let mut reverse = Planner::new(9);
+
+        let forward_actions =
+            continue_actions(forward.plan_round(SolverOutcome::Sat, &observations, &model));
+        let reverse_actions = continue_actions(reverse.plan_round(
+            SolverOutcome::Sat,
+            &observations.iter().cloned().rev().collect::<Vec<_>>(),
+            &model,
+        ));
+        assert_eq!(
+            forward_actions, reverse_actions,
+            "input/hash insertion order must not affect canonical actions"
+        );
+        assert_eq!(
+            forward_actions
+                .iter()
+                .map(|action| action.diagnostic_label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "event=l2_commit|kind=guarded|target=field:1|peers=field:4|edge_fn=1|edge_issuer=field:4|edge_requirers=field:1",
+                "event=l2_commit|kind=guarded|target=field:1|peers=field:5|edge_fn=2|edge_issuer=field:5|edge_requirers=field:1",
+                "event=l2_commit|kind=guarded|target=field:8|peers=field:3|edge_fn=9|edge_issuer=field:3|edge_requirers=field:7,field:8",
+            ],
+            "R7 diagnostic labels are a stable machine-parseable contract"
+        );
+        assert!(
+            forward_actions
+                .windows(2)
+                .all(|pair| { pair[0].diagnostic_key <= pair[1].diagnostic_key }),
+            "actions sort by canonical (target, peers, edge) key"
+        );
+
+        let (local_a, local_b, field_peer) = (local(7, 2), local(8, 2), field(40));
+        let local_observations = vec![
+            ConflictObservation::new(12, local_b, Some(field_peer), vec![local_b]),
+            ConflictObservation::new(12, local_a, Some(field_peer), vec![local_a]),
+        ];
+        let local_model = ref_model(&[local_a, local_b, field_peer]);
+        let mut local_forward = Planner::new(41);
+        let mut local_reverse = Planner::new(41);
+        let local_forward_actions = continue_actions(local_forward.plan_round(
+            SolverOutcome::Sat,
+            &local_observations,
+            &local_model,
+        ));
+        let local_reverse_actions = continue_actions(local_reverse.plan_round(
+            SolverOutcome::Sat,
+            &local_observations.iter().cloned().rev().collect::<Vec<_>>(),
+            &local_model,
+        ));
+        assert_eq!(
+            local_forward_actions, local_reverse_actions,
+            "local owner identity participates in deterministic ordering"
+        );
+        assert_eq!(
+            local_forward_actions
+                .iter()
+                .map(|action| action.diagnostic_label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "event=l2_commit|kind=guarded|target=local:7:2|peers=field:40|edge_fn=12|edge_issuer=field:40|edge_requirers=local:7:2",
+                "event=l2_commit|kind=guarded|target=local:8:2|peers=field:40|edge_fn=12|edge_issuer=field:40|edge_requirers=local:8:2",
+            ],
+            "different function owners cannot collide in the R7 local-slot identity"
+        );
+    }
+
+    #[test]
+    fn l2_red_solver_emission_uses_forbid_clause_and_core_family() {
+        let (target, peer) = (field(0), field(1));
+        let mut planner = Planner::new(2);
+        let action = continue_actions(planner.plan_round(
+            SolverOutcome::Sat,
+            &[ConflictObservation::new(
+                1,
+                target,
+                Some(peer),
+                vec![target],
+            )],
+            &ref_model(&[target, peer]),
+        ))
+        .pop()
+        .expect("one guarded action");
+
+        let mut field_slots = SlotUniverse::default();
+        field_slots.register_local(Local::from_u32(1), 2);
+        let slots = CrateSlots {
+            field_slots,
+            fn_local_slots: FxHashMap::default(),
+        };
+
+        let solver = KindSolver::new(&slots);
+        solver.assume(peer, SlotKind::Ref);
+        solver.add_guarded_commit(&action);
+        let model = solver.model_kinds().expect("guarded L2 model");
+        assert_eq!(model.get(&peer), Some(&SlotKind::Ref));
+        assert_ne!(
+            model.get(&target),
+            Some(&SlotKind::Ref),
+            "when the peer stays Ref, the emitted implication must force ¬ref(target)"
+        );
+
+        let tracked = KindSolver::new_tracked(&slots);
+        tracked.add_guarded_commit(&action);
+        let tracker = tracked.tracker().expect("tracked L2 solver");
+        assert!(
+            tracker
+                .tracks()
+                .iter()
+                .filter_map(|track| tracker.label_of(track))
+                .any(|label| {
+                    label.contains(GUARDED_COMMIT_CORE_FAMILY)
+                        && label.contains(&action.diagnostic_label)
+                }),
+            "the real guarded-repair clause must pass through assert_hard under its ruled core family"
+        );
+    }
+}

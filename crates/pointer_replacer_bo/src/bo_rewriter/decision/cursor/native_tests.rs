@@ -1,0 +1,638 @@
+use super::*;
+
+/// The cursor-family decisions of a program: each subject label with whether
+/// it settled as a wrapper cursor (the plan, not the emitted text — a held
+/// class reverts the text but the plan is the defect).
+pub(super) fn cursor_decisions(input: &str) -> Vec<(String, bool)> {
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        table
+            .entries
+            .iter()
+            .map(|(subject, decision)| {
+                let cursor = match decision {
+                    Decision::Cursor { plan, .. } => plan.wrapper,
+                    Decision::Slice { .. }
+                    | Decision::NestedSlice { .. }
+                    | Decision::Opt { .. }
+                    | Decision::Ref { .. }
+                    | Decision::InferredRef { .. }
+                    | Decision::Box(_)
+                    | Decision::Degraded(_) => false,
+                };
+                (subject.label.clone(), cursor)
+            })
+            .collect()
+    })
+    .expect("cursor decisions")
+}
+
+/// The cursor family's per-subject RECEIPT at the final pass: each subject label
+/// with its typed disposition (`Ok(())`, or `Err(<hold>)`) — the same field the
+/// census archive carries as `native_outcome`.
+pub(super) fn cursor_dispositions(input: &str) -> Vec<(String, String)> {
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        table
+            .cursor_receipts
+            .iter()
+            .filter_map(|receipt| {
+                table
+                    .entries
+                    .iter()
+                    .find(|(subject, _)| {
+                        subject.fn_did == receipt.owner && subject.hir_id == receipt.hir_id
+                    })
+                    .map(|(subject, _)| {
+                        (subject.label.clone(), format!("{:?}", receipt.disposition))
+                    })
+            })
+            .collect()
+    })
+    .expect("cursor dispositions")
+}
+
+pub(super) fn emitted(input: &str) -> String {
+    let source = utils::compilation::run_compiler_on_str(input, |tcx| {
+        let capture = crate::bo_rewriter::ast_transform::capture_ast(tcx).unwrap();
+        let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        println!(
+            "CURSOR-FAMILY {:?}",
+            ctx.raw_boundary_artifacts.additive_family_receipts
+        );
+        println!(
+            "CURSOR-NATIVE plans {:?}; decisions {:?}",
+            table.cursor_receipts,
+            table
+                .entries
+                .iter()
+                .map(|(s, d)| (&s.label, d))
+                .collect::<Vec<_>>()
+        );
+        let emission = crate::bo_rewriter::emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &ctx.retained_copy_plans,
+        )
+        .unwrap();
+        let held = emission.plan.held_classes();
+        if !held.is_empty() {
+            println!("CURSOR-HELD {:#?}", emission.plan.class_finalization);
+        }
+        let reverts = crate::bo_rewriter::ast_transform::revert_set_from_classes_and_atoms(
+            &held,
+            &std::collections::BTreeSet::new(),
+            &table,
+        )
+        .unwrap();
+        let (files, _, _, _) = crate::bo_rewriter::ast_transform::ast_emitted_files_from(
+            tcx,
+            &capture,
+            &reverts,
+            emission.plan.root_file.as_ref(),
+            &table,
+            Some(&emission.plan.terminal_call_plans),
+        )
+        .unwrap();
+        files.into_values().next().unwrap()
+    })
+    .unwrap();
+    compile(&source, None);
+    source
+}
+
+pub(super) fn compile(source: &str, main: Option<&str>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let directory = std::env::temp_dir().join(format!(
+        "cursor-native-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("fixture.rs");
+    std::fs::write(
+        &path,
+        format!(
+            "#![allow(unsafe_op_in_unsafe_fn)]\n{source}\n{}",
+            main.unwrap_or("")
+        ),
+    )
+    .unwrap();
+    let output = directory.join("fixture");
+    let mut rustc = std::process::Command::new("rustc");
+    rustc
+        .arg("--edition=2024")
+        .arg(&path)
+        .arg("-o")
+        .arg(&output);
+    if main.is_none() {
+        rustc.args(["--crate-type=lib", "--emit=metadata"]);
+    }
+    let result = rustc.output().unwrap();
+    assert!(
+        result.status.success(),
+        "cursor output did not compile: {}\n{source}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    if main.is_some() {
+        assert!(
+            std::process::Command::new(output)
+                .status()
+                .unwrap()
+                .success(),
+            "cursor runtime result mismatch"
+        );
+    }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn native_ref_fixture_probe() {
+    for (name, input) in [
+        (
+            "raw-array",
+            "pub unsafe fn witness() -> i32 { let a = [1_i32;4]; let p: *const i32 = ((&raw const a) as *const i32).add(2); *p.offset(-1) }",
+        ),
+        (
+            "raw-array-mut",
+            "pub unsafe fn witness() -> i32 { let mut a = [1_i32;4]; let p: *mut i32 = ((&raw mut a) as *mut i32).add(2); *p.offset(-1) = 3; *p }",
+        ),
+        (
+            "slice-input",
+            "pub unsafe fn witness(a: &[i32]) -> i32 { let p: *const i32 = a.as_ptr().add(2); *p.offset(-1) }",
+        ),
+        (
+            "slice-input-mut",
+            "pub unsafe fn witness(a: &mut [i32]) -> i32 { let p: *mut i32 = a.as_mut_ptr().add(2); *p.offset(-1) = 3; *p }",
+        ),
+    ] {
+        utils::compilation::run_compiler_on_str(input, |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+            let (subject, decision) = table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .unwrap();
+            let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(subject.fn_did)
+                .borrow();
+            let kinds = model_kinds(
+                subject.fn_did,
+                body.local_decls.indices(),
+                &ctx.slots,
+                &ctx.model,
+            );
+            println!("NATIVE-PROBE {name}: {kinds:?} DECISION {decision:?} ADMISSION {row:?}");
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn native_admission_binds_real_model_to_compiler_identity() {
+    utils::compilation::run_compiler_on_str("pub unsafe fn witness() -> i32 { let a = [1_i32; 4]; let p: *const i32 = a.as_ptr(); *p.offset(1) }", |tcx| {
+        // Production collection/solve on this small fixture supplies the
+        // accepted model; no all-Ref test map substitutes for it.
+        let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        let subject = &table.entries.iter().find(|(s, _)| s.param_name.as_deref() == Some("p")).unwrap().0;
+        let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+        assert_eq!(row.owner, subject.fn_did);
+        assert_eq!(row.local, subject.local);
+        assert_eq!(row.shape, admission::Shape::LocalArray);
+        let kinds = model_kinds(subject.fn_did, tcx.mir_drops_elaborated_and_const_checked(subject.fn_did).borrow().local_decls.indices(), &ctx.slots, &ctx.model);
+        println!("native component model: {kinds:?}; outcome: {row:?}");
+        // Measured at L01 double-prime: at least one native component member
+        // lacks Ref authority. The synthetic all-Ref premise must not leak in.
+        assert_eq!(row.status, admission::Status::NeedsFact, "{row:#?}");
+        assert_eq!(row.findings[0].outcome, admission::Outcome::Missing(admission::Need::RefAdmission));
+        let without_model = inspect_subject(tcx, &ctx.slots, &FxHashMap::default(), subject);
+        assert_eq!(without_model.status, admission::Status::NeedsFact);
+    }).unwrap();
+}
+
+// R394 migrates these standing witnesses to the legacy-shaped wrapper.
+#[test]
+fn requested_negative_offset_emits_cursor_index() {
+    let source = emitted(
+        "pub unsafe fn witness(a: &[i32; 4]) -> i32 { let p: *const i32 = a.as_ptr().add(2); *p.offset(-1) }",
+    );
+    assert!(
+        source.contains("slice_cursor::SliceCursor"),
+        "cursor index absent: {source}"
+    );
+    compile(
+        &source,
+        Some("fn main() { assert_eq!(unsafe { witness(&[10,20,30,40]) },20); }"),
+    );
+}
+
+#[test]
+fn requested_unknown_offset_emits_cursor_index() {
+    let source = emitted(
+        "pub unsafe fn witness(a: &[i32; 4], flag: bool) -> i32 { let p: *const i32 = a.as_ptr().add(2); *p.offset(if flag { -1 } else { 1 }) }",
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { assert_eq!(unsafe { witness(&[10,20,30,40],true) },20); assert_eq!(unsafe { witness(&[10,20,30,40],false) },40); }",
+        ),
+    );
+    assert!(
+        source.contains("slice_cursor::SliceCursor"),
+        "cursor index absent: {source}"
+    );
+}
+
+#[test]
+fn requested_raw_callee_emits_current_cursor_view() {
+    let source = emitted(
+        "unsafe fn raw_read(p: *const i32) -> i32 { p.read() } pub unsafe fn witness(a: &[i32; 4], flag: bool) -> i32 { let p: *const i32 = a.as_ptr().offset(if flag { 1 } else { 2 }); *p.offset(-1) + raw_read(p) }",
+    );
+    assert!(
+        source.contains("slice_cursor::SliceCursor") && source.contains("as_ptr"),
+        "current cursor view absent: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { assert_eq!(unsafe { witness(&[10,20,30,40],true) },30); assert_eq!(unsafe { witness(&[10,20,30,40],false) },50); }",
+        ),
+    );
+}
+
+#[test]
+fn cursor_unbounded_offsets_and_raw_aliases_remain_held() {
+    for (index, input) in [
+        "pub unsafe fn witness(a: &[i32;4], delta: isize) -> i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(delta) }",
+        "pub unsafe fn witness(a: &[i32;4], flag: bool) -> i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(if flag { -1 } else { 2 }) }",
+        "pub unsafe fn witness(a: &mut [i32;4]) -> i32 { let p:*mut i32=a.as_mut_ptr().add(2); let q:*mut i32=&raw mut *p; *p=7; *q=8; *p.offset(-1) }",
+        "unsafe extern \"C\" { fn opaque(p:*const i32) -> i32; } pub unsafe fn witness(a:&[i32;4]) -> i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(-1) + opaque(p) }",
+    ].into_iter().enumerate() {
+        let source = emitted(input);
+        assert_eq!(
+            source.contains("slice_cursor::SliceCursor"), index < 2,
+            "R394 admits dynamic indices; raw aliases and unknown retention stay held: {source}"
+        );
+    }
+}
+
+#[test]
+fn cursor_mutable_array_reference_keeps_writes_at_checked_index() {
+    let source = emitted(
+        "pub unsafe fn witness(a: &mut [i32;4]) -> i32 { let p:*mut i32=a.as_mut_ptr().add(2); *p.offset(-1)=9; *p }",
+    );
+    assert!(
+        source.contains("slice_cursor::SliceCursorMut"),
+        "mutable cursor missing: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main() { let mut a=[1,2,3,4]; assert_eq!(unsafe{witness(&mut a)},3); assert_eq!(a,[1,9,3,4]); }",
+        ),
+    );
+}
+
+#[test]
+fn cursor_mutable_t1_binding_supports_whole_tuple_reborrow() {
+    let source = emitted(
+        "unsafe fn raw_read(p:*const i32)->i32 { p.read() } pub unsafe fn witness(a: &mut [i32;4]) -> i32 { let p:*mut i32=a.as_mut_ptr().add(2); *p.offset(-1)=9; raw_read(p) }",
+    );
+    assert!(
+        source.contains("let mut p:"),
+        "mutable cursor needs a reborrowable binding: {source}"
+    );
+    compile(
+        &source,
+        Some(
+            "fn main(){let mut a=[1,2,3,4];assert_eq!(unsafe{witness(&mut a)},3);assert_eq!(a,[1,9,3,4]);}",
+        ),
+    );
+}
+
+#[test]
+fn cursor_checks_intermediate_positions_not_just_final_dereference() {
+    let source = emitted(
+        "pub unsafe fn witness(a:&[i32;4])->i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(-3).offset(3) }",
+    );
+    assert!(
+        source.contains("slice_cursor::SliceCursor"),
+        "R394 does not require a static intermediate window: {source}"
+    );
+    let source = emitted(
+        "pub unsafe fn witness(a:&[i32;4])->i32 { let p:*const i32=a.as_ptr().add(2); *p.offset(2).offset(-1) }",
+    );
+    assert!(
+        source.contains("::core::primitive::usize"),
+        "one-past then back is within the proved window: {source}"
+    );
+    compile(
+        &source,
+        Some("fn main(){assert_eq!(unsafe{witness(&[10,20,30,40])},40);}"),
+    );
+}
+
+#[test]
+fn cursor_preserves_raw_identifier_bindings() {
+    let source = emitted(
+        "pub unsafe fn witness(a:&[i32;4])->i32 { let r#type:*const i32=a.as_ptr().add(2); *r#type.offset(-1) }",
+    );
+    assert!(
+        source.contains("slice_cursor::SliceCursor"),
+        "raw identifier cursor did not survive: {source}"
+    );
+    compile(
+        &source,
+        Some("fn main(){assert_eq!(unsafe{witness(&[10,20,30,40])},20);}"),
+    );
+}
+
+#[test]
+fn requested_return_takes_raw_return_bridge() {
+    // Expectation migrated (relay 005): a derived pointer returned from a
+    // wrapper cursor takes the tail address under the raw-boundary T2 receipt.
+    let input =
+        "pub unsafe fn witness(p: *const i32, delta: isize) -> *const i32 { p.offset(delta) }";
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, _) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        let (_, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+            .unwrap();
+        let Decision::Cursor { plan, .. } = decision else {
+            panic!("returned cursor tail not bridged: {decision:?}")
+        };
+        assert!(
+            plan.uses
+                .iter()
+                .any(|edit| edit.bridge_kind == "raw-op-cursor-return"),
+            "{plan:?}"
+        );
+    })
+    .unwrap();
+    let source = emitted(input);
+    assert!(
+        source.contains(".as_ptr()") && source.contains("-> *const i32"),
+        "raw return bridge absent: {source}"
+    );
+}
+
+#[test]
+fn requested_storage_keeps_typed_cursor_hold() {
+    let input = "pub struct Store { p: *const i32 } pub unsafe fn witness(s: *mut Store, p: *const i32, delta: isize) { (*s).p = p.offset(delta); }";
+    assert_typed_hold(input, "p");
+    let source = emitted(input);
+    assert!(
+        source.contains("*const i32"),
+        "unsupported cursor storage must hold: {source}"
+    );
+}
+
+fn assert_typed_hold(input: &str, name: &str) {
+    utils::compilation::run_compiler_on_str(input, |tcx| {
+        let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+        let (subject, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.param_name.as_deref() == Some(name))
+            .unwrap();
+        let Decision::Degraded(reason) = decision else {
+            panic!("unsupported cursor boundary escaped typed hold: {decision:?}")
+        };
+        assert!(!reason.reason.key().is_empty());
+        let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+        assert_ne!(row.status, admission::Status::DecisionOnly);
+        println!(
+            "boundary {name}: {:?}; admission {:?}",
+            reason.reason, row.status
+        );
+    })
+    .unwrap();
+}
+
+/// **W-PARAM-BASE** — the base derivation for a PARAMETER root. The base origin
+/// of such a cursor is the entry position itself, so a subject that only walks
+/// forward from it has its retained base PROVEN at entry, named by root and
+/// site, where the seeded default said only "nothing was derived".
+#[test]
+fn native_admission_derives_a_forward_parameter_root() {
+    utils::compilation::run_compiler_on_str(
+        "pub unsafe fn witness(p: *const i32, k: isize) -> i32 { *p.offset(k) + *p.add(2) }",
+        |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+            let subject = &table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .unwrap()
+                .0;
+            let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+            assert_eq!(row.shape, admission::Shape::RawParameter);
+            assert_eq!(
+                row.findings[0].outcome,
+                admission::Outcome::Proven,
+                "{row:#?}"
+            );
+            assert_eq!(row.findings[0].root, Some(subject.local), "{row:#?}");
+            assert!(row.findings[0].site.is_some(), "{row:#?}");
+        },
+    )
+    .unwrap();
+}
+
+/// **W-PARAM-BASE-BACKWARD** — the same derivation types the entry window: a
+/// parameter root has no region BELOW the pointer it was handed, so a literal
+/// backward offset is a typed missing base origin, distinct from the variable
+/// case. This is the column the census archive needs to size the exposure the
+/// emitted form carries (report 033 §3).
+#[test]
+fn native_admission_types_a_backward_parameter_root() {
+    utils::compilation::run_compiler_on_str(
+        "pub unsafe fn witness(p: *const i32) -> i32 { *p.offset(-1) }",
+        |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+            let subject = &table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .unwrap()
+                .0;
+            let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+            assert_eq!(row.shape, admission::Shape::RawParameter);
+            assert_eq!(
+                row.findings[0].outcome,
+                admission::Outcome::Missing(admission::Need::EntryWindow),
+                "{row:#?}"
+            );
+        },
+    )
+    .unwrap();
+}
+
+/// **F-PARAM-BASE-SUB** — `p.sub(1)` is the same backward move with a POSITIVE
+/// constant: the derivation reads the operation, not the sign of the literal.
+#[test]
+fn native_admission_types_a_subtracting_parameter_root() {
+    utils::compilation::run_compiler_on_str(
+        "pub unsafe fn witness(p: *const i32) -> i32 { *p.sub(1) }",
+        |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+            let subject = &table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .unwrap()
+                .0;
+            let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+            assert_eq!(
+                row.findings[0].outcome,
+                admission::Outcome::Missing(admission::Need::EntryWindow),
+                "{row:#?}"
+            );
+        },
+    )
+    .unwrap();
+}
+
+/// **F-PARAM-BASE-UNKNOWN** — a variable delta proves nothing either way: the
+/// derivation leaves the seeded `BaseOrigin`, so the instrument never claims a
+/// window it did not observe.
+#[test]
+fn native_admission_leaves_a_variable_parameter_root_underived() {
+    utils::compilation::run_compiler_on_str(
+        "pub unsafe fn witness(p: *const i32, k: isize) -> i32 { let mut q = p; q = q.offset(k); *q }",
+        |tcx| {
+            let (table, ctx) = crate::bo_rewriter::decide_table_with_ctx(tcx).unwrap();
+            let subject = &table
+                .entries
+                .iter()
+                .find(|(s, _)| s.param_name.as_deref() == Some("p"))
+                .unwrap()
+                .0;
+            let row = inspect_subject(tcx, &ctx.slots, &ctx.model, subject);
+            assert_eq!(row.shape, admission::Shape::RawParameter);
+            assert_eq!(
+                row.findings[0].outcome,
+                admission::Outcome::Proven,
+                "a variable delta is not a backward move: {row:#?}"
+            );
+        },
+    )
+    .unwrap();
+}
+
+/// **R828-7 (relay 114), S2 first half.** The paper's cursor figure, verbatim
+/// as the pinned c2rust emits it (analysis-fanout 060 §4): a position walked
+/// down from one past the end, compared with its own base. Both positions are
+/// over one window starting at `a`, so `p != a` is `p.pos() != 0`; no
+/// reference to one past the end is formed.
+const R828_FIGURE: &str = r###"#![allow(dead_code,unused_unsafe,unused_mut,unused_assignments,unused_variables,non_snake_case,non_camel_case_types)]
+pub type size_t = usize;
+unsafe extern "C" fn last_nonzero(mut a: *const ::core::ffi::c_int, mut n: size_t) -> ::core::ffi::c_int {
+    let mut p = a.offset(n as isize);
+    while p != a { p = p.offset(-1); if *p != 0 { return *p; } }
+    return 0 as ::core::ffi::c_int;
+}
+pub unsafe fn caller() -> ::core::ffi::c_int {
+    let mut a: [::core::ffi::c_int; 5] = [4, 0, 7, 0, 0];
+    last_nonzero(a.as_mut_ptr(), 5)
+}
+"###;
+
+#[test]
+fn slicecursor_r828_a_position_compared_with_its_own_base_is_an_index() {
+    let out = emitted(R828_FIGURE);
+    let compact: String = out.split_whitespace().collect();
+    // `a` is the parameter's own cursor and never moves: its position is 0, so
+    // this is `p.pos() != 0`.
+    assert!(
+        compact.contains("whilep.pos()!=a.pos()") && !compact.contains("whilep!=a"),
+        "the figure's loop compares two positions over one window: {out}"
+    );
+    assert!(
+        compact.contains("p.seek(") && compact.contains("p[0isize]"),
+        "the walk steps the cursor back and reads through it: {out}"
+    );
+    assert!(
+        !compact.contains("a:*const"),
+        "the base is no longer a raw pointer: {out}"
+    );
+}
+
+/// **R828-7 control.** The same walk compared with ANOTHER parameter `b`: two
+/// roots, so no index comparison exists, and the backward step is not guarded
+/// by a test against its own root. The function stays raw.
+#[test]
+fn slicecursor_r828_control_a_position_compared_across_two_roots_stays_raw() {
+    let src = R828_FIGURE.replace(
+        "last_nonzero(mut a: *const ::core::ffi::c_int, mut n: size_t)",
+        "last_nonzero(mut a: *const ::core::ffi::c_int, mut b: *const ::core::ffi::c_int, mut n: size_t)",
+    )
+    .replace("while p != a", "while p != b")
+    .replace("last_nonzero(a.as_mut_ptr(), 5)", "last_nonzero(a.as_mut_ptr(), a.as_mut_ptr(), 5)");
+    let out = emitted(&src);
+    let compact: String = out.split_whitespace().collect();
+    assert!(
+        compact.contains("whilep!=b") && !compact.contains(".pos()"),
+        "a comparison across two roots is not an index comparison: {out}"
+    );
+}
+
+/// **R828-7 control (review finding 1).** An ORDERING of two positions over one
+/// root keeps the address view: a position one below the window's start wraps
+/// to `usize::MAX`, so `p.pos() >= a.pos()` would hold where `p >= a` does not
+/// (the caller passes `buf + 1`; the loop ends at `buf + 0`, below `a`).
+#[test]
+fn slicecursor_r828_control_an_ordering_of_two_positions_is_never_a_pos_ordering() {
+    let src = r###"#![allow(dead_code,unused_unsafe,unused_mut,unused_assignments,unused_variables,non_snake_case,non_camel_case_types)]
+pub type size_t = usize;
+unsafe extern "C" fn sum_back(mut a: *const ::core::ffi::c_int, mut n: size_t) -> ::core::ffi::c_int {
+    let mut q = a.offset(1 as isize);
+    let mut p = a.offset(n as isize).offset(-(1 as ::core::ffi::c_int) as isize);
+    let mut s: ::core::ffi::c_int = *q;
+    while p >= a { s += *p; p = p.offset(-1); }
+    return s;
+}
+pub unsafe fn caller() -> ::core::ffi::c_int {
+    let mut buf: [::core::ffi::c_int; 4] = [1, 2, 3, 4];
+    sum_back(buf.as_mut_ptr().offset(1), 1)
+}
+"###;
+    let out = emitted(src);
+    let compact: String = out.split_whitespace().collect();
+    assert!(
+        !compact.contains(".pos()>=") && !compact.contains(".pos()<="),
+        "an ordering never compares pos(): {out}"
+    );
+}
+
+/// **R828-7 control (review finding 2).** The guard `p != a` bounds the step
+/// only while `a` holds its entry value: here `a` is re-assigned past `p` first,
+/// so the walk goes below entry (the caller passes `b + 1`). The parameter's
+/// window stays refused and the function raw.
+#[test]
+fn slicecursor_r828_control_a_reassigned_root_does_not_guard_the_step() {
+    let src = r###"#![allow(dead_code,unused_unsafe,unused_mut,unused_assignments,unused_variables,non_snake_case,non_camel_case_types)]
+pub type size_t = usize;
+unsafe extern "C" fn f(mut a: *const ::core::ffi::c_int, mut n: size_t) -> ::core::ffi::c_int {
+    let mut p = a;
+    a = a.offset(n as isize);
+    while p != a { p = p.offset(-1); if *p != 0 { return *p; } }
+    return 0 as ::core::ffi::c_int;
+}
+pub unsafe fn caller() -> ::core::ffi::c_int {
+    let mut b: [::core::ffi::c_int; 2] = [5, 0];
+    f(b.as_mut_ptr().offset(1), 1)
+}
+"###;
+    let out = emitted(src);
+    let compact: String = out.split_whitespace().collect();
+    assert!(
+        compact.contains("whilep!=a") && !compact.contains("SliceCursor"),
+        "a re-assigned root guards nothing; the function stays raw: {out}"
+    );
+}

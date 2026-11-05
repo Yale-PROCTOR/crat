@@ -1,0 +1,84 @@
+//! **R573-4 — the forced cover, end to end.** brotli's `EncodeData` →
+//! `InitOrStitchToPreviousBlock(m, &mut (*s).hasher_, data, _, &mut (*s).params)` (class 2337):
+//! the A5 proof site for the raw `data` (a `*const u8`, which may address any object) overlaps
+//! `m`, `hasher` and `params`; `hasher` and `params` retain (the callee stores them through each
+//! other). The single-primary rule found no primary and held the class `a5-primary-ambiguous`.
+
+pub(super) const STAR: &str = r#"
+#![allow(dead_code, unused_unsafe, unused_mut, unused_variables, non_snake_case)]
+#[repr(C)]
+pub struct Mm { pub n: usize }
+#[repr(C)]
+pub struct Params { pub quality: i32, pub back: *mut Hasher }
+#[repr(C)]
+pub struct Hasher { pub params: *mut Params, pub count: usize }
+#[repr(C)]
+pub struct State { pub mm: Mm, pub hasher: Hasher, pub params: Params, pub buf: *mut u8 }
+pub unsafe extern "C" fn Setup(mut m: *mut Mm, mut hasher: *mut Hasher, mut params: *mut Params, mut data: *const u8) {
+    (*m).n = (*m).n.wrapping_add(*data as usize);
+    (*hasher).params = params;
+    (*params).back = hasher;
+}
+pub unsafe extern "C" fn Stitch(mut m: *mut Mm, mut hasher: *mut Hasher, mut data: *const u8, mut params: *mut Params) {
+    let _address = data as usize;
+    Setup(m, hasher, params, data);
+}
+pub unsafe extern "C" fn Encode(mut s: *mut State) {
+    let mut data: *const u8 = (*s).buf;
+    Stitch(&mut (*s).mm, &mut (*s).hasher, data, &mut (*s).params);
+}
+"#;
+
+/// The seam receipt (`seam_tsv_from_table`) in the precise-replay decision table.
+fn seam_receipts(src: &str) -> String {
+    ::utils::compilation::run_compiler_on_str(src, |tcx| {
+        let (table, _) = super::decide_table_with_ctx_config(
+            tcx,
+            Some((
+                super::OverlapMode::PreciseReplay,
+                Some(super::WholeProgramAttestation::FrozenBenchmarkGraph),
+            )),
+        )
+        .expect("one decision pipeline");
+        super::seam_tsv_from_table(tcx, &table)
+    })
+    .expect("fixture compiles")
+}
+
+/// **R573-4 witness, end to end — the receipt names the rule.** At `Stitch → Setup` the
+/// star is `data` (a non-retaining `*const u8`) against `m`, and against `hasher` / `params`,
+/// which `Setup` stores through each other (both retain). The single-primary rule held the call
+/// `a5-primary-ambiguous`; the forced cover makes `data` the raw view
+/// (`a5-site-proof-t2-fallback`) and `m` the primary, each receipted `pair-forced-cover`.
+/// (`hasher` / `params` are raw formals here, so the A5 path's own positive-retention gate
+/// holds them; in brotli they are pair-owned and never reach it.)
+#[test]
+fn r573_4_the_star_receipt_names_the_forced_cover() {
+    // Restated (relay 307, R889-1 on main 198's R4-2; main 198a): `Setup` keeps `hasher` in
+    // `(*params).back`, a known retention whose tier-2 retention waiver at `Stitch`'s sites
+    // reads no retention under R889-1, so `Stitch::hasher` / `Stitch::params` stay raw (a
+    // delivery lost). The star then has one primary, `m`, and `data` is its raw view: no
+    // forced cover is needed and none is receipted. The rule stays witnessed at the plan
+    // (`pair_plan_tests::r573_4_*`).
+    //
+    // wave-5d 58′ (relay 202 item 3), R934-1 (i): `Stitch::m` (`&mut (*s).mm`)
+    // now sits beside `data`, the loaded `(*s).buf`, at an unknown relation
+    // (the pointer may designate `*s`), so the pair holds `m` raw
+    // (`held:pair-not-shown-disjoint`) and, with `data` held beside it, no A5
+    // proof site forms at `Setup`: there is no star, ambiguous or forced. The
+    // rule stays witnessed at the plan (`pair_plan_tests::r573_4_*`).
+    let tsv = seam_receipts(STAR);
+    assert!(!tsv.contains("a5-primary-ambiguous"), "{tsv}");
+    assert!(!tsv.contains("pair-forced-cover"), "{tsv}");
+    assert!(
+        !tsv.lines()
+            .any(|row| row.starts_with("overlap-proof\tSetup\t")),
+        "{tsv}"
+    );
+    let rows = super::emit_tests::decisions_of(STAR);
+    assert!(
+        rows.iter()
+            .any(|(n, p, r)| n == "m" && *p && r == "held:pair-not-shown-disjoint"),
+        "{rows:?}"
+    );
+}

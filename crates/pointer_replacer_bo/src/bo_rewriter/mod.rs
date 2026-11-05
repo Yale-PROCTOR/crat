@@ -1,0 +1,14085 @@
+//! BO rewriter — GREENFIELD module (ruling 2026-07-27, Q2).
+//!
+//! This module consumes the borrow+ownership (BO) analysis results and emits
+//! rewritten Rust. It is a clean-room implementation: the existing
+//! [`crate::rewriter`] tree is a FROZEN production baseline and this module
+//! **never imports from it**.
+//!
+//! Design of record:
+//! - `docs/agents/plan/2026-07-27-bo-rewriter-scoping.md` (post-mortem + design)
+//! - `docs/agents/plan/2026-07-28-m05-export-surface-spec.md` (E-R1..E-R4)
+//! - `docs/agents/plan/2026-07-28-m05-decision-matrix.md` (kind mapping)
+//!
+//! # Isolation rule (Q2)
+//!
+//! A separate crate would have forced `mod analyses` public, so this is a
+//! top-level module instead. That trades compile-time isolation for a
+//! discipline that has to be enforced mechanically — see [`import_denylist`].
+//!
+//! | Target | Policy |
+//! |---|---|
+//! | `crate::rewriter::*` | **forbidden** — no import, path reference, or copied file |
+//! | `crate::analyses::*` | allowed, read-only |
+//! | `crate::utils::*`, `::utils::*` | allowed |
+//!
+//! # Phase separation (M1 architecture directive, binding from the first commit)
+//!
+//! The module is four phases with one-way data flow and no shared mutable
+//! context (E1 state visibility):
+//!
+//! ```text
+//!   analyses + BoExport ──▶ decision ──▶ plan ──▶ apply ──▶ verify
+//!                           (reads)     (data)   (blind)   (gates)
+//! ```
+//!
+//! Each phase hands the next a finished value. No phase holds a back-pointer to
+//! another, and [`apply`] is *analysis-blind* by enforced rule, not convention —
+//! see [`import_denylist`] for the per-phase checks.
+//!
+//! # Status
+//!
+//! M1/S0 lands the phase skeleton, the goldens as RED, and the per-phase
+//! isolation checks. The decision table, edit plan and applier arrive in S1
+//! (G01 walking skeleton) and S2–S3 (breadth).
+//!
+//! **Substrate of record.** Every corpus number attributed to this module
+//! derives from the post-`expand`→`extern`→`preprocess` form; see
+//! `docs/agents/2026-08-06-substrate-of-record.md`.
+
+use rustc_hir::{ItemKind, OwnerNode};
+use rustc_middle::{
+    mir::Local,
+    ty::{Mutability, TyCtxt, TyKind},
+};
+
+use crate::{
+    analyses::borrow_ownership::{
+        SlotKind,
+        construction::{cached_precise_rewriter_payload, solve_bo_overlap_config},
+        crate_slots::{CrateSlots, ptr_chain_depth},
+        export::with_bo_export,
+        model_cache,
+        mutability_facts::MutFacts,
+        origin_summary::OriginSummaries,
+        origins::compute_origins,
+        overlap_producer::PlannedCopyMark,
+        param_overlap::{OverlapMode, WholeProgramAttestation},
+        solver::SlotRef,
+    },
+    utils::rustc::RustProgram,
+};
+
+pub(crate) mod additive;
+pub(crate) mod apply;
+#[cfg(test)]
+pub(crate) mod artifact;
+pub(crate) mod bridge_receipt;
+pub(crate) mod bridge_spelling;
+pub(crate) mod c9;
+pub(crate) mod decision;
+pub(crate) mod fat_facts;
+pub(crate) mod mechanical_receipt;
+// R351 ownership/fields consumers arrive from the preserved lane commits.
+#[cfg(test)]
+mod conformance_tests;
+#[cfg(test)]
+mod construction_values_tests;
+#[cfg(test)]
+mod copy_lend_mut_emit_tests;
+#[cfg(test)]
+mod copy_walk_slice_tests;
+#[cfg(test)]
+mod exclusion_rederivation_tests;
+mod field_reference_ast;
+pub(crate) mod flexible_tail_ast;
+#[cfg(test)]
+mod local_pair_proof_tests;
+#[cfg(test)]
+mod nested_one_sided_tests;
+#[cfg(test)]
+mod one_element_guard_tests;
+pub(crate) mod ownership_fields;
+#[cfg(test)]
+mod ownership_fields_bodylocal_tests;
+#[cfg(test)]
+mod ownership_fields_cp2_tests;
+#[cfg(test)]
+mod ownership_fields_native_tests;
+#[cfg(test)]
+mod pair_allocated_here_tests;
+#[cfg(test)]
+mod pair_allocation_contract_tests;
+#[cfg(test)]
+mod pair_allocation_identity_tests;
+#[cfg(test)]
+mod pair_conditional_store_tests;
+#[cfg(test)]
+mod pair_disjoint_field_seam_tests;
+#[cfg(test)]
+mod pair_disjointness_tests;
+#[cfg(test)]
+mod pair_field_getter_tests;
+#[cfg(test)]
+mod pair_field_origin_tests;
+#[cfg(test)]
+mod pair_fresh_field_tests;
+#[cfg(test)]
+mod pair_heap_vs_stack_tests;
+#[cfg(test)]
+mod pair_one_sided_field_tests;
+#[cfg(test)]
+mod pair_projection_recovery_tests;
+#[cfg(test)]
+mod pair_r462_receipt_tests;
+#[cfg(test)]
+mod pair_raw_borrow_tests;
+#[cfg(test)]
+mod pair_read_read_tests;
+#[cfg(test)]
+mod pair_root_class_tests;
+#[cfg(test)]
+mod pair_shared_read_release_tests;
+#[cfg(test)]
+mod pair_spine_tests;
+#[cfg(test)]
+mod pair_static_callers_tests;
+#[cfg(test)]
+mod pair_static_literal_store_tests;
+#[cfg(test)]
+mod pair_static_root_tests;
+#[cfg(test)]
+mod pair_type_rule_yield_tests;
+#[cfg(test)]
+mod pair_view_of_formal_tests;
+#[cfg(test)]
+mod pending_hold_tests;
+pub(crate) mod plan;
+#[cfg(test)]
+pub(crate) mod premise_census;
+#[cfg(test)]
+mod premise_census_tests;
+#[cfg(test)]
+mod r674_line53_tests;
+#[cfg(test)]
+mod r763_depth1_view_tests;
+#[cfg(test)]
+mod r763_free_fn_tests;
+#[cfg(test)]
+mod raw_initializer_tests;
+#[cfg(test)]
+mod raw_place_values_tests;
+#[cfg(test)]
+mod released_indirect_tests;
+#[cfg(test)]
+mod retained_access_hold_tests;
+#[cfg(test)]
+mod retention_waiver_tests;
+pub(crate) mod revert_closure;
+#[cfg(test)]
+mod revert_closure_tests;
+mod rmw_relet;
+#[cfg(test)]
+mod rmw_relet_tests;
+mod shared_pair_ast;
+#[cfg(test)]
+mod shared_pair_tests;
+mod shared_read_arguments;
+pub(crate) mod sibling_audit;
+pub(crate) mod sign_facts;
+#[cfg(test)]
+mod slice_construction_values_tests;
+mod slice_cursor_prelude;
+mod slice_forms_ast;
+#[cfg(test)]
+mod slice_forms_tests;
+pub(crate) mod verify;
+#[cfg(test)]
+mod wave5d_accumulator_tests;
+#[cfg(test)]
+mod wave5d_address_root_tests;
+#[cfg(test)]
+mod wave5d_tests;
+mod wave5r_cast;
+mod wave5r_field_borrow;
+mod wave5r_helper_path;
+#[cfg(test)]
+mod wave5r_tests;
+#[cfg(test)]
+mod wave6a_a5_compose_tests;
+#[cfg(test)]
+mod wave6a_allocation_tests;
+#[cfg(test)]
+mod wave6a_allocator_contract_tests;
+#[cfg(test)]
+mod wave6a_box_param_tests;
+#[cfg(test)]
+mod wave6a_copy_lend_tests;
+#[cfg(test)]
+mod wave6a_fixture_tulip;
+#[cfg(test)]
+mod wave6a_held_callee_tests;
+#[cfg(test)]
+mod wave6a_leak_parity_receipt_tests;
+#[cfg(test)]
+mod wave6a_moved_owner_tests;
+#[cfg(test)]
+mod wave6a_outparam_tests;
+#[cfg(test)]
+mod wave6a_receiver_handover_tests;
+#[cfg(test)]
+mod wave6a_return_certificate_tests;
+#[cfg(test)]
+mod wave6a_view_bridge_tests;
+#[cfg(test)]
+mod wave6f_field_reference_tests;
+#[cfg(test)]
+mod wave6k_reverted_class_naming_tests;
+#[cfg(test)]
+mod wave6k_typedef_parameter_tests;
+#[cfg(test)]
+mod wave6l_call_result_option_tests;
+#[cfg(test)]
+mod wave6l_local_box_exemption_tests;
+#[cfg(test)]
+mod wave6l_nested_composition_tests;
+#[cfg(test)]
+mod wave6l_nul_contract_tests;
+#[cfg(test)]
+mod wave6l_nul_walk_arm_tests;
+#[cfg(test)]
+mod wave6l_return_origin_tests;
+#[cfg(test)]
+mod wave6o_callee_frame_bounded_tests;
+#[cfg(test)]
+mod wave6o_opt_use_shapes_tests;
+#[cfg(test)]
+mod wave6o_owned_field_load_tests;
+pub(crate) mod wave6r_child_access;
+mod wave6r_option_reborrow;
+pub(crate) mod wave6r_shared_root;
+
+#[cfg(test)]
+mod a5_inner_argument_tests;
+#[cfg(test)]
+mod additive_tests;
+#[cfg(test)]
+mod address_observation_only_tests;
+#[cfg(test)]
+mod address_view_tests;
+/// **R631-12** — the argument-order hoist, the emission premise of L01¹⁰'s arm (a).
+mod arg_order_hoist;
+#[cfg(test)]
+mod arg_order_hoist_tests;
+/// **The AST application layer's bridge** — phases 1–2 of the migration back to
+/// standing decision 3. Test-only while the bar is measured; it becomes
+/// production when phase 3 ports the edit vocabulary onto it.
+///
+/// **GRADUATED (M-2/A task 3, 2026-08-18)** — the verify loop now emits through
+/// this layer, so the condition this doc named is met.
+pub(crate) mod ast_bridge;
+/// **Phase 3** — the edit vocabulary as node transforms, with the fail-closed
+/// composition guard built beside its first arm.
+pub(crate) mod ast_transform;
+#[cfg(test)]
+mod binn_counted_tests;
+#[cfg(test)]
+mod binn_literal_width_tests;
+#[cfg(test)]
+pub(crate) mod bridge_custody_export;
+#[cfg(test)]
+pub(crate) mod bridge_custody_match;
+#[cfg(test)]
+pub(crate) mod bridge_custody_syntax;
+#[cfg(test)]
+mod bridge_custody_tests;
+#[cfg(test)]
+mod callee_bound_tests;
+#[cfg(test)]
+mod callee_input_tests;
+#[cfg(test)]
+mod cast_of_local_bridge_tests;
+#[cfg(test)]
+mod census_world_tests;
+#[cfg(test)]
+mod closure_coupling_tests;
+#[cfg(test)]
+mod contract_extent_integration_tests;
+#[cfg(test)]
+mod counted_void_tests;
+#[cfg(test)]
+mod counted_void_twin_tests;
+#[cfg(test)]
+mod declaration_pattern_tests;
+#[cfg(test)]
+mod declaration_tests;
+#[cfg(test)]
+pub(crate) mod delivery_custody;
+#[cfg(test)]
+mod diagnostic_message_tests;
+#[cfg(test)]
+mod emission_loop_seam_tests;
+#[cfg(test)]
+mod emit_tests;
+#[cfg(test)]
+mod escape_seam_tests;
+#[cfg(test)]
+mod expression_sibling_tests;
+#[cfg(test)]
+mod forced_cover_tests;
+#[cfg(test)]
+mod frame_bounded_tests;
+#[cfg(test)]
+mod goldens;
+#[cfg(test)]
+mod import_denylist;
+#[cfg(test)]
+mod io_domain_tests;
+#[cfg(test)]
+mod joint_c_base_view_tests;
+#[cfg(test)]
+mod native_return_receipt_tests;
+#[cfg(test)]
+mod native_return_replay_tests;
+#[cfg(test)]
+mod nested_use_tests;
+#[cfg(test)]
+mod nullinit_receiver_tests;
+#[cfg(test)]
+mod one_span_one_arm_tests;
+#[cfg(test)]
+mod option_call_dependency_tests;
+#[cfg(test)]
+mod option_carrier_tests;
+#[cfg(test)]
+mod option_cmp_tests;
+#[cfg(test)]
+mod option_decl_tests;
+#[cfg(test)]
+mod option_exported_null_handoff_tests;
+#[cfg(test)]
+mod option_forward_nullability_tests;
+#[cfg(test)]
+mod option_null_arg_tests;
+#[cfg(test)]
+mod option_ops_tests;
+#[cfg(test)]
+mod option_pending_sibling_tests;
+#[cfg(test)]
+mod option_projection_tests;
+#[cfg(test)]
+mod option_raw_formal_tests;
+#[cfg(test)]
+mod option_reborrow_tests;
+#[cfg(test)]
+mod option_receiver_tests;
+#[cfg(test)]
+mod option_return_arm_tests;
+#[cfg(test)]
+mod option_suffix_tests;
+#[cfg(test)]
+mod option_thin_extent_tests;
+#[cfg(test)]
+mod option_void_tests;
+#[cfg(test)]
+mod optional_cursor_tests;
+#[cfg(test)]
+mod ordinary_argument_permission_tests;
+#[cfg(test)]
+mod outbound_alias_permission_tests;
+#[cfg(test)]
+mod outbound_expression_shape_tests;
+#[cfg(test)]
+mod outbound_expression_tests;
+#[cfg(test)]
+mod outbound_return_receipt_tests;
+#[cfg(test)]
+pub(crate) mod outbound_return_transport;
+#[cfg(test)]
+mod r216_boundary_tests;
+#[cfg(test)]
+mod r233_shape_emission_tests;
+#[cfg(test)]
+mod r462_in_crate_alias_tests;
+#[cfg(test)]
+mod r593_raw_expression_tests;
+#[cfg(test)]
+mod raw_field_null_tests;
+#[cfg(test)]
+mod raw_receiver_tests;
+#[cfg(test)]
+mod raw_twin_inventory_tests;
+#[cfg(test)]
+mod retalias_semantics_tests;
+mod retirement_reason_tests;
+mod return_alias_tests;
+#[cfg(test)]
+mod return_atom_lifetime_tests;
+#[cfg(test)]
+mod return_family_premise_tests;
+#[cfg(test)]
+mod return_family_tests;
+#[cfg(test)]
+mod return_origin_mutability_frame_tests;
+#[cfg(test)]
+mod return_receiver_shape_tests;
+#[cfg(test)]
+mod return_receiver_tests;
+#[cfg(test)]
+mod return_shape_tests;
+#[cfg(test)]
+mod return_terminal_tests;
+#[cfg(test)]
+mod return_wrapper_tests;
+#[cfg(test)]
+mod returned_child_terminal_view_tests;
+#[cfg(test)]
+mod returned_child_tests;
+#[cfg(test)]
+mod revert_input_tests;
+#[cfg(test)]
+mod review107_tests;
+#[cfg(test)]
+mod scalar_bytes_tests;
+#[cfg(test)]
+mod sealed_source_edge_frame_tests;
+#[cfg(test)]
+mod seam_terminal_tests;
+#[cfg(test)]
+mod sibling_audit_tests;
+#[cfg(test)]
+mod sibling_overlap_tests;
+#[cfg(test)]
+mod slice_passon_tests;
+#[cfg(test)]
+mod slice_use_inventory_tests;
+#[cfg(test)]
+mod thin_extent_tests;
+#[cfg(test)]
+mod twin_raw_view_custody_tests;
+#[cfg(test)]
+mod void_pointee_tests;
+#[cfg(test)]
+mod void_region_tests;
+#[cfg(test)]
+mod zero_syntax_custody_tests;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct E1EditContext {
+    pub(crate) file: String,
+    pub(crate) lo_line: usize,
+    pub(crate) hi_line: usize,
+    pub(crate) shape: String,
+    pub(crate) replacement_head: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum E1DiagnosticSite {
+    CallBoundary,
+    BodyExpression,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct E1RevertDiagnostic {
+    pub(crate) function: String,
+    pub(crate) diagnostic: verify::Diag,
+    pub(crate) site_kind: E1DiagnosticSite,
+    pub(crate) attribution: String,
+    pub(crate) edits: Vec<E1EditContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "Item E's corpus worker is cfg(test); this transport crosses the production rewriter callback only for that measurement"
+)]
+pub(crate) struct E1Capture {
+    pub(crate) observed_root: std::path::PathBuf,
+    pub(crate) reverts: Vec<E1RevertDiagnostic>,
+    /// The FIRST verify's novel diagnostics (R423-5). `reverts` carries only
+    /// what span attribution could own; an emitted outcome whose classes were
+    /// taken back by the recovery bisect leaves `reverts` empty while these
+    /// messages are the whole record of what the reverts were for.
+    pub(crate) first_diags: Vec<verify::Diag>,
+    /// Exact call-adapter rows rendered from the SAME `DecisionTable` consumed
+    /// by the one E1 emission iteration.
+    pub(crate) adapter_receipt: String,
+    /// Every subject and item-axis exclusion from that same table/plan.
+    pub(crate) subject_receipt: String,
+    pub(crate) e2_artifacts: E2Artifacts,
+    pub(crate) raw_boundary_artifacts: RawBoundaryArtifacts,
+    pub(crate) novel_error_count: usize,
+    pub(crate) baseline_keys: usize,
+    pub(crate) baseline_errors: usize,
+    pub(crate) baseline_msg_env: usize,
+    pub(crate) attempted_placements: usize,
+    pub(crate) files_touched: usize,
+    pub(crate) unplaceable: usize,
+    pub(crate) overlap_receipt: String,
+    /// D4's emitted-MIR Box-drop reconciliation. Empty on non-census paths.
+    pub(crate) box_drop_receipt: String,
+    pub(crate) solve_receipt: model_cache::SolveReceipt,
+    /// Terminal verify-loop outcome. Kept distinct from the diagnostic count:
+    /// a degraded program may leave an empty final-revert ledger.
+    pub(crate) outcome_kind: CensusOutcomeKind,
+    /// Exact, untruncated escalation/reason payload for the census observer.
+    pub(crate) escalation: String,
+    pub(crate) bisect_probes: usize,
+    pub(crate) verify_rounds: usize,
+    pub(crate) reverted_count: usize,
+    /// The complete emitted Rust-file map on success. A degraded outcome has
+    /// no delivered tree and therefore carries `None`, never an empty map.
+    pub(crate) emitted_files: Option<std::collections::BTreeMap<plan::FileKey, String>>,
+    /// R1305-1 (relay main/367): the outcome's final degradations, keyed by the
+    /// subject identity `subject_receipt` uses, so a subject placed before the
+    /// verify loop and taken back by it (`RevertedAfterVerifyFailure`) is told
+    /// apart from one delivered. Read by the per-subject writer only.
+    pub(crate) final_degradations: Vec<decision::Degradation>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CensusOutcomeKind {
+    Emitted,
+    Degraded,
+}
+
+impl CensusOutcomeKind {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Emitted => "emitted",
+            Self::Degraded => "degraded",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct E2Artifacts {
+    pub(crate) subjects: String,
+    pub(crate) functions: String,
+    pub(crate) failures: String,
+    pub(crate) seams: String,
+    pub(crate) pb_web: String,
+    pub(crate) timings: E2Timings,
+    /// **A7/A8 — the lifetime plan must decide nothing.**
+    ///
+    /// Two `decide` runs over the same subjects differing in exactly one
+    /// argument: `lifetime_eligibility` present versus absent. Everything else
+    /// — gate, co-conversion, raw boundary, exposure, return receivers — is
+    /// held fixed, so a difference between the digests is attributable to the
+    /// lifetime pass and to nothing else. Quoted side by side in the receipt.
+    pub(crate) plan_inert_digest_with: String,
+    pub(crate) plan_inert_digest_without: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct E2Timings {
+    pub(crate) cache_load_wall_s: String,
+    pub(crate) origin_derivation_wall_s: String,
+    pub(crate) pb_web_wall_s: String,
+    pub(crate) eligibility_wall_s: String,
+    pub(crate) finalization_wall_s: String,
+    pub(crate) seam_wall_s: String,
+    pub(crate) ast_placement_wall_s: String,
+    pub(crate) receipt_render_wall_s: String,
+    pub(crate) compiler_verification_wall_s: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RawBoundaryArtifacts {
+    /// wave-6a W6A-T1: flexible-tail struct transactions (admitted / held).
+    pub(crate) flexible_tail_receipts: String,
+    /// **The session's per-program cells, carried OUT of the compiler thread.**
+    ///
+    /// `rustc_interface::run_compiler` runs its closure on a thread it spawns, so a
+    /// `thread_local!` written during the rewrite is gone when it returns — measured:
+    /// `same_thread=false value_after_return=0`. The census read four such cells
+    /// AFTER the capture returned, on its own thread, and so read a permanent zero:
+    /// `graft-held.tsv` was header-only on all twenty programs at batch 29 whether or not
+    /// the floor fired (so 072's "the floor never fired" was unproven), and
+    /// `raw_boundary_graft_refused` / `raw_boundary_replan_stale` could never be
+    /// non-zero — the latter being slicecursor's RETIREMENT condition. The cells are
+    /// snapshotted here, on the compiler thread, at the end of the session.
+    pub(crate) session_graft_held_table: String,
+    pub(crate) session_graft_refusals: usize,
+    pub(crate) session_stale_replans: usize,
+    /// The raw-cause ledger of the accepted model, one row per slot it settles not
+    /// Ref (`raw_cause::HEADER`'s columns after `program`), when the ledger is on;
+    /// `None` when it is off. Read by the per-subject writer only.
+    pub(crate) session_raw_cause_ledger: Option<Vec<String>>,
+    /// wave-6v2 (R442-4): one row per counted-void CALL plan, with the whole-call
+    /// replacements that cover it. An A5 proof-site raw view, a PAIR raw view or a
+    /// C-9 mark replaces the entire call expression, so an argument adapter planned
+    /// inside it is discarded and a delivered callee is left with a raw argument
+    /// (binn's `copy_int_value`: two such sites, two `E0308`, a verify-revert and a
+    /// 50-function closure partition). `eprintln` is not an observable channel in the
+    /// census worker, so the collision is reported as a receipt row instead.
+    pub(crate) counted_void_call_receipts: String,
+    /// R619-6 (slicecursor 080): SC-2's per-site receipt, one row per parameter
+    /// cursor that keeps the entry window over a `Top` index.
+    pub(crate) entry_window_receipts: String,
+    /// **R459-3 (wave-6b 019 STOP 2) — the FIRST failing verify tree, per program.**
+    ///
+    /// The census keeps the post-revert tree and the receipts, never the source
+    /// the verify stage actually compiled, so a diagnostic like wave-6b's 18
+    /// `expected *mut u8 found *mut libc::c_void` cannot be traced to the formal
+    /// that spells it: by the time anything is published, the class that produced
+    /// it has been reverted out of the tree. This holds the exact bytes handed to
+    /// the FIRST failing verify round and nothing after it — one round, one
+    /// program, so a later round cannot overwrite the evidence for an earlier one.
+    ///
+    /// Empty unless `CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE` names a
+    /// directory: brotli's tree alone is ~35 MB, and the standing census has no
+    /// use for it.
+    pub(crate) first_failing_verify_tree: String,
+    /// wave-6a W6A-C1: Box-parameter chains (admitted / held).
+    pub(crate) box_param_receipts: String,
+    /// wave-6a W6A-A1: allocation-return certificates (admitted / held).
+    pub(crate) return_certificate_receipts: String,
+    /// **R538-7 / R541-6** — wave-6v's field-load alias exemption, one row per
+    /// exempted site: `alias-exempt:field-load(<struct>.<field>-><pointee>)`.
+    pub(crate) field_load_exemption_receipts: String,
+    /// **R801-2 (wave-6o 106a (a), main 165)** — premise P7's `declaration-view`
+    /// sites, pushed by the families that make a view of a raw pointer (the
+    /// Option family, wave-6l's A8-1 arm): a table with the header
+    /// [`PREMISE_VIEW_SITES_HEADER`], one row per TERMINAL site where (b) fails.
+    /// The census writes it as `<p>.raw-boundary-premise-view-sites.tsv`; P7's
+    /// census reader counts its rows as the view kind in place of its own view
+    /// reading. Empty: the reader's own view reading stands.
+    pub(crate) premise_view_sites: String,
+    /// **P11 (R936-1, the USER with the advisor)** — every pair the pair
+    /// certificates clear only by the global-or-integer provenance premise
+    /// (`<p>.raw-boundary-pair-premise.tsv`; its rows are the program's count).
+    pub(crate) pair_premise_receipts: String,
+    /// Relay 297: the settled-table holds' receipts, one row per predicate that
+    /// named a subject (`<p>.raw-boundary-settled-holds.tsv`).
+    pub(crate) settled_hold_receipts: String,
+    /// R1305-1 (relay main/367): per decided subject, the facts the census
+    /// ledger's columns need beside `subject_receipt` (`e1_subject_facts_tsv`).
+    pub(crate) subject_facts: String,
+    /// wave-6a: allocator-contract owners (admitted / held).
+    pub(crate) allocator_contract_receipts: String,
+    /// R369 FIELD-CP observer, captured from the same frozen decision pass.
+    pub(crate) ownership_native: String,
+    pub(crate) shared_permissions: Vec<decision::overlapping_pairs::consumer::Permission>,
+    pub(crate) shared_pair_receipts: String,
+    #[cfg(test)]
+    pub(crate) bridge_custody_export: bridge_custody_export::Export,
+    pub(crate) pending_sibling_receipts: Vec<plan::sibling_overlap::PendingSite>,
+    pub(crate) sibling_coverage_gaps: Vec<decision::sibling_overlap::CoverageGapReceipt>,
+    pub(crate) sibling_audit_rows: Vec<sibling_audit::Row>,
+    /// R219: independent emitted-tree custody checks retain the exact decided
+    /// form, including distinctions absent from the historical coarse seed.
+    pub(crate) custody_expectations: Vec<DeliveryExpectation>,
+    pub(crate) additive_family_receipts: Vec<additive::FamilyFallbackReceipt>,
+    pub(crate) exposure: String,
+    /// R1295-1: the configured exposure names that matched no local function, and
+    /// those that matched several (with how many), as the seed received them.
+    pub(crate) configured_unmatched: Vec<String>,
+    pub(crate) configured_ambiguous: Vec<(String, usize)>,
+    /// wave-6f: the struct-field reference transactions, applied and held.
+    pub(crate) field_transactions: String,
+    pub(crate) d4_edges: String,
+    pub(crate) pairs: String,
+    pub(crate) addresses: String,
+    pub(crate) arm_outcomes: String,
+    pub(crate) edit_keys: String,
+    pub(crate) sites: String,
+    pub(crate) retention: String,
+    /// wave-6r (relay 017): the K18' child-access receipt, one row per callee
+    /// position with its outcome and refusal reason. Instrument-only; main
+    /// writes it as `raw-boundary-child-access.tsv` beside the other rows.
+    pub(crate) child_access: String,
+    /// wave-6r (R459-2, report 036): the raw twin's placement receipt. It was
+    /// built into the graft but never exported, so no census could read the
+    /// row it exists to answer; main writes it as
+    /// `raw-boundary-twin-placement.tsv` beside the other rows.
+    pub(crate) twin_placement: String,
+    pub(crate) dispositions: String,
+    pub(crate) subjects: String,
+    pub(crate) atoms: String,
+    pub(crate) atom_outcomes: String,
+    pub(crate) final_reverts: String,
+    pub(crate) bridge_events: Vec<bridge_receipt::BridgeReceiptEvent>,
+    pub(crate) unsafe_context_events: Vec<mechanical_receipt::UnsafeContextReceiptEvent>,
+    pub(crate) mechanical_events: Vec<mechanical_receipt::MechanicalObligationEvent>,
+    pub(crate) a5_proof_site_fallback_rows: Vec<mechanical_receipt::A5ProofSiteFallbackReceiptRow>,
+    pub(crate) slice_construction_rows: Vec<mechanical_receipt::SliceConstructionReceiptRow>,
+    pub(crate) slice_use_rows: Vec<mechanical_receipt::SliceUseAdapterReceiptRow>,
+    pub(crate) option_rows: Vec<mechanical_receipt::OptionPresentationReceiptRow>,
+    pub(crate) declaration_rows: Vec<mechanical_receipt::DeclarationShapeReceiptRow>,
+    pub(crate) outbound_return_required: Vec<mechanical_receipt::OutboundReturnRequirement>,
+    pub(crate) outbound_return_rows: Vec<mechanical_receipt::OutboundReturnBridgeReceiptRow>,
+    pub(crate) outbound_return_error: Option<String>,
+    pub(crate) class_costs: String,
+    pub(crate) class_collisions: String,
+    pub(crate) unresolved_classes: String,
+    /// **R517-8** — one row per held class whose edits the placement layer
+    /// dropped: the reason and how many edits it cost.
+    pub(crate) class_held_drops: String,
+    /// main 166: the views the terminal replan held `nested-caller-edit`.
+    pub(crate) a5_hold_views: String,
+    /// R397-6(b): contract candidates declined at the selection input.
+    pub(crate) contract_candidate_declines: String,
+    /// **W4-LIFT (R475-2)**: callers lifted to the slice form by an exact
+    /// licensed width, one row each.
+    pub(crate) licensed_lifts: String,
+    /// **R801-2 (USER: P7 extended)**: one row per site whose delivered form
+    /// rides a stated premise (`premise=…`, site kind), so the census counts
+    /// them per program.
+    pub(crate) premise_receipts: String,
+    /// **R1314-1 (relay main/372):** premise P12's per-subject writer file: the program
+    /// line `p12_scan=clean` / `p12_scan=<bindings>`, then one row per subject P12 decides.
+    pub(crate) p12_receipts: String,
+    /// **R1313-2 (relay main/371 step 2):** the byte-view receipt, one row per cast-offset site of
+    /// a subject decided `Slice` (`decision::cast_offset::receipts_tsv`).
+    pub(crate) byte_view_receipts: String,
+    /// **Relay 371 step 3:** the identity-cast strip's receipt, one row per stripped argument
+    /// (`decision::identity_cast::receipts_tsv`).
+    pub(crate) cast_strip_receipts: String,
+    /// **W4-B1 (R480-2)**: the root-extent rule's decided rows — lifted with
+    /// their evidence, or HELD with what the root said and why.
+    pub(crate) root_extents: String,
+    /// **main 071c (a), report 057**: the admitted sole assignments, with the
+    /// form each subject ended in.
+    pub(crate) sized_assignments: String,
+    pub(crate) interface_inventory: String,
+    /// R261-3 rider (addendum 264): subjects whose io-domain type walk ran out
+    /// of depth budget without deciding. A nonzero count reopens the depth
+    /// choice, not the rule.
+    pub(crate) io_domain_budget_exhausted: usize,
+    /// R271-1: slots held because their pointee is `c_void`.
+    pub(crate) void_pointee_held: usize,
+    pub(crate) sites_from_non_subject_arguments: usize,
+    pub(crate) converted_callee_without_site_receipt: usize,
+    pub(crate) degraded_output_receipt: String,
+    pub(crate) per_arm_timers_status: String,
+    pub(crate) attribution_hits: AttributionHits,
+    pub(crate) signature_class_count: usize,
+    pub(crate) class_bisect_probes: usize,
+    /// Classes first reverted in verify rounds >=2 whose diagnostic lies in a
+    /// function reverted during an earlier round.
+    pub(crate) revert_found_form_late_classes: usize,
+    pub(crate) class_verify_rounds: usize,
+    pub(crate) verify_wall_s: String,
+    pub(crate) emit_budget_s: String,
+    pub(crate) timings: RawBoundaryTimings,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct DeliveryExpectation {
+    pub(crate) subject_key: String,
+    pub(crate) owner_fn: String,
+    pub(crate) emitted_owner: String,
+    /// Exact source-map file identity; an unmapped file is a custody failure.
+    pub(crate) source_file: Option<String>,
+    pub(crate) binding: String,
+    pub(crate) parameter_index: Option<usize>,
+    pub(crate) expected_form: DeliveryForm,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum DeliveryForm {
+    Cursor {
+        mutable: bool,
+        optional: bool,
+        wrapper: bool,
+    },
+    Borrowed {
+        mutable: bool,
+        optional: bool,
+        slice: bool,
+    },
+    Owning {
+        optional: bool,
+        slice: bool,
+    },
+}
+
+fn delivery_form(decision: &decision::Decision) -> Option<DeliveryForm> {
+    match decision {
+        decision::Decision::Ref { mutable } | decision::Decision::InferredRef { mutable, .. } => {
+            Some(DeliveryForm::Borrowed {
+                mutable: *mutable,
+                optional: false,
+                slice: false,
+            })
+        }
+        decision::Decision::Cursor { mutable, plan } => {
+            if plan.wrapper && plan.parameter {
+                Some(DeliveryForm::Borrowed {
+                    mutable: *mutable,
+                    optional: plan.optional,
+                    slice: true,
+                })
+            } else {
+                Some(DeliveryForm::Cursor {
+                    mutable: *mutable,
+                    optional: plan.optional,
+                    wrapper: plan.wrapper,
+                })
+            }
+        }
+        decision::Decision::NestedSlice { mutable, .. }
+        | decision::Decision::Slice { mutable, .. } => Some(DeliveryForm::Borrowed {
+            mutable: *mutable,
+            optional: false,
+            slice: true,
+        }),
+        decision::Decision::Opt { mutable, slice, .. } => Some(DeliveryForm::Borrowed {
+            mutable: *mutable,
+            optional: true,
+            slice: *slice,
+        }),
+        decision::Decision::Box(plan) => Some(DeliveryForm::Owning {
+            optional: plan.optional,
+            slice: match plan.shape {
+                decision::box_facts::BoxShape::Sized => false,
+                decision::box_facts::BoxShape::Slice => true,
+            },
+        }),
+        decision::Decision::Degraded(_) => None,
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AttributionHits {
+    pub(crate) exact_edit: usize,
+    pub(crate) exact_seam: usize,
+    pub(crate) related_span: usize,
+    pub(crate) enclosing_region: usize,
+    pub(crate) unresolved: usize,
+}
+
+impl AttributionHits {
+    fn record(&mut self, rule: AttributionRule) {
+        match rule {
+            AttributionRule::ExactEdit => self.exact_edit += 1,
+            AttributionRule::ExactSeam => self.exact_seam += 1,
+            AttributionRule::RelatedSpan => self.related_span += 1,
+            AttributionRule::EnclosingRegion => self.enclosing_region += 1,
+            AttributionRule::Unresolved => self.unresolved += 1,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EmissionRunConfig {
+    pub(crate) configured_exposure: decision::exposure::ConfiguredExposureInput,
+    /// Relay main/375 §3: the analysis budget (off by default).
+    pub(crate) analysis_budget: crate::analysis_budget::Budget,
+}
+
+impl Default for EmissionRunConfig {
+    fn default() -> Self {
+        Self {
+            configured_exposure: decision::exposure::ConfiguredExposureInput::explicit_empty(
+                "bo-rewriter-default-explicit-empty",
+            ),
+            analysis_budget: crate::analysis_budget::Budget::default(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RawBoundaryTimings {
+    pub(crate) site_derivation_wall_s: String,
+    pub(crate) retention_fixpoint_wall_s: String,
+    pub(crate) certificate_replay_wall_s: String,
+    pub(crate) decision_wall_s: String,
+    pub(crate) render_wall_s: String,
+    pub(crate) receipt_wall_s: String,
+    pub(crate) initial_verify_wall_s: String,
+    pub(crate) atom_reverify_wall_s: String,
+}
+
+/// What one M1 rewrite attempt produced.
+///
+/// `Degraded` is a first-class outcome, not an error: §1.6 admits only
+/// conflict-non-increasing re-routes, and **everything outside that envelope
+/// degrades in the decision phase with a named reason**. Making that a variant
+/// rather than a panic or a silent skip is what lets S2 count envelope
+/// failures — the registered commitment that decides whether
+/// emission-guided refinement is ever built.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RewriteOutcome {
+    /// The emitted crate source, **with the degradations that accompanied it**.
+    ///
+    /// Degradations ride along with a successful emission on purpose: a crate
+    /// can emit while most of its subjects were degraded, and an `Emitted` that
+    /// did not say so would let a 100%-degraded program count as a success.
+    /// `emitted_count` is how a caller tells a real rewrite from a no-op.
+    Emitted {
+        /// The crate **root's** final text. For a single-file crate this is the
+        /// whole emitted crate; for a multi-file crate it is the root only, and
+        /// [`Self::Emitted::files`] carries every file the rewrite changed.
+        ///
+        /// Read back from the materialized copy rather than reconstructed, so it
+        /// is correct whether or not the root itself was edited.
+        source: String,
+        /// The files this outcome emits, keyed by file.
+        ///
+        /// ⚠ **NOT "every file the rewrite changed" — that is what this said,
+        /// and it was false on the AST layer** (2026-08-18). The AST emission
+        /// map is SEEDED with every file holding a function, because a crate
+        /// with no surviving edits must still emit its original text rather
+        /// than an empty file (the g09 fix). So on that layer `files` can
+        /// contain a file whose bytes are IDENTICAL to the substrate.
+        ///
+        /// Consequently **`files.len()` is not `files_touched`**, and the stale
+        /// wording here is what licensed a consumer to re-derive it that way.
+        /// Use [`Self::Emitted::files_touched`].
+        files: std::collections::BTreeMap<plan::FileKey, String>,
+        /// **Files with at least one SURVIVING EDIT** (ruling 2026-08-18),
+        /// carried from the loop rather than re-derived from `files`.
+        ///
+        /// It exists because it was already computed and then DROPPED here:
+        /// `OutcomeFacts` held the ruled value, `emitted()` did not pass it on,
+        /// and the reporting site recovered a number by measuring `files`
+        /// instead — a second derivation that agreed with the first only on the
+        /// span layer, where `render` returns edited files only.
+        files_touched: usize,
+        degradations: Vec<decision::Degradation>,
+        emitted_count: usize,
+        /// Pointer parameters on item kinds M1 does not rewrite. Carried out
+        /// here so the exclusions reach a consumer **by construction** — the
+        /// previous buckets were written and read by nothing outside one test,
+        /// while the ledger claimed they "flow into S2b's counters".
+        excluded: decision::universe::Excluded,
+        emitted_sites: Vec<EmittedSite>,
+        /// Bisect probes spent. **0 means the revert loop converged on its own**;
+        /// nonzero means attribution failed, the detector fired, and (C) found
+        /// the culprit the containing-function heuristic could not.
+        bisect_probes: usize,
+        /// Main verify-loop compiler invocations, excluding bisect probes.
+        verify_rounds: usize,
+        /// Why the loop escalated, when it did. `None` means it never had to.
+        /// Carried on the SUCCESS outcome because a crate recovered by bisect is
+        /// still a crate whose attribution was wrong — collapsing that into a
+        /// plain success would hide the very case (C) exists for.
+        escalated: Option<String>,
+        /// Subjects the verify loop took back.
+        reverted_count: usize,
+        /// Edit owners invisible to span attribution.
+        attribution_blind: usize,
+        /// The first verify's diagnostics.
+        first_diags: Vec<verify::Diag>,
+        /// The temp-copy root those diagnostics' paths are absolute within.
+        /// Captured with them, from the SAME round — each revert round
+        /// materializes its own temp directory, so a later round's root would
+        /// not canonicalize the first round's paths.
+        observed_root: Option<std::path::PathBuf>,
+        baseline_keys: usize,
+        baseline_errors: usize,
+        baseline_msg_env: usize,
+        /// Decisions that could not be turned into a placed edit — a
+        /// macro-generated span, a span straddling two files, a file with no
+        /// editable identity. Carried out for the same reason as `excluded`:
+        /// counted and attributed, never silently dropped. Expected zero on the
+        /// frozen corpus; a nonzero count is a finding to rule on.
+        unplaceable: Vec<plan::Unplaceable>,
+        /// Resolved A5 construction and selected-model identity.
+        overlap_receipt: String,
+        /// E1's single-iteration diagnostic rows. Empty on ordinary runs.
+        e1_reverts: Vec<E1RevertDiagnostic>,
+        /// E1's adapter receipt, empty on ordinary runs.
+        e1_adapter_receipt: String,
+        /// E1's identity-bearing subject seed, empty on ordinary runs.
+        e1_subject_receipt: String,
+        e2_artifacts: E2Artifacts,
+        raw_boundary_artifacts: RawBoundaryArtifacts,
+        /// Baseline-subtracted error count from the one verify invocation.
+        e1_novel_error_count: usize,
+        /// D4's emitted-MIR Box-drop reconciliation.
+        e1_box_drop_receipt: String,
+        /// Cache/solve receipt captured inside the compiler callback.
+        solve_receipt: Option<model_cache::SolveReceipt>,
+    },
+    /// No emission, with whatever attribution was available.
+    Degraded {
+        reason: String,
+        /// Byte-identical unmodified root input handed back to the pipeline.
+        source: String,
+        /// Byte-identical unmodified input file set. This is never a partially
+        /// rewritten attempt.
+        files: std::collections::BTreeMap<plan::FileKey, String>,
+        degradations: Vec<decision::Degradation>,
+        excluded: decision::universe::Excluded,
+        /// **Observability of the ATTEMPT.** A crate that fails the gate still
+        /// rewrote subjects — that is usually WHY it failed. Reporting zero here
+        /// is the "deferral recorded, never zeroed" rule violated at the
+        /// instrument, and it blocked S2b.0's span-bucket axis outright.
+        emitted_count: usize,
+        files_touched: usize,
+        /// The rewritten subjects' own functions, so a verify diagnostic can be
+        /// attributed to one.
+        emitted_sites: Vec<EmittedSite>,
+        /// Bisect probes spent before giving up.
+        bisect_probes: usize,
+        /// Main verify-loop compiler invocations, excluding bisect probes.
+        verify_rounds: usize,
+        /// Subjects the verify loop took back. **Measured, never zeroed** — the
+        /// defect this structure exists to prevent.
+        reverted_count: usize,
+        /// Edit owners invisible to span attribution.
+        attribution_blind: usize,
+        /// The first verify's diagnostics.
+        first_diags: Vec<verify::Diag>,
+        /// The temp-copy root those diagnostics' paths are absolute within.
+        /// Captured with them, from the SAME round — each revert round
+        /// materializes its own temp directory, so a later round's root would
+        /// not canonicalize the first round's paths.
+        observed_root: Option<std::path::PathBuf>,
+        baseline_keys: usize,
+        baseline_errors: usize,
+        baseline_msg_env: usize,
+        /// Decisions that could not be turned into a placed edit. **Measured,
+        /// never zeroed** — carried here for exactly the reason `emitted_count`
+        /// and `reverted_count` above are.
+        ///
+        /// This is the THIRD instance of the shape those two document, and it
+        /// survived the structure built to prevent a third: [`OutcomeFacts`]
+        /// stopped any site from *hand-filling* a field, but `degraded()` could
+        /// still DROP one, because the variant had nowhere to put it. A
+        /// one-filling-site rule constrains how a field is written and says
+        /// nothing about whether it is written at all.
+        ///
+        /// The reported zero was a constant on every FAIL row from `fb82552e`
+        /// until S2b.3, which made two S2b.0 claims — `unplaceable` "sound on
+        /// every row" and "0 on all 20" — hold over 10 programs rather than 20.
+        /// A pin on the constant would have been unfailable precisely where it
+        /// matters, so this is the precondition for S2b.3's `unplaceable == 0`
+        /// gate rather than a tidy-up.
+        unplaceable: Vec<plan::Unplaceable>,
+        /// Resolved A5 construction and selected-model identity.
+        overlap_receipt: String,
+        /// E1's single-iteration diagnostic rows. Empty on ordinary runs.
+        e1_reverts: Vec<E1RevertDiagnostic>,
+        /// E1's adapter receipt, empty on ordinary runs.
+        e1_adapter_receipt: String,
+        /// E1's identity-bearing subject seed, empty on ordinary runs.
+        e1_subject_receipt: String,
+        e2_artifacts: E2Artifacts,
+        raw_boundary_artifacts: RawBoundaryArtifacts,
+        /// Baseline-subtracted error count from the one verify invocation.
+        e1_novel_error_count: usize,
+        /// D4's emitted-MIR Box-drop reconciliation.
+        e1_box_drop_receipt: String,
+        /// Cache/solve receipt captured inside the compiler callback.
+        solve_receipt: Option<model_cache::SolveReceipt>,
+    },
+}
+
+#[cfg(test)]
+/// M1 entry point: source in, rewritten source out.
+///
+/// The four phases run in order, each handed the previous one's finished value:
+/// `decision` (the only phase that reads analyses) → `plan` (edits as data) →
+/// `apply` (analysis-blind splice) → `verify` (gates).
+///
+/// # Capture scope
+///
+/// The driver opens [`with_bo_export`] explicitly. The ambient `CRAT_BO_EXPORT`
+/// flag is for corpus workers; the driver **is** the consumer, so it arms
+/// unconditionally and pays the capture cost by design.
+///
+/// # S1 scope
+///
+/// Depth-0 pointer *parameters* decided `Ref`. Everything else degrades in the
+/// decision phase with a named reason.
+#[allow(
+    dead_code,
+    reason = "M1's only entry point, and it has no non-test caller until the \
+              rewriter is wired into the pipeline. The allow is HERE, on one \
+              item, rather than module-wide: seeding this as a live root keeps \
+              dead_code active over everything reachable from it, which is what \
+              the module-wide blanket switched off — it hid the two dead \
+              universe fields the lint exists to catch."
+)]
+pub(crate) fn rewrite_m1(input: &str) -> RewriteOutcome {
+    // **The single-file case of the general path — not a second path.** The
+    // input is staged as a one-file crate and handed to `rewrite_m1_path`, so
+    // the ten goldens exercise exactly the mechanism the corpus will. A parallel
+    // string pipeline is the hazard class this milestone exists to remove: it
+    // would be exercised by every test and by nothing real.
+    rewrite_core(
+        ::utils::compilation::str_to_input(input),
+        None,
+        MAX_REVERT_ROUNDS,
+    )
+}
+
+/// **W1's entry — the AST layer emitting under a NON-EMPTY revert set.**
+///
+/// Every cross-layer witness before this one ran with `RevertSet::default()`, a
+/// gap registered at the fabrication close. The loop this layer is being wired
+/// into reverts on every round but the first, so *"does the AST layer honour a
+/// revert set"* is the swap's precondition — and it could not be settled by
+/// reading, because the comment that answered it was stale.
+///
+/// ⚠ **ORDER IS LOAD-BEARING, and it is the loop's order too.** `capture_ast`
+/// must run before anything touches HIR; `oracle_reverts` queries
+/// `hir_body_owners`. Capture first, resolve second, emit third.
+///
+/// `reverts_text` is the oracle's own format (`{fn_path}::{param}#{mir_local}`,
+/// one per line) parsed by the production resolver — not a test-only shortcut,
+/// so this exercises revert RESOLUTION as well as revert honouring.
+#[cfg(test)]
+pub(crate) fn ast_emitted_source_of_reverting(
+    input: &str,
+    reverts_text: &str,
+) -> Result<String, String> {
+    match ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let capture = ast_transform::capture_ast(tcx)?;
+            let reverts = ast_transform::oracle_reverts(tcx, reverts_text, "w1-fixture")?;
+            ast_transform::ast_emitted_source_from(tcx, &capture, &reverts)
+                .map(|(source, _stats)| source)
+        },
+    ) {
+        Ok(inner) => inner,
+        Err(why) => Err(format!("{why:?}")),
+    }
+}
+
+/// **The one-capture-per-session fact, as an entry a test can call twice.**
+///
+/// Returns `(first, second)` outcomes of `capture_ast` in ONE session. The
+/// loop's design rests on this: it captures once and re-emits per round, and
+/// the reason is that the second capture cannot work, not that re-capturing
+/// would be slow.
+#[cfg(test)]
+pub(crate) fn two_captures_in_one_session(input: &str) -> Result<(bool, bool), String> {
+    match ::utils::compilation::run_compiler_on_input(
+        ::utils::compilation::str_to_input(input),
+        |tcx| {
+            let first = ast_transform::capture_ast(tcx).is_ok();
+            let second = ast_transform::capture_ast(tcx).is_ok();
+            Ok((first, second))
+        },
+    ) {
+        Ok(inner) => inner,
+        Err(why) => Err(format!("{why:?}")),
+    }
+}
+
+/// M1's **general** entry point: a crate rooted at `root`, rewritten into a temp
+/// copy and gated there.
+#[allow(
+    dead_code,
+    reason = "no caller until 0a.4's corpus smoke; `rewrite_m1` reaches the same               core through the other entry. Targeted here rather than               module-wide so the lint stays live over everything reachable."
+)]
+/// **R805-7 (relay 272), main 167 remedy (a)** — [`rewrite_m1`] in the census's
+/// A5 world: the precise replay against the frozen benchmark graph, the world
+/// every census runs in. `rewrite_m1` runs the open world (no attestation),
+/// where an A5 shape's emission trips `unowned A5 proof-site receipt
+/// identities`; an emission witness of an A5 shape runs here instead.
+#[cfg(test)]
+pub(crate) fn rewrite_m1_census_world(input: &str) -> RewriteOutcome {
+    rewrite_core_injected(
+        ::utils::compilation::str_to_input(input),
+        None,
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        false,
+        false,
+        Some((
+            OverlapMode::PreciseReplay,
+            Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+        )),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn rewrite_m1_path(root: &std::path::Path) -> RewriteOutcome {
+    rewrite_core(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+    )
+}
+
+/// **The one emission path.** Both entry points funnel here; they differ only in
+/// the compiler input and in what the emitted files are materialized *onto*.
+///
+/// # Why the string entry is not staged to disk first
+///
+/// Staging it would make every span render against a temp directory — an
+/// absolute, machine-specific path containing a pid and a counter. Sites would
+/// stop being reproducible between runs, which is the D19 failure again: a
+/// report whose values permute between runs is not comparable. Compiling the
+/// string as `<main.rs>` keeps attribution stable, and the emission logic below
+/// is shared regardless, which is what the one-path ruling is actually about.
+/// Dependency-group split/recurse recovery. It tests each half independently;
+/// when both halves are necessary it minimizes one while holding the other,
+/// then vice versa. No alphabetical function prefix enters the search.
+fn recover_class_groups(
+    candidates: &[Vec<bridge_receipt::SignatureClassId>],
+    base: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    mut compiles: impl FnMut(&std::collections::BTreeSet<bridge_receipt::SignatureClassId>) -> bool,
+) -> (
+    std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    usize,
+) {
+    fn minimize<F>(
+        groups: &[Vec<bridge_receipt::SignatureClassId>],
+        base: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+        compiles: &mut F,
+        probes: &mut usize,
+    ) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId>
+    where
+        F: FnMut(&std::collections::BTreeSet<bridge_receipt::SignatureClassId>) -> bool,
+    {
+        if groups.is_empty() {
+            return std::collections::BTreeSet::new();
+        }
+        if groups.len() == 1 {
+            return groups[0].iter().copied().collect();
+        }
+        let mid = groups.len() / 2;
+        let (left, right) = groups.split_at(mid);
+        let trial = |base: &std::collections::BTreeSet<_>, groups: &[Vec<_>]| {
+            let mut out = base.clone();
+            out.extend(groups.iter().flatten().copied());
+            out
+        };
+
+        let left_trial = trial(base, left);
+        *probes += 1;
+        if compiles(&left_trial) {
+            return minimize(left, base, compiles, probes);
+        }
+        let right_trial = trial(base, right);
+        *probes += 1;
+        if compiles(&right_trial) {
+            return minimize(right, base, compiles, probes);
+        }
+
+        let mut base_with_right = base.clone();
+        base_with_right.extend(right.iter().flatten().copied());
+        let left_min = minimize(left, &base_with_right, compiles, probes);
+        let mut base_with_left = base.clone();
+        base_with_left.extend(left_min.iter().copied());
+        let right_min = minimize(right, &base_with_left, compiles, probes);
+        left_min.union(&right_min).copied().collect()
+    }
+
+    let mut probes = 0usize;
+    let selected = minimize(candidates, base, &mut compiles, &mut probes);
+    let mut result = base.clone();
+    result.extend(selected);
+    (result, probes)
+}
+
+fn exact_diagnostic_classes(
+    exact: std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    _ready_universe: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
+    exact
+}
+
+pub(crate) fn record_revert_found_form_late_classes<T: Copy + Ord>(
+    round: usize,
+    enclosing: &std::collections::BTreeSet<T>,
+    reverted_before_round: &std::collections::BTreeSet<T>,
+    attributed: &std::collections::BTreeSet<T>,
+    recorded: &mut std::collections::BTreeSet<T>,
+) {
+    if round < 2
+        || !enclosing
+            .iter()
+            .any(|class| reverted_before_round.contains(class))
+    {
+        return;
+    }
+    recorded.extend(
+        attributed
+            .iter()
+            .copied()
+            .filter(|class| !reverted_before_round.contains(class)),
+    );
+}
+
+fn recovery_budget_deferred(projected_probes: f64, probe_secs: f64, budget_secs: f64) -> bool {
+    projected_probes * probe_secs > budget_secs
+}
+
+/// Test-only entry that lowers the round cap, so the CAP arm of the dual
+/// termination can be witnessed without manufacturing a looping fixture.
+/// A parameter rather than an env knob: no production seam.
+/// Test-only: force decisions at the phase boundary, reproducing a shape the
+/// decision phase would not itself emit.
+#[cfg(test)]
+pub(crate) fn rewrite_m1_path_injected(
+    root: &std::path::Path,
+    max_rounds: usize,
+    inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
+) -> RewriteOutcome {
+    rewrite_core_injected(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        max_rounds,
+        inject,
+        false,
+        false,
+        false,
+        None,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn rewrite_m1_path_a5_injected(
+    root: &std::path::Path,
+    mode: OverlapMode,
+    attestation: Option<WholeProgramAttestation>,
+    inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
+) -> RewriteOutcome {
+    rewrite_core_injected(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+        inject,
+        false,
+        false,
+        false,
+        Some((mode, attestation)),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn rewrite_m1_path_with_emission_config(
+    root: &std::path::Path,
+    mode: OverlapMode,
+    attestation: Option<WholeProgramAttestation>,
+    run_config: &EmissionRunConfig,
+) -> RewriteOutcome {
+    rewrite_core_injected_with_config(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        false,
+        false,
+        Some((mode, attestation)),
+        run_config,
+    )
+}
+
+#[cfg(test)]
+fn rewrite_core(
+    input: rustc_session::config::Input,
+    tree_base: Option<&std::path::Path>,
+    max_rounds: usize,
+) -> RewriteOutcome {
+    rewrite_core_injected(
+        input,
+        tree_base,
+        max_rounds,
+        &|_| {},
+        false,
+        false,
+        false,
+        None,
+    )
+}
+
+#[cfg(test)]
+/// [`rewrite_core`] with a hook applied to the finished decision table at the
+/// PHASE BOUNDARY, before `plan` sees it.
+///
+/// No-op in production. It exists so a test can hand the downstream phases a
+/// shape A1's envelope normally prevents — the `decide_table_perturbed`
+/// precedent, at the table rather than the subject. **Not a production fault
+/// seam:** a parameter with a no-op default, not an env-gated branch.
+fn rewrite_core_injected(
+    input: rustc_session::config::Input,
+    tree_base: Option<&std::path::Path>,
+    max_rounds: usize,
+    inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
+    probe_only: bool,
+    census_once: bool,
+    raw_boundary_full: bool,
+    a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
+) -> RewriteOutcome {
+    rewrite_core_injected_with_config(
+        input,
+        tree_base,
+        max_rounds,
+        inject,
+        probe_only,
+        census_once,
+        raw_boundary_full,
+        a5_override,
+        &EmissionRunConfig::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rewrite_core_injected_with_config(
+    input: rustc_session::config::Input,
+    tree_base: Option<&std::path::Path>,
+    max_rounds: usize,
+    inject: &(dyn Fn(&mut decision::DecisionTable) + Sync),
+    probe_only: bool,
+    census_once: bool,
+    raw_boundary_full: bool,
+    a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
+    run_config: &EmissionRunConfig,
+) -> RewriteOutcome {
+    // The string entry's original text, so a baseline exists for it too.
+    let virtual_original = match &input {
+        rustc_session::config::Input::Str { input, .. } => Some(input.clone()),
+        rustc_session::config::Input::File(_) => None,
+    };
+    let fallback_source = virtual_original
+        .clone()
+        .or_else(|| tree_base.and_then(|root| std::fs::read_to_string(root).ok()))
+        .unwrap_or_default();
+    let fallback_files = match tree_base {
+        Some(root) => std::collections::BTreeMap::from([(
+            plan::FileKey::Real(root.to_path_buf()),
+            fallback_source.clone(),
+        )]),
+        None => std::collections::BTreeMap::from([(
+            plan::FileKey::Virtual("main.rs".to_owned()),
+            fallback_source.clone(),
+        )]),
+    };
+    let root_hint = tree_base;
+    let result = ::utils::compilation::run_compiler_on_input(input, |tcx| {
+        // **THE ONE AST CAPTURE PER SESSION — hoisted here, and this position is
+        // the whole point** (M-2/A task 3, 2026-08-18).
+        //
+        // `capture_ast` succeeds at most once per session: `expanded_ast` panics
+        // once the HIR is built, and the capture builds it. `decide_table` on
+        // the very next line is HIR work, so a capture taken any later — at
+        // `emit_files`, or per round inside the verify loop — is already too
+        // late and returns `Err("AST capture panicked")`.
+        //
+        // The verify loop therefore re-emits from THIS pristine capture on every
+        // round rather than re-capturing; `transform_with` transforms a clone,
+        // so the capture stays reusable. Witnessed at
+        // `a_second_capture_in_one_session_fails` — the constraint is measured,
+        // not asserted.
+        //
+        // ⚠ Nothing may run a query ahead of this line.
+        crate::phase_log::mark("session:analysis", "start", "");
+        let capture = ast_transform::capture_ast(tcx)?;
+        crate::phase_log::mark("capture_ast", "end", "");
+        let (mut table, mut decide_ctx) =
+            decide_table_with_emission_config(tcx, a5_override, run_config)?;
+        crate::phase_log::mark("decide", "end", "");
+        let retained_copy_plans = decide_ctx.retained_copy_plans.clone();
+        let overlap_receipt = decide_ctx.overlap_receipt.clone();
+        inject(&mut table);
+        let table = table;
+        let source_map = tcx.sess.source_map();
+        let crate_dir = tree_base.and_then(std::path::Path::parent);
+        let original_files = source_map
+            .files()
+            .iter()
+            .filter_map(|source_file| {
+                let key = file_key(&source_file.name)?;
+                if let (Some(crate_dir), plan::FileKey::Real(path)) = (crate_dir, &key)
+                    && !path.starts_with(crate_dir)
+                {
+                    return None;
+                }
+                source_file
+                    .src
+                    .as_ref()
+                    .map(|source| (key, source.to_string()))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let original_source = virtual_original.clone().unwrap_or_else(|| {
+            tree_base
+                .and_then(|root| original_files.get(&plan::FileKey::Real(root.to_path_buf())))
+                .cloned()
+                .or_else(|| tree_base.and_then(|root| std::fs::read_to_string(root).ok()))
+                .unwrap_or_default()
+        });
+        crate::phase_log::mark("emit", "start", "");
+        let emission = emit_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &retained_copy_plans,
+        )?;
+        crate::phase_log::mark(
+            "emit",
+            "end",
+            &format!(
+                "files={} bytes={}",
+                emission.files.len(),
+                emission.files.values().map(String::len).sum::<usize>()
+            ),
+        );
+        let (emission_plan, emission_texts) = (emission.plan.clone(), emission.texts.clone());
+        // Structural gate: rollbacks must be zero.
+        if !emission.rollbacks.is_empty() {
+            // IDENTITY, not just a reason. The previous message mapped to
+            // `r.reason` alone, so a 17-edit rollback rendered as seventeen
+            // copies of one string with no way to tell WHICH edits collided —
+            // the plan defect it reports was undiagnosable from the row that
+            // reported it. Each rollback now names its owner and byte range.
+            return Err(format!(
+                "apply-invariant: unresolved rollback after owner recovery: {} edit(s): [{}]",
+                emission.rollbacks.len(),
+                emission
+                    .rollbacks
+                    .iter()
+                    .map(|r| format!(
+                        "{} @{}..{} owner={} just={:?}",
+                        r.reason, r.edit.lo, r.edit.hi, r.edit.owner_path, r.edit.justification
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+        }
+        #[cfg(test)]
+        if census_once || raw_boundary_full {
+            decide_ctx.raw_boundary_artifacts.bridge_custody_export =
+                bridge_custody_export::capture(
+                    tcx,
+                    &capture,
+                    &table,
+                    &emission_plan,
+                    &original_files,
+                );
+        }
+        let e1_subject_receipt = if census_once {
+            decide_ctx.raw_boundary_artifacts.custody_expectations =
+                delivery_expectations(tcx, &table, &emission_plan);
+            // R936-1 (P11): the premise table, after every rule has asked.
+            decide_ctx.raw_boundary_artifacts.pair_premise_receipts = decide_ctx
+                .a5_site_proofs
+                .pair_certificates()
+                .map(|certificates| certificates.premise_receipts_tsv(tcx))
+                .unwrap_or_default();
+            decide_ctx.raw_boundary_artifacts.subject_facts =
+                e1_subject_facts_tsv(tcx, &table, &decide_ctx);
+            e1_subject_seed_tsv(tcx, &table, &decide_ctx, &emission_plan)?
+        } else {
+            String::new()
+        };
+        let e1_box_drop_policies = if census_once {
+            box_mir_drop_policies(tcx, &table, &emission.unplaceable)
+        } else {
+            Vec::new()
+        };
+        let mut degradations: Vec<decision::Degradation> = table.degradations().cloned().collect();
+        let mut emitted_sites: Vec<EmittedSite> = Vec::new();
+        // One entry per EMITTED SUBJECT (not per function), so a revert can move
+        // exactly the right number of subjects from emitted to degraded and the
+        // accounting identity survives the loop.
+        let mut emitted_subjects: Vec<EmittedSubject> = Vec::new();
+        // PLACEMENT-TRUTH (S2b.3). A `Ref` decision that `plan` could not place
+        // produced no edit, so counting it as emitted over-reports the rewrite
+        // by exactly the unplaceable set. Exposure is zero on the frozen corpus
+        // today, which is the reason to fix the derivation NOW: a counter that
+        // is right by measurement rather than by construction is one corpus
+        // change away from being wrong, and the wrongness would present as a
+        // yield number rather than as a failure.
+        //
+        // Subtracted here, at the one place `emitted_subjects` is built, rather
+        // than from the total afterwards: `emitted_sites` is derived in the same
+        // loop, and a function whose only subject went unplaced is NOT a
+        // rewritten site — attributing a verify diagnostic to it would blame a
+        // function this run never touched.
+        let unplaceable_subjects: std::collections::BTreeSet<&str> = emission
+            .unplaceable
+            .iter()
+            .map(|u| u.subject.as_str())
+            .collect();
+        let mut seen_fns = rustc_hash::FxHashSet::default();
+        for (subject, decision) in &table.entries {
+            // EXHAUSTIVE (S3.0, ruling 5). A `matches!` here compiled clean
+            // against a third `Decision` variant and silently dropped the
+            // subject from `emitted_subjects` — measured with a variant probe
+            // before the repair. A `match` makes the next disposition a compile
+            // error at this site.
+            match decision {
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_) => {}
+                decision::Decision::Degraded(_) => continue,
+            }
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            let owner_class = bridge_receipt::SignatureClassId::of(subject.fn_did);
+            // S3.0′: the SAME key `plan` stamped into `Unplaceable::subject`.
+            // Built here by hand until S3.0′, beside an identical hand-built
+            // copy in `plan` — and both keyed on the NAME, so two subjects that
+            // render the same name in one function collapsed into one.
+            let key = subject.identity_key(&owner);
+            if unplaceable_subjects.contains(key.as_str()) {
+                continue;
+            }
+            if let Some(reason) = emission_plan.class_hold_reason(owner_class) {
+                degradations.push(decision::Degradation {
+                    subject: key,
+                    site: decision::emitability::EmitabilityFacts::site(
+                        tcx,
+                        subject.attribution_span(),
+                    ),
+                    reason: decision::DegradeReason::SignatureClassHeld { reason },
+                });
+                continue;
+            }
+            emitted_subjects.push(EmittedSubject {
+                owner_class,
+                owner_path: owner.clone(),
+                subject: key,
+                site: decision::emitability::EmitabilityFacts::site(
+                    tcx,
+                    subject.attribution_span(),
+                ),
+                atoms: table
+                    .seams
+                    .raw_boundary_atom_groups
+                    .get(&(subject.fn_did, subject.hir_id))
+                    .map(|atoms| atoms.iter().map(|atom| atom.id.clone()).collect())
+                    .unwrap_or_default(),
+            });
+            if !seen_fns.insert(subject.fn_did) {
+                continue;
+            }
+            // The signature span ALONE is not the function: `hir_span` on a fn
+            // returns its header, so `ht_iterator` measured as lines 207..207
+            // while the error it caused sat at 214. Every diagnostic then fell
+            // outside every extent and the own-fn bucket was unfailable by
+            // construction — it could only ever report zero. Union with the
+            // body's span.
+            let signature = tcx.hir_span(tcx.local_def_id_to_hir_id(subject.fn_did));
+            let fn_span = signature.to(tcx.hir_body_owned_by(subject.fn_did).value.span);
+            let source_map = tcx.sess.source_map();
+            let (lo, hi) = (
+                source_map.lookup_char_pos(fn_span.lo()),
+                source_map.lookup_char_pos(fn_span.hi()),
+            );
+            let Some(key) = file_key(&lo.file.name) else {
+                continue;
+            };
+            emitted_sites.push(EmittedSite {
+                owner_class: bridge_receipt::SignatureClassId::of(subject.fn_did),
+                file: match key {
+                    plan::FileKey::Real(path) => path.display().to_string(),
+                    plan::FileKey::Virtual(name) => name,
+                },
+                fn_path: tcx.def_path_str(subject.fn_did.to_def_id()),
+                lo_line: lo.line,
+                hi_line: hi.line,
+            });
+        }
+        // The crate ROOT's final text: its emitted version if the root was
+        // edited, otherwise its original source. Computed here because only the
+        // compiler session can supply the unedited text.
+        let source_map = tcx.sess.source_map();
+        let root_text = source_map
+            .files()
+            .iter()
+            .find_map(|sf| {
+                let key = file_key(&sf.name)?;
+                let is_root = match &key {
+                    plan::FileKey::Virtual(_) => true,
+                    plan::FileKey::Real(path) => Some(path.as_path()) == root_hint,
+                };
+                if !is_root {
+                    return None;
+                }
+                emission
+                    .files
+                    .get(&key)
+                    .cloned()
+                    .or_else(|| sf.src.as_ref().map(|src| src.to_string()))
+            })
+            .unwrap_or_default();
+        crate::phase_log::mark("verify", "start", "");
+        // **THE LOOP RUNS HERE NOW** (M-2/A) — inside the session, so `tcx` is
+        // live for every revert round. `emitted_subjects.len()` is NOT a count
+        // of `Ref` decisions (which is what the deleted `emitted_count()`
+        // computed): it is the placed set, already filtered above, so `emitted`
+        // names what the rewrite actually did to the source.
+        Ok(with_session_receipts(verify_and_revert(
+            tcx,
+            &capture,
+            &table,
+            tree_base,
+            virtual_original,
+            max_rounds,
+            probe_only,
+            census_once,
+            raw_boundary_full,
+            emission.files,
+            emission_plan,
+            emission_texts,
+            original_files,
+            original_source,
+            emission.unplaceable,
+            degradations,
+            emitted_subjects.len(),
+            root_text,
+            emitted_sites,
+            emitted_subjects,
+            overlap_receipt,
+            e1_subject_receipt,
+            decide_ctx.e2_artifacts.clone(),
+            decide_ctx.raw_boundary_artifacts.clone(),
+            e1_box_drop_policies,
+        )))
+    });
+
+    match result {
+        Ok(Ok(outcome)) => outcome,
+        // Nothing was decided, so the facts are genuinely empty here — the one
+        // place a zero is the measurement rather than an omission.
+        Ok(Err(reason)) => OutcomeFacts {
+            original_source: fallback_source.clone(),
+            original_files: fallback_files.clone(),
+            ..OutcomeFacts::default()
+        }
+        .degraded(reason),
+        Err(_) => OutcomeFacts {
+            original_source: fallback_source,
+            original_files: fallback_files,
+            ..OutcomeFacts::default()
+        }
+        .degraded("input crate did not compile".to_owned()),
+    }
+}
+
+/// **THE VERIFY/REVERT LOOP — RELOCATED INSIDE THE COMPILER SESSION** (M-2/A).
+///
+/// It used to run AFTER `run_compiler_on_input` returned, consuming ten values
+/// across the closure boundary. That worked only because `render` consumes
+/// PRE-COMPUTED data — a plan and file texts. The AST emitter cannot: it
+/// RE-DERIVES from `tcx`, and calling it outside the session is the `scoped-tls`
+/// panic four corpus programs already paid for.
+///
+/// So the loop moved to the data rather than the data to the loop.
+///
+/// ⚠ **NOT behaviour-preserving by construction.** Relocated control flow
+/// cannot be proven unchanged by its shape. The suite is the interim shield;
+/// the PROOF is the acceptance gate's byte/digest reproduction of the pinned
+/// oracle verdicts.
+#[allow(clippy::too_many_arguments)]
+/// **THE ROUND'S FILE SET — ONE derivation, BOTH call sites.**
+///
+/// The per-round re-render, the bisect probes, and **the bisect's final
+/// emission** must agree on which layer produced the program, because the
+/// bisect ATTRIBUTES diagnostics to functions: probing a span-layer program to
+/// explain a diagnostic observed on an AST-layer program compares against a
+/// program that was never verified. That is not a variant, it is a defect — so
+/// all three sites call this and none renders.
+///
+/// ⚠ **This doc said "both sites" and there were three** (corrected
+/// 2026-08-18). The third — the final emission after bisect — called `render`
+/// directly, so under `CRAT_M1_AST_EMIT` every escalating program emitted span
+/// text while its probes ran on the AST layer. The count is not small: on the
+/// corpus, 12 of 20 programs escalate.
+///
+/// The AST path returns **no rollbacks**, and that is structural rather than
+/// optimistic: rollbacks are byte-offset collisions between edits applied to one
+/// text, and a structural transform has no byte offsets to collide. The callers'
+/// rollback branches are therefore unreachable on this path — recorded here
+/// because "the check never fires" and "the check cannot fire" read identically
+/// at the call site.
+#[allow(clippy::too_many_arguments)]
+fn round_files(
+    tcx: TyCtxt<'_>,
+    capture: &ast_transform::AstCapture,
+    emission_plan: &plan::Plan,
+    _emission_texts: &std::collections::BTreeMap<plan::FileKey, String>,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
+    root_key: Option<&plan::FileKey>,
+    table: &decision::DecisionTable,
+) -> Result<
+    (
+        std::collections::BTreeMap<plan::FileKey, String>,
+        Vec<apply::Rollback>,
+        // **`files_touched`'s value — files with >=1 SURVIVING EDIT** (ruling
+        // 2026-08-18), NOT the emission map's size. On the span layer the two
+        // coincide because `render` returns only edited files; on the AST layer
+        // they do not, because the map is seeded (see `SubstStats`).
+        usize,
+        // **I-31**: emitted→original line translation, per file, from whichever
+        // splicer produced this round. `attribute` cannot key a diagnostic to a
+        // function without it once the emitter reflows.
+        std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+        // **R299-2**: the emitted text of each sibling-overlap call, keyed by
+        // its original span. The pending custody row states this rather than a
+        // reconstruction, because the bridges that reach the tree are grafted
+        // by the AST layer and never appear as `by_file` edits.
+        std::collections::BTreeMap<(u32, u32), String>,
+    ),
+    String,
+> {
+    let withheld = effective_withheld_classes(emission_plan, reverted, reverted_atoms);
+    emission_plan.validate_callee_parameter_input_receipts(&withheld, reverted_atoms)?;
+    emission_plan.validate_receiver_input_receipts(&withheld, reverted_atoms)?;
+    emission_plan.validate_outbound_return_receipts(&withheld, reverted_atoms)?;
+    let reverts =
+        ast_transform::revert_set_from_classes_and_atoms(&withheld, reverted_atoms, table)?;
+    // **PER-FILE (A1, revived 2026-08-18).** The one-entry map that stood here
+    // was licensed by C-20's corpus measurement — 20/20 single crate-source
+    // file — and that measurement still holds. What it did not cover is the
+    // verify loop's own end-to-end witnesses, which ARE multi-file, and which
+    // it silently collapsed. The corpus emission is unchanged by this: a
+    // single-file crate yields a single-entry map either way.
+    let (files, stats, maps, pending_call_renders) = ast_transform::ast_emitted_files_from(
+        tcx,
+        capture,
+        &reverts,
+        root_key,
+        table,
+        Some(&emission_plan.terminal_call_plans),
+    )?;
+    if !emission_plan.class_finalization.classes.is_empty()
+        && emission_plan
+            .class_finalization
+            .classes
+            .keys()
+            .all(|owner| withheld.contains(owner))
+    {
+        // Reverting every class is an identity invariant, not an alternative
+        // rendering path. Compare the actual candidate with source-map bytes
+        // for the pristine capture's file universe after rendering it.
+        let mut spans = Vec::new();
+        ast_bridge::collect_fn_spans(&capture.krate.items, &mut spans);
+        let mut original = std::collections::BTreeMap::new();
+        for span in spans {
+            let source = tcx.sess.source_map().lookup_source_file(span.lo());
+            if let (Some(key), Some(text)) = (file_key(&source.name), source.src.as_ref()) {
+                original.insert(key, text.to_string());
+            }
+        }
+        if files != original {
+            let owners = table
+                .entries
+                .iter()
+                .filter(|(subject, _)| {
+                    !withheld.contains(&bridge_receipt::SignatureClassId::of(subject.fn_did))
+                })
+                .map(|(subject, _)| tcx.def_path_str(subject.fn_did.to_def_id()))
+                .collect::<std::collections::BTreeSet<_>>();
+            let owner = if owners.is_empty() {
+                "unowned".to_owned()
+            } else {
+                owners.into_iter().collect::<Vec<_>>().join(",")
+            };
+            let changed = original
+                .keys()
+                .chain(files.keys())
+                .filter(|key| original.get(*key) != files.get(*key))
+                .collect::<std::collections::BTreeSet<_>>();
+            return Err(format!(
+                "revert-all-input-mismatch:{owner}:files={changed:?}"
+            ));
+        }
+    }
+    Ok((
+        files,
+        Vec::new(),
+        stats.files_with_edits,
+        maps,
+        pending_call_renders,
+    ))
+}
+
+/// The receipt refresh at an exit that has no rendered emission to state.
+///
+/// Every exit but the emitted one is here: a degraded or unresolved round
+/// produced no converged tree, so there is no call text for the pending rows
+/// to carry and the comparator keeps its plan-spliced reading.
+/// **The emission-loop withholding law, stated once.**
+///
+/// The tree is emitted against `reverted ∪ held_classes()`, closed under
+/// input-reversion — not against the directly-reverted set. Three places need
+/// that set and each used to spell it out: the round emitter, the receipt
+/// refresh, and the delivery partition. Three copies of one law is how
+/// R306-1 happened: the receipts were derived against `reverted` while the tree
+/// was emitted against `reverted ∪ held`, and nothing in the types objected.
+///
+/// It is `pub(crate)` because it is also the seam the emission-loop killers
+/// need: DEFERRED-KILLER(R291-5) (the delivery partition takes the effective
+/// set) and DEFERRED-KILLER(R306-1c) (the receipts are derived against the same
+/// set) are both statements about this function's result.
+/// **R451-2(2).** The withheld set together with WHY each member that is not a
+/// root entered it. The closure already records that -- `input_reversion_closure`
+/// returns a reason per class, naming the class and argument whose input became
+/// unavailable -- and it was being discarded one call above the artifact that
+/// needs it. `final-reverts` carries it as `partition_root`, so a lane reading a
+/// `closure:partition` row is not left to guess which verify-revert drove it
+/// (heman's 63 partition reverts sit on an EMPTY compiler-diagnostics table:
+/// ownership-fields 037 STOP 1, wave-6b 016).
+pub(crate) fn effective_withheld_classes_with_reasons(
+    emission_plan: &plan::Plan,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
+) -> (
+    std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >,
+) {
+    let effective = effective_withheld_classes(emission_plan, reverted, reverted_atoms);
+    let mut withheld = reverted.clone();
+    withheld.extend(emission_plan.held_classes());
+    let (_, reasons) = emission_plan
+        .terminal_call_plans
+        .input_reversion_closure(&withheld, reverted_atoms);
+    (effective, reasons)
+}
+
+pub(crate) fn effective_withheld_classes(
+    emission_plan: &plan::Plan,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
+    let mut withheld = reverted.clone();
+    withheld.extend(emission_plan.held_classes());
+    let mut effective = emission_plan.effective_reverted_classes(&withheld, reverted_atoms);
+    // wave-6f: a field transaction is one edit region across its owners — a
+    // reverted owner withdraws the field, and the field's other owners with it.
+    // R584-4: an allocation-return certificate likewise — its signature is
+    // withheld once any owner reverts, so its local plans go in the same round.
+    loop {
+        let before = effective.len();
+        for owners in emission_plan
+            .field_transaction_owners
+            .iter()
+            .chain(&emission_plan.certificate_owners)
+        {
+            if owners.iter().any(|owner| effective.contains(owner)) {
+                effective.extend(owners.iter().copied());
+            }
+        }
+        if effective.len() == before {
+            break;
+        }
+    }
+    effective
+}
+
+/// **R461-5 (wave-6f)** — rewrite the field receipt's additive
+/// `revert_status` column at THIS revert state. `status` stays plan-time;
+/// this column says what the tree got, because a transaction whose owner
+/// class is reverted is inactive in `field_reference_ast` and its struct
+/// declaration goes with it (report 039 / R460-11).
+/// **R469-1** — the set is the EFFECTIVE one, expanded exactly as the AST
+/// layer's is. `field_reference_ast::{apply, apply_wraps, apply_hoists}` run
+/// against `reverts.fns`, which comes from `effective_withheld_classes`: the
+/// held classes, the PARTITION closure, and this lane's field-transaction
+/// owner closure are all in it and none of them is in the raw `reverted`.
+/// Writing the column from the raw set said `active` for a
+/// partition-reverted owner and killed a census (`batch1314`, heman's
+/// `kmRay2IntersectBox`). The expansion happens HERE so no call site can get
+/// it wrong.
+pub(crate) fn refresh_field_transaction_revert_status(
+    artifacts: &mut RawBoundaryArtifacts,
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    emission_plan: &plan::Plan,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
+) {
+    let effective = effective_withheld_classes(emission_plan, reverted, reverted_atoms);
+    artifacts.field_transactions = table.field_transactions.receipt_tsv_at(tcx, &effective);
+}
+
+fn refresh_raw_boundary_receipt_events(
+    artifacts: &mut RawBoundaryArtifacts,
+    emission_plan: &plan::Plan,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
+) {
+    refresh_raw_boundary_receipt_events_with_renders(
+        artifacts,
+        emission_plan,
+        reverted,
+        reverted_atoms,
+        &std::collections::BTreeMap::new(),
+    );
+}
+
+fn refresh_raw_boundary_receipt_events_with_renders(
+    artifacts: &mut RawBoundaryArtifacts,
+    emission_plan: &plan::Plan,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    reverted_atoms: &std::collections::BTreeSet<String>,
+    // **R299-2** — the AST layer's own render of each sibling-overlap call at
+    // THIS revert state, keyed by original span.
+    call_renders: &std::collections::BTreeMap<(u32, u32), String>,
+) {
+    // **R306-1(i) — the ledger is derived against the population the TREE was
+    // emitted against.**
+    //
+    // `round_files` withholds `reverted ∪ held_classes()` and then takes the
+    // input-reversion closure; this derived its receipts from `reverted`
+    // alone. A class reverted only through the closure OF A HELD CLASS was
+    // therefore absent from every receipt while the tree kept it raw — heman's
+    // `kmPlaneIntersectLine` appears in `final_reverts`, its parameters stay
+    // `*const kmVec3` in the tree, and the ledger still carried a T2-pending
+    // sibling-overlap waiver over them, which custody read as
+    // `pending-protected-source-not-a-reference`.
+    //
+    // Correcting the ledger to the tree moves no decision: the partition into
+    // emitted and reverted subjects is computed by the caller from its own
+    // effective set, and this only decides which receipts that state produces.
+    let effective_reverted = effective_withheld_classes(emission_plan, reverted, reverted_atoms);
+    let reverted = &effective_reverted;
+    artifacts.shared_pair_receipts =
+        shared_pair_ast::terminal(&artifacts.shared_permissions, reverted, call_renders);
+    assert_eq!(
+        emission_plan.unowned_a5_proof_sites, 0,
+        "unowned A5 proof-site receipt identities"
+    );
+    artifacts.bridge_events = emission_plan.bridge_events_with_atoms(reverted, reverted_atoms);
+    artifacts.pending_sibling_receipts =
+        emission_plan.pending_sibling_receipts_with_atoms(reverted, reverted_atoms);
+    artifacts.sibling_coverage_gaps =
+        emission_plan.sibling_coverage_gaps_with_atoms(reverted, reverted_atoms);
+    artifacts.sibling_audit_rows =
+        emission_plan.sibling_audit_rows_with_atoms(reverted, reverted_atoms);
+    #[cfg(test)]
+    bridge_custody_export::refresh(
+        &mut artifacts.bridge_custody_export,
+        emission_plan,
+        reverted,
+        &artifacts.pending_sibling_receipts,
+        &artifacts.sibling_coverage_gaps,
+        &artifacts.sibling_audit_rows,
+        call_renders,
+    );
+    artifacts.unsafe_context_events =
+        emission_plan.unsafe_context_events_with_atoms(reverted, reverted_atoms);
+    let (mechanical_events, a5_rows, slice_rows) =
+        emission_plan.mechanical_receipts_with_atoms(reverted, reverted_atoms);
+    artifacts.mechanical_events = mechanical_events;
+    artifacts.a5_proof_site_fallback_rows = a5_rows;
+    artifacts.slice_construction_rows = slice_rows;
+    artifacts.slice_use_rows = emission_plan.slice_use_receipt_rows(reverted);
+    artifacts.option_rows = emission_plan.option_receipt_rows(reverted);
+    artifacts.declaration_rows =
+        emission_plan.declaration_receipt_rows_with_atoms(reverted, reverted_atoms);
+    artifacts.outbound_return_required.clear();
+    artifacts.outbound_return_rows.clear();
+    artifacts.outbound_return_error = None;
+    match emission_plan.outbound_return_receipts(reverted, reverted_atoms) {
+        Ok((required, common, rows)) => {
+            artifacts.mechanical_events.extend(common);
+            artifacts.outbound_return_error = mechanical_receipt::reconcile_outbound_return_rows(
+                &required,
+                &rows,
+                &artifacts.mechanical_events,
+                &artifacts.bridge_events,
+            )
+            .err();
+            artifacts.outbound_return_required = required;
+            artifacts.outbound_return_rows = rows;
+        }
+        Err(reason) => artifacts.outbound_return_error = Some(reason),
+    }
+    #[cfg(test)]
+    {
+        artifacts.bridge_custody_export.outbound_return =
+            Some(outbound_return_transport::capture(artifacts));
+        artifacts.bridge_custody_export.outbound_return_bridge_keys = Some(
+            artifacts
+                .bridge_events
+                .iter()
+                .filter(|event| {
+                    event.stage == bridge_receipt::BridgeReceiptStage::Terminal
+                        && event.state == bridge_receipt::BridgeReceiptState::Applied
+                        && mechanical_receipt::is_return_receipt_kind(&event.site.bridge_kind)
+                })
+                .map(|event| event.site.receipt_key())
+                .collect(),
+        );
+    }
+}
+
+fn verify_and_revert(
+    tcx: TyCtxt<'_>,
+    capture: &ast_transform::AstCapture,
+    table: &decision::DecisionTable,
+    tree_base: Option<&std::path::Path>,
+    virtual_original: Option<String>,
+    max_rounds: usize,
+    probe_only: bool,
+    census_once: bool,
+    raw_boundary_full: bool,
+    files: std::collections::BTreeMap<plan::FileKey, String>,
+    emission_plan: plan::Plan,
+    emission_texts: std::collections::BTreeMap<plan::FileKey, String>,
+    original_files: std::collections::BTreeMap<plan::FileKey, String>,
+    original_source: String,
+    unplaceable: Vec<plan::Unplaceable>,
+    degradations: Vec<decision::Degradation>,
+    emitted_count: usize,
+    root_text: String,
+    emitted_sites: Vec<EmittedSite>,
+    emitted_subjects: Vec<EmittedSubject>,
+    overlap_receipt: String,
+    e1_subject_receipt: String,
+    e2_artifacts: E2Artifacts,
+    mut raw_boundary_artifacts: RawBoundaryArtifacts,
+    e1_box_drop_policies: Vec<verify::BoxMirDropPolicy>,
+) -> RewriteOutcome {
+    // `excluded` is a LOCAL again: the loop holds `tcx`, so a value that used
+    // to cross the boundary is simply computed here. One of the ten, retired.
+    let excluded = decision::universe::classify(tcx).excluded;
+    // Built ONCE. Every return below goes through `facts.emitted(..)`
+    // or `facts.degraded(..)`; no site hand-fills a field.
+    let site_owners = emitted_sites
+        .iter()
+        .map(|site| site.owner_class)
+        .collect::<std::collections::BTreeSet<_>>();
+    let attribution_blind = emission_plan
+        .by_file
+        .values()
+        .flatten()
+        .filter_map(|edit| edit.owner_class)
+        .collect::<std::collections::BTreeSet<_>>()
+        .difference(&site_owners)
+        .count();
+    refresh_raw_boundary_receipt_events(
+        &mut raw_boundary_artifacts,
+        &emission_plan,
+        &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
+    );
+    raw_boundary_artifacts.class_collisions = render_class_collisions(&emission_plan);
+    raw_boundary_artifacts.arm_outcomes = atomic_arm_outcomes_tsv(tcx, table, &emission_plan);
+    let mut class_paths = std::collections::BTreeMap::new();
+    // **R430-1 — EVERY owner path of a class, not just its display path.** A
+    // signature class spans as many functions as its interface does;
+    // `class_paths` keeps ONE path per class for display, and the final-reverts
+    // artifact carried only that one. The census marks a subject reverted by
+    // its OWNER PATH, so the other owners of a withheld class kept `realized`
+    // rows while the tree left their text verbatim — heman's
+    // `kmRay2IntersectBox` (a class-mate of `kmRay2IntersectLineSegment`, the
+    // path that WAS rendered) and 24 more rows on batch 9's candidate.
+    let mut class_owner_paths: std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
+    for edit in emission_plan.by_file.values().flatten() {
+        if let Some(class) = edit.owner_class {
+            class_paths
+                .entry(class)
+                .or_insert_with(|| edit.owner_path.clone());
+            class_owner_paths
+                .entry(class)
+                .or_default()
+                .insert(edit.owner_path.clone());
+        }
+    }
+    for site in &emitted_sites {
+        class_paths
+            .entry(site.owner_class)
+            .or_insert_with(|| site.fn_path.clone());
+        class_owner_paths
+            .entry(site.owner_class)
+            .or_default()
+            .insert(site.fn_path.clone());
+    }
+    for subject in &emitted_subjects {
+        class_paths
+            .entry(subject.owner_class)
+            .or_insert_with(|| subject.owner_path.clone());
+        class_owner_paths
+            .entry(subject.owner_class)
+            .or_default()
+            .insert(subject.owner_path.clone());
+    }
+    raw_boundary_artifacts.class_held_drops = render_class_held_drops(&emission_plan, &class_paths);
+    raw_boundary_artifacts.a5_hold_views = render_a5_hold_views(&emission_plan.a5_hold_views);
+    let all_ready_classes = ready_classes(&emission_plan);
+    // BASELINE-DIFFERENTIAL GATE. The gate judges what the REWRITE
+    // introduced, not what the input already reported: brotli's frozen
+    // source trips a deny-by-default lint unedited, which made
+    // revert-all — the bisect base case — impossible to satisfy under an
+    // absolute gate. Excluding lints wholesale would instead blind the
+    // gate to rewrite-INTRODUCED violations of exactly our risk class
+    // (reference casting), so the baseline is subtracted, not the class.
+    // NOT COMPUTED HERE — see the loop, below the `probe_only` return.
+    // `baseline_of` COMPILES the unmodified crate, and its diagnostics
+    // are forwarded to the same stderr an instrument's consumer reads.
+    // Computed on the instrument path it would be dead work (probe mode
+    // returns before `novel` is ever consulted) whose only effect is to
+    // contaminate that stderr with a second crate's diagnostics — which
+    // is exactly what it did to brotli: 4 frozen-tree entries appeared
+    // on the rendered side of a transfer that measures the temp copy.
+    //
+    // The placement is the enforcement. A predicate here would work
+    // today and be one careless edit from unconditional again; below
+    // the return, "gate machinery does not run on instrument paths"
+    // holds by position.
+    let compute_baseline = || match (tree_base, &virtual_original) {
+        (Some(root), _) => verify::baseline_of(root),
+        (None, Some(text)) => match verify::materialize_single_file(text) {
+            Ok(staged) => verify::baseline_of(staged.root()),
+            Err(_) => verify::Baseline::default(),
+        },
+        (None, None) => verify::Baseline::default(),
+    };
+    // **S3.6-1 task 2.** Built ONCE, from the same plan and texts every
+    // revert round re-renders from, so attribution and rendering cannot
+    // drift apart across rounds — the divergence class that cost a
+    // brotli sweep when `candidates` and `emitted_sites` were derived
+    // two different ways.
+    // The round-0 emitted file — the key every later round re-emits into on the
+    // AST path. Taken from the map production already built, never re-derived.
+    let root_key: Option<plan::FileKey> = files.keys().next().cloned();
+    // Round 0 comes from `emit_files`, which returns only files it edited, so
+    // the seed is already the ruled definition.
+    let files_edited = files.len();
+    let planned_edit_sites = edit_sites(&emission_plan, &emission_texts);
+    // (α), relay 033: an A5 raw-view wrapper whose argument another class's C
+    // arm already renders is an AST-only composition — the wrapper takes the
+    // inner's product — so a string fixture must verify the AST round product,
+    // exactly as the nestings below do.
+    let a5_takes_an_inner_product = table.seams.a5_raw_calls.iter().any(|call| {
+        table.seams.edits.iter().any(|edit| {
+            edit.bridge.arm == "c"
+                && !edit.zero_syntax
+                && call.call_span.lo() < edit.span.lo()
+                && edit.span.hi() < call.call_span.hi()
+        })
+    });
+    let nested_seam_composition = !table.seams.pair_raw_calls.is_empty()
+        || a5_takes_an_inner_product
+        || emission_plan.by_file.values().any(|edits| {
+            edits.iter().enumerate().any(|(index, _)| {
+                nested_kind_under_seam(edits, index)
+                    || exact_kind_composed_by_seam(edits, index)
+                    || nested_seam_under_seam(edits, index)
+                    || nested_use_under_a5(edits, index, &|outer, inner| {
+                        emission_plan
+                            .class_finalization
+                            .classes
+                            .get(&outer)
+                            .is_some_and(|class| class.depends_on.contains(&inner))
+                    })
+            })
+        });
+    let e1_edit_contexts = if census_once {
+        e1_edit_contexts(&emission_plan, &emission_texts)
+    } else {
+        Vec::new()
+    };
+    let mut baseline: Option<verify::Baseline> = None;
+    let mut facts = OutcomeFacts {
+        original_source,
+        original_files,
+        verify_started: Some(std::time::Instant::now()),
+        signature_class_count: emission_plan.class_finalization.classes.len(),
+        emit_budget_s: EMIT_BUDGET_S.to_string(),
+        degradations,
+        excluded,
+        emitted_count,
+        files_touched: files_edited,
+        reverted_count: 0,
+        emitted_sites,
+        unplaceable,
+        bisect_probes: 0,
+        verify_rounds: 0,
+        escalated: None,
+        attribution_blind,
+        first_diags: Vec::new(),
+        observed_root: None,
+        // Filled below, on the gate path, when the baseline is
+        // actually computed. Probe mode HAS no baseline — its payload
+        // is the raw capture — so zero here is "not applicable in this
+        // mode", not a measured value that was zeroed.
+        baseline_keys: 0,
+        baseline_errors: 0,
+        baseline_msg_env: 0,
+        overlap_receipt,
+        e1_reverts: Vec::new(),
+        e1_adapter_receipt: if census_once {
+            seam_tsv_from_table(tcx, table)
+        } else {
+            String::new()
+        },
+        e1_subject_receipt,
+        e2_artifacts,
+        raw_boundary_artifacts,
+        e1_novel_error_count: 0,
+        e1_box_drop_receipt: String::new(),
+        solve_receipt: model_cache::solve_receipt(),
+    };
+    facts.raw_boundary_artifacts.edit_keys = {
+        let mut keys = planned_edit_sites
+            .iter()
+            .map(|edit| edit.edit_id.clone())
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys.dedup();
+        let mut out = String::from("edit_key\n");
+        for key in keys {
+            out.push_str(&key);
+            out.push('\n');
+        }
+        out
+    };
+    let crate_dir = tree_base
+        .and_then(|root| root.parent())
+        .map(|d| d.to_path_buf());
+    let mut reverted: std::collections::BTreeSet<bridge_receipt::SignatureClassId> =
+        std::collections::BTreeSet::new();
+    // **wave-6f, relay 056 — test-only.** Seed the loop's revert set with the
+    // classes `CRAT_W6F_FORCE_REVERT` names (comma-separated path suffixes),
+    // so a witness can ask what the emitted tree does when a chosen class is
+    // reverted — the question report 053 STOP 1 could not answer because the
+    // lane had no way to force one. `#[cfg(test)]`: production never reads it.
+    #[cfg(test)]
+    if let Ok(names) = std::env::var("CRAT_W6F_FORCE_REVERT") {
+        for name in names.split(',').filter(|s| !s.is_empty()) {
+            if let Some(did) = tcx
+                .hir_body_owners()
+                .find(|did| tcx.def_path_str(did.to_def_id()).ends_with(name))
+            {
+                reverted.insert(bridge_receipt::SignatureClassId::of(did));
+            }
+        }
+    }
+    let mut reverted_atoms: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut atom_reverify_count = 0usize;
+    let mut pending_atom_retry: Option<(String, Vec<String>)> = None;
+    let mut class_attempts =
+        std::collections::BTreeMap::<bridge_receipt::SignatureClassId, usize>::new();
+    let mut revert_found_form_late_classes =
+        std::collections::BTreeSet::<bridge_receipt::SignatureClassId>::new();
+    let mut census_captured = false;
+    // **ROUND 0 THROUGH THE SWITCH — the FOURTH site** (ruling 2026-08-18).
+    //
+    // `files` arrives from `emit_files`, whose product is `render`'s: the SPAN
+    // layer, unconditionally. The loop's first act is to materialize it, so
+    // until a revert occurred nothing switched — and a program that converges
+    // with ZERO reverts returns this map unchanged. On the corpus that is **7
+    // programs and 35 of the 64 emissions**, every one of them emitting span
+    // text while the AST arm reported agreement, because the three counters
+    // cannot see text. libcsv is the measured witness: 50,440 bytes on the AST
+    // layer against 55,764 on the span layer, same converged (empty) revert
+    // set, identical counters.
+    //
+    // Re-emitting round 0 here puts every exit shape behind the one derivation.
+    // The incoming `files` is still what `root_key` is taken from and what the
+    // pre-loop rollback gate judged — that gate validates the PLAN (byte-offset
+    // collisions), which is layer-independent, so it keeps its meaning.
+    let ast_started = std::time::Instant::now();
+    // **R299-2** — the AST layer's render of every sibling-overlap call, kept
+    // in step with `files` so whichever exit emits states the text of the round
+    // it emitted.
+    // The two sets are EMPTY here in production — nothing has reverted before
+    // round 0 — so passing them is identical to passing fresh empty sets, which
+    // is what stood here. They are passed so that the `#[cfg(test)]` seed above
+    // reaches round 0's render; without it a forced revert moves the counters
+    // and not one byte of the text (measured, report 054).
+    let (mut files, mut files_edited, mut line_maps, mut call_renders) = match round_files(
+        tcx,
+        capture,
+        &emission_plan,
+        &emission_texts,
+        &reverted,
+        &reverted_atoms,
+        root_key.as_ref(),
+        table,
+    ) {
+        Ok((round0, rollbacks, edited, maps, renders)) => {
+            if !rollbacks.is_empty() {
+                // The pre-loop structural gate already rejected a non-empty
+                // rollback set for this plan, so this is a DISAGREEMENT between
+                // the two, not a plan defect — loud, never silent.
+                facts.files_touched = files_edited;
+                return facts.degraded(format!(
+                    "round-0 re-emit produced {} rollback(s) after the                      structural gate accepted the plan",
+                    rollbacks.len()
+                ));
+            }
+            (round0, edited, maps, renders)
+        }
+        Err(why) => {
+            facts.files_touched = files_edited;
+            return facts.degraded(format!("round-0 emit failed: {why}"));
+        }
+    };
+    facts.e2_artifacts.timings.ast_placement_wall_s =
+        format!("{:.6}", ast_started.elapsed().as_secs_f64());
+    facts.files_touched = files_edited;
+
+    // **THE GRAFT FLOOR'S SECOND HALF (R515-1 ruling 3).**
+    //
+    // A colliding graft no longer aborts the program — it yields, and the arm
+    // records the class it was serving. That half alone would ship a
+    // HALF-COMPOSED call: the node carries the other claimant's edit, and the
+    // yielding class's remaining edits (a C-9 mark's companion temp is the
+    // sharpest case) are still in the tree without it. So the class is reverted
+    // WHOLE here and the round re-emitted, exactly as a verify-attributed
+    // revert would be, before anything is compiled.
+    //
+    // The loop terminates because each pass strictly grows `reverted` over a
+    // finite class set; the cap is a tripwire for a hold that does not clear,
+    // never the mechanism. A reverted class's grafts are not planned, so it
+    // cannot be held twice — if it is, that is the bug the cap reports.
+    const MAX_HOLD_ROUNDS: usize = 4;
+    let mut hold_rounds = 0usize;
+    let mut held_total = 0usize;
+    loop {
+        let held = ast_transform::graft_held_classes();
+        let newly = held
+            .iter()
+            .copied()
+            .filter(|class| !reverted.contains(class))
+            .collect::<Vec<_>>();
+        if newly.is_empty() {
+            break;
+        }
+        hold_rounds += 1;
+        held_total += newly.len();
+        if hold_rounds > MAX_HOLD_ROUNDS {
+            facts.files_touched = files_edited;
+            facts.reverted_count = reverted.len();
+            return facts.degraded(format!(
+                "graft-held: {held_total} class(es) held over {hold_rounds} round(s) without converging"
+            ));
+        }
+        reverted.extend(newly);
+        match round_files(
+            tcx,
+            capture,
+            &emission_plan,
+            &emission_texts,
+            &reverted,
+            &reverted_atoms,
+            root_key.as_ref(),
+            table,
+        ) {
+            Ok((next_files, rollbacks, next_edited, next_maps, next_renders)) => {
+                if !rollbacks.is_empty() {
+                    facts.files_touched = files_edited;
+                    facts.reverted_count = reverted.len();
+                    return facts.degraded(format!(
+                        "graft-held re-emit produced {} rollback(s)",
+                        rollbacks.len()
+                    ));
+                }
+                files = next_files;
+                files_edited = next_edited;
+                line_maps = next_maps;
+                call_renders = next_renders;
+            }
+            Err(why) => {
+                facts.files_touched = files_edited;
+                facts.reverted_count = reverted.len();
+                return facts.degraded(format!("graft-held re-emit failed: {why}"));
+            }
+        }
+    }
+    facts.files_touched = files_edited;
+
+    let mut rounds = 0usize;
+    let mut previous_errors: Option<usize> = None;
+    let mut probe_secs = 0.0f64;
+    let escalation: Option<String>;
+
+    loop {
+        let materialized = match tree_base {
+            Some(root) => verify::materialize(root, &files),
+            // String fixtures use the SAME AST round product as file-backed
+            // production. `root_text` is only the no-edit fallback; selecting it
+            // unconditionally here bypassed the use→seam composition the round
+            // had just built and made the test entry a second emitter.
+            None if nested_seam_composition => verify::materialize_single_file(
+                files
+                    .values()
+                    .next()
+                    .map_or(root_text.as_str(), String::as_str),
+            ),
+            None => verify::materialize_single_file(&root_text),
+        };
+        let staged = match materialized {
+            Ok(staged) => staged,
+            Err(err) => {
+                facts.files_touched = files_edited;
+                facts.reverted_count = reverted.len();
+                return facts.degraded(format!("could not materialize the emitted crate: {err}"));
+            }
+        };
+        let probe_started = std::time::Instant::now();
+        facts.verify_rounds += 1;
+        crate::phase_log::mark(
+            "verify:round",
+            "start",
+            &format!("round={} reverted={}", facts.verify_rounds, reverted.len()),
+        );
+        let diagnosis = verify::diagnose_crate(staged.root());
+        crate::phase_log::mark(
+            "verify:round",
+            "end",
+            &format!("round={} errors={}", facts.verify_rounds, diagnosis.errors),
+        );
+        // **R459-3 (wave-6b 019 STOP 2)** — the bytes the verify stage actually
+        // compiled, captured at the FIRST failing round and never overwritten.
+        // The post-revert tree the census publishes no longer contains the class
+        // that produced the diagnostic, so the formal a `*mut u8` error names is
+        // unreadable after the fact.
+        if diagnosis.errors > 0
+            && facts
+                .raw_boundary_artifacts
+                .first_failing_verify_tree
+                .is_empty()
+            && cfg!(test)
+            && std::env::var_os("CRAT_RAW_BOUNDARY_FIRST_FAILING_VERIFY_TREE").is_some()
+        {
+            // `TempCrate::root()` is the crate ROOT FILE, not its directory
+            // (`materialize_single_file` returns `dir.join("lib.rs")`), which is
+            // also what `diagnose_crate` is handed one line above. Joining
+            // "lib.rs" onto it wrote `Not a directory (os error 20)` into the
+            // capture on its first real census — caught at batch 13d.
+            facts.raw_boundary_artifacts.first_failing_verify_tree =
+                std::fs::read_to_string(staged.root())
+                    .unwrap_or_else(|error| format!("// unreadable verify tree: {error}\n"));
+        }
+        let probe_wall_s = probe_started.elapsed().as_secs_f64();
+        if atom_reverify_count > 0 {
+            facts.raw_boundary_artifacts.timings.atom_reverify_wall_s =
+                format!("{probe_wall_s:.6}");
+        } else if facts.raw_boundary_artifacts.timings.initial_verify_wall_s == "pending" {
+            facts.raw_boundary_artifacts.timings.initial_verify_wall_s =
+                format!("{probe_wall_s:.6}");
+        }
+        probe_secs = probe_secs.max(probe_wall_s);
+        if census_once && !census_captured {
+            facts.e2_artifacts.timings.compiler_verification_wall_s = format!("{probe_wall_s:.6}");
+        }
+        if probe_only {
+            // INSTRUMENTS MEASURE THE CAPTURE; GATES CONSUME THE
+            // FILTERED VIEW. The probe payload is the RAW diagnosis and
+            // gets its own assignment statement here, above the early
+            // return; the gate's baseline-subtracted `novel` is assigned
+            // separately below. The two never share an assignment site
+            // again.
+            //
+            // This is not a style preference. The payloads were shared
+            // once: the differential gate rewrote the single assignment
+            // to `novel`, which needs a root and a baseline, so it had
+            // to move BELOW this return — and the return did not move
+            // with it. `diagnose_once` then returned empty and
+            // `run_m1_diag` reported `struct_diags=0 status=ok` for
+            // every program, a zeroed payload wearing an ok status.
+            //
+            // Raw is also the SEMANTICALLY required payload, not merely
+            // the restored one: the transfer harness compares these
+            // against the child's unfiltered stderr, so subtracting a
+            // baseline from one side of that comparison would bias it.
+            // Baseline diagnostics appear on both sides, which is what
+            // makes the equality mean anything.
+            facts.first_diags = diagnosis.diags.clone();
+            facts.observed_root = Some(
+                staged
+                    .root()
+                    .parent()
+                    .unwrap_or(staged.root())
+                    .to_path_buf(),
+            );
+            facts.files_touched = files_edited;
+            return facts.degraded("probe-only: first diagnose recorded".to_owned());
+        }
+        // GATE MACHINERY STARTS HERE. Everything below the probe
+        // return belongs to the differential; the baseline compile is
+        // the first of it, computed once and reused across rounds.
+        let baseline = baseline.get_or_insert_with(&compute_baseline);
+        facts.baseline_keys = baseline.keys.values().sum();
+        facts.baseline_errors = baseline.errors;
+        facts.baseline_msg_env = baseline.messages_embedding_root;
+        let observed_root = staged
+            .root()
+            .parent()
+            .unwrap_or(staged.root())
+            .to_path_buf();
+        // **R465-3 (wave-6f)** — a committed way to read the candidate the
+        // verifier receives at EACH revert state. A finding no other lane can
+        // reproduce is not a finding (ownership-fields 044), and the rounds
+        // of report 039 §1 were read from an uncommitted tree. Test builds
+        // only, and silent unless `CRAT_DUMP_CANDIDATE` names a substring the
+        // candidate contains.
+        #[cfg(test)]
+        if let Ok(needle) = std::env::var("CRAT_DUMP_CANDIDATE") {
+            let candidate = std::fs::read_to_string(staged.root()).unwrap_or_default();
+            if candidate.contains(needle.as_str()) {
+                eprintln!(
+                    "CRAT-ROUND reverted={reverted:?}\nCRAT-CANDIDATE-BEGIN\n{candidate}\nCRAT-CANDIDATE-END"
+                );
+            }
+        }
+        let novel: Vec<verify::Diag> = baseline
+            .novel(&diagnosis.diags, &observed_root)
+            .into_iter()
+            .cloned()
+            .collect();
+        let novel_errors = diagnosis.errors.saturating_sub(baseline.errors);
+        if facts.first_diags.is_empty() {
+            facts.first_diags = novel.clone();
+            facts.observed_root = Some(observed_root.clone());
+        }
+        if census_once && !census_captured {
+            census_captured = true;
+            facts.first_diags = novel.clone();
+            facts.observed_root = Some(observed_root.clone());
+            facts.e1_novel_error_count = novel_errors;
+            facts.e1_box_drop_receipt =
+                match verify::box_mir_drops_path(staged.root(), &e1_box_drop_policies) {
+                    Ok(mut drops) => {
+                        drops.retain(|drop| {
+                            e1_box_drop_policies.iter().any(|policy| {
+                                policy.function == drop.function
+                                    && policy.local_name == drop.local_name
+                            })
+                        });
+                        match verify::reconcile_box_mir_drop_policies(&drops, &e1_box_drop_policies)
+                        {
+                            Ok(tsv) => {
+                                format!("status=ok\ndata=provisional\nrows={}\n{tsv}", drops.len())
+                            }
+                            Err(error) => format!(
+                                "status=error\ndata=false\ndetail={}\n",
+                                error.replace(['\t', '\r', '\n'], " ")
+                            ),
+                        }
+                    }
+                    Err(error) => format!(
+                        "status=error\ndata=false\ndetail={}\n",
+                        error.replace(['\t', '\r', '\n'], " ")
+                    ),
+                };
+            for diagnostic in &novel {
+                let first_attribution = attribute_with_rule(
+                    diagnostic,
+                    &line_maps,
+                    &observed_root,
+                    &facts.emitted_sites,
+                    &planned_edit_sites,
+                    &reverted,
+                    crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
+                );
+                let mut owners = first_attribution.classes;
+                let mut attribution = match first_attribution.rule {
+                    AttributionRule::RelatedSpan => "related-span",
+                    AttributionRule::ExactEdit
+                    | AttributionRule::ExactSeam
+                    | AttributionRule::EnclosingRegion
+                    | AttributionRule::Unresolved => "standard",
+                };
+                if owners.is_empty() {
+                    let original_root = crate_dir.as_deref().unwrap_or(std::path::Path::new(""));
+                    if let Some(original_line) =
+                        e1_bijective_line(diagnostic, &line_maps, &observed_root, original_root)
+                    {
+                        let mut remapped = diagnostic.clone();
+                        remapped.line = original_line;
+                        owners = attribute(
+                            std::slice::from_ref(&remapped),
+                            &std::collections::BTreeMap::new(),
+                            &observed_root,
+                            &facts.emitted_sites,
+                            &planned_edit_sites,
+                            &reverted,
+                            original_root,
+                        );
+                        if !owners.is_empty() {
+                            attribution = "equal-line-segment";
+                        }
+                    }
+                }
+                if owners.is_empty() {
+                    let original_root = crate_dir.as_deref().unwrap_or(std::path::Path::new(""));
+                    for related in &diagnostic.related {
+                        let mut related_diagnostic = verify::Diag {
+                            file: related.file.clone(),
+                            line: related.line,
+                            column: related.column,
+                            end_line: related.end_line,
+                            end_column: related.end_column,
+                            message: related.message.clone(),
+                            direction: verify::Direction::Other,
+                            code: diagnostic.code.clone(),
+                            related: Vec::new(),
+                        };
+                        let mut related_owners = attribute(
+                            std::slice::from_ref(&related_diagnostic),
+                            &line_maps,
+                            &observed_root,
+                            &facts.emitted_sites,
+                            &planned_edit_sites,
+                            &reverted,
+                            original_root,
+                        );
+                        if related_owners.is_empty()
+                            && let Some(original_line) = e1_bijective_line(
+                                &related_diagnostic,
+                                &line_maps,
+                                &observed_root,
+                                original_root,
+                            )
+                        {
+                            related_diagnostic.line = original_line;
+                            related_owners = attribute(
+                                std::slice::from_ref(&related_diagnostic),
+                                &std::collections::BTreeMap::new(),
+                                &observed_root,
+                                &facts.emitted_sites,
+                                &planned_edit_sites,
+                                &reverted,
+                                original_root,
+                            );
+                        }
+                        if related_owners.is_empty() {
+                            related_owners = e1_region_owners(
+                                &related_diagnostic,
+                                &line_maps,
+                                &observed_root,
+                                original_root,
+                                &facts.emitted_sites,
+                                &planned_edit_sites,
+                            );
+                        }
+                        owners.extend(related_owners);
+                    }
+                    if !owners.is_empty() {
+                        attribution = "related-span";
+                    }
+                }
+                if owners.is_empty() {
+                    let original_root = crate_dir.as_deref().unwrap_or(std::path::Path::new(""));
+                    owners = e1_region_owners(
+                        diagnostic,
+                        &line_maps,
+                        &observed_root,
+                        original_root,
+                        &facts.emitted_sites,
+                        &planned_edit_sites,
+                    );
+                    if !owners.is_empty() {
+                        attribution = "region-span";
+                    }
+                }
+                if owners.is_empty() {
+                    facts.e1_reverts.push(E1RevertDiagnostic {
+                        function: "<unattributed>".to_owned(),
+                        diagnostic: diagnostic.clone(),
+                        site_kind: e1_diagnostic_site(diagnostic),
+                        attribution: "unattributed".to_owned(),
+                        edits: Vec::new(),
+                    });
+                    continue;
+                }
+                for owner in owners {
+                    let edits = e1_edit_contexts
+                        .iter()
+                        .filter(|(candidate, _, _)| *candidate == owner)
+                        .map(|(_, _, edit)| edit.clone())
+                        .collect();
+                    facts.e1_reverts.push(E1RevertDiagnostic {
+                        function: class_paths
+                            .get(&owner)
+                            .cloned()
+                            .unwrap_or_else(|| format!("local-def-index:{}", owner.order_key())),
+                        diagnostic: diagnostic.clone(),
+                        site_kind: e1_diagnostic_site(diagnostic),
+                        attribution: attribution.to_owned(),
+                        edits,
+                    });
+                }
+            }
+            if novel_errors > 0 && facts.e1_reverts.is_empty() {
+                facts.e1_reverts.push(E1RevertDiagnostic {
+                    function: "<unattributed>".to_owned(),
+                    diagnostic: verify::Diag {
+                        file: "<spanless>".to_owned(),
+                        line: 0,
+                        column: 0,
+                        end_line: 0,
+                        end_column: 0,
+                        message: format!(
+                            "{novel_errors} baseline-subtracted error(s) carried no located diagnostic"
+                        ),
+                        direction: verify::Direction::Other,
+                        code: None,
+                        related: Vec::new(),
+                    },
+                    site_kind: E1DiagnosticSite::Other,
+                    attribution: "spanless".to_owned(),
+                    edits: Vec::new(),
+                });
+            }
+            facts.files_touched = files_edited;
+            if !raw_boundary_full {
+                return facts.degraded(
+                    "e1-single-iteration: first differential diagnose recorded".to_owned(),
+                );
+            }
+        }
+        if novel.is_empty() && novel_errors == 0 {
+            if let Some((reason, atoms)) = pending_atom_retry.take() {
+                facts
+                    .raw_boundary_artifacts
+                    .atom_outcomes
+                    .push_str(&format!(
+                        "atom-succeeded\t{}\t{}\n",
+                        reason,
+                        atoms.join(";")
+                    ));
+            }
+            if !reverted.is_empty() && all_ready_classes.is_subset(&reverted) {
+                facts.reverted_count = reverted.len();
+                refresh_raw_boundary_receipt_events(
+                    &mut facts.raw_boundary_artifacts,
+                    &emission_plan,
+                    &reverted,
+                    &reverted_atoms,
+                );
+                refresh_field_transaction_revert_status(
+                    &mut facts.raw_boundary_artifacts,
+                    tcx,
+                    table,
+                    &emission_plan,
+                    &reverted,
+                    &reverted_atoms,
+                );
+                record_unresolved_classes(
+                    &mut facts.raw_boundary_artifacts,
+                    &all_ready_classes,
+                    &class_paths,
+                    "revert-all-is-not-recovery",
+                );
+                return facts.degraded(
+                    "recovery-degraded: reverting every ready signature class is not success"
+                        .to_owned(),
+                );
+            }
+            let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
+            // **R291-5 — the ledger partitions on the same set the TREE does.**
+            //
+            // `reverted` is the set of classes taken back DIRECTLY. The emitted
+            // tree is rendered through `effective_reverted_classes`, which adds
+            // the input-reversion closure: reverting a callee retires every
+            // caller whose converted form depended on it. Partitioning on the
+            // direct set alone left the ledger claiming deliveries the tree had
+            // already retired — urlparser's `url_get_query::url#1`, whose
+            // parameter stayed `*mut libc::c_char` because `url_get_search` was
+            // reverted, while the ledger still called it placed.
+            let (effective_reverted, partition_reasons) =
+                effective_withheld_classes_with_reasons(&emission_plan, &reverted, &reverted_atoms);
+            let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects.iter().partition(|subject| {
+                !effective_reverted.contains(&subject.owner_class)
+                    && subject
+                        .atoms
+                        .iter()
+                        .all(|atom| !reverted_atoms.contains(atom))
+            });
+            // ACCOUNTING: a reverted subject moves from emitted to
+            // degraded under its OWN reason key, so
+            // `emitted_final + degraded == row count` survives the loop.
+            for subject in &taken {
+                facts.degradations.push(decision::Degradation {
+                    subject: subject.subject.clone(),
+                    site: subject.site.clone(),
+                    reason: decision::DegradeReason::RevertedAfterVerifyFailure,
+                });
+            }
+            facts.emitted_count = kept.len();
+            facts.reverted_count = taken.len();
+            facts.files_touched = files_edited;
+            let named_subjects = reverted_named_subjects(&taken);
+            name_reverted_classes(tcx, &effective_reverted, &mut class_paths);
+            facts.raw_boundary_artifacts.final_reverts = render_raw_boundary_final_reverts(
+                &effective_reverted,
+                &reverted_atoms,
+                &named_subjects,
+                &partition_reasons,
+                &class_paths,
+                &class_owner_paths,
+                &reverted,
+                Some(&emission_plan),
+            );
+            refresh_raw_boundary_receipt_events_with_renders(
+                &mut facts.raw_boundary_artifacts,
+                &emission_plan,
+                &reverted,
+                &reverted_atoms,
+                &call_renders,
+            );
+            refresh_field_transaction_revert_status(
+                &mut facts.raw_boundary_artifacts,
+                tcx,
+                table,
+                &emission_plan,
+                &reverted,
+                &reverted_atoms,
+            );
+            // R829-1 / R855-1, the post-condition (main 184): with the hold on, the
+            // pending table the census publishes reads 0, or the program does not emit.
+            let pending_left = facts.raw_boundary_artifacts.pending_sibling_receipts.len();
+            if pending_left > 0 {
+                return facts.degraded(format!(
+                    "pending-hold-incomplete: {pending_left} pending site(s) remain at the emitted revert state"
+                ));
+            }
+            return facts.emitted(source, files);
+        }
+
+        // Raw-boundary subject-atom pass: exactly one compiler reverify. The
+        // edit-span index is filtered by the same function/atom predicates as
+        // rendering before attribution, so a removed atom cannot be selected
+        // again through stale plan metadata.
+        if atom_reverify_count < MAX_ATOM_REVERIFIES {
+            let live_atom_sites = planned_edit_sites
+                .iter()
+                .filter(|edit| {
+                    edit.owner_class
+                        .is_some_and(|class| !reverted.contains(&class))
+                        && edit
+                            .atom_ids
+                            .iter()
+                            .all(|atom| !reverted_atoms.contains(atom))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let selection = select_subject_atoms(
+                &novel,
+                &line_maps,
+                &observed_root,
+                &live_atom_sites,
+                crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
+            );
+            if matches!(
+                selection.kind,
+                AtomSelectionKind::Exact
+                    | AtomSelectionKind::GroupAtomic
+                    | AtomSelectionKind::BisectGroup
+            ) {
+                atom_reverify_count += 1;
+                let selected_atoms = selection.atoms.into_iter().collect::<Vec<_>>();
+                reverted_atoms.extend(selected_atoms.iter().cloned());
+                let effective_reverted =
+                    emission_plan.effective_reverted_classes(&reverted, &reverted_atoms);
+                for owner in effective_reverted.difference(&reverted) {
+                    facts
+                        .raw_boundary_artifacts
+                        .atom_outcomes
+                        .push_str(&format!(
+                            "return-origin-class-reverted\treturn-origin-atom-reverted:{}\t{}\n",
+                            owner.order_key(),
+                            selected_atoms.join(";"),
+                        ));
+                }
+                reverted = effective_reverted;
+                pending_atom_retry = Some((selection.reason.to_owned(), selected_atoms));
+                let (next_files, rollbacks, next_edited, next_maps, next_renders) =
+                    match round_files(
+                        tcx,
+                        capture,
+                        &emission_plan,
+                        &emission_texts,
+                        &reverted,
+                        &reverted_atoms,
+                        root_key.as_ref(),
+                        table,
+                    ) {
+                        Ok(quad) => quad,
+                        Err(why) => {
+                            escalation =
+                                Some(format!("escalation-required: atom re-emit failed: {why}"));
+                            break;
+                        }
+                    };
+                if !rollbacks.is_empty() {
+                    escalation = Some(format!(
+                        "escalation-required: atom re-render rolled back {} edit(s)",
+                        rollbacks.len()
+                    ));
+                    break;
+                }
+                files = next_files;
+                files_edited = next_edited;
+                line_maps = next_maps;
+                call_renders = next_renders;
+                // The atom retry is its own bounded phase; its result must be
+                // allowed to fall through to ordinary function attribution
+                // rather than tripping the general no-progress detector.
+                previous_errors = None;
+                continue;
+            }
+            if !live_atom_sites.is_empty() {
+                facts
+                    .raw_boundary_artifacts
+                    .atom_outcomes
+                    .push_str(&format!(
+                        "atom-ambiguous-fallback\t{}\t-\n",
+                        selection.reason
+                    ));
+            }
+        } else if let Some((reason, atoms)) = pending_atom_retry.take() {
+            facts
+                .raw_boundary_artifacts
+                .atom_outcomes
+                .push_str(&format!(
+                    "atom-second-verify-fallback\t{}\t{}\n",
+                    reason,
+                    atoms.join(";")
+                ));
+        }
+
+        // DUAL TERMINATION, both arms. Neither alone: a no-progress
+        // detector can be starved by a loop that keeps finding new
+        // attributions, and a cap alone burns every round on a case
+        // that stopped improving after the first.
+        let outstanding = novel.len().max(novel_errors);
+        if previous_errors.is_some_and(|prev| outstanding >= prev) {
+            escalation = Some(format!(
+                "escalation-required: no progress ({} error(s) after \
+                 reverting {} function(s)) — attribution is wrong here \
+                 and (C) bisect must take over",
+                outstanding,
+                reverted.len()
+            ));
+            break;
+        }
+        previous_errors = Some(outstanding);
+        rounds += 1;
+        if rounds > max_rounds {
+            escalation = Some(format!(
+                "escalation-required: round cap {max_rounds} reached with \
+                 {outstanding} error(s) outstanding"
+            ));
+            break;
+        }
+
+        let mut attributed = std::collections::BTreeSet::new();
+        for diagnostic in &novel {
+            let result = attribute_with_rule(
+                diagnostic,
+                &line_maps,
+                &observed_root,
+                &facts.emitted_sites,
+                &planned_edit_sites,
+                &reverted,
+                crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
+            );
+            facts
+                .raw_boundary_artifacts
+                .attribution_hits
+                .record(result.rule);
+            if rounds >= 2 {
+                let enclosing = attribute_with_rule(
+                    diagnostic,
+                    &line_maps,
+                    &observed_root,
+                    &facts.emitted_sites,
+                    &[],
+                    &std::collections::BTreeSet::new(),
+                    crate_dir.as_deref().unwrap_or(std::path::Path::new("")),
+                );
+                record_revert_found_form_late_classes(
+                    rounds,
+                    &enclosing.classes,
+                    &reverted,
+                    &result.classes,
+                    &mut revert_found_form_late_classes,
+                );
+                facts.raw_boundary_artifacts.revert_found_form_late_classes =
+                    revert_found_form_late_classes.len();
+            }
+            attributed.extend(exact_diagnostic_classes(result.classes, &all_ready_classes));
+        }
+        let newly = attributed
+            .difference(&reverted)
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        if newly.is_empty() {
+            escalation = Some(format!(
+                "escalation-required: {outstanding} error(s) attributed to no rewritten \
+                 function"
+            ));
+            break;
+        }
+        let over_attempted = newly
+            .iter()
+            .copied()
+            .filter(|class| {
+                let attempts = class_attempts.entry(*class).or_default();
+                *attempts += 1;
+                *attempts > MAX_CLASS_ATTEMPTS
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if !over_attempted.is_empty() {
+            facts.files_touched = files_edited;
+            facts.reverted_count = reverted.len();
+            record_unresolved_classes(
+                &mut facts.raw_boundary_artifacts,
+                &over_attempted,
+                &class_paths,
+                "per-class-attempt-limit",
+            );
+            return facts.degraded(format!(
+                "recovery-degraded: {} signature class(es) exceeded MAX_CLASS_ATTEMPTS={MAX_CLASS_ATTEMPTS}",
+                over_attempted.len()
+            ));
+        }
+        // BATCH revert: the union of this round's attributions, not one
+        // at a time — one compile per round rather than one per function.
+        reverted.extend(newly);
+        let (next_files, rollbacks, next_edited, next_maps, next_renders) = match round_files(
+            tcx,
+            capture,
+            &emission_plan,
+            &emission_texts,
+            &reverted,
+            &reverted_atoms,
+            root_key.as_ref(),
+            table,
+        ) {
+            Ok(quad) => quad,
+            Err(why) => {
+                escalation = Some(format!("escalation-required: re-emit failed: {why}"));
+                break;
+            }
+        };
+        if !rollbacks.is_empty() {
+            escalation = Some(format!(
+                "escalation-required: re-render rolled back {} edit(s)",
+                rollbacks.len()
+            ));
+            break;
+        }
+        files = next_files;
+        files_edited = next_edited;
+        line_maps = next_maps;
+        call_renders = next_renders;
+    }
+
+    // ---- (C) BISECT: the escalation path ----
+    // Reaching here means the loop BROKE, and only the gate path can
+    // break: probe mode returns from inside it. So the baseline exists
+    // by construction — and it is asserted rather than defaulted,
+    // because a `Baseline::default()` fallback here would silently turn
+    // the differential into an absolute gate, which is the exact defect
+    // brotli's frozen source exposed in the first place.
+    let baseline = baseline.expect(
+        "the gate path computes a baseline on its first round; reaching \
+         the post-loop stages without one means the loop was exited by a \
+         path that skipped it",
+    );
+
+    let escalation = escalation.unwrap_or_else(|| "escalation-required".to_owned());
+    let recovery_base =
+        plan::dependent_closure(&emission_plan.class_finalization.classes, &reverted);
+    let candidates = plan::dependency_scc_order(&emission_plan.class_finalization.classes)
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .filter(|class| all_ready_classes.contains(class) && !recovery_base.contains(class))
+                .collect::<Vec<_>>()
+        })
+        .filter(|group| !group.is_empty())
+        .collect::<Vec<_>>();
+    let unresolved_candidates = candidates
+        .iter()
+        .flatten()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    // ESCALATION BUDGET. A bisect that cannot finish inside the worker
+    // budget is DEFERRED LOUDLY with its attribution state, never
+    // silently truncated — a truncated bisect returns a wrong answer
+    // that looks like a right one.
+    let projected = candidates.len().saturating_mul(3).saturating_add(1) as f64;
+    let budget_secs = EMIT_BUDGET_S as f64;
+    if recovery_budget_deferred(projected, probe_secs, budget_secs) {
+        facts.files_touched = files_edited;
+        facts.reverted_count = recovery_base.len();
+        facts.escalated = Some(escalation.clone());
+        record_unresolved_classes(
+            &mut facts.raw_boundary_artifacts,
+            &unresolved_candidates,
+            &class_paths,
+            "budget-deferral",
+        );
+        return facts.degraded(format!(
+            "escalation-deferred: {escalation}; class recovery needs ~{projected} probe(s) at ~{probe_secs:.1}s each against a {budget_secs:.0}s budget, with {} class(es) already reverted",
+            recovery_base.len()
+        ));
+    }
+
+    let (final_reverted, probes) = recover_class_groups(&candidates, &recovery_base, |trial| {
+        let Ok((trial_files, rollbacks, _, _, _)) = round_files(
+            tcx,
+            capture,
+            &emission_plan,
+            &emission_texts,
+            trial,
+            &reverted_atoms,
+            root_key.as_ref(),
+            table,
+        ) else {
+            return false;
+        };
+        if !rollbacks.is_empty() {
+            return false;
+        }
+        let materialized = match tree_base {
+            Some(root) => verify::materialize(root, &trial_files),
+            None => verify::materialize_single_file(&root_text),
+        };
+        let Ok(staged) = materialized else {
+            return false;
+        };
+        crate::phase_log::mark("verify:bisect-probe", "start", "");
+        let probe = verify::diagnose_crate(staged.root());
+        crate::phase_log::mark(
+            "verify:bisect-probe",
+            "end",
+            &format!("errors={}", probe.errors),
+        );
+        let probe_root = staged.root().parent().unwrap_or(staged.root());
+        baseline.novel(&probe.diags, probe_root).is_empty()
+            && probe.errors.saturating_sub(baseline.errors) == 0
+    });
+    facts.bisect_probes = probes;
+    if !plan::strict_recovery_subset(&all_ready_classes, &final_reverted) {
+        let unresolved = if unresolved_candidates.is_empty() {
+            all_ready_classes.clone()
+        } else {
+            unresolved_candidates
+        };
+        facts.files_touched = files_edited;
+        facts.reverted_count = final_reverted.len();
+        facts.escalated = Some(escalation.clone());
+        refresh_raw_boundary_receipt_events(
+            &mut facts.raw_boundary_artifacts,
+            &emission_plan,
+            &final_reverted,
+            &reverted_atoms,
+        );
+        refresh_field_transaction_revert_status(
+            &mut facts.raw_boundary_artifacts,
+            tcx,
+            table,
+            &emission_plan,
+            &final_reverted,
+            &reverted_atoms,
+        );
+        record_unresolved_classes(
+            &mut facts.raw_boundary_artifacts,
+            &unresolved,
+            &class_paths,
+            "revert-all-is-not-recovery",
+        );
+        return facts.degraded(format!(
+            "recovery-degraded: {escalation}; class recovery found no strict compiling subset"
+        ));
+    }
+
+    // **THE THIRD SITE — routed through `round_files` like the other two**
+    // (ruling 2026-08-18). This called `render` directly, with no layer
+    // switch, so under `CRAT_M1_AST_EMIT` every program that escalated
+    // emitted SPAN text: the bisect PROBES above ran on the selected layer
+    // and the emission that followed did not. That is precisely the defect
+    // `round_files`' own doc names — a program returned that is not the
+    // program the probes verified — and it also left M-3 with an escalation
+    // path that has no implementation once `render` is deleted.
+    let (final_files, rollbacks, final_edited, _final_maps, final_call_renders) = match round_files(
+        tcx,
+        capture,
+        &emission_plan,
+        &emission_texts,
+        &final_reverted,
+        &reverted_atoms,
+        root_key.as_ref(),
+        table,
+    ) {
+        Ok(quad) => quad,
+        Err(why) => {
+            // The bisect already found a compiling set; failing to re-emit it
+            // is a loud degrade, never a silent fall back to the other layer.
+            facts.files_touched = files_edited;
+            facts.reverted_count = final_reverted.len();
+            facts.bisect_probes = probes;
+            facts.escalated = Some(escalation.clone());
+            let unresolved = all_ready_classes
+                .difference(&final_reverted)
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            record_unresolved_classes(
+                &mut facts.raw_boundary_artifacts,
+                &unresolved,
+                &class_paths,
+                "final-reemit-failed",
+            );
+            return facts.degraded(format!("{escalation}; final re-emit failed: {why}"));
+        }
+    };
+    let materialized = match tree_base {
+        Some(root) => verify::materialize(root, &final_files),
+        None => verify::materialize_single_file(&root_text),
+    };
+    // INCIDENT-PROVEN DEFENSE — not a control over an unreachable case.
+    //
+    // `type_checks_crate` here can never be the thing that fails:
+    // `bisect` only ever assigns `hi` a `mid` it just tested true, so
+    // the returned `k` either compiled under test or equals
+    // `candidates.len()` — reverting every owner, which drops every
+    // edit and reduces the crate to the original input. The input
+    // compiled, or `decide_table` would not have produced a table.
+    // Non-monotonicity costs MINIMALITY, never correctness.
+    //
+    // `rollbacks` likewise cannot fire here: `render` applies a SUBSET
+    // of the edits that produced no rollbacks initially, and dropping
+    // edits cannot create an overlap, an out-of-bounds range, or a
+    // char-boundary violation.
+    //
+    // **This guard FIRED on brotli, 2026-07-31**, when `candidates` was
+    // derived from `emitted_sites` rather than from the plan's
+    // `owner_fn` domain: the two sets diverged, revert-all left edits
+    // standing, and bisect returned a set that did not compile. The
+    // derivation is fixed above; the guard stays because it is what
+    // turned a silently wrong emission into a loud `Degraded`.
+    //
+    // The `rollbacks` arm remains unreachable (a SUBSET of edits that
+    // produced no rollbacks cannot produce new ones); the reachable
+    // rollback path is the pre-loop structural gate, witnessed there.
+    match materialized {
+        Ok(staged)
+            if rollbacks.is_empty() && {
+                facts.verify_rounds += 1;
+                crate::phase_log::mark("verify:final", "start", "");
+                let final_diag = verify::diagnose_crate(staged.root());
+                crate::phase_log::mark("verify:final", "end", "");
+                let final_root = staged.root().parent().unwrap_or(staged.root());
+                baseline.novel(&final_diag.diags, final_root).is_empty()
+                    && final_diag.errors.saturating_sub(baseline.errors) == 0
+            } =>
+        {
+            let source = std::fs::read_to_string(staged.root()).unwrap_or_default();
+            let (kept, taken): (Vec<_>, Vec<_>) = emitted_subjects.iter().partition(|subject| {
+                !final_reverted.contains(&subject.owner_class)
+                    && subject
+                        .atoms
+                        .iter()
+                        .all(|atom| !reverted_atoms.contains(atom))
+            });
+            for subject in &taken {
+                facts.degradations.push(decision::Degradation {
+                    subject: subject.subject.clone(),
+                    site: subject.site.clone(),
+                    reason: decision::DegradeReason::RevertedAfterVerifyFailure,
+                });
+            }
+            facts.emitted_count = kept.len();
+            facts.reverted_count = taken.len();
+            // The RULED value from the same derivation the other exits use —
+            // not the map size, which is seeded on the AST layer.
+            facts.files_touched = final_edited;
+            facts.bisect_probes = probes;
+            facts.escalated = Some(escalation);
+            let (_, partition_reasons) =
+                effective_withheld_classes_with_reasons(&emission_plan, &reverted, &reverted_atoms);
+            let named_subjects = reverted_named_subjects(&taken);
+            name_reverted_classes(tcx, &final_reverted, &mut class_paths);
+            facts.raw_boundary_artifacts.final_reverts = render_raw_boundary_final_reverts(
+                &final_reverted,
+                &reverted_atoms,
+                &named_subjects,
+                &partition_reasons,
+                &class_paths,
+                &class_owner_paths,
+                &reverted,
+                Some(&emission_plan),
+            );
+            refresh_raw_boundary_receipt_events_with_renders(
+                &mut facts.raw_boundary_artifacts,
+                &emission_plan,
+                &final_reverted,
+                &reverted_atoms,
+                &final_call_renders,
+            );
+            refresh_field_transaction_revert_status(
+                &mut facts.raw_boundary_artifacts,
+                tcx,
+                table,
+                &emission_plan,
+                &final_reverted,
+                &reverted_atoms,
+            );
+            let pending_left = facts.raw_boundary_artifacts.pending_sibling_receipts.len();
+            if pending_left > 0 {
+                return facts.degraded(format!(
+                    "pending-hold-incomplete: {pending_left} pending site(s) remain after the bisect"
+                ));
+            }
+            facts.emitted(source, final_files)
+        }
+        _ => {
+            facts.files_touched = files_edited;
+            facts.reverted_count = final_reverted.len();
+            facts.bisect_probes = probes;
+            facts.escalated = Some(escalation.clone());
+            let unresolved = all_ready_classes
+                .difference(&final_reverted)
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>();
+            record_unresolved_classes(
+                &mut facts.raw_boundary_artifacts,
+                &unresolved,
+                &class_paths,
+                "final-verify-failed",
+            );
+            facts.degraded(format!("{escalation}; bisect did not recover the crate"))
+        }
+    }
+}
+
+/// Every top-level fn/struct item, in HIR owner order (the `bo_c1` shape).
+fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
+    let mut functions = Vec::new();
+    let mut structs = Vec::new();
+    for maybe_owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = maybe_owner.as_owner() else {
+            continue;
+        };
+        let OwnerNode::Item(item) = owner.node() else {
+            continue;
+        };
+        match item.kind {
+            ItemKind::Fn { .. } => functions.push(item.owner_id.def_id),
+            ItemKind::Struct(..) => structs.push(item.owner_id.def_id),
+            _ => {}
+        }
+    }
+    RustProgram {
+        tcx,
+        functions,
+        structs,
+    }
+}
+
+/// M1 subjects: each pointer-typed parameter of each local function, decided on
+/// the **resolved** type.
+///
+/// # Why resolved, not syntactic (R-A)
+///
+/// The previous collector matched `rustc_hir::TyKind::Ptr` on the syntactic HIR
+/// type node. A C2Rust type alias — `pub type lil_value_t = *mut _lil_value_t`
+/// — lowers to `TyKind::Path`, so a parameter declared `val: lil_value_t` was
+/// not a subject at all: BO decided it (MIR types are resolved) and the
+/// rewriter discarded that decision with no `Decision`, no `Degradation`, no
+/// site and no reason. That is the "unrewritten and unattributed" class the
+/// whole A1 layer exists to retire, and it is present in the evaluation corpus.
+///
+/// The predicate is now [`ptr_chain_depth`] over `tcx.fn_sig`'s inputs — the
+/// same in-tree function `CrateSlots` builds the slot universe from. **HIR
+/// supplies where, tcx supplies whether:** the plan edits source bytes, so the
+/// declaration span and the pointee span still come from HIR.
+///
+/// R-A rules these subjects **collected, not excluded** — they are real C
+/// pointer parameters. Whether each *emits* is A1's per-subject decision like
+/// any other, and the alias-specific emission obstacle (the alias already
+/// contains the `*mut`, so there is no pointee text to copy) degrades with its
+/// own attributed reason in [`decision::decide_one`].
+///
+/// The MIR local of parameter `i` is `_{i+1}` — params occupy `_1 ..= arg_count`
+/// — which is what lets a HIR-side span pair with a MIR-side slot lookup. That
+/// mapping is what [`decision::coverage`]'s fail-loud arm guards.
+fn collect_subjects(
+    tcx: TyCtxt<'_>,
+    program: &RustProgram<'_>,
+    mut_facts: &MutFacts,
+) -> Vec<decision::Subject> {
+    let mut subjects = Vec::new();
+    for &fn_did in &program.functions {
+        let node = tcx.hir_node_by_def_id(fn_did);
+        let (Some(decl), Some(body_id)) = (node.fn_decl(), node.body_id()) else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let fn_name = tcx.item_name(fn_did.to_def_id());
+        let sig = tcx.fn_sig(fn_did).skip_binder().skip_binder();
+        for (index, param_ty) in sig.inputs().iter().enumerate() {
+            if ptr_chain_depth(*param_ty) == 0 {
+                continue;
+            }
+            // F3: these used to `continue`, dropping the subject from BOTH the
+            // table and the count it was checked against — a double-sided drop
+            // no self-comparison could see. A mismatch here is a collector bug
+            // rather than a degradation, so it fails loudly instead of
+            // shrinking the work silently.
+            let Some(input) = decl.inputs.get(index) else {
+                panic!(
+                    "resolved signature of {fn_did:?} has input {index} but the HIR \
+                     declaration has only {} — parameter mapping broken",
+                    decl.inputs.len()
+                );
+            };
+            // The parameter's BINDING, so a use can be attributed to it without
+            // relying on a name that might be shadowed in an inner scope.
+            let Some(param) = body.params.get(index) else {
+                panic!(
+                    "HIR fn_decl has input {index} but the body has no matching \
+                     param binding for {fn_did:?} — collector invariant broken"
+                );
+            };
+            let (decl_shape, pointee_span) = match input.kind {
+                rustc_hir::TyKind::Ptr(mut_ty) => {
+                    (decision::DeclShape::RawPtr, Some(mut_ty.ty.span))
+                }
+                rustc_hir::TyKind::Ref(_, mut_ty) => {
+                    (decision::DeclShape::Reference, Some(mut_ty.ty.span))
+                }
+                rustc_hir::TyKind::Path(_) => (decision::DeclShape::Alias, None),
+                _ => (decision::DeclShape::Other, None),
+            };
+            let local = Local::from_usize(index + 1);
+            let name = param_name(param);
+            subjects.push(decision::Subject {
+                fn_did,
+                local,
+                hir_id: param.pat.hir_id,
+                param_name: name.clone(),
+                kind: decision::SubjectKind::Param { hir_index: index },
+                ptr_depth: ptr_chain_depth(*param_ty),
+                label: format!("{fn_name}::{}", name.as_deref().unwrap_or("<pattern>")),
+                ty_span: Some(input.span),
+                binding_span: param.pat.span,
+                pointee_span,
+                decl_shape,
+                // The declared mutability is a ceiling, not the decision: BO's
+                // mutability facts decide whether a `&mut` is warranted. Read
+                // off the RESOLVED type so it sees through an alias exactly as
+                // the pointer predicate above does.
+                mutable: matches!(
+                    param_ty.kind(),
+                    TyKind::RawPtr(_, Mutability::Mut) | TyKind::Ref(_, _, Mutability::Mut)
+                ) && mut_facts.is_mutable(fn_did, local),
+                // Stamped in `finish_decide`, once, over both universes.
+                freed_at: None,
+                len_recovered: false,
+                null_init: false,
+                mut_binding: false,
+                ctor: None,
+            });
+        }
+    }
+    subjects
+}
+
+/// M1 subjects, second universe: each **named pointer local** of each local
+/// function (S3.1).
+///
+/// # The universe rule — depth + named binding, and nothing else
+///
+/// A local is a subject iff its type has pointer depth > 0 **and** at least one
+/// `var_debug_info` entry keys to it. There is deliberately **no third
+/// condition**: a local BO has no slot for is collected and *degraded with a
+/// reason*, never omitted. The rule is structurally identical to the reference
+/// walker's, and that identity of shape is what makes a producer-B-only row a
+/// clean signal instead of an expected difference.
+///
+/// **Zero entries is the universe exclusion**, and it is what keeps MIR
+/// temporaries out: measured, the `*mut c_void` a `malloc` call lands in carries
+/// no debug entry at all, while being a depth-1 pointer. Depth alone would
+/// admit it, and it has no source binding anyone could rewrite.
+///
+/// # Mapping a MIR local back to its declaration
+///
+/// The `var_debug_info` entry's span **is** the HIR binding pattern's span —
+/// measured on this toolchain, `mut` included (`let mut p` reports `4:9:4:14` on
+/// both sides). So a map from simple-binding `let` pattern spans to their type
+/// annotation resolves the declaration exactly, without a name lookup that
+/// shadowing would break.
+///
+/// A local not found in that map has no declared type of its own: it is either
+/// unannotated, or a component of a destructuring pattern whose annotation
+/// belongs to the pattern. Both carry `ty_span: None`, which means the plan
+/// phase has no splice target — but **not** that nothing is known about the
+/// declaration: the SHAPE still comes from the resolved type, and the
+/// dissolution pass reads it there.
+fn collect_local_subjects(
+    tcx: TyCtxt<'_>,
+    program: &RustProgram<'_>,
+    mut_facts: &MutFacts,
+) -> Vec<decision::Subject> {
+    use rustc_hir::intravisit::Visitor;
+
+    /// Two maps over the same body, with **deliberately different predicates**.
+    ///
+    /// They are not merged into one entry, and must not be: they answer
+    /// different questions and their correct domains differ.
+    ///
+    /// - [`Self::by_pat_span`] — *what type was DECLARED here.* Simple-binding
+    ///   `let`s only, because a destructuring pattern's annotation belongs to
+    ///   the pattern and not to any component.
+    /// - [`Self::binding_hir`] — *which HIR binding IS this.* **Every** binding
+    ///   pattern, wherever it appears: destructuring components, `match` arms,
+    ///   `for` bindings. A binding has an identity even where it has no
+    ///   annotation of its own.
+    ///
+    /// Merging them would silently narrow the identity map to simple `let`s and
+    /// leave every other binding unattributable — the same shape of defect as
+    /// the placeholder this slice repairs, one level down.
+    struct Lets<'hir> {
+        by_pat_span: rustc_hash::FxHashMap<rustc_span::Span, Option<&'hir rustc_hir::Ty<'hir>>>,
+        binding_hir: rustc_hash::FxHashMap<rustc_span::Span, rustc_hir::HirId>,
+    }
+    impl<'hir> Visitor<'hir> for Lets<'hir> {
+        fn visit_stmt(&mut self, stmt: &'hir rustc_hir::Stmt<'hir>) {
+            if let rustc_hir::StmtKind::Let(local) = stmt.kind
+                && matches!(local.pat.kind, rustc_hir::PatKind::Binding(..))
+            {
+                // Only SIMPLE bindings: a destructuring pattern's annotation is
+                // the pattern's, not any component's, so recording it here would
+                // hand a component a type it does not have.
+                self.by_pat_span.insert(local.pat.span, local.ty);
+            }
+            rustc_hir::intravisit::walk_stmt(self, stmt);
+        }
+
+        fn visit_pat(&mut self, pat: &'hir rustc_hir::Pat<'hir>) {
+            // `hir_id` here is exactly the id `Res::Local` resolves a *use* to,
+            // which is what makes the A1 emitability lookup hit. S3.1 shipped a
+            // `CRATE_HIR_ID` placeholder instead, and both gates were dead over
+            // every local as a result.
+            if let rustc_hir::PatKind::Binding(..) = pat.kind {
+                self.binding_hir.insert(pat.span, pat.hir_id);
+            }
+            rustc_hir::intravisit::walk_pat(self, pat);
+        }
+    }
+
+    let mut subjects = Vec::new();
+    for &fn_did in &program.functions {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
+        let mut lets = Lets {
+            by_pat_span: rustc_hash::FxHashMap::default(),
+            binding_hir: rustc_hash::FxHashMap::default(),
+        };
+        lets.visit_body(tcx.hir_body(body_id));
+
+        let mir = tcx.mir_drops_elaborated_and_const_checked(fn_did).borrow();
+        let fn_name = tcx.item_name(fn_did.to_def_id());
+
+        // Entries per local, so the one-vs-more split is a count and not a
+        // first-match. Deterministic order: BTreeMap keyed by local index.
+        let mut entries: std::collections::BTreeMap<
+            Local,
+            Vec<&rustc_middle::mir::VarDebugInfo<'_>>,
+        > = std::collections::BTreeMap::new();
+        for info in &mir.var_debug_info {
+            if let rustc_middle::mir::VarDebugInfoContents::Place(place) = info.value
+                && let Some(local) = place.as_local()
+            {
+                entries.entry(local).or_default().push(info);
+            }
+        }
+
+        for (local, infos) in entries {
+            // Locals are `_(arg_count + 1) ..`; `_0` is the return place and
+            // `_1 ..= arg_count` is the parameter universe. Stated as a bound on
+            // the local rather than as "not a parameter", so the two universes
+            // are disjoint by construction rather than by filtering.
+            if local.index() <= mir.arg_count {
+                continue;
+            }
+            let ty = mir.local_decls[local].ty;
+            if ptr_chain_depth(ty) == 0 {
+                continue;
+            }
+            // The contradiction case: `argument_index` is set only on parameter
+            // locals. One here would mean the toolchain changed what it means,
+            // and reclassifying silently would hide that. Measured across plain
+            // locals, shadowing pairs, temporaries, tuple-pattern components and
+            // a reference pattern: never `Some` off the parameter universe.
+            for info in &infos {
+                assert!(
+                    info.argument_index.is_none(),
+                    "non-parameter local {local:?} of {fn_did:?} carries \
+                     argument_index {:?} — `var_debug_info`'s meaning has \
+                     changed and the locals universe rule must be re-derived",
+                    info.argument_index
+                );
+            }
+            let binding_span = infos[0].source_info.span;
+            // Exactly one entry names the local; more than one is defensive and
+            // NOT known to be reachable, so it declines to name rather than
+            // picking. `param_name: None` is what makes the artifact report Low.
+            let name = (infos.len() == 1).then(|| infos[0].name.to_string());
+            let declared = name
+                .is_some()
+                .then(|| lets.by_pat_span.get(&binding_span).copied())
+                .flatten()
+                .flatten();
+            let (decl_shape, pointee_span, ty_span) = match declared.map(|t| (t, t.kind)) {
+                Some((t, rustc_hir::TyKind::Ptr(mut_ty))) => (
+                    decision::DeclShape::RawPtr,
+                    Some(mut_ty.ty.span),
+                    Some(t.span),
+                ),
+                Some((t, rustc_hir::TyKind::Ref(_, mut_ty))) => (
+                    decision::DeclShape::Reference,
+                    Some(mut_ty.ty.span),
+                    Some(t.span),
+                ),
+                Some((t, rustc_hir::TyKind::Path(_))) => {
+                    (decision::DeclShape::Alias, None, Some(t.span))
+                }
+                Some((t, _)) => (decision::DeclShape::Other, None, Some(t.span)),
+                // No declared type of its own — unannotated, or a destructuring
+                // component. **The shape is still knowable**, from the resolved
+                // type: the universe filter above admits this local only when
+                // `ptr_chain_depth(ty) > 0`, which is `RawPtr` or `Ref` and
+                // nothing else.
+                //
+                // Reporting `Other` here — as every vintage before the
+                // dissolution did — asserted a syntax the subject does not
+                // have, and it HID a population: 51 of these locals are
+                // C2Rust's `let ref mut fresh…` temporaries, whose resolved
+                // type is already `&mut T`. They are not unconvertible, they
+                // are already converted, and `unsupported-decl-shape` with
+                // shape `reference` is the existing key that says so. Keyed on
+                // the resolved type rather than on the construction class,
+                // because 51-of-52 is a correlation and the type is the fact.
+                //
+                // `Alias` is deliberately unreachable here: an alias is a
+                // syntactic spelling, the resolved type has none, and there is
+                // no alias in the source for a rewrite to preserve.
+                None => (
+                    match ty.kind() {
+                        TyKind::RawPtr(..) => decision::DeclShape::RawPtr,
+                        TyKind::Ref(..) => decision::DeclShape::Reference,
+                        // Not reachable through the universe filter; attributed
+                        // rather than folded into either arm, so a widened
+                        // filter shows up as a reason and not as a silent
+                        // reclassification.
+                        _ => decision::DeclShape::Other,
+                    },
+                    None,
+                    None,
+                ),
+            };
+            // Attribution, not a placeholder. Absence is a contradiction, not a
+            // fallback: this local HAS a `var_debug_info` span, and a
+            // `CRATE_HIR_ID` here is what made both A1 gates dead for every
+            // local. Loud, on the same reasoning as the `argument_index` assert
+            // above — a silent default would restore the defect exactly.
+            let Some(&hir_id) = lets.binding_hir.get(&binding_span) else {
+                panic!(
+                    "local {local:?} of {fn_did:?} has debug-info span \
+                     {binding_span:?} matching no binding pattern in the body — \
+                     `var_debug_info`'s relationship to HIR bindings has changed \
+                     and the locals attribution rule must be re-derived"
+                );
+            };
+            subjects.push(decision::Subject {
+                fn_did,
+                local,
+                hir_id,
+                param_name: name.clone(),
+                kind: decision::SubjectKind::Local,
+                ptr_depth: ptr_chain_depth(ty),
+                label: format!("{fn_name}::{}", name.as_deref().unwrap_or("<unnamed>")),
+                ty_span,
+                binding_span,
+                pointee_span,
+                decl_shape,
+                mutable: matches!(
+                    ty.kind(),
+                    TyKind::RawPtr(_, Mutability::Mut) | TyKind::Ref(_, _, Mutability::Mut)
+                ) && mut_facts.is_mutable(fn_did, local),
+                // Stamped in `finish_decide`, once, over both universes.
+                freed_at: None,
+                len_recovered: false,
+                null_init: false,
+                mut_binding: false,
+                ctor: None,
+            });
+        }
+    }
+    subjects
+}
+
+/// **Census of the collector's own predicate** (§3, census discipline).
+///
+/// The ledger's `4171/0/0/2039` census came from an uncommitted scratchpad
+/// `syn` walk applying the same syntactic `*mut`/`*const` test as the
+/// classifier — so it inherited the alias blind spot and *could not have
+/// detected it*. A number enters the ledger only via a committed, in-tree code
+/// path; this is that path, and it runs the shipping collector.
+///
+/// `resolved - syntactic_ptr` is the population the retired predicate could not
+/// see, broken down by declaration shape so the alias class is a datum rather
+/// than a residual.
+// `cfg(test)` rather than `allow(dead_code)`: the only consumer is `bo_c1`'s
+// corpus harness, which is itself `cfg(test)`. Saying so is more honest than
+// silencing the lint, and it keeps the lint working here.
+
+/// Source name of a parameter binding.
+///
+/// `None` rather than a `"<pattern>"` placeholder: this feeds the artifact's
+/// `param_name` pairing term, and a placeholder would compare *equal* between
+/// two different pattern parameters — a pairing term that silently agrees is
+/// the F1 failure mode in miniature. The placeholder is applied only where it
+/// belongs, in the human-readable `label`.
+fn param_name(param: &rustc_hir::Param<'_>) -> Option<String> {
+    match param.pat.kind {
+        rustc_hir::PatKind::Binding(_, _, ident, _) => Some(ident.name.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+/// The analysis front-end: everything from BO's model to a finished decision
+/// table, with the structural self-check and the coverage gate applied.
+///
+/// Extracted so producer A's artifact is reachable without a second copy of the
+/// pipeline — and, deliberately, **without moving any comparison into this
+/// module**. `bo_rewriter` emits; `coverage_recon` compares.
+fn decide_table<'tcx>(tcx: TyCtxt<'tcx>) -> Result<decision::DecisionTable, String> {
+    decide_table_perturbed(tcx, |_| {}).map(|(table, _ctx)| table)
+}
+
+#[cfg(test)]
+/// [`decide_table`], keeping the pipeline's by-products (**R1**).
+///
+/// Exists so a caller that needs the slots, the accepted model or the
+/// emitability facts gets **the ones the table was built from**, instead of
+/// re-deriving them — which for the facts join meant a second BO solve per
+/// program. Kept as a sibling rather than by widening `decide_table`, so the
+/// existing call sites (and their witnesses) are untouched.
+fn decide_table_with_ctx<'tcx>(
+    tcx: TyCtxt<'tcx>,
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    decide_table_perturbed(tcx, |_| {})
+}
+
+#[cfg(test)]
+pub(crate) fn cache_decide_receipt_for_test(tcx: TyCtxt<'_>) -> Result<String, String> {
+    decide_table_with_ctx(tcx).map(|(_, context)| context.overlap_receipt)
+}
+
+#[cfg(test)]
+pub(crate) fn cache_fingerprint_for_test(tcx: TyCtxt<'_>) -> String {
+    let program = collect_program(tcx);
+    model_cache::fingerprint(
+        &program,
+        OverlapMode::PreciseReplay,
+        Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+    )
+}
+
+#[cfg(test)]
+fn decide_table_with_ctx_config<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    decide_table_perturbed_config(tcx, |_| {}, a5_override, &EmissionRunConfig::default())
+}
+
+pub(crate) fn decide_table_with_emission_config<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
+    run_config: &EmissionRunConfig,
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    decide_table_perturbed_config(tcx, |_| {}, a5_override, run_config)
+}
+
+#[cfg(test)]
+/// **Validation-transfer entry.** One emit, one diagnose, no revert loop.
+///
+/// The loop's `.err` log concatenates every round's compile, so a structural-vs-
+/// rendered comparison cannot be made 1:1 against it. This reproduces S2b.0's
+/// conditions exactly — a single verify of the fully-emitted crate — so the two
+/// extraction paths can be compared on the same diagnostics.
+#[allow(
+    dead_code,
+    reason = "reached only from bo_c1's `m1-diag` validation-transfer driver, \
+              which is #[cfg(test)]. Correct this reason if a non-test consumer \
+              appears."
+)]
+pub(crate) fn diagnose_once(
+    root: &std::path::Path,
+) -> Result<(std::path::PathBuf, Vec<verify::Diag>), String> {
+    // Routes through `rewrite_core` in probe mode rather than calling
+    // `emit_files` itself: a second call site would be a second emission path,
+    // which the one-path scan correctly rejected when this was first written
+    // that way.
+    let outcome = rewrite_core_injected(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        true,
+        false,
+        false,
+        None,
+    );
+    let (observed_root, diags) = outcome.into_capture();
+    // FAIL-CLOSED. A capture without its frame cannot be canonicalized, and the
+    // only remaining way to compare it against rendered output would be to
+    // invent a normalization at the consumer — the exact move that produced a
+    // second and a third canonicalizer. An error here is loud; a fallback would
+    // be silent and would key distinct files alike.
+    let observed_root = observed_root.ok_or_else(|| {
+        "the probe returned diagnostics with no observed root; their paths \
+         cannot be canonicalized"
+            .to_owned()
+    })?;
+    Ok((observed_root, diags))
+}
+
+/// Copy the session's thread-local cells into the outcome, ON the compiler thread.
+/// See [`RawBoundaryArtifacts::session_graft_held_table`] for why this exists.
+fn with_session_receipts(mut outcome: RewriteOutcome) -> RewriteOutcome {
+    let artifacts = match &mut outcome {
+        RewriteOutcome::Emitted {
+            raw_boundary_artifacts,
+            ..
+        }
+        | RewriteOutcome::Degraded {
+            raw_boundary_artifacts,
+            ..
+        } => raw_boundary_artifacts,
+    };
+    artifacts.session_graft_held_table = ast_transform::graft_held_table();
+    artifacts.session_graft_refusals = ast_transform::graft_refusals();
+    artifacts.session_stale_replans = decision::cursor_native::stale_replans();
+    artifacts.session_raw_cause_ledger = crate::analyses::borrow_ownership::raw_cause::take_last()
+        .map(|rows| rows.iter().map(|row| row.sidecar()).collect());
+    outcome
+}
+
+pub(crate) fn diagnose_raw_boundary_census_with_config(
+    root: &std::path::Path,
+    run_config: &EmissionRunConfig,
+) -> Result<E1Capture, String> {
+    rewrite_core_injected_with_config(
+        ::utils::compilation::path_to_input(root),
+        Some(root),
+        MAX_REVERT_ROUNDS,
+        &|_| {},
+        false,
+        true,
+        true,
+        None,
+        run_config,
+    )
+    .into_e1_capture()
+}
+
+/// Everything BOTH outcomes carry, built once and filled in one place.
+///
+/// # Why this exists
+///
+/// The outcome variants used to be hand-filled at seven construction sites, and
+/// twice a `Degraded` arm hardcoded a field to `0` that had a real value —
+/// S2b.0's `emitted_count` (which blocked the span-bucket axis outright) and
+/// then `reverted_count`, introduced while repairing the first. Two instances of
+/// one shape is a pattern; the third is prevented STRUCTURALLY rather than by
+/// another patch. Every field is filled here, once, and the constructors below
+/// are the only places the variants may be built — enforced by a scan.
+#[derive(Clone, Debug, Default)]
+struct OutcomeFacts {
+    original_source: String,
+    original_files: std::collections::BTreeMap<plan::FileKey, String>,
+    verify_started: Option<std::time::Instant>,
+    signature_class_count: usize,
+    emit_budget_s: String,
+    degradations: Vec<decision::Degradation>,
+    excluded: decision::universe::Excluded,
+    /// Subjects still emitted. **Observability of the ATTEMPT** on a failure —
+    /// a crate that fails the gate still rewrote subjects; that is usually why.
+    emitted_count: usize,
+    files_touched: usize,
+    /// Subjects the verify loop took back. Measured on BOTH arms.
+    reverted_count: usize,
+    emitted_sites: Vec<EmittedSite>,
+    unplaceable: Vec<plan::Unplaceable>,
+    bisect_probes: usize,
+    /// Main verify-loop compiler invocations, excluding bisect probes.
+    verify_rounds: usize,
+    escalated: Option<String>,
+    /// The FIRST verify's diagnostics, before any revert round. The validation
+    /// transfer compares these against the rendered parser 1:1.
+    first_diags: Vec<verify::Diag>,
+    /// What the UNMODIFIED input already reported — the differential's masking
+    /// power per program, and the scope measurement for how many programs
+    /// beyond brotli carry a load-bearing baseline.
+    baseline_keys: usize,
+    baseline_errors: usize,
+    /// Baseline messages embedding their own crate root. Expected zero.
+    baseline_msg_env: usize,
+    /// Edit owners with no `emitted_sites` entry: they carry edits but are
+    /// invisible to span attribution. brotli's divergence class, now counted.
+    attribution_blind: usize,
+    /// The crate root the diagnostics above were OBSERVED against — the temp
+    /// copy's root, not the input tree's.
+    ///
+    /// Carried with [`Self::first_diags`] because the two are one fact: those
+    /// paths are absolute inside a per-run temp directory, so a consumer that
+    /// receives the payload without its frame cannot canonicalize them and is
+    /// left inventing a normalization. That is precisely how a second and then
+    /// a third path canonicalizer came to exist.
+    observed_root: Option<std::path::PathBuf>,
+    overlap_receipt: String,
+    e1_reverts: Vec<E1RevertDiagnostic>,
+    e1_adapter_receipt: String,
+    e1_subject_receipt: String,
+    e2_artifacts: E2Artifacts,
+    raw_boundary_artifacts: RawBoundaryArtifacts,
+    e1_novel_error_count: usize,
+    e1_box_drop_receipt: String,
+    solve_receipt: Option<model_cache::SolveReceipt>,
+}
+
+impl RewriteOutcome {
+    #[cfg(test)]
+    /// The first verify's diagnostics, whichever way the run ended.
+    ///
+    /// An accessor rather than a `match` at the call site: the one-filling-site
+    /// scan is textual and cannot tell a construction from a destructuring, so
+    /// every avoidable naming of a variant outside the two constructors is one
+    /// less false positive for a guard that is otherwise exact.
+    ///
+    /// Hands out the payload and its frame **together** — a caller that could
+    /// take the diagnostics alone would have to invent a normalization for
+    /// their temp-absolute paths, which is how the second and third path
+    /// canonicalizers came to exist.
+    ///
+    /// No `#[allow(dead_code)]`, and the reason is measured rather than
+    /// assumed: `mod bo_c1` IS `#[cfg(test)]`, so in a non-test build the only
+    /// caller is gone — but `diagnose_once` carries its own `allow`, and
+    /// rustc's dead-code pass treats an `allow`ed item as a live root, which
+    /// keeps this reachable. `cargo check` on the non-test build is clean.
+    fn into_capture(self) -> (Option<std::path::PathBuf>, Vec<verify::Diag>) {
+        // ONE LINE PER PATTERN, deliberately: the one-filling-site scan skips a
+        // line carrying `..`, so a destructuring split across lines leaves
+        // `RewriteOutcome::Emitted {` alone on a line and is counted as a
+        // construction. That direction is safe — a multi-line CONSTRUCTION is
+        // still caught by its own first line — but it does fail the guard, as
+        // it did here. Keep these patterns single-line.
+        match self {
+            RewriteOutcome::Emitted {
+                first_diags,
+                observed_root,
+                ..
+            }
+            | RewriteOutcome::Degraded {
+                first_diags,
+                observed_root,
+                ..
+            } => (observed_root, first_diags),
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "consumed only by Item E's cfg(test) one-iteration corpus worker"
+    )]
+    fn into_e1_capture(self) -> Result<E1Capture, String> {
+        let final_degradations = match &self {
+            RewriteOutcome::Emitted { degradations, .. }
+            | RewriteOutcome::Degraded { degradations, .. } => degradations.clone(),
+        };
+        let (
+            observed_root,
+            first_diags,
+            e1_reverts,
+            e1_adapter_receipt,
+            e1_subject_receipt,
+            e2_artifacts,
+            raw_boundary_artifacts,
+            novel_error_count,
+            e1_box_drop_receipt,
+            baseline_keys,
+            baseline_errors,
+            baseline_msg_env,
+            attempted_placements,
+            files_touched,
+            unplaceable,
+            overlap_receipt,
+            solve_receipt,
+            outcome_reason,
+            outcome_kind,
+            escalation,
+            bisect_probes,
+            verify_rounds,
+            reverted_count,
+            emitted_files,
+        ) = match self {
+            RewriteOutcome::Emitted {
+                files,
+                observed_root,
+                first_diags,
+                e1_reverts,
+                e1_adapter_receipt,
+                e1_subject_receipt,
+                e2_artifacts,
+                raw_boundary_artifacts,
+                e1_novel_error_count,
+                e1_box_drop_receipt,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable,
+                overlap_receipt,
+                solve_receipt,
+                escalated,
+                bisect_probes,
+                verify_rounds,
+                reverted_count,
+                ..
+            } => (
+                observed_root,
+                first_diags,
+                e1_reverts,
+                e1_adapter_receipt,
+                e1_subject_receipt,
+                e2_artifacts,
+                raw_boundary_artifacts,
+                e1_novel_error_count,
+                e1_box_drop_receipt,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable.len(),
+                overlap_receipt,
+                solve_receipt,
+                "emitted".to_owned(),
+                CensusOutcomeKind::Emitted,
+                escalated.unwrap_or_default(),
+                bisect_probes,
+                verify_rounds,
+                reverted_count,
+                Some(files),
+            ),
+            RewriteOutcome::Degraded {
+                reason,
+                observed_root,
+                first_diags,
+                e1_reverts,
+                e1_adapter_receipt,
+                e1_subject_receipt,
+                e2_artifacts,
+                raw_boundary_artifacts,
+                e1_novel_error_count,
+                e1_box_drop_receipt,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable,
+                overlap_receipt,
+                solve_receipt,
+                bisect_probes,
+                verify_rounds,
+                reverted_count,
+                ..
+            } => (
+                observed_root,
+                first_diags,
+                e1_reverts,
+                e1_adapter_receipt,
+                e1_subject_receipt,
+                e2_artifacts,
+                raw_boundary_artifacts,
+                e1_novel_error_count,
+                e1_box_drop_receipt,
+                baseline_keys,
+                baseline_errors,
+                baseline_msg_env,
+                emitted_count,
+                files_touched,
+                unplaceable.len(),
+                overlap_receipt,
+                solve_receipt,
+                reason.clone(),
+                CensusOutcomeKind::Degraded,
+                reason,
+                bisect_probes,
+                verify_rounds,
+                reverted_count,
+                None,
+            ),
+        };
+        Ok(E1Capture {
+            observed_root: observed_root
+                .ok_or_else(|| format!("E1 capture has no observed root: {outcome_reason}"))?,
+            reverts: e1_reverts,
+            first_diags,
+            adapter_receipt: e1_adapter_receipt,
+            subject_receipt: e1_subject_receipt,
+            e2_artifacts,
+            raw_boundary_artifacts,
+            novel_error_count,
+            baseline_keys,
+            baseline_errors,
+            baseline_msg_env,
+            attempted_placements,
+            files_touched,
+            unplaceable,
+            overlap_receipt,
+            box_drop_receipt: e1_box_drop_receipt,
+            solve_receipt: solve_receipt
+                .ok_or_else(|| "E1 capture has no solve receipt".to_owned())?,
+            outcome_kind,
+            escalation,
+            bisect_probes,
+            verify_rounds,
+            reverted_count,
+            emitted_files,
+            final_degradations,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlap_receipt(&self) -> &str {
+        match self {
+            Self::Emitted {
+                overlap_receipt, ..
+            }
+            | Self::Degraded {
+                overlap_receipt, ..
+            } => overlap_receipt,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reverted_count(&self) -> usize {
+        match self {
+            Self::Emitted { reverted_count, .. } | Self::Degraded { reverted_count, .. } => {
+                *reverted_count
+            }
+        }
+    }
+}
+
+impl OutcomeFacts {
+    fn stamp_class_costs(&mut self) {
+        let verify_wall_s = self
+            .verify_started
+            .map_or(0.0, |started| started.elapsed().as_secs_f64());
+        let hits = &self.raw_boundary_artifacts.attribution_hits;
+        self.raw_boundary_artifacts.signature_class_count = self.signature_class_count;
+        self.raw_boundary_artifacts.class_bisect_probes = self.bisect_probes;
+        self.raw_boundary_artifacts.class_verify_rounds = self.verify_rounds;
+        self.raw_boundary_artifacts.verify_wall_s = format!("{verify_wall_s:.6}");
+        self.raw_boundary_artifacts.emit_budget_s = self.emit_budget_s.clone();
+        self.raw_boundary_artifacts.class_costs = format!(
+            "{}-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{verify_wall_s:.6}\t{}\n",
+            bridge_receipt::class_cost_header(),
+            self.signature_class_count,
+            hits.exact_edit,
+            hits.exact_seam,
+            hits.related_span,
+            hits.enclosing_region,
+            hits.unresolved,
+            self.bisect_probes,
+            self.verify_rounds,
+            self.emit_budget_s,
+        );
+    }
+
+    fn emitted(
+        mut self,
+        source: String,
+        files: std::collections::BTreeMap<plan::FileKey, String>,
+    ) -> RewriteOutcome {
+        self.stamp_class_costs();
+        // **R517-7** — the placement receipt is an EMISSION fact: the graft
+        // records it during the rounds above, and this is the first point
+        // after them that every exit path passes through.
+        self.raw_boundary_artifacts.twin_placement = decision::counted_void::twin_receipt();
+        RewriteOutcome::Emitted {
+            source,
+            files,
+            files_touched: self.files_touched,
+            degradations: self.degradations,
+            emitted_count: self.emitted_count,
+            excluded: self.excluded,
+            emitted_sites: self.emitted_sites,
+            bisect_probes: self.bisect_probes,
+            verify_rounds: self.verify_rounds,
+            escalated: self.escalated,
+            unplaceable: self.unplaceable,
+            reverted_count: self.reverted_count,
+            attribution_blind: self.attribution_blind,
+            first_diags: self.first_diags,
+            observed_root: self.observed_root,
+            baseline_keys: self.baseline_keys,
+            baseline_errors: self.baseline_errors,
+            baseline_msg_env: self.baseline_msg_env,
+            overlap_receipt: self.overlap_receipt,
+            e1_reverts: self.e1_reverts,
+            e1_adapter_receipt: self.e1_adapter_receipt,
+            e1_subject_receipt: self.e1_subject_receipt,
+            e2_artifacts: self.e2_artifacts,
+            raw_boundary_artifacts: self.raw_boundary_artifacts,
+            e1_novel_error_count: self.e1_novel_error_count,
+            e1_box_drop_receipt: self.e1_box_drop_receipt,
+            solve_receipt: self.solve_receipt,
+        }
+    }
+
+    fn degraded(mut self, reason: String) -> RewriteOutcome {
+        // **R517-7** — the placement receipt is an EMISSION fact: the graft
+        // records it during the rounds above, and this is the first point
+        // after them that every exit path passes through.
+        self.raw_boundary_artifacts.twin_placement = decision::counted_void::twin_receipt();
+        self.raw_boundary_artifacts.degraded_output_receipt =
+            "degraded-unmodified-input".to_owned();
+        for event in &mut self.raw_boundary_artifacts.bridge_events {
+            if event.stage == bridge_receipt::BridgeReceiptStage::Terminal {
+                event.state = bridge_receipt::BridgeReceiptState::Dropped;
+                event.drop_reason = Some("program-degraded-unmodified-input".to_owned());
+            }
+        }
+        for event in &mut self.raw_boundary_artifacts.unsafe_context_events {
+            if event.stage == bridge_receipt::BridgeReceiptStage::Terminal {
+                event.state = bridge_receipt::BridgeReceiptState::Dropped;
+                event.drop_reason = Some("program-degraded-unmodified-input".to_owned());
+                event.terminal_class_disposition = "degraded".to_owned();
+            }
+        }
+        for event in &mut self.raw_boundary_artifacts.mechanical_events {
+            if event.stage == mechanical_receipt::MechanicalStage::Terminal {
+                event.state = mechanical_receipt::MechanicalState::Dropped;
+                event.terminal_reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
+        for row in &mut self.raw_boundary_artifacts.a5_proof_site_fallback_rows {
+            if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
+                row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
+                row.terminal.reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
+        for row in &mut self.raw_boundary_artifacts.slice_construction_rows {
+            if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
+                row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
+                row.terminal.reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
+        for row in &mut self.raw_boundary_artifacts.slice_use_rows {
+            row.terminal_class_state = mechanical_receipt::MechanicalState::Dropped;
+            if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
+                row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
+                row.terminal.reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
+        for row in &mut self.raw_boundary_artifacts.option_rows {
+            if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
+                row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
+                row.terminal.reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
+        for row in &mut self.raw_boundary_artifacts.declaration_rows {
+            row.terminal_class_result = mechanical_receipt::MechanicalState::Dropped;
+            if row.terminal.stage == mechanical_receipt::MechanicalStage::Terminal {
+                row.terminal.state = mechanical_receipt::MechanicalState::Dropped;
+                row.terminal.reason = Some(
+                    mechanical_receipt::MechanicalTerminalReason::ProgramDegradedUnmodifiedInput,
+                );
+            }
+        }
+        self.stamp_class_costs();
+        RewriteOutcome::Degraded {
+            reason,
+            source: self.original_source,
+            files: self.original_files,
+            degradations: self.degradations,
+            excluded: self.excluded,
+            emitted_count: self.emitted_count,
+            files_touched: self.files_touched,
+            emitted_sites: self.emitted_sites,
+            bisect_probes: self.bisect_probes,
+            verify_rounds: self.verify_rounds,
+            unplaceable: self.unplaceable,
+            reverted_count: self.reverted_count,
+            attribution_blind: self.attribution_blind,
+            first_diags: self.first_diags,
+            observed_root: self.observed_root,
+            baseline_keys: self.baseline_keys,
+            baseline_errors: self.baseline_errors,
+            baseline_msg_env: self.baseline_msg_env,
+            overlap_receipt: self.overlap_receipt,
+            e1_reverts: self.e1_reverts,
+            e1_adapter_receipt: self.e1_adapter_receipt,
+            e1_subject_receipt: self.e1_subject_receipt,
+            e2_artifacts: self.e2_artifacts,
+            raw_boundary_artifacts: self.raw_boundary_artifacts,
+            e1_novel_error_count: self.e1_novel_error_count,
+            e1_box_drop_receipt: self.e1_box_drop_receipt,
+            solve_receipt: self.solve_receipt,
+        }
+    }
+}
+
+/// Hard ceiling on revert rounds. Paired with the no-progress detector, never
+/// relied on alone: a cap that fires is a loop that stopped being understood.
+const MAX_REVERT_ROUNDS: usize = 8;
+/// The verify loop's recovery budget in seconds: a class recovery projected past it is deferred
+/// and the program degrades. Fixed at the record's 900 s (the switch `CRAT_BOC1_EMIT_TIMEOUT_SECS`,
+/// the master-merge cleanup S3, the user's word in main's session 11-02).
+const EMIT_BUDGET_S: u32 = 900;
+const MAX_CLASS_ATTEMPTS: usize = 3;
+/// Raw-boundary atom mode is one bounded retry, never a repair loop.
+const MAX_ATOM_REVERIFIES: usize = 1;
+
+/// Where one planned edit landed, in the lines a diagnostic is reported in.
+///
+/// **S3.6-1 task 2.** The plan's edits are byte ranges into the original text;
+/// a diagnostic carries a line. The conversion is done once, in the driver,
+/// from the texts the plan was rendered against — no compiler session, and no
+/// second derivation of either quantity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EditSite {
+    pub file: String,
+    /// Direct signature-class ownership. `None` is only the derived crate-level
+    /// fallback extent declaration.
+    pub owner_class: Option<bridge_receipt::SignatureClassId>,
+    /// Display-only path for receipts.
+    pub fn_path: String,
+    pub lo_line: usize,
+    pub lo_column: usize,
+    pub hi_line: usize,
+    pub hi_column: usize,
+    /// Stable plan-edit identity used only in atom coverage/receipts.
+    pub edit_id: String,
+    /// Typed interval role used by attribution precedence.
+    pub site_kind: &'static str,
+    /// Already-expanded subject dependency group.
+    pub atom_ids: Vec<String>,
+    /// False means another edit under this owner has no atom coverage, so the
+    /// verifier must use the established function fallback.
+    pub atom_covered: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct EditKey {
+    owner: String,
+    subject: String,
+    arms: String,
+    kind: &'static str,
+    file: String,
+    lo: usize,
+    hi: usize,
+    replacement_sha256: String,
+}
+
+impl EditKey {
+    fn render(&self) -> String {
+        format!(
+            "owner={}|subject={}|arms={}|kind={}|interval={}:{}:{}|replacement_sha256={}",
+            self.owner,
+            self.subject,
+            self.arms,
+            self.kind,
+            self.file,
+            self.lo,
+            self.hi,
+            self.replacement_sha256,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AtomSelectionKind {
+    Exact,
+    GroupAtomic,
+    BisectGroup,
+    Fallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AtomSelection {
+    pub kind: AtomSelectionKind,
+    pub atoms: std::collections::BTreeSet<String>,
+    pub reason: &'static str,
+}
+
+fn atom_fallback(reason: &'static str) -> AtomSelection {
+    AtomSelection {
+        kind: AtomSelectionKind::Fallback,
+        atoms: std::collections::BTreeSet::new(),
+        reason,
+    }
+}
+
+/// wave-6k (relay 009 §3): the fourth column attributes every identity —
+/// `verify-reverted` (the loop reverted it from a diagnostic or a bisect),
+/// `held:<reason>` (held at plan finalization; `dependency-class-held:<root>`
+/// is the planning-time closure) or `closure:partition` (reached only by the
+/// input-reversion closure at the partition). The first two columns are the
+/// ones every consumer parses.
+/// R451-2(2). The head of a final-reverts attribution: the cause a root table
+/// groups by, with the class ids and site details that make each row unique
+/// stripped. `held:dependency-class-held:1107` -> `dependency-class-held`,
+/// `held:dropped-site:seam-site-overlap:seam-site-overlap` -> `dropped-site`,
+/// `closure:partition` and `verify-reverted` are their own heads. Derived, never
+/// stored: the projection is the same one main's re-itemizer has applied to
+/// every batch's non-delivered table.
+/// R451-2(2). The subjects each withheld class actually took with it, as the
+/// lanes name them. One row per owner path already; this is the other half a
+/// reader needs to recognise the row without joining the subject ledger.
+fn reverted_named_subjects(
+    taken: &[&EmittedSubject],
+) -> std::collections::BTreeMap<bridge_receipt::SignatureClassId, std::collections::BTreeSet<String>>
+{
+    let mut out = std::collections::BTreeMap::<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >::new();
+    for subject in taken {
+        out.entry(subject.owner_class)
+            .or_default()
+            .insert(subject.subject.clone());
+    }
+    out
+}
+
+pub(crate) fn raw_boundary_reason_head(attribution: &str) -> String {
+    match attribution.split_once(':') {
+        Some(("held", rest)) => rest.split(':').next().unwrap_or(rest).to_owned(),
+        Some(("closure", _)) | None => attribution.to_owned(),
+        Some((head, _)) => head.to_owned(),
+    }
+}
+
+/// **R477-6 (wave-6k 027) — every reverted class names itself.** `class_paths`
+/// is filled from planned edits, emitted sites and emitted subjects only, so a
+/// class HELD before it produced any of the three had no entry and the
+/// final-reverts artifact wrote `<unknown-local-class>`: 161 rows over eight
+/// programs at batch 16, five of them 100 % unnamed, every row carrying its
+/// class id and its reason head. The run knows the path — `tcx.def_path_str` is
+/// the same call `mechanical_receipt` makes for its `owner_path` column — so
+/// the identity is a lookup, not a derivation. An existing entry wins, so no
+/// already-named row moves, and `class_owner_paths` is deliberately untouched:
+/// R430-1 renders one row per OWNER path, and seeding it would invent rows.
+fn name_reverted_classes(
+    tcx: TyCtxt<'_>,
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    class_paths: &mut std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
+) {
+    for &class in reverted {
+        class_paths
+            .entry(class)
+            .or_insert_with(|| tcx.def_path_str(class.local_def_id().to_def_id()));
+    }
+}
+
+/// **R482-3** — whether this function's PARTITION ROOT is the interface dependency, read
+/// from `partition_reasons` exactly as `root` is. A member is rooted there; a seed is not,
+/// and that is the only difference between them.
+fn interface_dependency_rooted(
+    partition_reasons: &std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >,
+    function: bridge_receipt::SignatureClassId,
+) -> bool {
+    partition_reasons
+        .get(&function)
+        .and_then(|reasons| reasons.iter().next())
+        .is_some_and(|reason| reason.starts_with("input-interface-dependency-reverted"))
+}
+
+fn render_raw_boundary_final_reverts(
+    functions: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    atoms: &std::collections::BTreeSet<String>,
+    named_subjects: &std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >,
+    partition_reasons: &std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >,
+    display_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
+    owner_paths: &std::collections::BTreeMap<
+        bridge_receipt::SignatureClassId,
+        std::collections::BTreeSet<String>,
+    >,
+    verify_reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    emission_plan: Option<&plan::Plan>,
+) -> String {
+    // R451-2(2): three derived columns so the root table reads without a join —
+    // the subject a lane recognises, the root that drove a partition member, and
+    // the attribution's head (`reason` itself is a production key and is never
+    // overloaded: main report 046 §6, accepted).
+    let mut out = String::from(
+        "kind\tidentity\tclass_id\tattribution\tnamed_subject\tpartition_root\treason_head\tinterface_seed\n",
+    );
+    // **The orphan column (R471-2)** — `input-interface-dependency-reverted` names no
+    // interface, so a member held by one could not be routed. The seeds are the reverted
+    // classes that are NOT themselves dependents; every other member resolves to the
+    // nearest one, or to `orphan` when the graph does not reach a seed at all.
+    // **R482-3** — the seed set reads `partition_reasons`, the SAME source as `root`.
+    //
+    // It used to filter on `hold_reasons()`, where the root string never appears: a
+    // member's hold reason is `dependency-class-held:N`. So the filter excluded nothing,
+    // every member was in its own seed set, `seed_reaching` took its "a seed is not
+    // reached BY anything" early return for every row, and all 56 rendered `orphan`.
+    //
+    // R472-6 moved the CONSUMER to `partition_root` and left the producer of the seed set
+    // behind; the witness pinned the consumer's field and not the seed set's, so it
+    // passed. Both are now read from one place and the witness pins that they agree.
+    let interface_seeds = functions
+        .iter()
+        .copied()
+        .filter(|function| !interface_dependency_rooted(partition_reasons, *function))
+        .collect::<std::collections::BTreeSet<_>>();
+    let graft_held = ast_transform::graft_held_attributions();
+    for &function in functions {
+        // **R430-1 — one row per OWNER PATH of the withheld class.** The census
+        // marks a subject reverted by its owner path; a class-mate this
+        // artifact does not name keeps a `realized` row over verbatim text.
+        let owners = owner_paths
+            .get(&function)
+            .filter(|paths| !paths.is_empty())
+            .map(|paths| paths.iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_else(|| {
+                vec![
+                    display_paths
+                        .get(&function)
+                        .cloned()
+                        .unwrap_or_else(|| "<unknown-local-class>".to_owned()),
+                ]
+            });
+        let attribution = if let Some(held) = graft_held.get(&function.order_key()) {
+            // R547-6: the floor's revert names the arm that yielded, not the verify loop.
+            held.clone()
+        } else if verify_reverted.contains(&function) {
+            "verify-reverted".to_owned()
+        } else if let Some(reason) = emission_plan.and_then(|plan| {
+            plan.class_finalization
+                .classes
+                .get(&function)
+                .and_then(|class| class.hold_reasons().first())
+        }) {
+            format!("held:{reason}")
+        } else {
+            "closure:partition".to_owned()
+        };
+        let named = named_subjects
+            .get(&function)
+            .filter(|subjects| !subjects.is_empty())
+            .map_or_else(
+                || "-".to_owned(),
+                |subjects| subjects.iter().cloned().collect::<Vec<_>>().join(" "),
+            );
+        let root = partition_reasons
+            .get(&function)
+            .and_then(|reasons| reasons.iter().next().cloned())
+            .unwrap_or_else(|| "-".to_owned());
+        let head = raw_boundary_reason_head(&attribution);
+        // The orphan column: `-` for a seed (nothing reached it), the reaching class for
+        // a member, `orphan` for a member the graph does not connect to any seed.
+        // **R472-6** — keyed on `root`, NOT `attribution`. The first real reading caught
+        // this: every one of the 137 members carries the root in `partition_root` and
+        // `attribution` reads `closure:partition`, so the column tested a field that is
+        // never set and emitted `-` for all 364 rows. An instrument that names nothing
+        // looks exactly like a corpus with nothing to name, which is why it had to be
+        // read against a frame that has the rows before it could be believed.
+        let seed = if !interface_dependency_rooted(partition_reasons, function) {
+            "-".to_owned()
+        } else {
+            emission_plan
+                .and_then(|plan| {
+                    plan.terminal_call_plans
+                        .return_origin_dependencies
+                        .seed_reaching(function, &interface_seeds)
+                })
+                .map(|seed| {
+                    display_paths
+                        .get(&seed)
+                        .cloned()
+                        .unwrap_or_else(|| format!("local-def-index:{}", seed.order_key()))
+                })
+                .unwrap_or_else(|| "orphan".to_owned())
+        };
+        for path in owners {
+            out.push_str(&format!(
+                "function\t{path}\tlocal-def-index:{}\t{attribution}\t{named}\t{root}\t{head}\t{seed}\n",
+                function.order_key()
+            ));
+        }
+    }
+    for atom in atoms {
+        out.push_str(&format!(
+            "atom\t{atom}\t-\tatom-reverted\t-\t-\tatom-reverted\t-\n"
+        ));
+    }
+    out
+}
+
+/// **R517-8** — the class-hold receipt table.
+/// The columns of `<p>.raw-boundary-a5-hold-views.tsv` (main 166).
+pub(crate) const A5_HOLD_VIEW_HEADER: &str = "caller\tcallee\tcall_span\targ\tshape\targument\troot\troot_terminal_form\ttarget_terminal_form";
+
+fn render_a5_hold_views(rows: &[String]) -> String {
+    let mut out = format!("{A5_HOLD_VIEW_HEADER}\n");
+    for row in rows {
+        out.push_str(row);
+        out.push('\n');
+    }
+    out
+}
+
+#[test]
+fn main_166_a5_hold_views_render_one_row_per_held_view_under_the_header() {
+    let rows = vec!["c\tf\t1..2\t0\taddr-of-mut\t&mut *p.offset(i)\tp\tSlice\tRaw".to_owned()];
+    assert_eq!(
+        render_a5_hold_views(&rows),
+        format!("{A5_HOLD_VIEW_HEADER}\n{}\n", rows[0])
+    );
+    assert_eq!(
+        render_a5_hold_views(&[]),
+        format!("{A5_HOLD_VIEW_HEADER}\n")
+    );
+}
+
+fn render_class_held_drops(
+    plan: &plan::Plan,
+    class_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
+) -> String {
+    let mut out = bridge_receipt::class_held_drop_header();
+    for drop in &plan.class_held_drops {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            drop.class.order_key(),
+            class_paths
+                .get(&drop.class)
+                .map_or("<unknown-local-class>", String::as_str),
+            drop.reason.replace(['\t', '\r', '\n'], " "),
+            drop.dropped_edits,
+        ));
+    }
+    out
+}
+
+fn render_class_collisions(plan: &plan::Plan) -> String {
+    let mut out = bridge_receipt::class_collision_header();
+    for collision in &plan.class_finalization.collisions {
+        out.push_str(&format!(
+            "-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            collision.left_class.order_key(),
+            collision.right_class.order_key(),
+            collision.left_edit_key,
+            collision.right_edit_key,
+            collision.file,
+            collision.lo,
+            collision.hi,
+            collision.left_kind,
+            collision.right_kind,
+        ));
+    }
+    out
+}
+
+fn ready_classes(
+    plan: &plan::Plan,
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
+    plan.class_finalization
+        .classes
+        .values()
+        .filter(|class| class.is_ready())
+        .map(|class| class.id)
+        .collect()
+}
+
+fn record_unresolved_classes(
+    artifacts: &mut RawBoundaryArtifacts,
+    classes: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    display_paths: &std::collections::BTreeMap<bridge_receipt::SignatureClassId, String>,
+    reason: &str,
+) {
+    let reason = reason.replace(['\t', '\r', '\n'], " ");
+    let mut out = bridge_receipt::unresolved_class_header();
+    for class in classes {
+        out.push_str(&format!(
+            "-\t{}\t{}\t{}\n",
+            class.order_key(),
+            display_paths
+                .get(class)
+                .map_or("<unknown-local-class>", String::as_str),
+            reason,
+        ));
+    }
+    artifacts.unresolved_classes = out;
+}
+
+/// Pure selection over original-source lines. Production first translates
+/// rustc's emitted lines back to these coordinates; the unit witnesses use it
+/// directly so exact-vs-group-vs-fallback is observable without a compiler.
+pub(crate) fn select_atoms_on_original_lines(
+    diags: &[verify::Diag],
+    edits: &[EditSite],
+) -> AtomSelection {
+    let mut files = edits
+        .iter()
+        .map(|edit| edit.file.as_str())
+        .collect::<Vec<_>>();
+    files.sort_unstable();
+    files.dedup();
+    let single_file = files.len() <= 1;
+    let at = |file: &str, lo: (usize, usize), hi: (usize, usize)| {
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        edits
+            .iter()
+            .filter(|edit| {
+                (single_file || edit.file == file)
+                    && lo <= (edit.hi_line, edit.hi_column)
+                    && (edit.lo_line, edit.lo_column) <= hi
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut selected = std::collections::BTreeSet::new();
+    let mut grouped = false;
+    for diagnostic in diags {
+        let primary = at(
+            &diagnostic.file,
+            (diagnostic.line, diagnostic.column),
+            (diagnostic.end_line, diagnostic.end_column),
+        );
+        if primary.is_empty() {
+            return atom_fallback("atom-attribution-ambiguous");
+        }
+        if primary
+            .iter()
+            .any(|edit| !edit.atom_covered || edit.atom_ids.is_empty())
+        {
+            return atom_fallback("atom-coverage-incomplete");
+        }
+        let alias_group = matches!(diagnostic.code.as_deref(), Some("E0499" | "E0502"));
+        let primary_groups = primary
+            .iter()
+            .map(|edit| edit.atom_ids.as_slice())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !alias_group && primary_groups.len() != 1 {
+            let groups = primary_groups
+                .into_iter()
+                .map(|group| group.to_vec())
+                .collect::<Vec<_>>();
+            if groups.len() < 2 {
+                return atom_fallback("atom-attribution-ambiguous");
+            }
+            // One deterministic half only. The following compiler pass is the
+            // sole experiment: success keeps the sibling half, failure falls
+            // back to the established function-level revert. There is no
+            // recursive search and MAX_ATOM_REVERIFIES remains one.
+            let take = groups.len().div_ceil(2);
+            let atoms = groups
+                .into_iter()
+                .take(take)
+                .flatten()
+                .collect::<std::collections::BTreeSet<_>>();
+            return AtomSelection {
+                kind: AtomSelectionKind::BisectGroup,
+                atoms,
+                reason: "atom-bounded-group-bisection",
+            };
+        }
+        for edit in primary {
+            selected.extend(edit.atom_ids.iter().cloned());
+        }
+        if alias_group {
+            grouped = true;
+            for related in &diagnostic.related {
+                let related_sites = at(
+                    &related.file,
+                    (related.line, related.column),
+                    (related.end_line, related.end_column),
+                );
+                if related_sites
+                    .iter()
+                    .any(|edit| !edit.atom_covered || edit.atom_ids.is_empty())
+                {
+                    return atom_fallback("atom-coverage-incomplete");
+                }
+                for edit in related_sites {
+                    selected.extend(edit.atom_ids.iter().cloned());
+                }
+            }
+        }
+    }
+    if selected.is_empty() {
+        return atom_fallback("atom-attribution-ambiguous");
+    }
+    AtomSelection {
+        kind: if grouped || selected.len() > 1 {
+            AtomSelectionKind::GroupAtomic
+        } else {
+            AtomSelectionKind::Exact
+        },
+        atoms: selected,
+        reason: if grouped {
+            "atom-related-span-group"
+        } else {
+            "atom-exact"
+        },
+    }
+}
+
+fn select_subject_atoms(
+    diags: &[verify::Diag],
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+    observed_root: &std::path::Path,
+    edits: &[EditSite],
+    original_root: &std::path::Path,
+) -> AtomSelection {
+    let maps = line_maps
+        .iter()
+        .map(|(key, map)| {
+            let original = match key {
+                plan::FileKey::Real(path) => path.display().to_string(),
+                plan::FileKey::Virtual(name) => name.clone(),
+            };
+            (
+                verify::crate_relative(&original, original_root),
+                original,
+                map,
+            )
+        })
+        .collect::<Vec<_>>();
+    let edit_files = edits
+        .iter()
+        .map(|edit| edit.file.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let translate = |file: &str, line: usize, column: usize| {
+        let relative = verify::crate_relative(file, observed_root);
+        let matched = maps
+            .iter()
+            .filter(|(candidate, _, _)| *candidate == relative)
+            .collect::<Vec<_>>();
+        if let [(_, original, map)] = matched.as_slice() {
+            let (line, column) = map.to_original_point(line, column);
+            return ((*original).clone(), line, column);
+        }
+        if maps.len() == 1 {
+            let (line, column) = maps[0].2.to_original_point(line, column);
+            return (maps[0].1.clone(), line, column);
+        }
+        let matching_files = edit_files
+            .iter()
+            .filter(|candidate| verify::crate_relative(candidate, original_root) == relative)
+            .cloned()
+            .collect::<Vec<_>>();
+        if let [original] = matching_files.as_slice() {
+            (original.clone(), line, column)
+        } else {
+            (file.to_owned(), line, column)
+        }
+    };
+    let translated = diags
+        .iter()
+        .map(|diagnostic| {
+            let (file, line, column) =
+                translate(&diagnostic.file, diagnostic.line, diagnostic.column);
+            let (_, end_line, end_column) =
+                translate(&diagnostic.file, diagnostic.end_line, diagnostic.end_column);
+            let related = diagnostic
+                .related
+                .iter()
+                .map(|related| {
+                    let (file, line, column) =
+                        translate(&related.file, related.line, related.column);
+                    let (_, end_line, end_column) =
+                        translate(&related.file, related.end_line, related.end_column);
+                    verify::RelatedDiag {
+                        file,
+                        line,
+                        column,
+                        end_line,
+                        end_column,
+                        message: related.message.clone(),
+                    }
+                })
+                .collect();
+            verify::Diag {
+                file,
+                line,
+                column,
+                end_line,
+                end_column,
+                message: diagnostic.message.clone(),
+                direction: diagnostic.direction,
+                code: diagnostic.code.clone(),
+                related,
+            }
+        })
+        .collect::<Vec<_>>();
+    select_atoms_on_original_lines(&translated, edits)
+}
+
+#[cfg(test)]
+pub(crate) fn atom_surviving_edit_ids(
+    edits: &[EditSite],
+    reverted: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    edits
+        .iter()
+        .filter(|edit| edit.atom_ids.iter().all(|atom| !reverted.contains(atom)))
+        .map(|edit| edit.edit_id.clone())
+        .collect()
+}
+
+/// Line range of a byte range in `text`, 1-based, inclusive.
+fn line_span(text: &str, lo: usize, hi: usize) -> (usize, usize) {
+    let count = |upto: usize| {
+        text.get(..upto.min(text.len()))
+            .map_or(1, |s| s.matches('\n').count() + 1)
+    };
+    (count(lo), count(hi))
+}
+
+/// Display coordinates of a byte range, 1-based and end-exclusive.
+fn source_span(text: &str, lo: usize, hi: usize) -> (usize, usize, usize, usize) {
+    let point = |at: usize| {
+        let at = at.min(text.len());
+        let line = text[..at].matches('\n').count() + 1;
+        let line_start = text[..at].rfind('\n').map_or(0, |index| index + 1);
+        (line, text[line_start..at].chars().count() + 1)
+    };
+    let (lo_line, lo_column) = point(lo);
+    let (hi_line, hi_column) = point(hi);
+    (lo_line, lo_column, hi_line, hi_column)
+}
+
+/// Every planned edit, located in lines.
+fn edit_sites(
+    planned: &plan::Plan,
+    texts: &std::collections::BTreeMap<plan::FileKey, String>,
+) -> Vec<EditSite> {
+    let mut owners_with_atoms = std::collections::BTreeSet::new();
+    let mut owners_with_uncovered_edits = std::collections::BTreeSet::new();
+    for edit in planned.by_file.values().flatten() {
+        let Some(owner_class) = edit.owner_class else {
+            continue;
+        };
+        if edit.atom_ids.is_empty() {
+            owners_with_uncovered_edits.insert(owner_class);
+        } else {
+            owners_with_atoms.insert(owner_class);
+        }
+    }
+    let mut out = Vec::new();
+    for (key, edits) in &planned.by_file {
+        let Some(text) = texts.get(key) else {
+            continue;
+        };
+        let file = match key {
+            plan::FileKey::Real(path) => path.display().to_string(),
+            plan::FileKey::Virtual(name) => name.clone(),
+        };
+        for edit in edits {
+            let (lo_line, lo_column, hi_line, hi_column) = source_span(text, edit.lo, edit.hi);
+            let replacement_sha256 = {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(edit.replacement.as_bytes()))
+            };
+            let edit_key = EditKey {
+                owner: edit.owner_path.clone(),
+                subject: edit.subject_id.clone(),
+                arms: edit.required_arms.clone(),
+                kind: edit.edit_kind,
+                file: file.clone(),
+                lo: edit.lo,
+                hi: edit.hi,
+                replacement_sha256,
+            };
+            out.push(EditSite {
+                file: file.clone(),
+                owner_class: edit.owner_class,
+                fn_path: edit.owner_path.clone(),
+                lo_line,
+                lo_column,
+                hi_line,
+                hi_column,
+                edit_id: edit_key.render(),
+                site_kind: edit.edit_kind,
+                atom_ids: edit.atom_ids.clone(),
+                atom_covered: !edit.atom_ids.is_empty()
+                    && edit
+                        .owner_class
+                        .is_some_and(|owner| owners_with_atoms.contains(&owner))
+                    && edit
+                        .owner_class
+                        .is_some_and(|owner| !owners_with_uncovered_edits.contains(&owner)),
+            });
+        }
+    }
+    for interval in &planned.attribution_intervals {
+        let Some(text) = texts.get(&interval.file) else {
+            continue;
+        };
+        let file = match &interval.file {
+            plan::FileKey::Real(path) => path.display().to_string(),
+            plan::FileKey::Virtual(name) => name.clone(),
+        };
+        let (lo_line, lo_column, hi_line, hi_column) = source_span(text, interval.lo, interval.hi);
+        out.push(EditSite {
+            file,
+            owner_class: Some(interval.owner_class),
+            fn_path: interval.owner_path.clone(),
+            lo_line,
+            lo_column,
+            hi_line,
+            hi_column,
+            edit_id: format!(
+                "class={}|attribution={}:{}:{}|kind={}",
+                interval.owner_class.order_key(),
+                match &interval.file {
+                    plan::FileKey::Real(path) => path.display().to_string(),
+                    plan::FileKey::Virtual(name) => name.clone(),
+                },
+                interval.lo,
+                interval.hi,
+                interval.kind,
+            ),
+            site_kind: interval.kind,
+            atom_ids: Vec::new(),
+            atom_covered: false,
+        });
+    }
+    out
+}
+
+fn e1_edit_contexts(
+    planned: &plan::Plan,
+    texts: &std::collections::BTreeMap<plan::FileKey, String>,
+) -> Vec<(bridge_receipt::SignatureClassId, String, E1EditContext)> {
+    let mut out = Vec::new();
+    for (key, edits) in &planned.by_file {
+        let Some(text) = texts.get(key) else {
+            continue;
+        };
+        let file = match key {
+            plan::FileKey::Real(path) => path.display().to_string(),
+            plan::FileKey::Virtual(name) => name.clone(),
+        };
+        for edit in edits {
+            let Some(owner_class) = edit.owner_class else {
+                continue;
+            };
+            let (lo_line, hi_line) = line_span(text, edit.lo, edit.hi);
+            let replacement_head = edit
+                .replacement
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(160)
+                .collect();
+            out.push((
+                owner_class,
+                edit.owner_path.clone(),
+                E1EditContext {
+                    file: file.clone(),
+                    lo_line,
+                    hi_line,
+                    shape: format!("{:?}", edit.justification),
+                    replacement_head,
+                },
+            ));
+        }
+    }
+    out.sort_by(|left, right| {
+        (
+            left.0,
+            left.1.as_str(),
+            left.2.file.as_str(),
+            left.2.lo_line,
+            left.2.hi_line,
+            left.2.shape.as_str(),
+        )
+            .cmp(&(
+                right.0,
+                right.1.as_str(),
+                right.2.file.as_str(),
+                right.2.lo_line,
+                right.2.hi_line,
+                right.2.shape.as_str(),
+            ))
+    });
+    out
+}
+
+/// Functions whose own rewrite is implicated by these diagnostics.
+///
+/// Direction is recorded on the diagnostic and reported, but is deliberately
+/// NOT consulted here: it is diagnostic, not a router — the no-progress
+/// detector decides escalation, so a mis-attribution is caught by measurement
+/// rather than pre-empted by a heuristic that could be wrong.
+///
+/// # The S3 repair (task 2), and what it does and does not fix
+///
+/// Attribution used to be span containment against each rewritten subject's own
+/// **function extent**, and nothing else. That is sound only while every edit
+/// sits inside a function that holds a subject — true through S3.2′, and
+/// **false the moment call-site adaptation emits into a caller file**: the
+/// diagnostic then lands in a function that may hold no subject at all, so it
+/// attributes to nobody, the revert loop cannot converge on the culprit, and it
+/// falls through to bisect, which "may revert more than strictly necessary".
+///
+/// So an **edit range is consulted first**: a diagnostic inside a planned
+/// edit's own lines names the subject that justifies that edit — which is
+/// `Edit::owner_fn`, the CALLEE, even when the edit is in the caller's file.
+/// Function-extent containment stays as the fallback, because most diagnostics
+/// land near an edit rather than on it.
+///
+/// **Stated as a residual rather than claimed away:** a diagnostic in a caller
+/// function that holds neither an edit nor a subject — the zero-text adaptation
+/// case, where the caller's argument needs no change at all — still attributes
+/// to nobody. That case is what escalation and bisect exist for, and
+/// `attribution_blind` is what counts it.
+fn e1_bijective_line(
+    diagnostic: &verify::Diag,
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+    observed_root: &std::path::Path,
+    original_root: &std::path::Path,
+) -> Option<usize> {
+    let diagnostic_file = verify::crate_relative(&diagnostic.file, observed_root);
+    let mut candidates = line_maps
+        .iter()
+        .filter_map(|(key, map)| match key {
+            plan::FileKey::Real(path)
+                if verify::crate_relative(&path.display().to_string(), original_root)
+                    == diagnostic_file =>
+            {
+                Some(map)
+            }
+            plan::FileKey::Virtual(name) if *name == diagnostic_file => Some(map),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() && line_maps.len() == 1 {
+        candidates.extend(line_maps.values());
+    }
+    if candidates.len() != 1 {
+        return None;
+    }
+    candidates[0].to_original_if_bijective(diagnostic.line)
+}
+
+fn e1_region_owners(
+    diagnostic: &verify::Diag,
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+    observed_root: &std::path::Path,
+    original_root: &std::path::Path,
+    sites: &[EmittedSite],
+    edits: &[EditSite],
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
+    let diagnostic_file = verify::crate_relative(&diagnostic.file, observed_root);
+    let mut maps = line_maps
+        .iter()
+        .filter_map(|(key, map)| match key {
+            plan::FileKey::Real(path)
+                if verify::crate_relative(&path.display().to_string(), original_root)
+                    == diagnostic_file =>
+            {
+                Some(map)
+            }
+            plan::FileKey::Virtual(name) if *name == diagnostic_file => Some(map),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if maps.is_empty() && line_maps.len() == 1 {
+        maps.extend(line_maps.values());
+    }
+    let Some((lo, hi)) = (maps.len() == 1)
+        .then(|| maps[0].original_region(diagnostic.line))
+        .flatten()
+    else {
+        return std::collections::BTreeSet::new();
+    };
+    let single_file = line_maps.len() == 1;
+    let same_file =
+        |file: &str| single_file || verify::crate_relative(file, original_root) == diagnostic_file;
+    let mut owners = edits
+        .iter()
+        .filter(|edit| same_file(&edit.file) && edit.lo_line <= hi && lo <= edit.hi_line)
+        .filter_map(|edit| edit.owner_class)
+        .collect::<std::collections::BTreeSet<_>>();
+    if owners.is_empty() {
+        owners.extend(
+            sites
+                .iter()
+                .filter(|site| same_file(&site.file) && site.lo_line <= hi && lo <= site.hi_line)
+                .map(|site| site.owner_class),
+        );
+    }
+    owners
+}
+
+fn e1_diagnostic_site(diagnostic: &verify::Diag) -> E1DiagnosticSite {
+    let callee_relation = diagnostic.message.contains("function defined here")
+        || diagnostic
+            .related
+            .iter()
+            .any(|related| related.message.contains("function defined here"));
+    if callee_relation {
+        E1DiagnosticSite::CallBoundary
+    } else if diagnostic.direction == verify::Direction::RawIntoRewritten
+        || (matches!(diagnostic.code.as_deref(), Some("E0308" | "ErrCode(308)"))
+            && diagnostic.message.contains("found raw pointer"))
+    {
+        E1DiagnosticSite::BodyExpression
+    } else {
+        E1DiagnosticSite::Other
+    }
+}
+
+#[cfg(test)]
+fn e1_call_site_not_adapted(diagnostic: &verify::Diag) -> bool {
+    e1_diagnostic_site(diagnostic) == E1DiagnosticSite::CallBoundary
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AttributionRule {
+    ExactEdit,
+    ExactSeam,
+    RelatedSpan,
+    EnclosingRegion,
+    Unresolved,
+}
+
+impl AttributionRule {
+    #[cfg(test)]
+    pub(crate) const ALL: [Self; 5] = [
+        Self::ExactEdit,
+        Self::ExactSeam,
+        Self::RelatedSpan,
+        Self::EnclosingRegion,
+        Self::Unresolved,
+    ];
+
+    #[cfg(test)]
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::ExactEdit => "exact-edit",
+            Self::ExactSeam => "exact-seam",
+            Self::RelatedSpan => "related-span",
+            Self::EnclosingRegion => "enclosing-region",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AttributionResult {
+    pub(crate) classes: std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    pub(crate) rule: AttributionRule,
+}
+
+fn seam_site_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "seam-adapter"
+            | "seam-site"
+            | "body-adapter"
+            | "pair-raw-view"
+            | "address-observation"
+            | "c9-mark"
+            | "raw-boundary-atom"
+            | "interface-inventory-site"
+    )
+}
+
+pub(crate) fn attribute_with_rule(
+    diagnostic: &verify::Diag,
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+    observed_root: &std::path::Path,
+    sites: &[EmittedSite],
+    edits: &[EditSite],
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    original_root: &std::path::Path,
+) -> AttributionResult {
+    let edits: Vec<&EditSite> = edits
+        .iter()
+        .filter(|edit| {
+            edit.owner_class
+                .is_some_and(|class| !reverted.contains(&class))
+        })
+        .collect();
+    let sites = sites
+        .iter()
+        .filter(|site| !reverted.contains(&site.owner_class))
+        .collect::<Vec<_>>();
+    let single_file = {
+        let mut files: Vec<&str> = sites
+            .iter()
+            .map(|s| s.file.as_str())
+            .chain(edits.iter().map(|e| e.file.as_str()))
+            .collect();
+        files.sort_unstable();
+        files.dedup();
+        files.len() <= 1
+    };
+    let maps_by_rel: std::collections::BTreeMap<String, &apply::LineMap> = line_maps
+        .iter()
+        .filter_map(|(key, map)| match key {
+            plan::FileKey::Real(path) => Some((
+                verify::crate_relative(&path.display().to_string(), original_root),
+                map,
+            )),
+            plan::FileKey::Virtual(name) => Some((name.clone(), map)),
+        })
+        .collect();
+    let translate = |file: &str, line: usize, column: usize| {
+        let relative = verify::crate_relative(file, observed_root);
+        let point = maps_by_rel
+            .get(&relative)
+            .or(if maps_by_rel.len() == 1 {
+                maps_by_rel.values().next()
+            } else {
+                None
+            })
+            .map_or((line, column), |map| map.to_original_point(line, column));
+        (relative, point)
+    };
+    let overlaps = |left_lo: (usize, usize), left_hi: (usize, usize), edit: &&EditSite| {
+        let (left_lo, left_hi) = if left_lo <= left_hi {
+            (left_lo, left_hi)
+        } else {
+            (left_hi, left_lo)
+        };
+        left_lo <= (edit.hi_line, edit.hi_column) && (edit.lo_line, edit.lo_column) <= left_hi
+    };
+    let exact_edits = |diagnostic: &verify::Diag, seam: bool| {
+        let (relative, lo) = translate(&diagnostic.file, diagnostic.line, diagnostic.column);
+        let (_, hi) = translate(&diagnostic.file, diagnostic.end_line, diagnostic.end_column);
+        edits
+            .iter()
+            .filter(|edit| seam_site_kind(edit.site_kind) == seam)
+            .filter(|edit| {
+                single_file || verify::crate_relative(&edit.file, original_root) == relative
+            })
+            .filter(|edit| overlaps(lo, hi, edit))
+            .filter_map(|edit| edit.owner_class)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let exact_sites = |file: &str, line: usize| {
+        let (relative, (line, _)) = translate(file, line, 1);
+        sites
+            .iter()
+            .filter(|site| {
+                single_file || verify::crate_relative(&site.file, original_root) == relative
+            })
+            .filter(|site| site.lo_line <= line && line <= site.hi_line)
+            .map(|site| site.owner_class)
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    let ordinary = exact_edits(diagnostic, false);
+    if !ordinary.is_empty() {
+        return AttributionResult {
+            classes: ordinary,
+            rule: AttributionRule::ExactEdit,
+        };
+    }
+    let seam = exact_edits(diagnostic, true);
+    if !seam.is_empty() {
+        return AttributionResult {
+            classes: seam,
+            rule: AttributionRule::ExactSeam,
+        };
+    }
+    let mut related_classes = std::collections::BTreeSet::new();
+    for related in &diagnostic.related {
+        let related = verify::Diag {
+            file: related.file.clone(),
+            line: related.line,
+            column: related.column,
+            end_line: related.end_line,
+            end_column: related.end_column,
+            message: related.message.clone(),
+            direction: verify::Direction::Other,
+            code: diagnostic.code.clone(),
+            related: Vec::new(),
+        };
+        related_classes.extend(exact_edits(&related, false));
+        related_classes.extend(exact_edits(&related, true));
+        if related_classes.is_empty() {
+            related_classes.extend(exact_sites(&related.file, related.line));
+        }
+    }
+    if !related_classes.is_empty() {
+        return AttributionResult {
+            classes: related_classes,
+            rule: AttributionRule::RelatedSpan,
+        };
+    }
+    let enclosing = exact_sites(&diagnostic.file, diagnostic.line);
+    if enclosing.len() == 1 {
+        return AttributionResult {
+            classes: enclosing,
+            rule: AttributionRule::EnclosingRegion,
+        };
+    }
+    AttributionResult {
+        classes: std::collections::BTreeSet::new(),
+        rule: AttributionRule::Unresolved,
+    }
+}
+
+fn attribute(
+    diags: &[verify::Diag],
+    line_maps: &std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+    observed_root: &std::path::Path,
+    sites: &[EmittedSite],
+    edits: &[EditSite],
+    reverted: &std::collections::BTreeSet<bridge_receipt::SignatureClassId>,
+    original_root: &std::path::Path,
+) -> std::collections::BTreeSet<bridge_receipt::SignatureClassId> {
+    let mut classes = std::collections::BTreeSet::new();
+    for diagnostic in diags {
+        classes.extend(
+            attribute_with_rule(
+                diagnostic,
+                line_maps,
+                observed_root,
+                sites,
+                edits,
+                reverted,
+                original_root,
+            )
+            .classes,
+        );
+    }
+    classes
+}
+
+/// Where a rewritten subject's own function lives, for attributing a verify
+/// diagnostic to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct EmittedSite {
+    pub owner_class: bridge_receipt::SignatureClassId,
+    pub file: String,
+    pub fn_path: String,
+    pub lo_line: usize,
+    pub hi_line: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EmittedSubject {
+    owner_class: bridge_receipt::SignatureClassId,
+    owner_path: String,
+    subject: String,
+    site: String,
+    atoms: Vec<String>,
+}
+
+/// The rewritten source of every file the plan touched, plus what could not be
+/// placed. **This is the general emission path**; the string entry point is its
+/// single-file case.
+#[allow(
+    dead_code,
+    reason = "`plan` and `texts` are read by S2b.1.2's revert loop, landing in \
+              this slice; extracted here so a round needs no second compiler \
+              session. Correct this reason when the loop lands."
+)]
+pub(crate) struct Emission {
+    pub files: std::collections::BTreeMap<plan::FileKey, String>,
+    pub rollbacks: Vec<apply::Rollback>,
+    pub unplaceable: Vec<plan::Unplaceable>,
+    /// **Extracted once, inside the single compiler session.** The verify loop's
+    /// rounds re-render from these rather than re-planning, so a round needs no
+    /// second session — nesting one rustc session inside another was rejected
+    /// for lack of soundness evidence. Re-planning degenerates to re-RENDERING,
+    /// which is the phase architecture's own claim taken seriously: `plan`
+    /// produces edits as DATA.
+    pub plan: plan::Plan,
+    pub texts: std::collections::BTreeMap<plan::FileKey, String>,
+}
+
+/// Apply a plan's edits, minus the reverted owners, to the original texts.
+///
+/// Pure: no compiler session, no analysis. This is what a revert round runs.
+/// # THE EMISSION SITES ARE GONE — this is PLAN VALIDATION (M-3, 2026-08-18)
+///
+/// This was `render`, the span layer's emitter. Four emission sites routed
+/// through it and each was found one at a time, after the previous was called
+/// the last: the bisect final emission (`:1069`), then round 0 — the largest,
+/// carrying 35 of the corpus's 64 emissions. M-3 deleted the span layer, so
+/// **there is no longer an emission path here at all**, and the class of defect
+/// that table existed to prevent is now unrepresentable rather than merely
+/// absent: the only emitter is the AST layer, reached through `round_files`.
+///
+/// What survives is the part that was never layer-specific. `emit_files` calls
+/// this once, with **no revert set**, to answer one question: does the PLAN
+/// apply — are its byte ranges in bounds, on char boundaries, and mutually
+/// non-overlapping? Those rollbacks feed the pre-loop structural gate. That
+/// gate judges the plan, not a layer, which is why it was kept when its
+/// emitter was deleted.
+///
+/// ⚠ **Its `files` are NOT an emission.** They exist so the caller can pick a
+/// `root_key`, and nothing verifies or ships them.
+///
+/// Not this function and never were: the `.render(…)` METHODS on `fat_facts`,
+/// `sign_facts` and `decision::seam`, which share only the name.
+pub(crate) fn validate_plan(
+    planned: &plan::Plan,
+    texts: &std::collections::BTreeMap<plan::FileKey, String>,
+) -> (
+    std::collections::BTreeMap<plan::FileKey, String>,
+    Vec<apply::Rollback>,
+    // **I-31**: per-file emitted→original line translation, from the splicer.
+    std::collections::BTreeMap<plan::FileKey, apply::LineMap>,
+) {
+    let mut files = std::collections::BTreeMap::new();
+    let mut rollbacks = Vec::new();
+    let mut maps = std::collections::BTreeMap::new();
+    // Revert by JUSTIFICATION, not geography: an edit survives only if the
+    // subject that justifies it has not been taken back.
+    let mut kept_by_file: std::collections::BTreeMap<plan::FileKey, Vec<plan::Edit>> =
+        planned.by_file.clone();
+    let held = planned.held_classes();
+    for edits in kept_by_file.values_mut() {
+        edits.retain(|edit| edit.owner_class.is_none_or(|owner| !held.contains(&owner)));
+        // Exact duplicate edits have one semantic effect and one owner.
+        // Keep their first occurrence; differing replacements still reach the
+        // owned-conflict path rather than selecting an arbitrary winner.
+        let mut unique = Vec::new();
+        for edit in std::mem::take(edits) {
+            if !unique.contains(&edit) {
+                unique.push(edit);
+            }
+        }
+        *edits = unique;
+    }
+    // **The fabricated-extent const is DERIVED FROM THE SURVIVORS** (marker
+    // ruling, 2026-08-15), which is why it is computed here and not in `plan`:
+    // this is the one place that knows which adapters a given revert set
+    // leaves standing, and `render` is called once per revert round.
+    //
+    // No surviving fabricated adapter ⇒ no const, so no dead item; one or many
+    // ⇒ exactly one, in the crate root, so no `E0433` when a single fabricated
+    // site's function reverts and its siblings do not.
+    //
+    if kept_by_file.values().flatten().any(|e| {
+        matches!(
+            e.justification,
+            plan::Justification::SeamAdapter {
+                fabricated: true,
+                ..
+            }
+        )
+    }) && let Some(root) = planned.root_file.clone()
+        && let Some(item) = planned.len_const_item.as_deref()
+        && let Some(source) = texts.get(&root)
+    {
+        // Appended at END OF FILE — the one offset both emitters compute
+        // identically without parsing. A crate-level `const` is legal there
+        // whatever the file's inner attributes, outer attributes or trailing
+        // comments look like, and every alternative anchor (after the last
+        // inner attribute; before the first item) needs a parse that the span
+        // layer, running after HIR is built, cannot redo.
+        let at = source.len();
+        kept_by_file.entry(root).or_default().push(plan::Edit {
+            lo: at,
+            hi: at,
+            replacement: format!("\n{item}\n"),
+            justification: plan::Justification::FabricatedLenConst,
+            // Added AFTER the revert filter, so this name is never matched
+            // against the revert set — it is not a sentinel that must be kept
+            // out of it, it is simply not subject to it.
+            owner_class: None,
+            owner_path: "<crate>".to_owned(),
+            bridge: None,
+            atom_ids: Vec::new(),
+            subject_id: "<crate>".to_owned(),
+            required_arms: "-".to_owned(),
+            edit_kind: "fabricated-length-const",
+        });
+    }
+    for (key, kept) in &kept_by_file {
+        if kept.is_empty() {
+            continue;
+        }
+        let Some(source) = texts.get(key) else {
+            continue;
+        };
+        let validation_edits = validation_projection(kept, &|outer, inner| {
+            planned
+                .class_finalization
+                .classes
+                .get(&outer)
+                .is_some_and(|class| class.depends_on.contains(&inner))
+        });
+        let applied = apply::apply(source, &validation_edits);
+        rollbacks.extend(applied.rollbacks);
+        maps.insert(key.clone(), applied.line_map);
+        files.insert(key.clone(), applied.source);
+    }
+    (files, rollbacks, maps)
+}
+
+/// The byte projection `validate_plan` splices: one file's kept edits less the
+/// nestings the AST pass composes.
+///
+/// Wave-1 call adapters make one previously-zero composition live: a
+/// seam can strictly contain an ordinary `KindDecision` use edit. The AST
+/// choke point applies use first and seam second; this span projection is
+/// validation-only and cannot represent nesting. Suppress exactly the
+/// contained inner use from the obsolete splice projection while keeping
+/// both edits in the real plan for attribution, reverts, and AST
+/// consumption. Every other overlap still reaches `apply` and rolls back.
+fn validation_projection(
+    kept: &[plan::Edit],
+    composed: &dyn Fn(bridge_receipt::SignatureClassId, bridge_receipt::SignatureClassId) -> bool,
+) -> Vec<plan::Edit> {
+    kept.iter()
+        .enumerate()
+        .filter(|(inner_index, inner)| {
+            (!matches!(
+                inner.justification,
+                plan::Justification::KindDecision { .. }
+            ) || !nested_kind_under_seam(kept, *inner_index))
+                && (!matches!(
+                    inner.justification,
+                    plan::Justification::KindDecision { .. }
+                ) || !exact_kind_composed_by_seam(kept, *inner_index))
+                && !nested_c9_over_seam(kept, *inner_index)
+                && !nested_use_under_a5(kept, *inner_index, composed)
+                && !composed_by_slice_constructor(kept, *inner_index)
+                && !nested_seam_under_seam(kept, *inner_index)
+        })
+        .map(|(_, edit)| edit.clone())
+        .collect()
+}
+
+/// Item-2 constructors seal the already-rendered inner adapter text into the
+/// outer initializer replacement. The validation-only byte projection cannot
+/// apply both ranges, so it omits exactly those inner ranges owned by the same
+/// class while retaining both plan sites and receipts.
+fn composed_by_slice_constructor(edits: &[plan::Edit], inner_index: usize) -> bool {
+    let inner = &edits[inner_index];
+    edits.iter().enumerate().any(|(outer_index, outer)| {
+        let slice =
+            outer.edit_kind == "slice-local-construction" && outer.owner_class == inner.owner_class;
+        let option = outer
+            .bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.bridge_kind == "option-value-composed")
+            && inner
+                .bridge
+                .as_ref()
+                .is_none_or(|bridge| bridge.bridge_kind != "option-value-composed")
+            && matches!(
+                inner.justification,
+                plan::Justification::KindDecision { .. } | plan::Justification::SeamAdapter { .. }
+            );
+        // A wrapper cursor constructor composed over its outer table's element
+        // rewrite; the AST pass applies only the constructor at that span.
+        // R615-5: likewise a cursor element or address whose index holds
+        // another subject's use (`base[length[i] + 1]`).
+        let cursor = matches!(
+            outer.edit_kind,
+            "cursor-constructor" | "cursor-advance" | "cursor-element" | "cursor-address"
+        ) && inner.edit_kind == "subject-use"
+            && outer.owner_class == inner.owner_class;
+        let value_over_cursor_address = outer.edit_kind == "option-value"
+            && inner.edit_kind == "cursor-address"
+            && outer.owner_class == inner.owner_class;
+        outer_index != inner_index
+            && (slice || option || cursor || value_over_cursor_address)
+            && outer.lo <= inner.lo
+            && inner.hi <= outer.hi
+    })
+}
+
+/// Exactly the one nested plan class the AST pass orders deliberately:
+/// ordinary `KindDecision` use first, strictly enclosing call seam second.
+/// Equal spans and every other justification remain ordinary overlap failures.
+fn nested_kind_under_seam(edits: &[plan::Edit], inner_index: usize) -> bool {
+    let inner = &edits[inner_index];
+    matches!(
+        inner.justification,
+        plan::Justification::KindDecision { .. }
+    ) && edits.iter().enumerate().any(|(outer_index, outer)| {
+        outer_index != inner_index
+            && matches!(outer.justification, plan::Justification::SeamAdapter { .. })
+            && outer.lo <= inner.lo
+            && inner.hi <= outer.hi
+            && (outer.lo < inner.lo || inner.hi < outer.hi)
+    })
+}
+
+/// wave-6l: a seam adapter STRICTLY inside another seam adapter is an L07
+/// containment the plan admitted (a declined pair holds both classes before
+/// this projection sees their edits). The AST pass grafts the inner first
+/// and builds the outer over the adapted subtree (`SeamGraftVisitor`), so
+/// the byte projection omits the inner range exactly as it does for a use
+/// under a seam; both edits stay in the plan for attribution and reverts.
+fn nested_seam_under_seam(edits: &[plan::Edit], inner_index: usize) -> bool {
+    let inner = &edits[inner_index];
+    matches!(inner.justification, plan::Justification::SeamAdapter { .. })
+        && edits.iter().enumerate().any(|(outer_index, outer)| {
+            outer_index != inner_index
+                && matches!(outer.justification, plan::Justification::SeamAdapter { .. })
+                && outer.lo <= inner.lo
+                && inner.hi <= outer.hi
+                && (outer.lo < inner.lo || inner.hi < outer.hi)
+        })
+}
+
+/// The AST path has a typed use-to-seam handoff for one exact-span seam. This
+/// projection cannot represent sequential ownership of one byte range, so it
+/// omits the use projection only when the plan proves the handoff is unique.
+fn exact_kind_composed_by_seam(edits: &[plan::Edit], kind_index: usize) -> bool {
+    let kind = &edits[kind_index];
+    matches!(kind.justification, plan::Justification::KindDecision { .. })
+        && edits
+            .iter()
+            .enumerate()
+            .filter(|(seam_index, seam)| {
+                *seam_index != kind_index
+                    && matches!(seam.justification, plan::Justification::SeamAdapter { .. })
+                    // wave 2's body adapters have no handoff; the raw-initializer
+                    // reborrow (relay wave-5d/026 §2) is built over the grafted use.
+                    && (seam.edit_kind != "body-adapter"
+                        || seam.bridge.as_ref().is_some_and(|bridge| {
+                            bridge.bridge_kind == decision::raw_initializer::BRIDGE_KIND
+                        }))
+                    && seam.lo == kind.lo
+                    && seam.hi == kind.hi
+            })
+            .count()
+            == 1
+}
+
+/// C-9 owns the enclosing call while a seam owns one argument. The AST choke
+/// point composes those structural edits; the byte-splice validator cannot.
+/// Suppress only the enclosing C-9 projection when it strictly contains a seam
+/// and keep both edits in the authoritative plan and receipts.
+fn nested_c9_over_seam(edits: &[plan::Edit], c9_index: usize) -> bool {
+    let c9 = &edits[c9_index];
+    matches!(
+        c9.justification,
+        plan::Justification::C9Mark | plan::Justification::A5RawView
+    ) && edits.iter().enumerate().any(|(seam_index, seam)| {
+        seam_index != c9_index
+            && matches!(seam.justification, plan::Justification::SeamAdapter { .. })
+            && c9.lo <= seam.lo
+            && seam.hi <= c9.hi
+            && (c9.lo < seam.lo || seam.hi < c9.hi)
+    })
+}
+
+/// **wave-6a 158 (main 207a item 4).** A `KindDecision` use edit STRICTLY
+/// inside another class's A5 raw view: the caller's own subject-use in an
+/// argument the view does not select (brotli's `EmitLiterals` →
+/// `BrotliWriteBits(*depth.offset(lit), …, storage)`). The class planner
+/// recorded the composition (`a5_wrapper_composition`: the use overlaps no
+/// selected view, so the view's class depends on the use's; `composed`), and the
+/// AST pass grafts the use first and builds the view over the call's grafted
+/// children (`A5RawGraftVisitor`). At 56 a seam inside the call suppressed the
+/// view instead (`nested_c9_over_seam`); with the view's selected argument held
+/// raw at 57 no seam is left. The USE is suppressed, as under a seam
+/// (`nested_kind_under_seam`), and the view stays in the projection: an edit
+/// enclosing the call still collides with it (the stand-in review's F1).
+fn nested_use_under_a5(
+    edits: &[plan::Edit],
+    use_index: usize,
+    composed: &dyn Fn(bridge_receipt::SignatureClassId, bridge_receipt::SignatureClassId) -> bool,
+) -> bool {
+    let used = &edits[use_index];
+    let (plan::Justification::KindDecision { .. }, Some(use_owner)) =
+        (&used.justification, used.owner_class)
+    else {
+        return false;
+    };
+    edits.iter().enumerate().any(|(a5_index, a5)| {
+        a5_index != use_index
+            && matches!(a5.justification, plan::Justification::A5RawView)
+            && a5
+                .owner_class
+                .is_some_and(|a5_owner| a5_owner != use_owner && composed(a5_owner, use_owner))
+            && a5.lo <= used.lo
+            && used.hi <= a5.hi
+            && (a5.lo < used.lo || used.hi < a5.hi)
+    })
+}
+
+/// A source file's identity for editing. `None` for anything not written back
+/// to a nameable file (macro-expansion contexts, synthetic inputs).
+fn file_key(name: &rustc_span::FileName) -> Option<plan::FileKey> {
+    match name {
+        rustc_span::FileName::Real(real) => real
+            .local_path()
+            .map(|path| plan::FileKey::Real(path.to_path_buf())),
+        rustc_span::FileName::Custom(name) => Some(plan::FileKey::Virtual(name.clone())),
+        _ => None,
+    }
+}
+
+fn pair_raw_view_failure_site(
+    call: &decision::seam::PairRawViewCall,
+    file: &plan::FileKey,
+    lo: usize,
+    hi: usize,
+    source: &str,
+    error: &str,
+) -> plan::ClassSite {
+    let file = match file {
+        plan::FileKey::Real(path) => path.display().to_string(),
+        plan::FileKey::Virtual(name) => name.clone(),
+    };
+    let readable = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let source_hex = source
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let bridge = bridge_receipt::BridgeSitePlan {
+        caller: call.caller,
+        callee: bridge_receipt::BridgeCalleeId::Local(call.callee),
+        arm: decision::Arm::Pair.key().to_owned(),
+        position: format!(
+            "args={};site-hold",
+            call.views
+                .iter()
+                .map(|view| view.argument_index.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        bridge_kind: "pair-c9-source-held".to_owned(),
+        expected_form: "raw".to_owned(),
+        found_form: "safe-pair-source".to_owned(),
+        argument_kind: "pair-call".to_owned(),
+        extent: bridge_receipt::BridgeExtentKind::None,
+        retention: bridge_receipt::BridgeRetentionTier::None,
+        waiver_id: None,
+        unsafe_context: None,
+    };
+    plan::ClassSite {
+        key: bridge.materialize(
+            call.owner_class,
+            file,
+            u32::try_from(lo).unwrap_or(u32::MAX),
+            u32::try_from(hi).unwrap_or(u32::MAX),
+        ),
+        edit_key: "-".to_owned(),
+        atom_ids: Vec::new(),
+        state: plan::ClassSiteState::Dropped(format!(
+            "c9-source-held:{}:argument-text={}:argument-hex={}",
+            error.replace(['\t', '\r', '\n'], " "),
+            readable,
+            source_hex,
+        )),
+        expected_form: "raw".to_owned(),
+        found_form: "safe-pair-source".to_owned(),
+        argument_kind: "pair-call".to_owned(),
+        extent: bridge_receipt::BridgeExtentKind::None,
+        retention: bridge_receipt::BridgeRetentionTier::None,
+        waiver_id: None,
+        unsafe_context: bridge.unsafe_context,
+    }
+}
+
+#[derive(Clone)]
+struct PendingA5RawViewCall {
+    call: decision::seam::A5RawViewCall,
+    file: plan::FileKey,
+    lo: usize,
+    hi: usize,
+    source: String,
+    bridge: bridge_receipt::BridgeSitePlan,
+}
+
+pub(crate) fn terminal_interface_form(
+    input: decision::seam::Form,
+    placed: Option<decision::seam::Form>,
+    owner_class_live: bool,
+) -> decision::seam::Form {
+    if owner_class_live {
+        placed.unwrap_or(input)
+    } else {
+        input
+    }
+}
+
+/// The application decision used by both terminal interfaces and census custody.
+fn terminal_application(
+    decision: &decision::Decision,
+    owner_class_live: bool,
+) -> Option<&decision::Decision> {
+    if !owner_class_live {
+        return None;
+    }
+    match decision {
+        decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Cursor { .. }
+        | decision::Decision::NestedSlice { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Box(_) => Some(decision),
+        decision::Decision::Degraded(_) => None,
+    }
+}
+
+fn terminal_subject_form(
+    table: &decision::DecisionTable,
+    finalization: &plan::ClassFinalization,
+    key: (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+) -> decision::seam::Form {
+    let class = bridge_receipt::SignatureClassId::of(key.0);
+    let live = finalization
+        .classes
+        .get(&class)
+        .is_some_and(plan::SignatureClassPlan::is_ready);
+    let placed = table
+        .entries
+        .iter()
+        .find(|(subject, _)| subject.fn_did == key.0 && subject.hir_id == key.1)
+        .and_then(|(_, decision)| terminal_application(decision, live))
+        .map(decision::seam::form_of);
+    let input = table
+        .input_interfaces
+        .subject_forms
+        .get(&key)
+        .copied()
+        .unwrap_or(decision::seam::Form::Raw);
+    terminal_interface_form(input, placed, live)
+}
+
+fn terminal_parameter_form(
+    table: &decision::DecisionTable,
+    finalization: &plan::ClassFinalization,
+    callee: rustc_hir::def_id::LocalDefId,
+    argument_index: usize,
+) -> decision::seam::Form {
+    let live = finalization
+        .classes
+        .get(&bridge_receipt::SignatureClassId::of(callee))
+        .is_some_and(plan::SignatureClassPlan::is_ready);
+    let placed = table
+        .entries
+        .iter()
+        .find(|(subject, _)| {
+            subject.fn_did == callee
+                && matches!(
+                    subject.kind,
+                    decision::SubjectKind::Param { hir_index } if hir_index == argument_index
+                )
+        })
+        .and_then(|(_, decision)| terminal_application(decision, live))
+        .map(decision::seam::form_of);
+    let input = table
+        .input_interfaces
+        .parameter_forms
+        .get(&(callee, argument_index))
+        .copied()
+        .unwrap_or(decision::seam::Form::Raw);
+    terminal_interface_form(input, placed, live)
+}
+
+/// **R761-2** — the calls routed to the raw twin, located `(caller, file, lo, hi)`.
+fn raw_twin_calls_located(
+    table: &decision::DecisionTable,
+    locate: impl Fn(rustc_span::Span) -> Result<(plan::FileKey, usize, usize), &'static str>,
+) -> Vec<(rustc_span::def_id::LocalDefId, plan::FileKey, usize, usize)> {
+    table
+        .seams
+        .counted_void_calls
+        .iter()
+        .filter(|call| call.route == decision::counted_void::Route::RawTwin)
+        .filter_map(|call| {
+            locate(call.call_span)
+                .ok()
+                .map(|(file, lo, hi)| (call.caller, file, lo, hi))
+        })
+        .collect()
+}
+
+fn seal_terminal_outbound_calls(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    planned: &mut plan::Plan,
+) -> Result<(), String> {
+    use decision::{
+        raw_boundary::BridgeTemplate,
+        seam::{Form, GlueCore, GlueSpec, SeamInputRendering},
+    };
+    loop {
+        let before = planned.held_classes();
+        let candidates = planned.terminal_call_plans.seam_edits.clone();
+        for (index, old) in candidates.iter().enumerate() {
+            let Some(endpoint) = old.raw_outbound.as_ref() else { continue };
+            let live = planned
+                .class_finalization
+                .classes
+                .get(&old.owner_class)
+                .is_some_and(plan::SignatureClassPlan::is_ready);
+            if !live {
+                continue;
+            }
+            let Some(node) = old.source_node else {
+                planned.hold_terminal_class(
+                    old.owner_class,
+                    decision::Arm::C,
+                    "outbound-terminal-source",
+                    "outbound-terminal-source-missing".to_owned(),
+                );
+                continue;
+            };
+            let terminal = terminal_subject_form(table, &planned.class_finalization, node);
+            if let Err(permission) = decision::seam::terminal_returned_child_permission(
+                endpoint.returned_child.as_ref(),
+                old.source_shape,
+                terminal,
+            ) {
+                let reason = match permission {
+                    decision::raw_boundary::ReturnedChildPermissionFailure::Writes => {
+                        "returned-child-writes"
+                    }
+                    decision::raw_boundary::ReturnedChildPermissionFailure::Unknown => {
+                        "returned-child-permission-unknown"
+                    }
+                };
+                planned.hold_terminal_class(
+                    old.owner_class,
+                    decision::Arm::C,
+                    "outbound-returned-child-permission",
+                    format!("outbound-terminal:{reason}"),
+                );
+                continue;
+            }
+            let current = table
+                .entries
+                .iter()
+                .find(|(subject, _)| (subject.fn_did, subject.hir_id) == node)
+                .and_then(|(_, decision)| terminal_application(decision, live));
+            let mut sealed = old.clone();
+            sealed.found = terminal;
+            sealed.bridge.found_form = terminal.key().to_owned();
+            sealed.input_rendering = Some(SeamInputRendering::ZeroSyntax { found: Form::Raw });
+            if let Some(current) = current {
+                let reference_view =
+                    decision::raw_boundary::outbound_reference_view(current, old.source_shape);
+                let reference_view =
+                    wave6r_shared_root::terminal_view(current, old, reference_view);
+                let effective_source = reference_view.as_ref().unwrap_or(current);
+                if let Some(view) = &reference_view {
+                    sealed.found = decision::seam::form_of(view);
+                    sealed.bridge.found_form = sealed.found.key().to_owned();
+                }
+                let template = if old
+                    .spec
+                    .raw_boundary
+                    .as_ref()
+                    .is_some_and(|raw| raw.template == BridgeTemplate::TypedRawTemporary)
+                {
+                    Ok(BridgeTemplate::TypedRawTemporary)
+                } else {
+                    decision::raw_boundary::template_for(
+                        effective_source,
+                        &endpoint.target,
+                        endpoint.ownership,
+                        endpoint.negative_write,
+                    )
+                };
+                let template = match template {
+                    Ok(template) => template,
+                    Err(reason) => {
+                        planned.hold_terminal_class(
+                            old.owner_class,
+                            decision::Arm::C,
+                            "outbound-terminal-template",
+                            format!("outbound-terminal-template:{}", reason.key()),
+                        );
+                        continue;
+                    }
+                };
+                let template = if let Some(child) = endpoint
+                    .returned_child
+                    .as_ref()
+                    .filter(|child| !(child.raw_field_parent && old.source_shape == "raw-expr"))
+                {
+                    let selected = decision::raw_boundary::returned_child_template(
+                        effective_source,
+                        &endpoint.target,
+                        child.child.as_ref().ok().map(|child| &child.access),
+                        template,
+                    );
+                    match selected {
+                        Ok(selected)
+                            if !selected.mutable_binding_required
+                                || table.option_mut_bindings.contains(&node) =>
+                        {
+                            selected.template
+                        }
+                        Ok(_) => {
+                            planned.hold_terminal_class(
+                                old.owner_class,
+                                decision::Arm::C,
+                                "outbound-terminal-mutable-binding",
+                                "outbound-terminal-mutable-binding-unplanned".into(),
+                            );
+                            continue;
+                        }
+                        Err(reason) => {
+                            planned.hold_terminal_class(
+                                old.owner_class,
+                                decision::Arm::C,
+                                "outbound-returned-child-view",
+                                format!("outbound-terminal:{}", reason.key()),
+                            );
+                            continue;
+                        }
+                    }
+                } else if endpoint.target.mutability == decision::raw_boundary::RawMutability::Const
+                {
+                    // Addendum 259, the terminal half of the same rule the
+                    // disposition applies. Without a contract row there is no
+                    // returned-child evidence, and the block above never ran,
+                    // so a `*const` position received `as_ptr()` however the
+                    // callee used what it got.
+                    // K18'/OAP-CHILD-ACCESS at the terminal half, asking the
+                    // same question the disposition asked.
+                    let child_access = endpoint.child_access.as_ref();
+                    if decision::raw_boundary::is_mutable_safe_source(effective_source) {
+                        // (1) A writable derivation satisfies the const
+                        // parameter type and keeps write permission, so this
+                        // costs no hold. The shared presentation of a mutable
+                        // subject is retired at this seam.
+                        match decision::raw_boundary::returned_child_template(
+                            effective_source,
+                            &endpoint.target,
+                            child_access,
+                            template,
+                        ) {
+                            Ok(selected)
+                                if !selected.mutable_binding_required
+                                    || table.option_mut_bindings.contains(&node) =>
+                            {
+                                selected.template
+                            }
+                            Ok(_) => {
+                                planned.hold_terminal_class(
+                                    old.owner_class,
+                                    decision::Arm::C,
+                                    "outbound-terminal-mutable-binding",
+                                    "ordinary-argument-permission:mutable-binding-unplanned".into(),
+                                );
+                                continue;
+                            }
+                            // The writable carrier does not exist for this
+                            // base. Hold only where the callee could actually
+                            // hand a pointer back.
+                            Err(_) if endpoint.callee_may_yield_pointer => {
+                                planned.hold_terminal_class(
+                                    old.owner_class,
+                                    decision::Arm::C,
+                                    "outbound-returned-child-view",
+                                    "ordinary-argument-permission:writable-carrier-unavailable"
+                                        .into(),
+                                );
+                                continue;
+                            }
+                            Err(_) => template,
+                        }
+                    } else if decision::raw_boundary::is_shared_safe_source(effective_source)
+                        && endpoint.callee_may_yield_pointer
+                        && endpoint.ownership.is_none()
+                        && !(matches!(
+                            decision::seam::form_of(effective_source),
+                            decision::seam::Form::Slice { .. }
+                        ) && endpoint.return_independent.is_some())
+                        && decision::raw_boundary::returned_child_permission(
+                            effective_source,
+                            child_access,
+                        )
+                        .is_err()
+                    {
+                        // (2) A shared source has no mutable view to upgrade
+                        // to, and in this branch no descendant evidence exists
+                        // at all -- that is what an absent returned child
+                        // means. Negative-write evidence does not discharge
+                        // it: that speaks to the callee's own access, not to
+                        // what the caller may do with a descendant. A pinned
+                        // contract row does discharge it -- `ownership` is
+                        // `Some` exactly when the row classified, and a row
+                        // whose `returns_alias_of` is not this argument proves
+                        // no child descends from it.
+                        planned.hold_terminal_class(
+                            old.owner_class,
+                            decision::Arm::C,
+                            "outbound-returned-child-permission",
+                            "ordinary-argument-permission:write-through-shared-view".into(),
+                        );
+                        continue;
+                    } else {
+                        template
+                    }
+                } else {
+                    template
+                };
+                let mut spec = GlueSpec::raw_boundary_target(
+                    template,
+                    &endpoint.target,
+                    endpoint.box_slice,
+                    false,
+                );
+                spec.forward_slice = old.spec.forward_slice.clone();
+                let Some(replacement) = spec
+                    .render_in_context(&endpoint.operand_expression, endpoint.enclosing_unsafe_fn)
+                else {
+                    planned.hold_terminal_class(
+                        old.owner_class,
+                        decision::Arm::C,
+                        "outbound-terminal-render",
+                        "outbound-terminal-render-unavailable".to_owned(),
+                    );
+                    continue;
+                };
+                sealed.spec = spec;
+                sealed.replacement = replacement;
+                sealed.bridge.bridge_kind = template.key().to_owned();
+                // Existing borrowed-to-raw coercions still count as sites,
+                // while needing no syntax edit at the original argument.
+                sealed.zero_syntax = sealed.spec.forward_slice.is_none()
+                    && matches!(
+                        template.render(
+                            &endpoint.operand_expression,
+                            endpoint.target.mutability,
+                            endpoint.box_slice,
+                            sealed
+                                .spec
+                                .raw_boundary
+                                .as_ref()
+                                .and_then(|raw| raw.cast_pointee.as_deref())
+                        ),
+                        Ok(decision::raw_boundary::BridgeRender::ZeroSyntax)
+                    );
+            } else {
+                // No safe declaration was applied for this source. The input
+                // argument already obeys the original raw ABI, including its
+                // pointee cast. A view through the earlier Ref is invalid.
+                sealed.spec = GlueSpec::core(GlueCore::Bare, false);
+                sealed.arg_span = sealed.span;
+                sealed.replacement = endpoint.original_expression.clone();
+                sealed.zero_syntax = true;
+                sealed.bridge.bridge_kind = "outbound-input-form".to_owned();
+                sealed.bridge.retention = bridge_receipt::BridgeRetentionTier::None;
+                sealed.bridge.waiver_id = None;
+                sealed.bridge.extent = bridge_receipt::BridgeExtentKind::None;
+            }
+            if sealed != *old {
+                let source = tcx.sess.source_map().lookup_source_file(old.span.lo());
+                let file = file_key(&source.name).ok_or("terminal-outbound-file-unmapped")?;
+                let lo = old
+                    .span
+                    .lo()
+                    .0
+                    .checked_sub(source.start_pos.0)
+                    .ok_or("terminal-outbound-span-before-file")? as usize;
+                let hi = old
+                    .span
+                    .hi()
+                    .0
+                    .checked_sub(source.start_pos.0)
+                    .ok_or("terminal-outbound-span-before-file")? as usize;
+                planned.replace_terminal_seam(old, &sealed, (file, lo, hi))?;
+                planned.terminal_call_plans.seam_edits[index] = sealed;
+            }
+        }
+        if planned.held_classes() == before {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn validate_terminal_option_calls(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    planned: &mut plan::Plan,
+) {
+    use mechanical_receipt::{
+        CanonicalCallee, MechanicalState, MechanicalTerminalReason, TerminalContract,
+    };
+
+    // Every nonempty pass holds at least one ready class. Holds are monotone,
+    // so caller/callee chains reach a fixed point in finitely many passes.
+    loop {
+        let mut holds = std::collections::BTreeMap::<_, Vec<String>>::new();
+        for receipt in &mut planned.option_receipt_plans {
+            if receipt.obligation.intended_terminal_state == MechanicalState::Reclassified
+                || !matches!(
+                    receipt.operation.as_str(),
+                    "call-required" | "call-optional"
+                )
+            {
+                continue;
+            }
+            let site = &receipt.obligation.planned.key.site;
+            let callee = site.callee.as_ref().and_then(|callee| match callee {
+                CanonicalCallee::Local(callee) => callee.as_local(),
+                CanonicalCallee::Foreign(_) | CanonicalCallee::Generated { .. } => None,
+            });
+            let terminal = callee
+                .zip(
+                    site.argument_index
+                        .and_then(|index| usize::try_from(index).ok()),
+                )
+                .map(|(callee, argument_index)| {
+                    (
+                        callee,
+                        argument_index,
+                        terminal_parameter_form(
+                            table,
+                            &planned.class_finalization,
+                            callee,
+                            argument_index,
+                        ),
+                    )
+                });
+            let contract = terminal.and_then(|(callee, argument_index, form)| {
+                if form.key() != receipt.target_form
+                    || receipt.target_form != receipt.obligation.planned.expected_form
+                {
+                    return None;
+                }
+                let interface = format!(
+                    "{}:arg{}:{}",
+                    tcx.def_path_str(callee.to_def_id()),
+                    argument_index,
+                    form.key(),
+                );
+                match (receipt.operation.as_str(), form) {
+                    (
+                        "call-required",
+                        decision::seam::Form::Ref { .. } | decision::seam::Form::Slice { .. },
+                    ) => Some(TerminalContract::Required { interface }),
+                    ("call-optional", decision::seam::Form::Opt { .. }) => {
+                        Some(TerminalContract::Optional { interface })
+                    }
+                    _ => None,
+                }
+            });
+            receipt.terminal_contract = contract.clone().unwrap_or(TerminalContract::Missing);
+            receipt.obligation.planned.evidence.terminal_contract =
+                receipt.terminal_contract.clone();
+            if contract.is_none() {
+                receipt.obligation.intended_terminal_state = MechanicalState::HeldNonmechanical;
+                receipt.obligation.intended_terminal_reason =
+                    Some(MechanicalTerminalReason::TerminalContractMissing);
+                if planned
+                    .class_finalization
+                    .classes
+                    .get(&receipt.owner_class)
+                    .is_some_and(plan::SignatureClassPlan::is_ready)
+                {
+                    holds.entry(receipt.owner_class).or_default().push(format!(
+                        "option-terminal-contract-missing:site={};expected={};terminal={}",
+                        site.receipt_key(),
+                        receipt.target_form,
+                        terminal.map_or("missing", |(_, _, form)| form.key()),
+                    ));
+                }
+            }
+        }
+        if holds.is_empty() {
+            break;
+        }
+        for (owner, mut reasons) in holds {
+            reasons.sort();
+            reasons.dedup();
+            planned.hold_terminal_class(
+                owner,
+                decision::Arm::Surface,
+                "option-terminal-contract-missing",
+                reasons.join(";"),
+            );
+        }
+    }
+}
+
+fn canonical_a5_site_matches(
+    canonical: &mechanical_receipt::CanonicalSiteKey,
+    proof: decision::a5_site_proof::A5ProofSiteKey,
+) -> bool {
+    canonical.owner == proof.caller
+        && matches!(
+            &canonical.location,
+            mechanical_receipt::CanonicalLocation::Mir {
+                basic_block,
+                statement_index,
+                terminator: true,
+            } if *basic_block == proof.location.block
+                && usize::try_from(*statement_index).ok() == Some(proof.location.statement_index)
+        )
+        && matches!(
+            &canonical.callee,
+            Some(mechanical_receipt::CanonicalCallee::Local(callee)) if *callee == proof.callee
+        )
+        && canonical
+            .argument_index
+            .and_then(|index| usize::try_from(index).ok())
+            == Some(proof.argument_index)
+        && usize::try_from(canonical.slot_depth).ok() == Some(proof.slot_depth)
+}
+
+/// Plan and apply, **grouped by file**.
+///
+/// Grouping is what makes the offsets meaningful: `lookup_byte_offset` yields
+/// *file-relative* positions, so two edits in different files can carry
+/// identical `(lo, hi)`. Applying them against one string would splice each into
+/// whichever file happened to be passed — silently, and with a plausible result.
+pub(crate) fn emit_files<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    table: &decision::DecisionTable,
+    reverted: &rustc_hash::FxHashSet<rustc_hir::def_id::LocalDefId>,
+    retained_copy_plans: &[PlannedCopyMark],
+) -> Result<Emission, String> {
+    prepare_plan_files(tcx, table, reverted, retained_copy_plans)
+}
+
+/// Pure planning, class finalization and structural validation shared with
+/// additive-family preflight. The AST is emitted only through round_files.
+/// Seal each base against its original native type or its exact constructor
+/// plan. Cursor recovery also follows the selected base's atom dependencies.
+fn validate_cursor_delivered_bases(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    planned: &mut plan::Plan,
+) {
+    for (subject, choice) in &table.entries {
+        let cursor = match choice {
+            decision::Decision::Cursor { plan, .. } => plan,
+            decision::Decision::NestedSlice { .. }
+            | decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_)
+            | decision::Decision::Degraded(_) => continue,
+        };
+        if !decision::cursor_native::wrapper::parent_available(table, subject, cursor) {
+            planned.hold_terminal_class(
+                bridge_receipt::SignatureClassId::of(subject.fn_did),
+                decision::Arm::Surface,
+                "cursor-parent-unavailable",
+                "derived cursor parent was not delivered".to_owned(),
+            );
+        }
+        let Some(base) = &cursor.delivered_base else { continue };
+        let node = (subject.fn_did, base.binding);
+        let valid_binding = base.binding == base.window_binding
+            && base.binding.owner.def_id == subject.fn_did
+            && matches!(tcx.hir_node(base.binding), rustc_hir::Node::Pat(pattern)
+                if matches!(pattern.kind, rustc_hir::PatKind::Binding(_, id, _, None) if id == base.binding));
+        let original_slice = valid_binding
+            && {
+                let ty = tcx.typeck(subject.fn_did).node_type(base.binding);
+                matches!(ty.kind(), TyKind::Ref(_, pointee, mutability)
+                if (matches!(pointee.kind(), TyKind::Slice(_)) || (cursor.wrapper && matches!(pointee.kind(), TyKind::Array(..)))) && (!subject.mutable || mutability.is_mut()))
+            };
+        // Reject a planned change even when its current type happens to be a
+        // slice: that change can be withdrawn independently during recovery.
+        let changed_base = table.entries.iter().any(|(other, decision)| {
+            (other.fn_did, other.hir_id) == node
+                && match decision {
+                    decision::Decision::Degraded(_) => false,
+                    decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Slice { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Box(_)
+                    | decision::Decision::Cursor { .. } => true,
+                }
+        }) || table
+            .seams
+            .explicit_declarations
+            .iter()
+            .any(|site| site.node == Some(node))
+            || table
+                .slice_constructions
+                .iter()
+                .any(|constructor| constructor.node == node)
+            || table.return_receivers.plans.contains_key(&node)
+            || table.seams.receiver_inputs.plans.contains_key(&node)
+            || table
+                .seams
+                .callee_parameter_inputs
+                .values()
+                .any(|input| input.node == node);
+        let exact_cursor_source = cursor
+            .uses
+            .iter()
+            .zip(&cursor.use_hirs)
+            .filter(|(edit, _)| edit.bridge_kind == "cursor-constructor")
+            .all(|(edit, hir)| {
+                let rustc_hir::Node::Expr(init) = tcx.hir_node(*hir) else { return false };
+                if init.span != edit.span {
+                    return false;
+                }
+                if cursor.wrapper
+                    && matches!(
+                        base.provider,
+                        decision::cursor_native::DeliveredBaseProvider::TableElement
+                            | decision::cursor_native::DeliveredBaseProvider::SliceParameter
+                    )
+                    && let rustc_hir::ExprKind::Unary(rustc_hir::UnOp::Deref, pointer) = init.kind
+                {
+                    return decision::cursor_native::wrapper::source_binding(
+                        tcx,
+                        subject.fn_did,
+                        pointer,
+                    ) == Some(base.binding);
+                }
+                if cursor.wrapper {
+                    return decision::cursor_native::wrapper::source_binding(
+                        tcx,
+                        subject.fn_did,
+                        init,
+                    ) == Some(base.binding);
+                }
+                let source = match init.kind {
+                    rustc_hir::ExprKind::MethodCall(_, receiver, [], _) => receiver,
+                    rustc_hir::ExprKind::Path(_) => init,
+                    _ => return false,
+                };
+                matches!(source.kind, rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path))
+                    if path.res == rustc_hir::def::Res::Local(base.binding))
+            })
+            && cursor
+                .uses
+                .iter()
+                .filter(|edit| edit.bridge_kind == "cursor-constructor")
+                .count()
+                == 1;
+        let valid_initializer = match base.initializer {
+            Some(hir) => {
+                hir.owner.def_id == subject.fn_did
+                    && matches!(tcx.parent_hir_node(base.binding), rustc_hir::Node::LetStmt(decl)
+                    if decl.pat.hir_id == base.binding && decl.init.is_some_and(|init| init.hir_id == hir))
+            }
+            None => tcx
+                .hir_body_owned_by(subject.fn_did)
+                .params
+                .iter()
+                .any(|param| param.pat.hir_id == base.binding),
+        };
+        use decision::cursor_native::DeliveredBaseProvider;
+        let overrides_base = table.return_receivers.plans.contains_key(&node)
+            || table.seams.receiver_inputs.plans.contains_key(&node)
+            || table
+                .seams
+                .callee_parameter_inputs
+                .values()
+                .any(|input| input.node == node);
+        let provider_delivered = match &base.provider {
+            DeliveredBaseProvider::OriginalSlice => original_slice && !changed_base,
+            DeliveredBaseProvider::Slice { producer } => {
+                let exact_constructor = producer.node == node
+                    && base.initializer == Some(producer.init_hir)
+                    && producer.replacement.is_some()
+                    && producer.hold_reason.is_none()
+                    && !producer.nullable
+                    && (!subject.mutable || producer.mutable)
+                    && table
+                        .slice_constructions
+                        .iter()
+                        .filter(|plan| plan.node == node)
+                        .count()
+                        == 1
+                    && table
+                        .slice_constructions
+                        .iter()
+                        .any(|plan| plan == producer);
+                exact_constructor
+                    && !overrides_base
+                    && terminal_subject_form(table, &planned.class_finalization, node)
+                        == decision::seam::Form::Slice {
+                            mutable: producer.mutable,
+                        }
+            }
+            DeliveredBaseProvider::Box {
+                producer,
+                elements: _,
+            } => {
+                let exact_box = !producer.optional
+                    && !producer.fabricated_extent
+                    && producer.shape == decision::box_facts::BoxShape::Slice
+                    && table.entries.iter().any(|(candidate, choice)| {
+                        (candidate.fn_did, candidate.hir_id) == node
+                            && match choice {
+                                decision::Decision::Box(actual) => actual == producer,
+                                decision::Decision::NestedSlice { .. }
+                                | decision::Decision::Ref { .. }
+                                | decision::Decision::InferredRef { .. }
+                                | decision::Decision::Slice { .. }
+                                | decision::Decision::Opt { .. }
+                                | decision::Decision::Cursor { .. }
+                                | decision::Decision::Degraded(_) => false,
+                            }
+                    });
+                exact_box
+                    && !overrides_base
+                    && base.initializer.is_some()
+                    && planned
+                        .class_finalization
+                        .classes
+                        .get(&bridge_receipt::SignatureClassId::of(subject.fn_did))
+                        .is_some_and(plan::SignatureClassPlan::is_ready)
+            }
+            // The outer table is a delivered slice whose element the cursor
+            // loads; the cursor's own extent is the receipted fallback, so a
+            // caller-side input plan on the outer (`overrides_base`) changes
+            // nothing the base relies on.
+            // The base is a delivered slice parameter; the cursor's window is
+            // that binding's runtime length, so the parameter's Slice decision
+            // is the whole condition.
+            DeliveredBaseProvider::SliceParameter => {
+                cursor.wrapper
+                    && !cursor.fallback
+                    && table.entries.iter().any(|(candidate, choice)| {
+                        (candidate.fn_did, candidate.hir_id) == node
+                            && matches!(candidate.kind, decision::SubjectKind::Param { .. })
+                            && match choice {
+                                decision::Decision::Slice { mutable, .. } => {
+                                    !subject.mutable || *mutable
+                                }
+                                decision::Decision::NestedSlice { .. }
+                                | decision::Decision::Ref { .. }
+                                | decision::Decision::InferredRef { .. }
+                                | decision::Decision::Opt { .. }
+                                | decision::Decision::Box(_)
+                                | decision::Decision::Cursor { .. }
+                                | decision::Decision::Degraded(_) => false,
+                            }
+                    })
+            }
+            DeliveredBaseProvider::TableElement => {
+                // **R519-3 (slicecursor 067 §2).** The twin of
+                // `wrapper::table_element_base`, stated as the exact
+                // correspondence it is rather than as two conjuncts that happen
+                // to coincide: `fallback` is DEFINED as `!delivered_inner`, and
+                // `delivered_inner` is true exactly when the table is
+                // `NestedSlice`. So the table's form and the plan's `fallback`
+                // must agree, and the pair `(NestedSlice, fallback == true)` is
+                // not a case to admit — it is a fabricated
+                // `FALLBACK_SLICE_EXTENT` window over an element whose length is
+                // evidence-backed. Dropping the conjunct on the delivered side
+                // would wave that through; this re-asserts the invariant the
+                // constructor established, for the same admissions.
+                //
+                // `table_named_once` is unchanged on both sides. It keeps its
+                // force on the flat side and gains some on the delivered one: a
+                // second naming of a `&mut [&mut [T]]` table is an `E0499`.
+                cursor.wrapper
+                    && (!subject.mutable
+                        || decision::cursor_native::wrapper::table_named_once(
+                            tcx,
+                            subject.fn_did,
+                            base.binding,
+                        ))
+                    && table.entries.iter().any(|(candidate, choice)| {
+                        (candidate.fn_did, candidate.hir_id) == node
+                            && match choice {
+                                decision::Decision::Slice { .. } => cursor.fallback,
+                                decision::Decision::NestedSlice { .. } => !cursor.fallback,
+                                decision::Decision::Ref { .. }
+                                | decision::Decision::InferredRef { .. }
+                                | decision::Decision::Opt { .. }
+                                | decision::Decision::Box(_)
+                                | decision::Decision::Cursor { .. }
+                                | decision::Decision::Degraded(_) => false,
+                            }
+                    })
+            }
+        };
+        if !valid_binding || !provider_delivered || !valid_initializer || !exact_cursor_source {
+            planned.hold_terminal_class(
+                bridge_receipt::SignatureClassId::of(subject.fn_did),
+                decision::Arm::Surface,
+                "cursor-delivered-base-unavailable",
+                format!("binding-hir={}:window-hir={}:original-slice={original_slice}:changed-base={changed_base}:initializer={valid_initializer}:provider-delivered={provider_delivered}",
+                    base.binding.local_id.as_u32(), base.window_binding.local_id.as_u32()),
+            );
+        }
+    }
+}
+
+fn prepare_plan_files<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    table: &decision::DecisionTable,
+    reverted: &rustc_hash::FxHashSet<rustc_hir::def_id::LocalDefId>,
+    retained_copy_plans: &[PlannedCopyMark],
+) -> Result<Emission, String> {
+    // Repeated edits can have one licensed effect; repeated subjects corrupt
+    // placement and receipt accounting and are an input invariant violation.
+    let mut subject_keys = rustc_hash::FxHashSet::default();
+    for (subject, _) in &table.entries {
+        if !subject_keys.insert((subject.fn_did, subject.hir_id)) {
+            return Err(format!(
+                "decision-table-invariant:duplicate-subject:{}:hir={}",
+                subject.identity_key(&tcx.def_path_str(subject.fn_did.to_def_id())),
+                subject.hir_id.local_id.as_u32(),
+            ));
+        }
+    }
+    let source_map = tcx.sess.source_map();
+    let text_of = |key: &plan::FileKey| -> Option<String> {
+        source_map
+            .files()
+            .iter()
+            .find(|sf| file_key(&sf.name).as_ref() == Some(key))
+            .and_then(|sf| sf.src.as_ref().map(|src| src.to_string()))
+    };
+    let span_to_loc =
+        |span: rustc_span::Span| -> Result<(plan::FileKey, usize, usize), &'static str> {
+            // A macro-generated span points into an expansion, not into source
+            // anyone can edit. Splicing it would corrupt the file it nominally
+            // resolves to.
+            if span.from_expansion() {
+                return Err("span is macro-generated and cannot be spliced into source");
+            }
+            let lo = source_map.lookup_byte_offset(span.lo());
+            let hi = source_map.lookup_byte_offset(span.hi());
+            let (Some(lo_key), Some(hi_key)) = (file_key(&lo.sf.name), file_key(&hi.sf.name))
+            else {
+                return Err("span resolves to a file with no editable identity");
+            };
+            if lo_key != hi_key {
+                return Err("span straddles two source files");
+            }
+            let (lo, hi) = (lo.pos.0 as usize, hi.pos.0 as usize);
+            if lo > hi {
+                return Err("span bounds are inverted");
+            }
+            Ok((lo_key, lo, hi))
+        };
+
+    let mut planned = plan::plan(
+        table,
+        text_of,
+        span_to_loc,
+        |subject| tcx.def_path_str(subject.fn_did.to_def_id()),
+        &|subject: &decision::Subject| reverted.contains(&subject.fn_did),
+    );
+    let mut pending_a5_raw_calls = Vec::new();
+    for call in &table.seams.a5_raw_calls {
+        if reverted.contains(&call.owner_class.local_def_id()) {
+            continue;
+        }
+        // **The intra-class arm (relay 034).** The PAIR raw-view call renders
+        // this same call for this same class, materializing the raw views the
+        // A5 T2 fallback exists to materialize — planning a SECOND whole-call
+        // rewrite of one interval is what holds the class
+        // (`intra-class-interval-overlap`: lodepng's `lodepng_assign_icc`,
+        // where `pair-t2-raw-view` and `a5-site-proof-t2-fallback` both own
+        // 272439..272561). The fallback yields to the rendering it is a
+        // fallback FOR, and its per-argument proof sites ride that carrier —
+        // which is what `link_a5_fallback_carriers` already does for them
+        // (`calls.push((file, lo, hi, "pair-raw-view"))`). Held to the exact
+        // call, the exact class, and views that cover every A5 argument, so a
+        // PAIR call that renders something else is not a carrier.
+        if table.seams.pair_raw_calls.iter().any(|pair| {
+            pair.owner_class == call.owner_class
+                && pair.caller == call.caller
+                && pair.callee == call.callee
+                && pair.call_span == call.call_span
+                && call.views.iter().all(|view| {
+                    pair.views
+                        .iter()
+                        .any(|other| other.argument_index == view.argument_index)
+                })
+        }) {
+            continue;
+        }
+        // **R490-1(a), one layer earlier: the raw twin renders this call too.**
+        //
+        // A counted-void call routed `RawTwin` replaces the call's arguments with the
+        // input's own text -- deliberately, because the twin's parameters are raw. The A5
+        // fallback's stamps at that call are then DEAD: brotli's
+        // `ProcessSingleCodeLength` site carried four `let __crat_a5_raw_6925671_*` that
+        // nothing reads, followed by `__crat_raw_ProcessSingleCodeLength(&mut (*h).repeat,
+        // ..)` with the original arguments.
+        //
+        // Suppressing them in the LEDGER (`75ce6fedb`) was the wrong layer, and batch 20
+        // proved it: the applied receipt survived without a descriptor
+        // (`bridge-custody:missing-descriptor:..:typed-carrier-candidate-count:0`), and the
+        // stamps stayed in the tree where no receipt could ever claim them. The fallback
+        // has to yield where it is superseded, exactly as it already yields to the PAIR
+        // rendering above -- same shape, same reason, one arm further along.
+        if table.seams.counted_void_calls.iter().any(|counted| {
+            counted.route == decision::counted_void::Route::RawTwin
+                && counted.caller == call.caller
+                && counted.call_span == call.call_span
+        }) {
+            continue;
+        }
+        let (file, lo, hi) = span_to_loc(call.call_span)
+            .map_err(|why| format!("unplaceable A5 raw-view call: {why}"))?;
+        let source = text_of(&file)
+            .ok_or_else(|| format!("no source text for A5 raw-view file {file:?}"))?;
+        let original = source
+            .get(lo..hi)
+            .ok_or_else(|| "A5 raw-view span is outside its source file".to_owned())?
+            .to_owned();
+        let proof_keys = call
+            .views
+            .iter()
+            .map(|view| view.proof_site_key.receipt_key())
+            .collect::<Vec<_>>()
+            .join(",");
+        let bridge = bridge_receipt::BridgeSitePlan {
+            caller: call.caller,
+            callee: bridge_receipt::BridgeCalleeId::Local(call.callee),
+            arm: decision::Arm::Pair.key().to_owned(),
+            position: format!("args={proof_keys}"),
+            bridge_kind: "a5-site-proof-t2-fallback".to_owned(),
+            expected_form: call
+                .views
+                .iter()
+                .map(|view| view.expected_form.key())
+                .collect::<Vec<_>>()
+                .join(","),
+            found_form: call
+                .views
+                .iter()
+                .map(|view| view.found_form.key())
+                .collect::<Vec<_>>()
+                .join(","),
+            argument_kind: "a5-proof-call".to_owned(),
+            extent: if call
+                .views
+                .iter()
+                .any(|view| view.extent_expression.is_some())
+            {
+                bridge_receipt::BridgeExtentKind::Evidence("settled-safe-length".to_owned())
+            } else {
+                bridge_receipt::BridgeExtentKind::None
+            },
+            retention: bridge_receipt::BridgeRetentionTier::T2,
+            waiver_id: Some(bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+            unsafe_context: call.views.iter().find_map(|view| view.unsafe_context),
+        };
+        let views = call
+            .views
+            .iter()
+            .map(|view| {
+                (
+                    view.argument_index,
+                    view.raw_expression.clone(),
+                    view.target_type.clone(),
+                    view.adapted_expression.clone(),
+                    view.extent_expression.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let stem = format!("__crat_a5_raw_{}", call.call_span.lo().0);
+        let replacement = match c9::render_a5_raw_view_source(&original, &stem, &views) {
+            Ok(replacement)
+                if call.views.iter().all(|view| {
+                    view.expected_form == decision::seam::Form::Raw
+                        && view.adapted_expression == c9::A5_RAW_VALUE_PLACEHOLDER
+                }) =>
+            {
+                replacement
+            }
+            result => {
+                let reason = match result {
+                    Ok(_) => "non-raw-target-or-argument".to_owned(),
+                    Err(why) => why,
+                };
+                planned.preclass_sites.push(plan::ClassSite::dropped(
+                    call.owner_class,
+                    call.owner_class,
+                    decision::Arm::Pair,
+                    "a5-fallback-unrenderable",
+                    format!("a5-fallback-unrenderable:{reason}"),
+                ));
+                continue;
+            }
+        };
+        planned
+            .by_file
+            .entry(file.clone())
+            .or_default()
+            .push(plan::Edit {
+                lo,
+                hi,
+                replacement,
+                justification: plan::Justification::A5RawView,
+                owner_class: Some(call.owner_class),
+                owner_path: tcx.def_path_str(call.callee.to_def_id()),
+                bridge: Some(bridge.clone()),
+                atom_ids: Vec::new(),
+                subject_id: format!(
+                    "a5-proof-call:{}..{}",
+                    call.call_span.lo().0,
+                    call.call_span.hi().0
+                ),
+                required_arms: "PAIR".to_owned(),
+                edit_kind: "a5-proof-site-raw-view",
+            });
+        pending_a5_raw_calls.push(PendingA5RawViewCall {
+            call: call.clone(),
+            file,
+            lo,
+            hi,
+            source: original,
+            bridge,
+        });
+    }
+    for call in &table.seams.pair_raw_calls {
+        if reverted.contains(&call.owner_class.local_def_id()) {
+            continue;
+        }
+        let (file, lo, hi) = span_to_loc(call.call_span)
+            .map_err(|why| format!("unplaceable PAIR raw-view call: {why}"))?;
+        let source = text_of(&file)
+            .ok_or_else(|| format!("no source text for PAIR raw-view file {file:?}"))?;
+        let original = source
+            .get(lo..hi)
+            .ok_or_else(|| "PAIR raw-view span is outside its source file".to_owned())?;
+        let views = call
+            .views
+            .iter()
+            .map(|view| {
+                (
+                    view.argument_index,
+                    view.raw_expression.clone(),
+                    view.target_type.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let temp_stem = format!("__crat_pair_raw_{}", call.call_span.lo().0);
+        let replacement = match c9::render_pair_raw_view_source(original, &temp_stem, &views) {
+            Ok(replacement) => replacement,
+            Err(error) => {
+                planned.preclass_sites.push(pair_raw_view_failure_site(
+                    call, &file, lo, hi, original, &error,
+                ));
+                continue;
+            }
+        };
+        planned.by_file.entry(file).or_default().push(plan::Edit {
+            lo,
+            hi,
+            replacement,
+            justification: plan::Justification::C9Mark,
+            owner_class: Some(call.owner_class),
+            owner_path: tcx.def_path_str(call.callee.to_def_id()),
+            bridge: Some(bridge_receipt::BridgeSitePlan {
+                caller: call.caller,
+                callee: bridge_receipt::BridgeCalleeId::Local(call.callee),
+                arm: decision::Arm::Pair.key().to_owned(),
+                position: format!(
+                    "args={};reasons={}",
+                    call.views
+                        .iter()
+                        .map(|view| view.argument_index.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    call.reasons.join(","),
+                ),
+                bridge_kind: "pair-t2-raw-view".to_owned(),
+                expected_form: "raw".to_owned(),
+                found_form: "safe-pair-source".to_owned(),
+                argument_kind: "pair-call".to_owned(),
+                extent: bridge_receipt::BridgeExtentKind::None,
+                retention: bridge_receipt::BridgeRetentionTier::T2,
+                waiver_id: Some(bridge_receipt::RAW_BOUNDARY_T2_WAIVER_ID.to_owned()),
+                unsafe_context: None,
+            }),
+            atom_ids: call.atom_ids.clone(),
+            subject_id: format!(
+                "pair-call:{}..{}",
+                call.call_span.lo().0,
+                call.call_span.hi().0
+            ),
+            required_arms: "PAIR".to_owned(),
+            edit_kind: "pair-raw-view",
+        });
+    }
+    for mark in retained_copy_plans {
+        if reverted.contains(&mark.owner_did) {
+            continue;
+        }
+        let (file, lo, hi) = span_to_loc(mark.call_span)
+            .map_err(|why| format!("unplaceable retained C-9 mark: {why}"))?;
+        let source = text_of(&file)
+            .ok_or_else(|| format!("no source text for retained C-9 mark file {file:?}"))?;
+        let original = source
+            .get(lo..hi)
+            .ok_or_else(|| "retained C-9 mark span is outside its source file".to_owned())?;
+        let replacement = c9::render_marked_source(&mark.key, original)?;
+        planned.by_file.entry(file).or_default().push(plan::Edit {
+            lo,
+            hi,
+            replacement,
+            justification: plan::Justification::C9Mark,
+            owner_class: Some(bridge_receipt::SignatureClassId::of(mark.owner_did)),
+            owner_path: mark.owner_fn.clone(),
+            bridge: Some(bridge_receipt::BridgeSitePlan {
+                caller: mark.caller_did,
+                callee: bridge_receipt::BridgeCalleeId::Local(mark.owner_did),
+                arm: decision::Arm::Pair.key().to_owned(),
+                position: format!(
+                    "copy-snapshot:carrier=c9:bb{}:s{}:pointee={}",
+                    mark.key.location.block,
+                    mark.key.location.statement_index,
+                    mark.key.pointee_type,
+                ),
+                bridge_kind: "pair-copy-snapshot".to_owned(),
+                expected_form: "safe-parameter".to_owned(),
+                found_form: "copy-snapshot".to_owned(),
+                argument_kind: "pair-copy".to_owned(),
+                extent: bridge_receipt::BridgeExtentKind::None,
+                retention: bridge_receipt::BridgeRetentionTier::T1,
+                waiver_id: None,
+                unsafe_context: None,
+            }),
+            atom_ids: Vec::new(),
+            subject_id: mark.owner_fn.clone(),
+            required_arms: "-".to_owned(),
+            edit_kind: "pair-copy-snapshot",
+        });
+    }
+    shared_read_arguments::plan(tcx, table, reverted, &mut planned, span_to_loc)?;
+    plan::link_a5_fallback_carriers(&mut planned, table, span_to_loc);
+    let declaration_rendered_elsewhere =
+        plan::declarations_rendered_by_another_plan(&planned, table, span_to_loc);
+    plan::finalize_signature_classes(
+        &mut planned,
+        table,
+        reverted,
+        &declaration_rendered_elsewhere,
+    );
+    validate_cursor_delivered_bases(tcx, table, &mut planned);
+    let return_dependency_edges = planned
+        .class_finalization
+        .classes
+        .values()
+        .filter(|class| class.is_ready())
+        .flat_map(|class| {
+            class
+                .depends_on
+                .iter()
+                .map(move |dependency| (class.id, *dependency))
+        })
+        .collect::<Vec<_>>();
+    let return_dependency_edges = return_dependency_edges
+        .into_iter()
+        .chain(planned.narrowed_dependency_edges.iter().copied())
+        .collect::<Vec<_>>();
+    planned.terminal_call_plans.return_origin_dependencies =
+        decision::lifetime::ReturnOriginAtomDependencies::derive(table, &return_dependency_edges);
+    let mut terminal_a5_raw_calls = Vec::new();
+    for mut pending in pending_a5_raw_calls {
+        if !planned
+            .class_finalization
+            .classes
+            .get(&pending.call.owner_class)
+            .is_some_and(plan::SignatureClassPlan::is_ready)
+        {
+            continue;
+        }
+        let mut terminal_views = Vec::new();
+        let mut terminal_hold = None;
+        for view in &pending.call.views {
+            let terminal_target = terminal_parameter_form(
+                table,
+                &planned.class_finalization,
+                pending.call.callee,
+                view.argument_index,
+            );
+            let terminal_subject = view
+                .source_node
+                .map_or(decision::seam::Form::Raw, |source| {
+                    terminal_subject_form(table, &planned.class_finalization, source)
+                });
+            let terminal_source =
+                decision::seam::a5_argument_expression_form(view.argument_shape, terminal_subject)
+                    .unwrap_or(terminal_subject);
+            // wave-5d2 (relay 009): the argument text is the ORIGINAL; a root
+            // delivered in a non-raw form whose uses inside the argument the AST
+            // layer rewrites would be re-emitted stale (`from_ref(&*chunk.offset(4))`
+            // over `chunk: &[u8]`). Typed hold instead.
+            if matches!(view.argument_shape, "addr-of" | "addr-of-mut" | "raw-expr")
+                && view.source_node.is_some_and(|(owner, hir)| {
+                    table.entries.iter().any(|(subject, _)| {
+                        subject.fn_did == owner
+                            && subject.hir_id == hir
+                            && subject.param_name.as_deref().is_some_and(|name| {
+                                decision::raw_boundary::a5_view_argument_is_stale_over_root(
+                                    &view.argument_expression,
+                                    name,
+                                    terminal_subject,
+                                )
+                            })
+                    })
+                })
+            {
+                let root = view
+                    .source_node
+                    .and_then(|(owner, hir)| {
+                        table.entries.iter().find_map(|(subject, _)| {
+                            (subject.fn_did == owner && subject.hir_id == hir)
+                                .then(|| subject.param_name.clone())
+                                .flatten()
+                        })
+                    })
+                    .unwrap_or_default();
+                planned.a5_hold_views.push(format!(
+                    "{}\t{}\t{}..{}\t{}\t{}\t{}\t{}\t{:?}\t{:?}",
+                    tcx.def_path_str(pending.call.caller.to_def_id()),
+                    tcx.def_path_str(pending.call.callee.to_def_id()),
+                    pending.call.call_span.lo().0,
+                    pending.call.call_span.hi().0,
+                    view.argument_index,
+                    view.argument_shape,
+                    view.argument_expression.replace(['\t', '\n'], " "),
+                    root,
+                    terminal_subject,
+                    terminal_target,
+                ));
+                terminal_hold = Some("a5-fallback-unrenderable:nested-caller-edit".into());
+                break;
+            }
+            match decision::seam::replan_a5_raw_view(view, terminal_target, terminal_source) {
+                Ok(mut replanned) => {
+                    if view.source_node.is_some() {
+                        let original_subject = view.source_node.and_then(|node| {
+                            table.input_interfaces.subject_forms.get(&node).copied()
+                        });
+                        if matches!(view.argument_shape, "bare-local" | "cast-of-local")
+                            && original_subject.is_none()
+                        {
+                            terminal_hold =
+                                Some("a5-fallback-unrenderable:input-subject-form-absent".into());
+                            break;
+                        }
+                        let input_found = decision::seam::a5_argument_expression_form(
+                            view.argument_shape,
+                            original_subject.unwrap_or(decision::seam::Form::Raw),
+                        )
+                        .unwrap_or(decision::seam::Form::Raw);
+                        match decision::seam::replan_a5_raw_view(
+                            &replanned,
+                            terminal_target,
+                            input_found,
+                        ) {
+                            Ok(input) => {
+                                replanned.input_rendering =
+                                    Some(decision::seam::A5RawViewRendering::from_view(&input));
+                            }
+                            Err(_) => {
+                                terminal_hold = Some(format!(
+                                    "a5-fallback-unrenderable:terminal-replan;planned={}<-{};terminal={}<-{}",
+                                    view.expected_form.key(),
+                                    view.found_form.key(),
+                                    terminal_target.key(),
+                                    input_found.key(),
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    let mut receipt_matches = 0usize;
+                    for receipt in &mut planned.a5_receipt_plans {
+                        if canonical_a5_site_matches(&receipt.proof_site_key, view.proof_site_key) {
+                            receipt_matches += 1;
+                            receipt.settled_form = replanned.found_form.key().to_owned();
+                            receipt.raw_view_template = replanned.template.clone();
+                        }
+                    }
+                    if receipt_matches != 1 {
+                        return Err(format!(
+                            "A5 terminal receipt identity mismatch at {}: matches={receipt_matches}",
+                            view.proof_site_key.receipt_key(),
+                        ));
+                    }
+                    terminal_views.push(replanned);
+                }
+                Err(_) => {
+                    terminal_hold = Some(format!(
+                        "a5-fallback-unrenderable:terminal-replan;planned={}<-{};terminal={}<-{}",
+                        view.expected_form.key(),
+                        view.found_form.key(),
+                        terminal_target.key(),
+                        terminal_source.key(),
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(reason) = terminal_hold {
+            for view in &pending.call.views {
+                let mut receipt_matches = 0usize;
+                for receipt in &mut planned.a5_receipt_plans {
+                    if canonical_a5_site_matches(&receipt.proof_site_key, view.proof_site_key) {
+                        receipt_matches += 1;
+                        receipt.obligation.intended_terminal_state =
+                            mechanical_receipt::MechanicalState::HeldNonmechanical;
+                        receipt.obligation.intended_terminal_reason = Some(
+                            mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(
+                                reason.clone(),
+                            ),
+                        );
+                    }
+                }
+                if receipt_matches != 1 {
+                    return Err(format!(
+                        "A5 terminal receipt identity mismatch at {}: matches={receipt_matches}",
+                        view.proof_site_key.receipt_key(),
+                    ));
+                }
+            }
+            planned.hold_terminal_a5_class(pending.call.owner_class, reason);
+            continue;
+        }
+        pending.call.views = terminal_views;
+        pending.bridge.expected_form = pending
+            .call
+            .views
+            .iter()
+            .map(|view| view.expected_form.key())
+            .collect::<Vec<_>>()
+            .join(",");
+        pending.bridge.found_form = pending
+            .call
+            .views
+            .iter()
+            .map(|view| view.found_form.key())
+            .collect::<Vec<_>>()
+            .join(",");
+        let views = pending
+            .call
+            .views
+            .iter()
+            .map(|view| {
+                (
+                    view.argument_index,
+                    view.raw_expression.clone(),
+                    view.target_type.clone(),
+                    view.adapted_expression.clone(),
+                    view.extent_expression.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let stem = format!("__crat_a5_raw_{}", pending.call.call_span.lo().0);
+        let replacement = c9::render_a5_raw_view_source(&pending.source, &stem, &views)?;
+        let edit = plan::Edit {
+            lo: pending.lo,
+            hi: pending.hi,
+            replacement,
+            justification: plan::Justification::A5RawView,
+            owner_class: Some(pending.call.owner_class),
+            owner_path: tcx.def_path_str(pending.call.callee.to_def_id()),
+            bridge: Some(pending.bridge.clone()),
+            atom_ids: Vec::new(),
+            subject_id: format!(
+                "a5-proof-call:{}..{}",
+                pending.call.call_span.lo().0,
+                pending.call.call_span.hi().0
+            ),
+            required_arms: "PAIR".to_owned(),
+            edit_kind: "a5-proof-site-raw-view",
+        };
+        planned.replace_terminal_a5_edit(&pending.file, edit, &pending.call.views)?;
+        terminal_a5_raw_calls.push(pending.call);
+    }
+    loop {
+        let before = planned.held_classes();
+        validate_cursor_delivered_bases(tcx, table, &mut planned);
+        validate_terminal_option_calls(tcx, table, &mut planned);
+        seal_terminal_outbound_calls(tcx, table, &mut planned)?;
+        if planned.held_classes() == before {
+            break;
+        }
+    }
+    // R761-2: on the sealed plan, the raw twin's A5 receipts follow the call
+    // that is emitted.
+    planned.withdraw_unbridged_twin_a5_receipts(&raw_twin_calls_located(table, span_to_loc));
+    let ready_a5_classes = planned
+        .class_finalization
+        .classes
+        .values()
+        .filter(|class| class.is_ready())
+        .map(|class| class.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    terminal_a5_raw_calls.retain(|call| ready_a5_classes.contains(&call.owner_class));
+    planned.terminal_call_plans.a5_raw_calls = terminal_a5_raw_calls;
+    // **The crate root, asked of the compiler rather than guessed** — not
+    // `files()[0]`, which is source-map insertion order, and not the first
+    // planned file, which is whichever file happened to hold an edit.
+    // `crate::FALLBACK_SLICE_EXTENT` resolves from exactly one module.
+    planned.root_file = {
+        let root = tcx.def_span(rustc_hir::def_id::CRATE_DEF_ID);
+        file_key(&source_map.lookup_byte_offset(root.lo()).sf.name)
+    };
+    // **Produced HERE, where a `TyCtxt` provably exists.** `render` runs three
+    // more times inside the verify/revert loop, which is OUTSIDE the compiler
+    // session — parsing or printing there panics `scoped-tls`. Built
+    // unconditionally: it is one small string, and making it conditional would
+    // put a second copy of the survivor rule in a place that cannot see the
+    // survivors.
+    planned.len_const_item = Some(decision::seam::fabricated_len_item());
+
+    let mut texts = std::collections::BTreeMap::new();
+    for key in planned.by_file.keys() {
+        let Some(source) = text_of(key) else {
+            return Err(format!("no source text for planned file {key:?}"));
+        };
+        texts.insert(key.clone(), source);
+    }
+    // The root is included even when it holds no edit: a crate whose only
+    // fabricated adapters land in other files still declares the const at its
+    // root, and `render` cannot splice a file whose text it was not given.
+    //
+    // ⚠ **Its absence is NOT fatal** (ADV-FAB-09). Folding the root into the
+    // loop above made an unreadable root text fail the WHOLE emission — for
+    // every crate, including the fourteen that fabricate nothing. A feature that
+    // may never fire in a program must not be able to stop that program from
+    // emitting. Missing root text fail-closes the const alone: `render`'s
+    // `texts.get(&root)` misses, no insertion happens, and the fabricated
+    // adapters that name it fail `verify` and revert.
+    if let Some(root) = planned.root_file.clone()
+        && !texts.contains_key(&root)
+        && let Some(source) = text_of(&root)
+    {
+        texts.insert(root, source);
+    }
+    let (files, rollbacks) = loop {
+        let (files, rollbacks, _) = validate_plan(&planned, &texts);
+        if rollbacks.is_empty() {
+            break (files, rollbacks);
+        }
+        let mut holds = std::collections::BTreeMap::<_, Vec<String>>::new();
+        for rollback in &rollbacks {
+            let owner = rollback.edit.owner_class.ok_or_else(|| {
+                format!(
+                    "apply-invariant:unowned-rollback:{}@{}..{}",
+                    rollback.reason, rollback.edit.lo, rollback.edit.hi,
+                )
+            })?;
+            if !planned
+                .class_finalization
+                .classes
+                .get(&owner)
+                .is_some_and(plan::SignatureClassPlan::is_ready)
+            {
+                return Err(format!(
+                    "apply-invariant:rollback-owner-not-ready:{}",
+                    owner.order_key()
+                ));
+            }
+            holds.entry(owner).or_default().push(format!(
+                "apply-site-rollback:{}@{}..{}:{}",
+                rollback.edit.edit_kind, rollback.edit.lo, rollback.edit.hi, rollback.reason,
+            ));
+        }
+        // Each pass withdraws at least one ready owner. No new edit or class
+        // is admitted by recovery, so this reaches a fixed point finitely.
+        for (owner, reasons) in holds {
+            planned.hold_terminal_class(
+                owner,
+                decision::Arm::Surface,
+                "apply-site-rollback",
+                reasons.join(";"),
+            );
+        }
+        validate_cursor_delivered_bases(tcx, table, &mut planned);
+        validate_terminal_option_calls(tcx, table, &mut planned);
+        seal_terminal_outbound_calls(tcx, table, &mut planned)?;
+    };
+    Ok(Emission {
+        files,
+        rollbacks,
+        unplaceable: planned.unplaceable.clone(),
+        plan: planned,
+        texts,
+    })
+}
+
+#[cfg(test)]
+/// [`decide_table`] with a hook applied to the collector's real output at the
+/// PHASE BOUNDARY, before `decide` runs.
+///
+/// The hook is a no-op in production (`decide_table` passes `|_| {}`) and exists
+/// so a test can inject the exact defect this axis guards — a mis-associated
+/// span on the collector's own `Subject` type — and then drive it through the
+/// real `decide → artifact → encode → decode → compare` path.
+///
+/// **This is deliberately not a production fault seam.** A `CRAT_*`-gated seam
+/// inside decision-phase code was considered and DENIED; a collector fault
+/// manifests as exactly the mis-associated output a boundary hook injects, so
+/// the verification power is the same at zero production-code cost. That is the
+/// phase-separated architecture paying for itself.
+fn decide_table_perturbed<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    perturb: impl FnOnce(&mut Vec<decision::Subject>),
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    decide_table_perturbed_config(tcx, perturb, None, &EmissionRunConfig::default())
+}
+
+/// Read-only analysis inputs carried across the solve/cache boundary without
+/// shaping them for a particular rewriter consumer.
+///
+/// A5 site proofs are the first reader. E2-FN is ruled to reuse this same
+/// carrier: in particular, the complete `OriginSummaries` object remains
+/// intact rather than being projected into an A5-specific export.
+struct DecisionAnalysisCarrier {
+    origins: Option<OriginSummaries>,
+    a5_mode: OverlapMode,
+    attestation: Option<WholeProgramAttestation>,
+    cache_load_wall_s: f64,
+    origin_derivation_wall_s: f64,
+}
+
+fn cached_rewriter_plans(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    mut_facts: &MutFacts,
+    a5_mode: OverlapMode,
+    attestation: Option<WholeProgramAttestation>,
+    cached: &model_cache::CachedModel,
+) -> Result<(Vec<PlannedCopyMark>, Option<OriginSummaries>, f64), String> {
+    match a5_mode {
+        OverlapMode::Baseline => Ok((Vec::new(), None, 0.0)),
+        OverlapMode::PreciseReplay => {
+            let origin_started = std::time::Instant::now();
+            let origins = compute_origins(program);
+            let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
+            let plans = cached_precise_rewriter_payload(
+                program,
+                slots,
+                &origins,
+                mut_facts,
+                &cached.baseline_model,
+                &cached.model,
+                attestation,
+                &cached.overlap_receipt,
+            )?;
+            Ok((plans, Some(origins), origin_derivation_wall_s))
+        }
+        OverlapMode::CoarseConstraint => {
+            Err("the pricing-only coarse A5 mode is not cacheable".to_owned())
+        }
+    }
+}
+
+fn decide_table_perturbed_config<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    perturb: impl FnOnce(&mut Vec<decision::Subject>),
+    a5_override: Option<(OverlapMode, Option<WholeProgramAttestation>)>,
+    run_config: &EmissionRunConfig,
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    // Relay main/375 §3: on the compiler thread, for the whole decide.
+    let _budget = crate::analysis_budget::enter(run_config.analysis_budget);
+    crate::phase_log::mark("decide:program", "start", "");
+    let program = collect_program(tcx);
+    crate::phase_log::mark(
+        "decide:program",
+        "end",
+        &format!(
+            "functions={} structs={}",
+            program.functions.len(),
+            program.structs.len()
+        ),
+    );
+    let slots = CrateSlots::build(&program);
+    crate::phase_log::mark("decide:slots", "end", "");
+    let mut_facts = MutFacts::from_program(&program);
+    crate::phase_log::mark("decide:mut_facts", "end", "");
+    let (a5_mode, attestation) = a5_override.unwrap_or((
+        OverlapMode::PreciseReplay,
+        Some(WholeProgramAttestation::FrozenBenchmarkGraph),
+    ));
+
+    // Phase 1 input: the BO run, under an explicit capture scope.
+    //
+    // The cache is consulted FIRST and is fail-closed: `load` returns `None` on
+    // absence, corruption, fingerprint mismatch or an unresolvable key, and
+    // `None` can only be answered by solving. Dev iteration reads it; every
+    // gate sweep bypasses it and refreshes it.
+    // ONE fingerprint computation, shared by the memo and the on-disk cache —
+    // they are two tiers of the same question, so they must not disagree about
+    // which program this is.
+    let fp = model_cache::fingerprint(&program, a5_mode, attestation);
+    // The key does not name the A5 mode (S2 D5): only the frame's mode is cached.
+    let cacheable = a5_mode == OverlapMode::PreciseReplay
+        && attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
+    let cache_started = std::time::Instant::now();
+
+    // Tier 1: the in-process memo. The recon worker has three independent
+    // consumers of the decision table, and before this each ran the entire
+    // pipeline — `total ≈ 3 × solve` on every program. Reusing the model here
+    // makes a consumer's cost its own work, not another whole solve.
+    if cacheable
+        && let Some(cached) = model_cache::memo_get(&fp)
+        && let Ok((retained_copy_plans, origins, origin_derivation_wall_s)) =
+            cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
+    {
+        return finish_decide(
+            tcx,
+            program,
+            slots,
+            mut_facts,
+            cached.model,
+            retained_copy_plans,
+            cached.overlap_receipt,
+            DecisionAnalysisCarrier {
+                origins,
+                a5_mode,
+                attestation,
+                cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
+                origin_derivation_wall_s,
+            },
+            run_config,
+            perturb,
+        );
+    }
+
+    // Tier 2: the on-disk cache.
+    if cacheable
+        && let Some(cached) = model_cache::load(tcx, &program, &slots, a5_mode, attestation)
+        && let Ok((retained_copy_plans, origins, origin_derivation_wall_s)) =
+            cached_rewriter_plans(&program, &slots, &mut_facts, a5_mode, attestation, &cached)
+    {
+        let model_sha256 = model_cache::model_bytes_sha256(tcx, &slots, &cached.model)
+            .ok_or_else(|| "cached model contains an unrenderable slot key".to_owned())?;
+        model_cache::record_solve(model_cache::SolveProvenance {
+            source: "cache",
+            cache_status: "hit",
+            fingerprint: fp.clone(),
+            model_sha256,
+            cache_entry: model_cache::configured_entry_path(&fp)
+                .map(|path| path.display().to_string()),
+            solve_secs: 0.0,
+        });
+        model_cache::memo_put(&fp, &cached);
+        return finish_decide(
+            tcx,
+            program,
+            slots,
+            mut_facts,
+            cached.model,
+            retained_copy_plans,
+            cached.overlap_receipt,
+            DecisionAnalysisCarrier {
+                origins,
+                a5_mode,
+                attestation,
+                cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
+                origin_derivation_wall_s,
+            },
+            run_config,
+            perturb,
+        );
+    }
+    let solve_t0 = std::time::Instant::now();
+    let origin_started = std::time::Instant::now();
+    crate::phase_log::mark("decide:origins", "start", "");
+    let origins = compute_origins(&program);
+    let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
+    crate::phase_log::mark("decide:origins", "end", "");
+    crate::phase_log::mark("decide:solve", "start", "");
+    // Relay main/388 O2 (R1383-1 R2): a solve any of whose rounds took an optimize incumbent writes
+    // its final model to neither the memo nor the on-disk cache.
+    let ((verified, _export), cacheable) =
+        crate::analyses::borrow_ownership::execution_guard::solve_then_cacheable(cacheable, || {
+            with_bo_export(|| {
+                solve_bo_overlap_config(
+                    &program,
+                    &slots,
+                    &origins,
+                    &mut_facts,
+                    a5_mode,
+                    attestation,
+                )
+            })
+        });
+    crate::phase_log::mark("decide:solve", "end", "");
+    let Some(verified) = verified else {
+        // Relay main/375 §3: a solve the budget ended is that, typed.
+        if let Some(exceeded) = crate::analysis_budget::exceeded() {
+            return Err(format!("degraded: {}", exceeded.reason()));
+        }
+        return Err("BO declined — no accepted model".to_owned());
+    };
+    let solve_secs = solve_t0.elapsed().as_secs_f64();
+    let model_sha256 = model_cache::model_bytes_sha256(tcx, &slots, &verified.model)
+        .ok_or_else(|| "fresh model contains an unrenderable slot key".to_owned())?;
+    let cached = model_cache::CachedModel {
+        model: verified.model.clone(),
+        baseline_model: verified.baseline_model.clone(),
+        overlap_receipt: verified.receipt.clone(),
+    };
+    let cache_entry = if cacheable {
+        model_cache::memo_put(&fp, &cached);
+        model_cache::store(tcx, &program, &slots, &cached, a5_mode, attestation)
+            .map(|path| path.display().to_string())
+    } else {
+        None
+    };
+    // Write-through on every real solve, so a bypassed gate sweep refreshes
+    // what dev iteration reads next.
+    model_cache::record_solve(model_cache::SolveProvenance {
+        source: "real",
+        cache_status: if model_cache::read_enabled() {
+            "miss"
+        } else {
+            "bypass"
+        },
+        fingerprint: fp.clone(),
+        model_sha256,
+        cache_entry,
+        solve_secs,
+    });
+
+    crate::phase_log::mark("decide:store", "end", "");
+    finish_decide(
+        tcx,
+        program,
+        slots,
+        mut_facts,
+        verified.model,
+        verified.retained_copy_plans,
+        verified.receipt,
+        DecisionAnalysisCarrier {
+            origins: Some(origins),
+            a5_mode,
+            attestation,
+            cache_load_wall_s: cache_started.elapsed().as_secs_f64(),
+            origin_derivation_wall_s,
+        },
+        run_config,
+        perturb,
+    )
+}
+
+/// The phases after the solve, shared by the cached and real-solve paths.
+///
+/// Extracted so the two paths cannot drift: everything downstream of the model
+/// runs from one body, and a cache hit differs from a real solve **only** in
+/// where the model came from. That is what makes the byte-identity acceptance
+/// meaningful rather than a coincidence.
+fn restored_reference_copy_sites(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    constructions: &decision::construction::ConstructionFacts,
+    policy: &additive::FamilyPolicy,
+) -> Vec<decision::emitability::BodyAdapterSite> {
+    use decision::emitability::{ArgShape, BodyAdapterContext, BodyAdapterSite};
+    let mut sites = Vec::new();
+    for (destination, decided) in &table.entries {
+        let is_reference = match decided {
+            decision::Decision::Ref { .. } => true,
+            decision::Decision::InferredRef { .. }
+            | decision::Decision::Cursor { .. }
+            | decision::Decision::NestedSlice { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_)
+            | decision::Decision::Degraded(_) => false,
+        };
+        // A subject-scoped exclusion (R397-6(a)) restores a copied source to
+        // raw exactly like an owner rollback does; the destination's adapter
+        // is needed either way.
+        if !is_reference
+            || !(policy
+                .withdrawn
+                .iter()
+                .any(|(_, owner)| owner.local_def_id() == destination.fn_did)
+                || policy
+                    .withdrawn_subjects
+                    .iter()
+                    .any(|(_, owner, _)| owner.local_def_id() == destination.fn_did))
+        {
+            continue;
+        }
+        let node = (destination.fn_did, destination.hir_id);
+        let Some(&initializer) = constructions.init_hirs.get(&node) else { continue };
+        let expression = tcx.hir_node(initializer).expect_expr();
+        let shape = decision::emitability::classify_arg(tcx, expression);
+        let ArgShape::BareLocal(source) = shape else { continue };
+        let source_is_raw = table
+            .entries
+            .iter()
+            .find(|(subject, _)| subject.fn_did == destination.fn_did && subject.hir_id == source)
+            .is_none_or(|(_, decision)| match decision {
+                decision::Decision::Degraded(_) => true,
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_) => false,
+            });
+        let typeck = tcx.typeck(destination.fn_did);
+        let exact_pointee = matches!((typeck.expr_ty(expression).kind(), typeck.node_type(destination.hir_id).kind()),
+            (TyKind::RawPtr(source, _), TyKind::RawPtr(target, _)) if source == target);
+        if !source_is_raw || !exact_pointee {
+            continue;
+        }
+        sites.push(BodyAdapterSite {
+            owner: destination.fn_did,
+            destination: destination.hir_id,
+            rhs_span: expression.span,
+            shape,
+            context: BodyAdapterContext::LocalInitializer,
+            side_effecting: false,
+        });
+    }
+    sites
+}
+
+fn finish_decide<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    program: RustProgram<'tcx>,
+    slots: CrateSlots,
+    mut_facts: MutFacts,
+    model: rustc_hash::FxHashMap<SlotRef, SlotKind>,
+    mut retained_copy_plans: Vec<PlannedCopyMark>,
+    overlap_receipt: String,
+    analysis: DecisionAnalysisCarrier,
+    run_config: &EmissionRunConfig,
+    perturb: impl FnOnce(&mut Vec<decision::Subject>),
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    fn decision_is_safe(decision: &decision::Decision) -> bool {
+        match decision {
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Cursor { .. }
+            | decision::Decision::NestedSlice { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => true,
+            decision::Decision::Degraded(_) => false,
+        }
+    }
+    crate::phase_log::mark("finish_decide", "start", "");
+    let mut subjects = collect_subjects(tcx, &program, &mut_facts);
+    // S3.1: the second universe. Appended rather than merged into
+    // `collect_subjects` so the parameter census keeps measuring the parameter
+    // predicate — a census whose denominator silently gained a population is not
+    // the same instrument.
+    subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
+    // wave-6f (W6F-3), TEST ONLY: a fixture may stand in for a coming analysis
+    // frame by overriding slot kinds by name (era-5c's owned fields). Never
+    // compiled into a census binary.
+    #[cfg(test)]
+    let model = test_model_override::apply(tcx, &program, &slots, &subjects, model);
+    let box_facts = decision::box_facts::BoxOwnershipFacts::derive(&program, &slots, &model)?;
+
+    // The freed-slot fact, stamped over BOTH universes from ONE walk of the
+    // production recognizer — the same `free_sites` the S2-2 census asks. Two
+    // properties follow by construction rather than by test: the parameter and
+    // locals populations cannot acquire different freed-ness, and the gate
+    // cannot disagree with the census about which bindings are freed.
+    //
+    // BEFORE `perturb`, so a test hook can perturb this field like any other.
+    let freed =
+        decision::FreedBindings::from_resolved(&free_sites(tcx, &program.functions).resolved);
+    // U-2′'s length recovery, from the SAME construction recognizer the facts
+    // join reports `len_class` from — one authority, so the flag and the census
+    // cannot disagree about which subjects have a recovered length.
+    let ctors = decision::construction::collect(tcx, &program.functions);
+    for subject in &mut subjects {
+        subject.freed_at = freed.site_of(subject.fn_did, subject.hir_id);
+        subject.len_recovered = !matches!(subject.kind, decision::SubjectKind::Param { .. })
+            && ctors
+                .by_binding
+                .get(&(subject.fn_did, subject.hir_id))
+                .is_some_and(|c| matches!(c.len_class(), "array-len" | "alloc-count"));
+        // **S3.2′-3** — the two facts the optional forms need, from the same
+        // pass, for the same reason: one authority per fact.
+        subject.null_init = ctors
+            .by_binding
+            .get(&(subject.fn_did, subject.hir_id))
+            .is_some_and(|c| matches!(c, decision::construction::Construction::NullLit));
+        // **The dissolution** — the class itself, from the same lookup the two
+        // booleans above already make. A parameter has no construction site in
+        // this crate, and the map has no entry for one, so this reads `None`
+        // for the whole parameter universe without a `kind` test.
+        subject.ctor = ctors
+            .by_binding
+            .get(&(subject.fn_did, subject.hir_id))
+            .cloned();
+        subject.mut_binding = matches!(
+            tcx.hir_node(subject.hir_id),
+            rustc_hir::Node::Pat(pat) if matches!(
+                pat.kind,
+                rustc_hir::PatKind::Binding(
+                    rustc_hir::BindingMode(_, rustc_hir::Mutability::Mut),
+                    ..
+                )
+            )
+        );
+    }
+
+    perturb(&mut subjects);
+    let mut declaration_pointees = decision::declaration::collect(tcx, &subjects);
+    // wave-6l relay 071 (R697-7): the field-carried allocation lengths.
+    let field_alloc_licences = decision::field_alloc::Licences::infer(tcx);
+    let mut counted_void =
+        decision::counted_void::collect(tcx, &subjects, &mut declaration_pointees, |subject| {
+            // BO's kind first (the ladder's own rule): a contract is never
+            // proven against a `Raw` verdict, so a forwarder cannot take a
+            // view its raw callee would not.
+            slots
+                .fn_local_slots
+                .get(&subject.fn_did)
+                .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                .is_some_and(|slot| {
+                    matches!(
+                        model.get(&SlotRef::Local(subject.fn_did, slot)),
+                        Some(SlotKind::Raw)
+                    )
+                })
+        });
+    let (io_domain_subjects, io_domain_budget_exhausted) =
+        decision::io_domain::collect(tcx, &subjects);
+    let void_pointee_subjects = decision::void_pointee::collect(tcx, &subjects);
+    let declaration_patterns = decision::declaration_pattern::collect(tcx, &subjects);
+    let input_interfaces = decision::interface::collect(tcx, &subjects, &program.functions);
+    let mut facts = decision::emitability::collect(tcx, &program.functions);
+    let mut void_region = decision::void_region::collect(
+        tcx,
+        &subjects,
+        &facts.referenced,
+        &facts.call_args,
+        &mut declaration_pointees,
+    );
+    let void_region_receivers =
+        decision::void_region::receivers(tcx, &subjects, &ctors, &void_region);
+    // Composition seam (wave-6v × wave-6b): one void parameter, one hook. A
+    // subject wave-6b's region reader delivers keeps no counted contract —
+    // both would plan the same call, and the counted graft would then meet
+    // the region bridge's node instead of the call.
+    counted_void.retain(|key, _| !void_region.contains_key(key));
+    let original_body_adapters = facts.body_adapters.clone();
+    let thin_extent_subjects = decision::thin_extent::collect(tcx, &facts);
+    // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
+    // here in the decision phase and nowhere later — E1's rule that no phase
+    // after this one asks an analysis a question.
+    let fat = fat_facts::FatFacts::from_program(&program);
+    let subject_fatness = subjects
+        .iter()
+        .map(|s| ((s.fn_did, s.local), fat.render(s.fn_did, s.local)))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let names: rustc_hash::FxHashMap<_, _> = subjects
+        .iter()
+        .filter_map(|s| s.param_name.clone().map(|n| ((s.fn_did, s.hir_id), n)))
+        .collect();
+    // **S3.2′-2b.** The self-advance arm's two gates, decided where their facts
+    // live: the NON-NEGATIVE sign verdict (the negative class is `SliceCursor`'s,
+    // which S3.2′-5 owns) and a `mut` binding, which `p = …` needs. `SignFacts`
+    // becomes load-bearing here — it shipped entry-validated at -3 and read by
+    // nothing.
+    let sign = sign_facts::SignFacts::from_program(&program);
+    let mutable_of: rustc_hash::FxHashSet<_> = subjects
+        .iter()
+        .filter(|s| s.mutable)
+        .map(|s| (s.fn_did, s.hir_id))
+        .collect();
+    let advance_ok: rustc_hash::FxHashSet<_> = subjects
+        .iter()
+        .filter(|s| s.mut_binding && !sign.may_be_negative(s.fn_did, s.local))
+        .map(|s| (s.fn_did, s.hir_id))
+        .collect();
+    let raw_boundary_argument_paths = facts.raw_boundary_argument_paths();
+    let full_slice_uses = decision::emitability::collect_slice_uses(
+        tcx,
+        &program.functions,
+        &names,
+        &mutable_of,
+        &advance_ok,
+        &raw_boundary_argument_paths,
+    );
+    // **R517-11 — the cursor CANDIDATES, derived where their facts live.** The
+    // C-string exemption yields to a callee parameter the cursor family can
+    // admit, and it must do so in THIS pass: a hold lifted by a second pass is
+    // decided but never planned (wave-5c 047 §2). `cursor_native` admits from
+    // three degrade reasons — `SliceCursorUse` / `SliceUseUnsupported`, both of
+    // which are `uses.unsupported`, and `SliceNegOrUnknownOffset`, which is the
+    // sign verdict the self-advance gate reads — and every subject reaching any
+    // of them has first passed BO's kind, which is the authority on whether a
+    // reference is sound at all. A `Raw` slot degrades at `kind-raw` long
+    // before the slice arm, and the family then reaches it only through a
+    // DELIVERED base, which a bare C-string walk never has.
+    //
+    // It is deliberately a CANDIDATE set and not a prediction of the family's
+    // plan: it is read only to KEEP a hold, so over-inclusion costs yield and
+    // never soundness.
+    let cursor_candidates: decision::local_callee_extent::CursorCandidates = subjects
+        .iter()
+        .filter(|subject| {
+            decision::local_callee_extent::is_cursor_candidate(
+                slots
+                    .fn_local_slots
+                    .get(&subject.fn_did)
+                    .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                    .and_then(|slot| model.get(&SlotRef::Local(subject.fn_did, slot)))
+                    .copied(),
+                full_slice_uses.get(&(subject.fn_did, subject.hir_id)),
+                sign.may_be_negative(subject.fn_did, subject.local)
+                    && decision::compare_only_offset::every_advancing_offset_is_a_non_negative_literal(
+                        tcx,
+                        subject.fn_did,
+                        subject.local,
+                    )
+                    .is_err(),
+            )
+        })
+        .filter_map(|subject| match subject.kind {
+            decision::SubjectKind::Param { hir_index } => Some((subject.fn_did, hir_index)),
+            decision::SubjectKind::Local => None,
+        })
+        .collect();
+    // After `full_slice_uses`, deliberately: a callee parameter that can become
+    // `&[T]` carries its own checked extent and is out of this class (R365-2).
+    // First pass: no decision is settled yet, so the exemption has the use facts
+    // and the candidate set to read (R485-4(b)'s second pass supplies the
+    // decided-`Slice` exemption below).
+    let local_callee_extent_subjects = decision::local_callee_extent::collect(
+        tcx,
+        &subjects,
+        &facts,
+        &full_slice_uses,
+        &cursor_candidates,
+        None,
+        None,
+    );
+    let return_parameter_nodes = subjects
+        .iter()
+        .filter(|subject| {
+            subject.ptr_depth == 1 && matches!(subject.kind, decision::SubjectKind::Param { .. })
+        })
+        .map(|subject| (subject.fn_did, subject.hir_id))
+        .collect::<rustc_hash::FxHashSet<_>>();
+    let return_slice_uses = decision::emitability::collect_slice_uses_with_returns(
+        tcx,
+        &program.functions,
+        &names,
+        &mutable_of,
+        &advance_ok,
+        &raw_boundary_argument_paths,
+        &facts.return_sites,
+        &return_parameter_nodes,
+    );
+    let prior_slice_uses = decision::emitability::collect_slice_uses_before_family(
+        tcx,
+        &program.functions,
+        &names,
+        &mutable_of,
+        &advance_ok,
+        &raw_boundary_argument_paths,
+    );
+    // **S3.2′-3.** The accessor a subject's uses are rewritten through, chosen
+    // per subject by the idiom rule (micro-plan §9c): `unwrap()` where the
+    // optional is `Copy` or used once, `as_mut()` otherwise. It has to be
+    // decided HERE because it depends on the use count, which is what the
+    // collector is about to produce — so the count is taken from the raw walk
+    // and the collector is handed the answer.
+    //
+    // `deref` and `index` differ by one `*`: `Option<&mut T>::as_mut().unwrap()`
+    // is `&mut &mut T`, two derefs from the pointee, where `unwrap()` is one.
+    let opt_accessors: rustc_hash::FxHashMap<_, _> = subjects
+        .iter()
+        .filter_map(|s| {
+            let name = s.param_name.clone()?;
+            let uses = decision::emitability::non_test_use_count(tcx, s.fn_did, s.hir_id);
+            let as_mut = s.mutable && uses > 1;
+            Some((
+                (s.fn_did, s.hir_id),
+                decision::emitability::Accessor {
+                    deref: if as_mut {
+                        format!("*{name}.as_mut().unwrap()")
+                    } else {
+                        format!("{name}.unwrap()")
+                    },
+                    index: if as_mut {
+                        format!("{name}.as_mut().unwrap()")
+                    } else {
+                        format!("{name}.unwrap()")
+                    },
+                },
+            ))
+        })
+        .collect();
+    let opt_fat: rustc_hash::FxHashSet<_> = subjects
+        .iter()
+        .filter(|s| fat.is_array(s.fn_did, s.local))
+        .map(|s| (s.fn_did, s.hir_id))
+        .collect();
+    let opt_deferred_uses = full_slice_uses
+        .iter()
+        .flat_map(|(node, uses)| {
+            uses.raw_uses
+                .iter()
+                .filter(|site| site.source_shape != "cursor")
+                .map(move |site| (node.0, node.1, site.span.lo().0, site.span.hi().0))
+        })
+        .collect();
+    let provisional_opt_uses = decision::emitability::collect_opt_uses(
+        tcx,
+        &program.functions,
+        &names,
+        &opt_accessors,
+        &opt_fat,
+        &raw_boundary_argument_paths,
+        &opt_deferred_uses,
+    );
+
+    let prior_opt_uses = decision::emitability::collect_opt_uses_before_family(
+        tcx,
+        &program.functions,
+        &names,
+        &opt_accessors,
+        &opt_fat,
+        &raw_boundary_argument_paths,
+        &opt_deferred_uses,
+    );
+    // Core keeps the predecessor's raw-path multiplicity rule. The expanded
+    // family counts its own deferrals/assignments before choosing reborrows.
+    let current_opt_accessors = subjects
+        .iter()
+        .filter_map(|subject| {
+            let name = subject.param_name.as_ref()?;
+            let node = (subject.fn_did, subject.hir_id);
+            let repeated = subject.mutable
+                && provisional_opt_uses
+                    .get(&node)
+                    .is_some_and(|uses| uses.non_test_uses > 1);
+            Some((
+                node,
+                decision::emitability::Accessor {
+                    deref: if repeated {
+                        format!("*{name}.as_mut().unwrap()")
+                    } else {
+                        format!("{name}.unwrap()")
+                    },
+                    index: if repeated {
+                        format!("{name}.as_mut().unwrap()")
+                    } else {
+                        format!("{name}.unwrap()")
+                    },
+                },
+            ))
+        })
+        .collect();
+    let full_opt_uses = decision::emitability::collect_opt_uses(
+        tcx,
+        &program.functions,
+        &names,
+        &current_opt_accessors,
+        &opt_fat,
+        &raw_boundary_argument_paths,
+        &opt_deferred_uses,
+    );
+
+    let return_opt_uses = decision::emitability::collect_opt_uses_with_returns(
+        tcx,
+        &program.functions,
+        &names,
+        &current_opt_accessors,
+        &opt_fat,
+        &raw_boundary_argument_paths,
+        &opt_deferred_uses,
+        &facts.return_sites,
+        &return_parameter_nodes,
+    );
+    // After both full use maps, deliberately: R397-6(b)'s up-front decline
+    // reads the candidate's own pre-selection use walls — the slice walker's
+    // for a plain form, the Option walker's for a nullable one — and, for
+    // R395-2, the model kind and fatness of every caller argument's subject.
+    let contract_extent_candidates = decision::contract_extent_adapter::collect(
+        &subjects,
+        &facts,
+        &ctors,
+        &local_callee_extent_subjects,
+        &full_slice_uses,
+        &full_opt_uses,
+        &model,
+        &slots,
+        &fat,
+    );
+
+    // Complete the frozen A5 site's legacy drops-elaborated reads before the
+    // const-MIR fn-pointer collector becomes the terminal const-body reader
+    // through `mir_for_ctfe`.  The proof object remains derived once and is
+    // passed unchanged to PAIR and seam synthesis below.
+    let a5_site_proofs = decision::a5_site_proof::A5SeamProofIndex::derive(
+        &program,
+        &slots,
+        analysis.origins.as_ref(),
+        analysis.a5_mode,
+        analysis.attestation,
+    );
+    let web_started = std::time::Instant::now();
+    let fnptr_web = decision::lifetime::derive_fn_ptr_web(&program, analysis.attestation);
+    let fnptr_web_wall_s = web_started.elapsed().as_secs_f64();
+    // wave-6p (R400-4): pair-disjointness certificates ride the attested A5
+    // index; an unavailable index attaches nothing. The closed-world call
+    // inventory admits allocator wrappers through function pointers (R402-5).
+    let a5_site_proofs = if a5_site_proofs.is_available() {
+        a5_site_proofs.with_pair_certificates(
+            decision::pair_disjointness::PairDisjointnessIndex::derive(
+                &program,
+                &mut_facts,
+                fnptr_web.as_ref().ok().map(|web| web.mir_call_sites()),
+            ),
+        )
+    } else {
+        a5_site_proofs
+    };
+    // wave-6b (R609-4 (a)): two byte-region formals of one call are paired on
+    // the same proofs; an unproven pair keeps its read side raw.
+    decision::void_region::pair_gate(
+        &mut void_region,
+        &subjects,
+        &facts.call_args,
+        &a5_site_proofs,
+        &mut declaration_pointees,
+    );
+    let exposure_seed = decision::exposure::ExposureSeed::derive(
+        &program,
+        &run_config.configured_exposure,
+        fnptr_web.as_ref().ok(),
+    )
+    .map_err(|error| format!("raw-boundary exposure seed: {error:?}"))?;
+    let surface_world_attested =
+        analysis.attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
+    let all_functions = if surface_world_attested {
+        program.functions.iter().copied().collect()
+    } else {
+        rustc_hash::FxHashSet::default()
+    };
+    let preliminary_exposure = decision::exposure::ExposurePolicy::derive(
+        &program,
+        &exposure_seed,
+        fnptr_web.as_ref().ok(),
+        &all_functions,
+    );
+
+    // **S3.6-1 task 2 — the co-conversion classes.**
+    //
+    // Built from a SECOND run of the same ladder under
+    // `RefGate::LiftAdaptable`, which answers *"what would convert if the gate
+    // were lifted for the adaptable population?"*. The real `decide_one` and
+    // never a replay of it: micro-plan §1b measured a `facts.tsv`-only replay
+    // reporting 2,133 against a true 2,075, and retracted it.
+    //
+    // **The production table above is built first**, so nothing here can move a
+    // decision — the S3.6-0 pattern that makes zero corpus delta structural
+    // rather than lucky. ⚠ **This said "and from `BlockAll`"; that was true of
+    // task 2 only.** Production has passed `LiftAdaptable` since S3.6-1 and the
+    // `BlockAll` variant was deleted at M-3 (X-3). Task 3 is where the verdict
+    // reaches a gate.
+    // wave-6a W6A-T1: flexible-tail struct transactions, derived once from the
+    // construction facts and the subject universe (no model, no analysis).
+    // R419-3 (relay wave-6a/011): an owning endpoint that is a fn-pointer-web
+    // member or a positive seed keeps a raw outer surface (the exposure
+    // family's wrapper, which every in-crate caller binds to) — the
+    // allocation forms hold such chains whole rather than split them.
+    let raw_surface = |did: rustc_hir::def_id::LocalDefId| {
+        exposure_seed.contains(did) || fnptr_web.as_ref().is_ok_and(|web| web.contains(did))
+    };
+    let flexible_tails =
+        decision::flexible_tail::derive(tcx, &program.functions, &ctors, &subjects, &raw_surface);
+    // era-5c relay 182 (R826-1): the retained-access check of record, once per program.
+    let retained_access =
+        decision::retained_access::RetainedAccessCheck::compute(&program, &slots, &model);
+    // wave-6a W6A-C1: Box-parameter chains of consuming callees (the model is
+    // read only to refuse a chain whose members are not all Owning).
+    // wave-6a W6A-A1: allocation-return certificates (relay wave-6a/005 §1),
+    // derived first: a receiver may move into a consuming formal (A1-c) —
+    // admitted on the formal's shape, confirmed once the chains derive.
+    let consuming_formals =
+        decision::box_param::consuming_formals(tcx, &program.functions, &subjects);
+    // R427-4 (relay wave-6a/017): the pointees whose exported surface is
+    // closed — every function mentioning them is an exported producer or an
+    // exported consumer, and no struct field holds one. The certificates and
+    // the chains read it to admit a pair the crate itself never calls.
+    let exported_pairs =
+        decision::exported_pair::derive(tcx, &program.functions, &raw_surface, &consuming_formals);
+    // R579-4 R2: formals whose re-seat a later stage withdrew; the
+    // certificates re-derive without them (grows only).
+    let mut excluded_reseats: rustc_hash::FxHashSet<(
+        rustc_hir::def_id::LocalDefId,
+        rustc_hir::HirId,
+    )> = rustc_hash::FxHashSet::default();
+    let mut return_certificates = decision::return_certificate::derive(
+        tcx,
+        &program.functions,
+        &ctors,
+        &subjects,
+        &box_facts,
+        &slots,
+        &model,
+        &consuming_formals,
+        &raw_surface,
+        &exported_pairs,
+        &excluded_reseats,
+    );
+    // wave-6a: allocator-contract owners (relay wave-6a/006, R409-1/3).
+    let allocator_contracts = decision::allocator_contract::derive(
+        tcx,
+        &program.functions,
+        &subjects,
+        &slots,
+        &model,
+        &consuming_formals,
+        &box_facts,
+        &ctors,
+    );
+    let mut box_params = decision::box_param::derive(
+        tcx,
+        &program.functions,
+        &ctors,
+        &subjects,
+        &box_facts,
+        &slots,
+        &model,
+        &return_certificates,
+        &allocator_contracts.plans,
+        &consuming_formals,
+        &raw_surface,
+        &exported_pairs,
+        &declaration_pointees,
+    );
+    // R450-8 rung 3: the chain has spoken — an owner whose release was a
+    // transfer into a formal it did not plan is withdrawn.
+    let mut allocator_contracts = allocator_contracts;
+    decision::allocator_contract::confirm_transfers(
+        &mut allocator_contracts,
+        tcx,
+        &|did, index| {
+            did.as_local().is_some_and(|callee| {
+            subjects.iter().any(|s| {
+                s.fn_did == callee
+                    && matches!(s.kind, decision::SubjectKind::Param { hir_index } if hir_index == index)
+                    && box_params.plans.contains_key(&(s.fn_did, s.hir_id))
+            })
+        })
+        },
+    );
+    decision::return_certificate::confirm_transfers(
+        &mut return_certificates,
+        tcx,
+        &subjects,
+        &|did, index| {
+            did.as_local().is_some_and(|callee| {
+                subjects.iter().any(|s| {
+                    s.fn_did == callee
+                        && matches!(s.kind, decision::SubjectKind::Param { hir_index } if hir_index == index)
+                        && box_params.plans.contains_key(&(s.fn_did, s.hir_id))
+                })
+            })
+        },
+    );
+    // R579-4 R2: the certificates' own inputs, for a re-derivation inside the
+    // loop (which shadows `ctors` / `subjects` with the stage's augmented
+    // copies).
+    let certificate_ctors = ctors.clone();
+    let certificate_subjects = subjects.clone();
+    // **R857-2 / R858-4 (reading (A); fan-out 074) — the backstop's candidates**,
+    // once: they read the program, not a decision.
+    let released_through_indirect = decision::released_indirect::holds(&program, &subjects);
+    // **R864-3 (relay 299; era-5c 154 / 154a / 157c) — the retained-access check's
+    // holds, the joint fixpoint's fourth predicate**, named on the settled table
+    // after the field transactions (filter 3 reads them) and held for the rest of
+    // the stage like the planned holds.
+    let mut retained_held: (
+        Option<additive::FamilyStage>,
+        rustc_hash::FxHashMap<
+            (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+            decision::DegradeReason,
+        >,
+    ) = (None, Default::default());
+    // Relay 297 (main 187): the sources the stage's plan named pending, held for
+    // the rest of the stage (see below, before the stage snapshot).
+    let mut planned_held: (
+        Option<additive::FamilyStage>,
+        rustc_hash::FxHashMap<
+            (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+            decision::DegradeReason,
+        >,
+    ) = (None, Default::default());
+    // The formals the backstop held at the current family stage (see below).
+    let mut released_held: (
+        Option<additive::FamilyStage>,
+        rustc_hash::FxHashSet<(rustc_hir::def_id::LocalDefId, rustc_hir::HirId)>,
+    ) = (None, Default::default());
+    let mut family_policy = additive::FamilyPolicy::at(additive::FamilyStage::Core);
+    let mut predecessor: Option<additive::StageSnapshot> = None;
+    let mut native_ownership_candidates = decision::ownership_fields_native::Candidates::default();
+    let mut retired = additive::RetiredReceipts::default();
+    let mut family_receipts = Vec::new();
+    // **R857-1 (main 184a §2).** The pending hold's set, carried across the
+    // re-runs of ONE family stage: a withdrawal the hold caused (a caller's slice
+    // with no bridge into the held formal) re-decides the same stage, and the
+    // held subject must keep the hold's reason there rather than the withdrawn
+    // family's. A new stage re-enables the families and asks the hold afresh.
+    let mut pending_held: (
+        Option<additive::FamilyStage>,
+        rustc_hash::FxHashMap<
+            (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+            decision::DegradeReason,
+        >,
+    ) = (None, Default::default());
+    let original_c9_plans = retained_copy_plans.clone();
+    let mut a5_role_profile = None;
+    // wave-6f: fields a finalization refused, with the cause; grows only, so
+    // the re-derivation below terminates.
+    // The C free sites an owned field's allocation may leave through: libc
+    // `free` itself, a local deallocator proved from its source
+    // (`ownership_fields_deallocator`), or a user-named allocator contract
+    // (none in production yet; the test frame names one).
+    let field_deallocator = |callee: Option<rustc_hir::def_id::LocalDefId>,
+                             foreign: Option<&str>,
+                             argument: usize| {
+        if foreign == Some("free") && argument == 0 {
+            return Some(decision::field_reference::DEALLOC_TRANSFER);
+        }
+        #[cfg(test)]
+        if let Some(callee) = callee
+            && test_model_override::contract_deallocator(tcx, callee, argument)
+        {
+            return Some(decision::field_reference::DEALLOC_TRANSFER_CONTRACT);
+        }
+        callee
+            .filter(|callee| {
+                decision::ownership_fields_deallocator::derive(&program, *callee, argument).is_ok()
+            })
+            .map(|_| decision::field_reference::DEALLOC_TRANSFER)
+    };
+    let mut withdrawn_fields: std::collections::BTreeMap<
+        decision::field_reference::FieldKey,
+        String,
+    > = std::collections::BTreeMap::new();
+    // R586-2: the sole-origin formals decided mutable, grown by the fixpoint.
+    let mut sole_origin_upgrades = rustc_hash::FxHashSet::default();
+    // R575-6: subjects the aliased-storage twin's refusals withdrew to raw, with
+    // the refused calls. Learned per profile like the A5 roles, and grows only
+    // within one, so the re-derivation below terminates.
+    let mut aliased_storage_withdrawn: rustc_hash::FxHashMap<
+        (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+        String,
+    > = rustc_hash::FxHashMap::default();
+    let mut a5_roles: Vec<decision::co_conversion::PairSiteDecision> = Vec::new();
+    let mut a5_role_proofs: Vec<decision::seam::A5PositionProof> = Vec::new();
+    // wave-6l relay 067: the extent prover's verdicts, once per
+    // (function, parameter, companion) across the iterations.
+    let mut extent_proofs: rustc_hash::FxHashMap<
+        (rustc_hir::def_id::LocalDefId, usize, usize),
+        Option<decision::extent_proof::Proof>,
+    > = rustc_hash::FxHashMap::default();
+    let a5_role_bound = facts
+        .call_args
+        .values()
+        .flatten()
+        .map(|site| site.args.len())
+        .sum::<usize>();
+    crate::phase_log::mark(
+        "finish_decide:facts",
+        "end",
+        &format!("subjects={}", subjects.len()),
+    );
+    let mut phase_round = 0usize;
+    loop {
+        phase_round += 1;
+        crate::phase_log::mark(
+            "finish_decide:round",
+            "start",
+            &format!("round={phase_round}"),
+        );
+        let profile = (
+            family_policy.stage,
+            family_policy.withdrawn.clone(),
+            family_policy.withdrawn_subjects.clone(),
+        );
+        if a5_role_profile.as_ref() != Some(&profile) {
+            a5_roles.clear();
+            a5_role_proofs.clear();
+            aliased_storage_withdrawn.clear();
+            a5_role_profile = Some(profile);
+        }
+        let mut ctors = ctors.clone();
+        let mut subjects = subjects.clone();
+        decision::declaration_pattern::augment(
+            &declaration_patterns,
+            &family_policy,
+            &mut ctors,
+            &mut subjects,
+        );
+        retained_copy_plans = original_c9_plans.clone();
+        facts.body_adapters = original_body_adapters.clone();
+        let current_slice_uses = additive::select_uses(
+            &return_slice_uses,
+            &full_slice_uses,
+            &family_policy,
+            additive::FamilyStage::Return,
+        );
+        let mut slice_uses = additive::select_uses(
+            &current_slice_uses,
+            &prior_slice_uses,
+            &family_policy,
+            additive::FamilyStage::SliceUse,
+        );
+        decision::counted_void::install(&counted_void, &mut slice_uses);
+        decision::void_region::install(&void_region, &mut slice_uses);
+        let mut current_opt_uses = additive::select_uses(
+            &return_opt_uses,
+            &full_opt_uses,
+            &family_policy,
+            additive::FamilyStage::Return,
+        );
+        decision::counted_void::install_opt(&counted_void, &mut current_opt_uses);
+        let opt_uses = additive::select_uses(
+            &current_opt_uses,
+            &prior_opt_uses,
+            &family_policy,
+            additive::FamilyStage::Option,
+        );
+        // Candidate inventory is independent of hypothetical Box rendering.
+        // Native producer installation remains an explicit pre-census gate.
+        let ownership_fields =
+            decision::ownership_fields_hook::Inputs::discover(&model, &slots, &subjects)
+                .with_native_candidates(native_ownership_candidates.clone());
+        // wave-6f: the field-transaction candidates, from the frozen model and
+        // the program's syntax; refused fields are excluded at this input.
+        let field_candidates = decision::field_reference::derive(
+            &program,
+            &slots,
+            &model,
+            &subjects,
+            &withdrawn_fields,
+        );
+        decision::field_reference::lift_store_walls(tcx, &field_candidates, &mut slice_uses);
+        let raw_field_null =
+            decision::raw_field_null::derive(&program, &slots, &model, &field_candidates);
+        let slice_uses = slice_uses;
+        // **Row (vi), option (a) (R473-1)** — a MACRO, not a closure.
+        //
+        // As a closure this captured `&facts` for its whole live range, so NLL kept the
+        // shared borrow alive across `facts.body_adapters.push(..)` the moment anything
+        // rebuilt a `Ctx` after that push — which is exactly what the nested lane's
+        // `replan_delivered_table_elements` call does, and why 51 rows sat behind an
+        // `E0502`. Re-parameterising cannot fix it: a closure parameter is
+        // higher-ranked, a fresh region per call, while `Ctx<'a, 'tcx>` needs `facts` to
+        // share the one region its other thirty references already have, and that region
+        // has no name inside the function body (main report 051, row (vi)).
+        //
+        // A macro expands at each use site, so each `Ctx` borrows `facts` only for its
+        // own expression and nothing is held across the push. Same struct literal, same
+        // semantics, no signature to spell and no region to name.
+        macro_rules! ctx_of {
+            ($gate:expr, $coconv:expr, $lifetime_eligibility:expr, $raw_boundary:expr,
+             $exposure:expr, $return_receivers:expr $(,)?) => {
+                decision::Ctx {
+                    tcx,
+                    counted_void: &counted_void,
+                    flexible_tails: &flexible_tails,
+                    box_params: &box_params,
+                    return_certificates: &return_certificates,
+                    allocator_contracts: &allocator_contracts,
+                    void_region: &void_region,
+                    void_region_receivers: &void_region_receivers,
+                    return_receivers: $return_receivers,
+                    family_policy: &family_policy,
+                    io_domain: &io_domain_subjects,
+                    void_pointee: &void_pointee_subjects,
+                    thin_extent: &thin_extent_subjects,
+                    local_callee_extent: &local_callee_extent_subjects,
+                    contract_extent: &contract_extent_candidates,
+                    declaration_pointees: &declaration_pointees,
+                    declaration_patterns: &declaration_patterns,
+                    input_interfaces: &input_interfaces,
+                    model: &model,
+                    slots: &slots,
+                    facts: &facts,
+                    fat: &fat,
+                    sign: &sign,
+                    slice_uses: &slice_uses,
+                    opt_uses: &opt_uses,
+                    box_facts: &box_facts,
+                    ownership_fields: &ownership_fields,
+                    constructions: &ctors,
+                    subjects: &subjects,
+                    gate: $gate,
+                    coconv: $coconv,
+                    lifetime_eligibility: $lifetime_eligibility,
+                    raw_boundary: $raw_boundary,
+                    exposure: $exposure,
+                    field_reference: Some(&field_candidates),
+                    raw_field_null: &raw_field_null,
+                }
+            };
+        }
+
+        crate::phase_log::mark("finish_decide:hypothetical", "start", "");
+        let hypothetical = decision::decide(
+            &ctx_of!(
+                decision::RefGate::LiftAdaptable,
+                None,
+                None,
+                None,
+                Some(&preliminary_exposure),
+                None,
+            ),
+            &subjects,
+        );
+        // Escapes are computed BEFORE the classes now: P1 makes them a gate, not a
+        // report, so `build` consumes them rather than the census reading them
+        // alongside.
+        let escapes = decision::co_conversion::escapes(tcx, &program.functions, &subjects);
+        let return_family_functions = program
+            .functions
+            .iter()
+            .copied()
+            .filter(|owner| family_policy.enabled(*owner, additive::FamilyStage::Return))
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let mut lifetime_eligibility = decision::lifetime::derive_return_eligibility(
+            &program,
+            &return_family_functions,
+            &facts.return_sites,
+            &slots,
+            &model,
+            analysis.origins.as_ref(),
+            &hypothetical,
+            &subjects,
+            &ctors,
+            &escapes,
+            fnptr_web.clone(),
+            fnptr_web_wall_s,
+            &preliminary_exposure,
+            &facts.raw_only_uses,
+        );
+        lifetime_eligibility.admit_field_stores(field_candidates.store_permit_pairs());
+        let lifetime_eligibility = lifetime_eligibility;
+        // Candidate receiver interfaces use only the already-derived native
+        // permits. Actual settled interfaces are checked before emission.
+        let mut receiver_prototype = hypothetical.clone();
+        receiver_prototype.lifetime_plan = decision::lifetime::finalize(
+            &program,
+            analysis.origins.as_ref(),
+            &lifetime_eligibility,
+            &receiver_prototype,
+        )?;
+        receiver_prototype.return_interfaces = decision::return_interface::plan(
+            tcx,
+            &receiver_prototype,
+            &facts,
+            &lifetime_eligibility,
+            &return_family_functions,
+        );
+        let return_receivers = decision::return_receiver::plan(
+            tcx,
+            &receiver_prototype,
+            &ctors,
+            &lifetime_eligibility,
+        );
+        let e2_hypothetical = decision::decide(
+            &ctx_of!(
+                decision::RefGate::LiftAdaptable,
+                None,
+                Some(&lifetime_eligibility),
+                None,
+                Some(&preliminary_exposure),
+                Some(&return_receivers),
+            ),
+            &subjects,
+        );
+        // **A7/A8 control — the same decision, one argument removed.**
+        //
+        // `hypothetical` above is NOT this control: it also drops
+        // `return_receivers`, so a difference against it would be attributable
+        // to two changes at once. This run differs from `e2_hypothetical` in
+        // exactly `lifetime_eligibility`, which is what the rider is about —
+        // a lifetime plan annotates signatures and must decide nothing.
+        let e2_plan_inert_control = decision::decide(
+            &ctx_of!(
+                decision::RefGate::LiftAdaptable,
+                None,
+                None,
+                None,
+                Some(&preliminary_exposure),
+                Some(&return_receivers),
+            ),
+            &subjects,
+        );
+        let plan_inert_digest_with = digest_of(&decision_vector_render(tcx, &e2_hypothetical));
+        let plan_inert_digest_without =
+            digest_of(&decision_vector_render(tcx, &e2_plan_inert_control));
+        let converting_signature_functions = e2_hypothetical
+            .entries
+            .iter()
+            .filter(|(subject, decision)| {
+                matches!(subject.kind, decision::SubjectKind::Param { .. })
+                    && decision_is_safe(decision)
+            })
+            .map(|(subject, _)| subject.fn_did)
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let no_surface_functions = rustc_hash::FxHashSet::default();
+        let candidate_surface_functions = if surface_world_attested {
+            &converting_signature_functions
+        } else {
+            &no_surface_functions
+        };
+        let candidate_exposure = decision::exposure::ExposurePolicy::derive(
+            &program,
+            &exposure_seed,
+            fnptr_web.as_ref().ok(),
+            candidate_surface_functions,
+        );
+        let raw_boundary_sites_started = std::time::Instant::now();
+        let raw_boundary_sites =
+            decision::raw_boundary::RawBoundarySiteFacts::derive(&program, &facts);
+        let raw_boundary_site_derivation_wall_s =
+            raw_boundary_sites_started.elapsed().as_secs_f64();
+        let retention_started = std::time::Instant::now();
+        let mut retention = decision::raw_boundary::RetentionSummaries::derive(
+            &program,
+            analysis.origins.as_ref(),
+            analysis.attestation,
+        );
+        // wave-6v2 (R453-6): the caller-level settled fact needs both derives.
+        retention.record_output_storage_settlement(&raw_boundary_sites);
+        let retention = retention;
+        let retention_fixpoint_wall_s = retention_started.elapsed().as_secs_f64();
+        let raw_boundary_decision_started = std::time::Instant::now();
+        let boundary_hypothesis = a5_role_target_hypothesis(tcx, &e2_hypothetical, &a5_roles);
+        let raw_boundary = decision::raw_boundary::RawBoundaryDispositionIndex::derive(
+            &raw_boundary_sites,
+            &retention,
+            &boundary_hypothesis,
+            &facts,
+            &mut_facts,
+        );
+        // Wave-6o (relay 018 §1): the pending sibling-overlap market the
+        // null-init family consults before delivering, from the same inputs
+        // the terminal inventory reads.
+        let pending_sibling_sources = decision::pending_sibling::pending_sibling_sources(
+            tcx,
+            &decision::sibling_overlap::SiblingInputs {
+                slots: &slots,
+                model: &model,
+                mut_facts: &mut_facts,
+                facts: &facts,
+                subjects: &subjects,
+                a5_site_proofs: &a5_site_proofs,
+                raw_boundary_sites: &raw_boundary_sites,
+                retention: &retention,
+                origins: analysis.origins.as_ref(),
+            },
+            &raw_boundary,
+        );
+        let raw_boundary = raw_boundary.with_pending_sibling_sources(pending_sibling_sources);
+        let raw_boundary_decision_wall_s = raw_boundary_decision_started.elapsed().as_secs_f64();
+        let coconv =
+            decision::co_conversion::build_with_c9_marks_lifetimes_raw_boundary_pair_proofs_and_a5_roles(
+                &facts,
+                &subjects,
+                &e2_hypothetical,
+                &escapes,
+                decision::co_conversion::OverlapRule::BlindOnly,
+                &retained_copy_plans,
+                &lifetime_eligibility,
+                &raw_boundary,
+                Some(&a5_site_proofs),
+                &retention,
+                &a5_roles,
+            );
+        // **Production is decided AFTER the classes**, because step 2's gate reads
+        // them. No cycle: the hypothetical above was decided with `None`.
+        // **S3.6-1 step 3 — THE LIFT.** Production decides under `LiftAdaptable`
+        // with the class verdict in hand: the adaptable population passes the
+        // `referenced` gate, and the class gate then governs every node uniformly.
+        // The pinned population still blocks inside `LiftAdaptable`.
+        let mut table = decision::decide(
+            &ctx_of!(
+                decision::RefGate::LiftAdaptable,
+                Some(&coconv),
+                Some(&lifetime_eligibility),
+                Some(&raw_boundary),
+                Some(&candidate_exposure),
+                Some(&return_receivers),
+            ),
+            &subjects,
+        );
+        // **R485-4(b) — the decided-slice exemption, as a second pass.** A
+        // callee parameter this run decided `Slice` carries a checked extent,
+        // so the `held:local-callee-access-extent` hold its callers took no
+        // longer applies. The decision is not available when the map is first
+        // collected (it is one of the map's own inputs), so the pass runs once
+        // over the SETTLED table and re-decides only if a hold actually went.
+        let mut decided = decision::local_callee_extent::DecidedForms::default();
+        for (subject, decision) in &table.entries {
+            let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                continue;
+            };
+            // Exhaustive by rule (`import_denylist`): a new disposition must be
+            // classified here, not silently dropped.
+            match decision {
+                decision::Decision::Slice { .. } => {
+                    decided.slice.insert((subject.fn_did, hir_index));
+                }
+                decision::Decision::Cursor { .. }
+                | decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Box(_)
+                | decision::Decision::Degraded(_) => {}
+            }
+        }
+        let relaxed = decision::local_callee_extent::relaxed_by_decisions(
+            tcx,
+            &subjects,
+            &facts,
+            &full_slice_uses,
+            &cursor_candidates,
+            &fat,
+            &decided,
+            &local_callee_extent_subjects,
+        );
+        if let Some(relaxed) = &relaxed {
+            let ctx = decision::Ctx {
+                local_callee_extent: relaxed,
+                ..ctx_of!(
+                    decision::RefGate::LiftAdaptable,
+                    Some(&coconv),
+                    Some(&lifetime_eligibility),
+                    Some(&raw_boundary),
+                    Some(&candidate_exposure),
+                    Some(&return_receivers),
+                )
+            };
+            table = decision::decide(&ctx, &subjects);
+        }
+        // **The settled-table holds, one fixpoint** (main 186 §6): R857-2's backstop
+        // (`held:released-through-indirect-call`; reading (A), era-5c 151; fan-out
+        // 074) and R829-1 / R855-1 / R857-1's pending hold
+        // (`held:pair-not-shown-disjoint`; main 184 / 184a), read on the settled
+        // table before anything is planned. Each pass adds what either names on the
+        // current table, and the table is decided again with EVERY hold forced raw,
+        // so neither drops the other's; a held formal is a raw target for the calls
+        // into it, so the loop asks again until nothing new is held (each pass only
+        // adds). The seams below then plan every call into a held formal with the
+        // ordinary bridge. Within one family stage, a subject held earlier keeps its
+        // hold's reason where a re-run after a withdrawal decides it raw anyway (a
+        // relabel, never a forced raw form, so the withdrawal still restores
+        // whatever the predecessor delivered).
+        if released_held.0 != Some(family_policy.stage) {
+            released_held = (Some(family_policy.stage), Default::default());
+        }
+        if pending_held.0 != Some(family_policy.stage) {
+            pending_held = (Some(family_policy.stage), Default::default());
+        }
+        // The planned holds are the stage's own plan's (a later stage's family
+        // can deliver the target a Declaration-stage plan left raw), so they reset
+        // with the stage too, and persist only through its re-runs.
+        if planned_held.0 != Some(family_policy.stage) {
+            planned_held = (Some(family_policy.stage), Default::default());
+        }
+        if retained_held.0 != Some(family_policy.stage) {
+            retained_held = (Some(family_policy.stage), Default::default());
+        }
+        let pending_coverage = decision::sibling_overlap::collect_inventory_from(
+            tcx,
+            &decision::sibling_overlap::SiblingInputs {
+                slots: &slots,
+                model: &model,
+                mut_facts: &mut_facts,
+                facts: &facts,
+                subjects: &subjects,
+                a5_site_proofs: &a5_site_proofs,
+                raw_boundary_sites: &raw_boundary_sites,
+                retention: &retention,
+                origins: analysis.origins.as_ref(),
+            },
+            &decision::outbound_expression::OutboundExpressionPlans::default(),
+        )
+        .coverage;
+        let mut carried = pending_held
+            .1
+            .iter()
+            .filter(|(node, _)| {
+                table.entries.iter().any(|(subject, decision)| {
+                    (subject.fn_did, subject.hir_id) == **node
+                        && match decision {
+                            decision::Decision::Degraded(_) => true,
+                            decision::Decision::Ref { .. }
+                            | decision::Decision::InferredRef { .. }
+                            | decision::Decision::Slice { .. }
+                            | decision::Decision::NestedSlice { .. }
+                            | decision::Decision::Cursor { .. }
+                            | decision::Decision::Opt { .. }
+                            | decision::Decision::Box(_) => false,
+                        }
+                })
+            })
+            .map(|(node, reason)| (*node, reason.clone()))
+            .collect::<Vec<_>>();
+        let mut forced = rustc_hash::FxHashMap::default();
+        // Every predicate that names a subject, in the pass it names it: a subject
+        // two predicates hold carries both receipts (relay 297), though its
+        // decision carries the first reason.
+        let mut receipts = Vec::new();
+        loop {
+            let mut new = rustc_hash::FxHashMap::default();
+            for (node, reason) in decision::released_indirect::to_hold(
+                &released_through_indirect,
+                &table,
+                &released_held.1,
+            ) {
+                if !forced.contains_key(&node) {
+                    receipts.push(decision::settled_holds::SettledHoldReceipt::of(
+                        node, &reason,
+                    ));
+                    released_held.1.insert(node);
+                    new.entry(node).or_insert(reason);
+                }
+            }
+            // Relay 297 (main 187, D5 (a)): the pending predicate reads a callee
+            // formal's form, and before the Declaration stage a formal can be raw
+            // only because its family is not on yet; a hold taken there is not
+            // the emitted program's.
+            for (node, reason) in planned_held.1.iter().chain(&retained_held.1) {
+                if !forced.contains_key(node) && !new.contains_key(node) {
+                    receipts.push(decision::settled_holds::SettledHoldReceipt::of(
+                        *node, reason,
+                    ));
+                    new.insert(*node, reason.clone());
+                }
+            }
+            if family_policy.stage >= additive::FamilyStage::Declaration {
+                // R864-1 (relay 299): the pairs the pair pass drops, a delivered
+                // reference formal beside a raw one at an in-program call, held by
+                // the same rule (R833-1) and carried as the pending holds are.
+                for (node, reason) in std::mem::take(&mut carried)
+                    .into_iter()
+                    .chain(decision::pending_hold::holds(
+                        &table,
+                        &pending_coverage,
+                        &raw_boundary,
+                    ))
+                    .chain(decision::ref_beside_raw::holds(
+                        tcx,
+                        &facts,
+                        &table,
+                        &a5_site_proofs,
+                        &mut_facts,
+                        coconv.pair_sites(),
+                        &retained_copy_plans,
+                    ))
+                {
+                    if forced.contains_key(&node) {
+                        continue;
+                    }
+                    receipts.push(decision::settled_holds::SettledHoldReceipt::of(
+                        node, &reason,
+                    ));
+                    if let std::collections::hash_map::Entry::Vacant(e) = new.entry(node) {
+                        pending_held.1.insert(node, reason.clone());
+                        e.insert(reason);
+                    }
+                }
+            }
+            for (node, reason) in decision::settled_holds::into_held_formals(
+                tcx,
+                &facts,
+                &table,
+                &boundary_hypothesis,
+                &forced,
+            ) {
+                receipts.push(decision::settled_holds::SettledHoldReceipt::of(
+                    node, &reason,
+                ));
+                new.entry(node).or_insert(reason);
+            }
+            if new.is_empty() {
+                break;
+            }
+            forced.extend(new);
+            table = match &relaxed {
+                Some(relaxed) => {
+                    let ctx = decision::Ctx {
+                        local_callee_extent: relaxed,
+                        ..ctx_of!(
+                            decision::RefGate::LiftAdaptable,
+                            Some(&coconv),
+                            Some(&lifetime_eligibility),
+                            Some(&raw_boundary),
+                            Some(&candidate_exposure),
+                            Some(&return_receivers),
+                        )
+                    };
+                    decision::decide_with_raw_fallbacks(&ctx, &subjects, &forced)
+                }
+                None => decision::decide_with_raw_fallbacks(
+                    &ctx_of!(
+                        decision::RefGate::LiftAdaptable,
+                        Some(&coconv),
+                        Some(&lifetime_eligibility),
+                        Some(&raw_boundary),
+                        Some(&candidate_exposure),
+                        Some(&return_receivers),
+                    ),
+                    &subjects,
+                    &forced,
+                ),
+            };
+        }
+        table.settled_hold_receipts = receipts;
+        // R586-2: the sole-origin upgrades, on the table the ladder settled.
+        decision::return_origin_mutability::apply(&mut table, &sole_origin_upgrades);
+        // **R666-1 / R697-2 — the loader.** The model's arm-(a) receipts
+        // (`arg-order-applied`: a pure read hoisted above the lend it sits
+        // beside) key the emission's hoist; without them the premise the model
+        // decided under is absent from the emitted call (quadtree's E0502 at
+        // the L01¹¹ frame). An entry that records none leaves the set empty.
+        table.arg_order_hoists = model_cache::prepared_arg_order_hoists(
+            tcx,
+            &model_cache::fingerprint(&program, analysis.a5_mode, analysis.attestation),
+        )
+        .unwrap_or_default();
+        // R575-6: on the settled table, before anything is planned from it.
+        apply_aliased_storage_withdrawals(tcx, &mut table, &aliased_storage_withdrawn);
+        // **After the re-decide, deliberately.** `decide` returns a fresh table,
+        // so anything recorded on the old one is gone; the seam's C-string
+        // licences are recomputed here, on whatever table the ladder settled.
+        // **R491-7** — the exact C-string extents, recorded for the seam: a
+        // callee parameter whose walk is licensed exact gives its callers
+        // `strlen(p) + 1` rather than the fallback.
+        table.nul_exact_parameters = subjects
+            .iter()
+            .filter_map(|subject| {
+                let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                    return None;
+                };
+                matches!(
+                    decision::local_callee_extent::nul_walk(tcx, subject, &facts),
+                    Some(decision::local_callee_extent::NulWalk::Exact)
+                )
+                .then_some((subject.fn_did, hir_index))
+            })
+            .collect();
+        // **R622-1 / R628-2** — the parameters accessed past one element, for
+        // the seam's `(Slice, Ref)` row (R416-5).
+        table.wide_access_parameters =
+            decision::local_callee_extent::accessed_past_one_element(tcx, &subjects, &facts);
+        // R491-7's caller-side clause: the subjects whose own body establishes
+        // the terminator.
+        // R780-3 item 3: only where nothing writes through the subject (or a
+        // copy) in the caller — the NUL its own `strlen` saw is still there
+        // at the call.
+        table.nul_exact_callers = subjects
+            .iter()
+            .filter(|subject| decision::local_callee_extent::caller_establishes_nul(tcx, subject))
+            .filter(|subject| {
+                decision::nul_walk_arm::only_read(tcx, &facts, subject.fn_did, subject.hir_id)
+            })
+            .map(|subject| (subject.fn_did, subject.hir_id))
+            .collect();
+        // Surface policies are provisional until the full ladder settles. A raw
+        // wrapper or entry shim exists only when at least one signature subject
+        // survives every arm; blocked functions retain their seed/web evidence but
+        // receive NotApplicable and therefore no pointless surface edit.
+        let settled_signature_functions = table
+            .entries
+            .iter()
+            .filter(|(subject, decision)| {
+                matches!(subject.kind, decision::SubjectKind::Param { .. })
+                    && decision_is_safe(decision)
+            })
+            .map(|(subject, _)| subject.fn_did)
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let exposure = decision::exposure::ExposurePolicy::derive(
+            &program,
+            &exposure_seed,
+            fnptr_web.as_ref().ok(),
+            if surface_world_attested {
+                &settled_signature_functions
+            } else {
+                &no_surface_functions
+            },
+        );
+        table.exposure = Some(exposure.clone());
+
+        // wave-6f: finalize every field transaction against the settled table;
+        // a refused field is excluded at the candidate input and the stage is
+        // re-derived, so its dependents reproduce their prior decisions.
+        let (field_transactions, refused_fields) = decision::field_reference::finalize(
+            tcx,
+            &field_candidates,
+            &table,
+            &exposure,
+            &field_deallocator,
+        );
+        if !refused_fields.is_empty() {
+            let before = withdrawn_fields.len();
+            withdrawn_fields.extend(refused_fields);
+            if withdrawn_fields.len() <= before {
+                return Err("field-transaction-invariant:no-strict-progress".to_owned());
+            }
+            continue;
+        }
+        // R528-3 (wave-6a): A1-e's companion gate, keyed on the DELIVERED
+        // field form. A certificate spells its owner's owned fields as their
+        // raw zero; if an applied transaction delivers one of them, the
+        // certificate withdraws and the stage re-derives (certificates only
+        // shrink, so this terminates).
+        // R531-4 (vii): the parameter-side mirror — A9's declines on a
+        // struct whose owned field is delivered withdraw the same way.
+        let delivered = |struct_did: rustc_hir::def_id::LocalDefId, field_index: usize| {
+            field_transactions.applied.iter().any(|t| {
+                t.owning
+                    && t.array.is_none()
+                    && t.key.struct_did == struct_did
+                    && t.key.field_index == field_index
+            })
+        };
+        // R579-4 R1: a synthesised literal re-renders with the delivered
+        // forms instead of withdrawing; C2: a certified call stored into a
+        // delivered owned field is the transaction's move.
+        let delivered_form = |struct_did: rustc_span::def_id::DefId, field_index: usize| {
+            let struct_did = struct_did.as_local()?;
+            field_transactions
+                .applied
+                .iter()
+                .find(|t| {
+                    t.owning
+                        && t.array.is_none()
+                        && t.key.struct_did == struct_did
+                        && t.key.field_index == field_index
+                })
+                .map(|t| t.delivered_form_key().to_owned())
+        };
+        let certificates_withdrawn = decision::return_certificate::withdraw_delivered_owned_fields(
+            &mut return_certificates,
+            tcx,
+            &subjects,
+            &delivered,
+            &delivered_form,
+        );
+        let lends_withdrawn =
+            decision::box_param::withdraw_delivered_owned_field_lends(&mut box_params, &delivered);
+        // R536-3: a re-seat whose moved-out field is not delivered withdraws.
+        let reseats_withdrawn =
+            decision::box_param::withdraw_undelivered_reseats(&mut box_params, &delivered);
+        // R579-4 R2: a certificate whose owner is a withdrawn re-seat's formal
+        // re-derives without it, then re-confirms its transfers.
+        let unseated = decision::return_certificate::unseated_owner_parameters(
+            &return_certificates,
+            &|f, h| box_params.plans.contains_key(&(f, h)),
+        );
+        if !unseated.is_empty() {
+            excluded_reseats.extend(unseated);
+            return_certificates = decision::return_certificate::derive(
+                tcx,
+                &program.functions,
+                &certificate_ctors,
+                &certificate_subjects,
+                &box_facts,
+                &slots,
+                &model,
+                &consuming_formals,
+                &raw_surface,
+                &exported_pairs,
+                &excluded_reseats,
+            );
+            decision::return_certificate::confirm_transfers(
+                &mut return_certificates,
+                tcx,
+                &certificate_subjects,
+                &|did, index| {
+                    did.as_local().is_some_and(|callee| {
+                        certificate_subjects.iter().any(|s| {
+                            s.fn_did == callee
+                                && matches!(s.kind, decision::SubjectKind::Param { hir_index } if hir_index == index)
+                                && box_params.plans.contains_key(&(s.fn_did, s.hir_id))
+                        })
+                    })
+                },
+            );
+            continue;
+        }
+        if certificates_withdrawn || lends_withdrawn || reseats_withdrawn {
+            continue;
+        }
+        table.field_transactions = field_transactions;
+        // R864-3: the retained-access check's holds on the settled table, under the
+        // three filters; a new hold decides the stage again with it raw (the map only
+        // grows within a stage).
+        let mut retained_grew = false;
+        for (node, reason) in decision::retained_access_hold::holds(
+            tcx,
+            &table,
+            &raw_boundary,
+            &retained_access,
+            &lifetime_eligibility,
+        ) {
+            if let std::collections::hash_map::Entry::Vacant(entry) = retained_held.1.entry(node) {
+                entry.insert(reason);
+                retained_grew = true;
+            }
+        }
+        if retained_grew {
+            continue;
+        }
+        // R425-3: the reader chain's own companion, for the seam's count
+        // evidence (`count_companions`). Read from the settled table so the
+        // index the seam licenses is the one the chain proved.
+        let slice_input_extents = table
+            .entries
+            .iter()
+            .filter_map(|(subject, _)| {
+                let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                    return None;
+                };
+                let proof = decision::slice_input::prove(tcx, subject, &facts, &fat).ok()?;
+                let companion = proof.extent.companion_index(hir_index)?;
+                Some((
+                    (subject.fn_did, subject.hir_id),
+                    (companion, proof.extent.is_mask()),
+                ))
+            })
+            .collect::<Vec<_>>();
+        // R477-6: the masked arm licenses the same integer and a different
+        // LENGTH (`companion + 1`), so the two facts travel together.
+        table.slice_input_mask_companions = slice_input_extents
+            .iter()
+            .filter(|(_, (_, masked))| *masked)
+            .map(|(key, _)| *key)
+            .collect();
+        table.slice_input_companions = slice_input_extents
+            .into_iter()
+            .map(|(key, (companion, _))| (key, companion))
+            .collect();
+        // wave-6l relay 067 (the extent build's first case): a delivered slice
+        // parameter no other producer licenses takes its adjacent integer when
+        // the extent prover shows that integer bounds every access (ht's
+        // `ht_set_entry(entries, capacity)`).
+        table.extent_proof_companions = table
+            .entries
+            .iter()
+            .filter_map(|(subject, decision)| {
+                let decision::SubjectKind::Param { hir_index } = subject.kind else {
+                    return None;
+                };
+                match decision {
+                    decision::Decision::Slice { .. } => {}
+                    decision::Decision::Cursor { .. }
+                    | decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Box(_)
+                    | decision::Decision::Degraded(_) => return None,
+                }
+                let key = (subject.fn_did, subject.hir_id);
+                if table.slice_input_companions.contains_key(&key) {
+                    return None;
+                }
+                let companion =
+                    match decision::seam::length_evidence(tcx, subject.fn_did, hir_index) {
+                        decision::seam::LenEvidence::Following => hir_index + 1,
+                        decision::seam::LenEvidence::Preceding => hir_index.checked_sub(1)?,
+                        _ => return None,
+                    };
+                let proof = extent_proofs
+                    .entry((subject.fn_did, hir_index, companion))
+                    .or_insert_with(|| {
+                        decision::extent_proof::prove_parameter_extent(
+                            tcx,
+                            subject.fn_did,
+                            hir_index,
+                            companion,
+                        )
+                        .ok()
+                    })
+                    .clone()?;
+                Some((key, (companion, proof.premises)))
+            })
+            .collect();
+        // wave-6l relay 071 (R697-7): the field-carried allocation length of
+        // every call argument that reads a licensed field.
+        table.field_alloc_lengths = facts
+            .call_args
+            .values()
+            .flatten()
+            .flat_map(|call| {
+                call.args.iter().filter_map(|arg| {
+                    field_alloc_licences
+                        .length_at(tcx, call.caller, arg.span)
+                        .map(|length| ((call.caller, arg.span), length))
+                })
+            })
+            .collect();
+        // wave-6l relay 077 (R776-4): the C strings the NUL-walk arm licenses.
+        table.nul_walk_sites = decision::nul_walk_arm::sites(tcx, &facts);
+
+        // Use-edit nesting is a property of a PAIR of edits, so it cannot be seen by
+        // `decide_one`, which is handed one subject at a time. Runs here, over the
+        // finished table, where both the within-subject and the cross-subject case
+        // are visible — a per-subject check left 15 of brotli's 17 collisions
+        // standing, measured.
+        decision::refuse_nested_use_edits(tcx, &mut table);
+        table.depth2_npo_storages = decision::plan_depth2_npo_storages(tcx, &table, &facts, &ctors);
+
+        let finalization_started = std::time::Instant::now();
+        table.lifetime_plan = decision::lifetime::finalize(
+            &program,
+            analysis.origins.as_ref(),
+            &lifetime_eligibility,
+            &table,
+        )?;
+        table.return_interfaces = decision::return_interface::plan(
+            tcx,
+            &table,
+            &facts,
+            &lifetime_eligibility,
+            &return_family_functions,
+        );
+        // R586-2 (main 118): a formal that is the sole origin of a mutable scalar
+        // return is decided mutable. The origin is read from the settled plan,
+        // so a new target re-derives the stage with the upgrade applied at the
+        // decide (the field transactions render the view's mutability).
+        let targets = decision::return_origin_mutability::targets(tcx, &table, &facts);
+        if !targets.is_subset(&sole_origin_upgrades) {
+            sole_origin_upgrades.extend(targets);
+            continue;
+        }
+        for failure in decision::return_receiver::validate_current(&return_receivers, &table) {
+            table
+                .return_receivers
+                .failures
+                .insert(failure.node, failure);
+        }
+        let finalization_wall_s = finalization_started.elapsed().as_secs_f64();
+
+        // **S3.6-1 seam adapters.** Runs AFTER every gate that can still refuse a
+        // subject, including the nesting pass above: a seam is computed from the
+        // forms both ends actually settle on, so a subject withdrawn later would
+        // leave glue bridging to a form that no longer exists.
+        // A family rollback may restore a copied source to raw while its
+        // scalar-reference destination remains admitted. Reuse the existing
+        // typed body-glue path for that exact initializer and pointee.
+        for site in restored_reference_copy_sites(tcx, &table, &ctors, &family_policy) {
+            if !facts.body_adapters.iter().any(|old| {
+                old.owner == site.owner
+                    && old.destination == site.destination
+                    && old.rhs_span == site.rhs_span
+            }) {
+                facts.body_adapters.push(site);
+            }
+        }
+        let seam_started = std::time::Instant::now();
+        table.seams = decision::seam::synthesize_with_raw_boundary(
+            tcx,
+            &facts,
+            &subjects,
+            &table,
+            &retained_copy_plans,
+            &a5_site_proofs,
+            &raw_boundary,
+            &coconv,
+            &retention,
+            &lifetime_eligibility,
+            &mut_facts,
+        );
+        retire_box_edits_under_base_views(&mut table);
+        let mut arm_requirements =
+            derive_arm_requirements(&subjects, &table, &coconv, &raw_boundary, &exposure);
+        table.seams.d4_pair_discharges = discharge_d4_by_pair_certificates(
+            &table,
+            &coconv,
+            a5_site_proofs.pair_certificates(),
+            &mut arm_requirements,
+        );
+        table.arm_requirements = arm_requirements;
+        let seam_wall_s = seam_started.elapsed().as_secs_f64();
+        let raw_boundary_render_wall_s = seam_started.elapsed().as_secs_f64();
+        let c9_before_final_filter = retained_copy_plans.len();
+        retained_copy_plans.retain(|mark| {
+            let call_span = mark.call_span.source_callsite();
+            let caller = tcx.def_path_str(mark.caller_did.to_def_id());
+            let nested_reborrow = table.seams.edits.iter().any(|edit| {
+                edit.caller_fn == caller
+                    && edit.family == decision::seam::SeamFamily::Reborrow
+                    && call_span.contains(edit.span.source_callsite())
+            });
+            let params = mark.key.pair.params();
+            !nested_reborrow
+                && [params.first(), params.second()].into_iter().all(|param| {
+                    let local = Local::from_usize(param as usize);
+                    table.entries.iter().any(|(subject, decision)| {
+                        let is_ref = match decision {
+                            decision::Decision::Ref { .. }
+                            | decision::Decision::InferredRef { .. } => true,
+                            decision::Decision::Cursor { .. }
+                            | decision::Decision::NestedSlice { .. }
+                            | decision::Decision::Slice { .. }
+                            | decision::Decision::Opt { .. }
+                            | decision::Decision::Box(_)
+                            | decision::Decision::Degraded(_) => false,
+                        };
+                        subject.fn_did == mark.owner_did && subject.local == local && is_ref
+                    })
+                })
+        });
+        if retained_copy_plans.len() != c9_before_final_filter {
+            table.seams = decision::seam::synthesize_with_raw_boundary(
+                tcx,
+                &facts,
+                &subjects,
+                &table,
+                &retained_copy_plans,
+                &a5_site_proofs,
+                &raw_boundary,
+                &coconv,
+                &retention,
+                &lifetime_eligibility,
+                &mut_facts,
+            );
+            retire_box_edits_under_base_views(&mut table);
+        }
+        // C-9 filtering can reveal a fallback only after co-conversion ran.
+        // Learn all exact raw roles together, then rebuild this profile's
+        // decision/planning suffix from the same frozen facts.
+        let mut a5_role_growth = false;
+        for (role, proof) in learn_a5_fallback_roles(&facts, &subjects, &mut table) {
+            if a5_roles.iter().any(|old| {
+                old.caller == role.caller
+                    && old.callee == role.callee
+                    && old.argument_index == role.argument_index
+                    && old.call_span == role.call_span
+            }) {
+                continue;
+            }
+            a5_roles.push(role);
+            a5_role_proofs.push(proof);
+            a5_role_growth = true;
+        }
+        if a5_role_growth {
+            if a5_roles.len() > a5_role_bound {
+                return Err("a5-fallback-role-invariant:call-argument-bound-exceeded".into());
+            }
+            continue;
+        }
+        restore_a5_role_obligations(
+            tcx,
+            &mut_facts,
+            &facts,
+            &a5_roles,
+            &a5_role_proofs,
+            &coconv,
+            &mut table,
+        );
+        // R575-6: read the refusals off the SETTLED seams only. Before A5's
+        // fallback roles converge a call its PAIR row will own (a raw-view role)
+        // still reaches the twin's gate, and a withdrawal learned there is wrong
+        // for the settled table (brotli's `WriteMetadataHeader`).
+        if record_aliased_storage_withdrawals(tcx, &table, &mut aliased_storage_withdrawn) {
+            continue;
+        }
+        let returned_child_mut_bindings = table
+            .seams
+            .edits
+            .iter()
+            .filter(|edit| {
+                edit.raw_outbound
+                    .as_ref()
+                    .is_some_and(|endpoint| endpoint.mutable_binding_required)
+            })
+            .filter_map(|edit| edit.source_node)
+            .collect::<Vec<_>>();
+        table
+            .option_mut_bindings
+            .extend(returned_child_mut_bindings);
+        // wave-6s: the forward-slice / computed-view renderings must be on the
+        // seam set BEFORE anything composes or snapshots a seam's text (the
+        // Option value composition below, the callee-parameter inputs).
+        decision::slice_forms::lower(
+            tcx,
+            &mut table,
+            &advance_ok,
+            &raw_boundary_sites,
+            &slice_uses,
+        )?;
+
+        // Item 2 renders local raw-result constructors only after the terminal
+        // seam set exists, so a contained raw-view/cast edit is composed into the
+        // initializer rather than overwritten by an outer constructor.
+        (
+            table.option_receipts,
+            table.option_value_initializers,
+            table.option_composed_uses,
+        ) = decision::option::plan_values(tcx, &mut table, &ctors, &opt_uses, &family_policy);
+        table.slice_use_receipts = decision::slice_use::receipt_plans(
+            &program,
+            &mut table,
+            &slice_uses,
+            &raw_boundary,
+            &retention,
+            &mut_facts,
+            &family_policy,
+        );
+        decision::slice_carrier::complete(tcx, &mut table);
+        let option_operations = decision::option::plan_operations(
+            &program,
+            &mut table,
+            &opt_uses,
+            &raw_boundary,
+            &slice_uses,
+            &retention,
+            &mut_facts,
+            &family_policy,
+        );
+        table.option_receipts.extend(option_operations);
+        for (subject, decision) in &table.entries {
+            let unsupported = match decision {
+                decision::Decision::Degraded(record) => {
+                    record.reason == decision::DegradeReason::OptUseUnsupported
+                }
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_) => false,
+            };
+            if !unsupported {
+                continue;
+            }
+            let node = (subject.fn_did, subject.hir_id);
+            let Some(uses) = opt_uses.get(&node) else { continue };
+            let slice = opt_fat.contains(&node)
+                && facts.raw_only_uses.get(&node).is_some_and(|uses| {
+                    uses.iter().any(|(op, _)| {
+                        decision::emitability::SLICE_ARITHMETIC_OPS.contains(&op.as_str())
+                    })
+                });
+            for site in uses.sites.iter().filter(|site| {
+                matches!(
+                    site.operation,
+                    "excluded-cursor" | "handoff-return" | "handoff-use"
+                )
+            }) {
+                let reason = if site.operation == "excluded-cursor" {
+                    mechanical_receipt::MechanicalTerminalReason::Cursor
+                } else {
+                    mechanical_receipt::MechanicalTerminalReason::EvidenceMissing(format!(
+                        "{}:later-return-or-sink-wave",
+                        site.operation
+                    ))
+                };
+                table.option_receipts.push(decision::option::receipt(
+                    tcx,
+                    subject,
+                    site.hir_id,
+                    mechanical_receipt::MechanicalFamily::OptUseUnsupported,
+                    site.operation,
+                    decision::seam::Form::Raw,
+                    decision::seam::Form::Opt {
+                        mutable: subject.mutable,
+                        slice,
+                    },
+                    site.operation.to_owned(),
+                    Some(reason),
+                    mechanical_receipt::MechanicalEvidence::default(),
+                ));
+            }
+        }
+        for receipt in &mut table.option_receipts {
+            let mechanical_receipt::MechanicalSubjectKey::Local {
+                owner, mir_local, ..
+            } = receipt.obligation.planned.key.subject
+            else {
+                continue;
+            };
+            let Some((subject, _)) = table.entries.iter().find(|(subject, _)| {
+                subject.fn_did == owner && subject.local.as_u32() == mir_local
+            }) else {
+                continue;
+            };
+            let node = (subject.fn_did, subject.hir_id);
+            receipt.obligation.planned.required_arms = table
+                .arm_requirements
+                .get(&node)
+                .copied()
+                .unwrap_or_default()
+                .render();
+            let mut nullability = Vec::new();
+            if let Some(hir) = ctors.init_hirs.get(&node)
+                && decision::emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr())
+            {
+                nullability.push(format!("null-initializer:hir{}", hir.local_id.as_u32()));
+            }
+            if let Some(uses) = opt_uses.get(&node) {
+                nullability.extend(
+                    uses.sites
+                        .iter()
+                        .filter(|site| site.operation == "null-test")
+                        .map(|site| format!("is-null:hir{}", site.hir_id.local_id.as_u32())),
+                );
+                nullability.extend(
+                    uses.assignments
+                        .iter()
+                        .filter(|site| {
+                            decision::emitability::is_zero_literal(
+                                tcx.hir_node(site.rhs).expect_expr(),
+                            )
+                        })
+                        .map(|site| format!("null-assignment:hir{}", site.rhs.local_id.as_u32())),
+                );
+            }
+            nullability.sort();
+            nullability.dedup();
+            receipt.nullability_fact = if nullability.is_empty() {
+                "existing-layout-option-carrier".to_owned()
+            } else {
+                nullability.join(";")
+            };
+        }
+        table.slice_constructions =
+            decision::construction::plan_slice_constructions(tcx, &table, &ctors, &family_policy);
+        append_surface_declaration_plans(tcx, &exposure, &mut table);
+        append_inferred_local_declaration_plans(tcx, &mut table);
+        decision::slice_construction_values::append_declarations(tcx, &mut table);
+        append_field_load_declaration_plans(&mut table)?;
+        decision::field_reference::reconcile_a5_raw_views(tcx, &mut table)?;
+        // wave-6a W6A-B1: explicit types on constructor-typed slice locals.
+        decision::slice_local_construction::append_explicit_declarations(tcx, &mut table);
+        decision::flexible_tail::append_explicit_declarations(tcx, &mut table);
+        decision::box_param::append_explicit_declarations(tcx, &mut table);
+        decision::return_certificate::append_explicit_declarations(tcx, &mut table);
+        decision::allocator_contract::append_explicit_declarations(tcx, &mut table);
+        decision::return_certificate::append_interface_dependencies(&mut table);
+        decision::flexible_tail::append_interface_dependencies(&mut table);
+        decision::box_param::append_interface_dependencies(&mut table);
+        // R536-3: a selected native Box plan built from an owning field's form
+        // withdraws with that field's transaction (after `finalize`, before the plan).
+        native_ownership_candidates.register_seam_consumers(&mut table);
+        // R579-4 R1: a certificate's re-rendered literal likewise.
+        decision::return_certificate::register_seam_consumers(&mut table);
+        decision::void_region::append_receiver_declarations(&mut table);
+        append_literal_local_declaration_plans(tcx, &ctors, &mut table);
+        decision::null_init_declaration::append_explicit_declarations(tcx, &mut table);
+        table.c9_marks = retained_copy_plans.clone();
+        table.seams.receiver_inputs = decision::receiver_input::plan(&program, &table, &retention);
+        table.seams.raw_receivers =
+            decision::raw_receiver::plan(&program, &table, &ctors, &retention);
+        table.seams.native_result_expressions =
+            decision::native_result_expression::plan(&program, &table);
+        table.seams.native_return_sites = facts.return_sites.clone();
+        table.seams.outbound_expressions = decision::outbound_expression::plan(
+            &program,
+            &table,
+            &raw_boundary_sites,
+            &retention,
+            &mut_facts,
+        );
+        table.seams.callee_parameter_inputs = decision::callee_parameter_input::plan(
+            tcx,
+            &table,
+            &facts,
+            &table.seams,
+            &raw_boundary,
+        );
+        let mut table = table;
+
+        // Structural self-check: the table matches the subjects it was handed. NOT
+        // the coverage gate — every comparison in it is against the collector's own
+        // This is the same pure plan/class/terminal-interface preparation used
+        // by emit_files. It performs no AST emission or analysis derivation.
+        // R585-4: class formation reads which callers the predecessor stage held.
+        table.predecessor_held_classes = predecessor
+            .as_ref()
+            .map(|prior| prior.plan.held_classes())
+            .unwrap_or_default();
+        // **Relay 297 (main 188; the stand-in review's H1).** The plan's pending
+        // receipts read the table's sibling inventory, which only the emission
+        // set; the planning-time feedback below read an empty list. With the
+        // hold on, the in-loop plan carries the inventory the emission will read
+        // (receipt and audit readers only: no edit reads it).
+        if family_policy.stage >= additive::FamilyStage::Declaration {
+            table.sibling_overlap_inventory = decision::sibling_overlap::collect_inventory_from(
+                tcx,
+                &decision::sibling_overlap::SiblingInputs {
+                    slots: &slots,
+                    model: &model,
+                    mut_facts: &mut_facts,
+                    facts: &facts,
+                    subjects: &subjects,
+                    a5_site_proofs: &a5_site_proofs,
+                    raw_boundary_sites: &raw_boundary_sites,
+                    retention: &retention,
+                    origins: analysis.origins.as_ref(),
+                },
+                &table.seams.outbound_expressions,
+            );
+        }
+        crate::phase_log::mark("finish_decide:plan", "start", "");
+        let prepared = prepare_plan_files(
+            tcx,
+            &table,
+            &rustc_hash::FxHashSet::default(),
+            &retained_copy_plans,
+        )?;
+        let prepared = if decision::nested_slice::promote(
+            tcx,
+            &mut table,
+            &slots,
+            &model,
+            &prepared.plan.class_finalization,
+            &family_policy,
+            // R506-5: the flip hands the cursor family its base inside the same
+            // transaction, so `promote` needs the same `Ctx` the replan below
+            // already builds. Row (vi)'s macro is what makes that legal beside
+            // `&mut table` — `Ctx` never borrows the `DecisionTable`.
+            &ctx_of!(
+                decision::RefGate::LiftAdaptable,
+                Some(&coconv),
+                Some(&lifetime_eligibility),
+                Some(&raw_boundary),
+                Some(&candidate_exposure),
+                Some(&return_receivers),
+            ),
+        ) {
+            // **R452-6 / R475-3.** A table that just gained its inner level
+            // hands its elements as slices; a cursor built over one of those
+            // elements was planned against the flat form, so it re-plans
+            // through its OWN family here. A post-hoc rewrite of a finalised
+            // cursor plan costs the cursor entirely (nested 007's A/B), which
+            // is why this is a rebuild and not a patch. Inert when no such
+            // cursor exists. Row (vi)'s macro is what lets a `Ctx` be built
+            // after the flip at all (main 051).
+            decision::cursor_native::replan_delivered_table_elements(
+                &ctx_of!(
+                    decision::RefGate::LiftAdaptable,
+                    Some(&coconv),
+                    Some(&lifetime_eligibility),
+                    Some(&raw_boundary),
+                    Some(&candidate_exposure),
+                    Some(&return_receivers),
+                ),
+                &mut table.entries,
+            );
+            prepare_plan_files(
+                tcx,
+                &table,
+                &rustc_hash::FxHashSet::default(),
+                &retained_copy_plans,
+            )?
+        } else {
+            prepared
+        };
+        let native_inputs = decision::ownership_fields_native::Inputs {
+            program: &program,
+            slots: &slots,
+            model: &model,
+            constructions: &ctors,
+            sites: &raw_boundary_sites,
+            retention: &retention,
+            a5: &a5_site_proofs,
+        };
+        if family_policy.stage == additive::FamilyStage::Return {
+            native_ownership_candidates = decision::ownership_fields_native::Candidates::derive(
+                &native_inputs,
+                &table,
+                &prepared.plan.class_finalization,
+            );
+        } else if family_policy.stage == additive::FamilyStage::Ownership {
+            let (invalid, refreshed) = native_ownership_candidates.refresh_or_invalidate(
+                &native_inputs,
+                &table,
+                &prepared.plan.class_finalization,
+            );
+            let mut withdrawn = false;
+            for owner in invalid {
+                withdrawn |= family_policy.withdrawn.insert((
+                    additive::FamilyStage::Ownership,
+                    bridge_receipt::SignatureClassId::of(owner),
+                ));
+            }
+            if withdrawn || refreshed {
+                continue;
+            }
+        }
+        // **Relay 297 (main 187): the planning-time pending sites, fed back.** A
+        // callee formal the plan leaves raw (binn `binn_object_get_value::key`,
+        // `unplaceable:slice-use-evidence-held`) is invisible to the settled-table
+        // hold, and the post-condition then degraded the whole program. The pending
+        // predicate on the plan names its delivered sources here; they join the
+        // settled-table holds for the rest of the stage and the stage is decided
+        // again (the map only grows within a stage). The post-condition stays the
+        // tripwire for a site only a verify revert creates.
+        if family_policy.stage >= additive::FamilyStage::Declaration {
+            // The terminal's state before any verify revert: the classes the plan
+            // itself withholds (binn's `binn_object_get_value` is class-held at
+            // planning), as the post-condition reads them.
+            let withheld = effective_withheld_classes(
+                &prepared.plan,
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
+            );
+            let mut grew = false;
+            for site in prepared.plan.pending_sibling_receipts(&withheld) {
+                let Some(source) = site.receipt.potential.source.declared() else {
+                    continue;
+                };
+                let node = (source.fn_did, source.hir_id);
+                if planned_held.1.contains_key(&node) {
+                    continue;
+                }
+                planned_held.1.insert(
+                    node,
+                    decision::DegradeReason::PairNotShownDisjoint {
+                        detail: format!(
+                            "pair-not-shown-disjoint:{};planned;risky-siblings={}",
+                            decision::raw_boundary::site_atom_id(&site.receipt.potential.site),
+                            site.receipt
+                                .risky_siblings
+                                .iter()
+                                .map(|sibling| format!("arg{}", sibling.argument_index))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                    },
+                );
+                grew = true;
+            }
+            if grew {
+                continue;
+            }
+        }
+        let candidate = additive::StageSnapshot {
+            table: table.clone(),
+            plan: prepared.plan.clone(),
+        };
+        if let Some(prior) = &predecessor {
+            // No soundness withdrawal is registered by this mechanical repair.
+            // A future registration must prove its exact prior mis-rendering.
+            let requests = additive::withdrawals_narrowed(
+                prior,
+                &candidate,
+                &family_policy,
+                &[],
+                &|owner, binding| subject_footprint(tcx, owner, binding),
+            );
+            if !requests.is_empty() {
+                let old_count = family_policy.exclusions();
+                for request in &requests {
+                    // 035 clause (3): an unresolved row is RECORDED and acted on
+                    // by nobody — no capture, no exclusion, no progress. The
+                    // loop leaves the frame as the pipeline produced it.
+                    if request.unresolved {
+                        // **R500-4.** Remember that this owner had nothing of
+                        // its own to retire at this stage. A later re-ask from
+                        // it is a repeated guess, and `unwithdrawn` declines it.
+                        family_policy
+                            .unresolved_anchors
+                            .insert((family_policy.stage, request.owner));
+                        family_receipts.push(additive::FamilyFallbackReceipt {
+                            scope: "unresolved".to_owned(),
+                            family: format!("{:?}", family_policy.stage),
+                            owner_local_def_id: request.owner.order_key(),
+                            owner_path: tcx.def_path_str(request.owner.local_def_id().to_def_id()),
+                            cause: request.cause.clone(),
+                            subjects: Vec::new(),
+                        });
+                        continue;
+                    }
+                    retired.capture(prior, &candidate, request, family_policy.stage);
+                    let owner = tcx.def_path_str(request.owner.local_def_id().to_def_id());
+                    let mut subject_rows = Vec::new();
+                    for (subject, current) in &table.entries {
+                        if subject.fn_did != request.owner.local_def_id()
+                            || !(request.subjects.is_empty()
+                                || request.subjects.contains(&subject.hir_id))
+                        {
+                            continue;
+                        }
+                        let old = prior
+                            .table
+                            .entries
+                            .iter()
+                            .find(|(s, _)| s.fn_did == subject.fn_did && s.hir_id == subject.hir_id)
+                            .map(|(_, d)| decision::seam::form_of(d).key().to_owned())
+                            .unwrap_or_else(|| "absent".to_owned());
+                        subject_rows.push((
+                            subject.identity_key(&owner),
+                            old,
+                            decision::seam::form_of(current).key().to_owned(),
+                        ));
+                    }
+                    family_receipts.push(additive::FamilyFallbackReceipt {
+                        scope: if request.subjects.is_empty() {
+                            "owner"
+                        } else {
+                            "subject"
+                        }
+                        .to_owned(),
+                        family: format!("{:?}", family_policy.stage),
+                        owner_local_def_id: request.owner.order_key(),
+                        owner_path: owner,
+                        cause: request.cause.clone(),
+                        subjects: subject_rows,
+                    });
+                    // R397-6(a): a subject-scoped request excludes exactly the
+                    // named candidates at the selection input; the owner keeps
+                    // the stage and its siblings re-derive their prior result.
+                    if request.subjects.is_empty() {
+                        family_policy
+                            .withdrawn
+                            .insert((family_policy.stage, request.owner));
+                    } else {
+                        for &hir_id in &request.subjects {
+                            family_policy.withdrawn_subjects.insert((
+                                family_policy.stage,
+                                request.owner,
+                                hir_id.local_id.as_u32(),
+                            ));
+                            // **R500-4.** Beside the exclusion, who asked for
+                            // it. `exclusions()` still counts the set above, so
+                            // strict transaction progress is untouched.
+                            if let Some(anchor) = request.anchor {
+                                family_policy.withdrawal_anchors.insert(
+                                    (family_policy.stage, request.owner, hir_id.local_id.as_u32()),
+                                    anchor,
+                                );
+                            }
+                        }
+                    }
+                }
+                // 035 clause (3): a round whose every row is unresolved
+                // retires nothing by design, so it is not a progress failure —
+                // it is the loop declining to widen. Strict progress is still
+                // required of any round that DID retire something.
+                if requests.iter().any(|request| !request.unresolved) {
+                    if family_policy.exclusions() <= old_count {
+                        return Err(
+                            "additive-family-fallback-invariant:no-strict-transaction-progress"
+                                .to_owned(),
+                        );
+                    }
+                    continue;
+                }
+                // Every row is unresolved: the loop retired nothing, so
+                // re-deriving would produce the same rows for ever. It accepts
+                // the frame the pipeline produced and moves on, with the
+                // `interface-path-unresolved:` receipts as the record of what
+                // it declined to widen. The preservation invariant is not
+                // consulted here for the same reason: the unresolved receipt IS
+                // the statement that a prior delivery was not preserved and
+                // that this rule had nothing it was allowed to retire for it.
+            } else if let Some(error) =
+                additive::preservation_error(prior, &candidate, &[], &family_policy)
+            {
+                return Err(error);
+            }
+        }
+        if let Some(next) = family_policy.stage.next()
+            && (next != additive::FamilyStage::Ownership || !native_ownership_candidates.is_empty())
+        {
+            predecessor = Some(candidate);
+            family_policy.stage = next;
+            continue;
+        }
+        // R579-4 R3: the owners a certificate adopted are planned by their
+        // own family, which has now settled; one that is not withdraws the
+        // certificate and the stage re-derives (certificates only shrink).
+        if decision::return_certificate::confirm_adopted(
+            &mut return_certificates,
+            &subjects,
+            &|f, h| {
+                table
+                    .entries
+                    .iter()
+                    .find(|(s, _)| s.fn_did == f && s.hir_id == h)
+                    .and_then(|(_, decision)| match decision {
+                        decision::Decision::Box(plan) => Some(plan.clone()),
+                        decision::Decision::Ref { .. }
+                        | decision::Decision::InferredRef { .. }
+                        | decision::Decision::Slice { .. }
+                        | decision::Decision::NestedSlice { .. }
+                        | decision::Decision::Cursor { .. }
+                        | decision::Decision::Opt { .. }
+                        | decision::Decision::Degraded(_) => None,
+                    })
+            },
+        ) {
+            continue;
+        }
+        retired.append(&mut table, &prepared.plan);
+        // R528-3: on the settled table, after every family that reads a reason.
+        decision::return_certificate::relabel_refused(&mut table);
+        // output.
+        if let Err(why) = table.is_self_consistent_over(&subjects) {
+            return Err(format!("decision table self-consistency: {why}"));
+        }
+        crate::phase_log::mark("finish_decide:receipts", "start", "");
+        let receipt_started = std::time::Instant::now();
+        let mut e2_artifacts =
+            e2_artifacts_from_table(tcx, &table, &hypothetical, &lifetime_eligibility)?;
+        e2_artifacts.plan_inert_digest_with = plan_inert_digest_with.clone();
+        e2_artifacts.plan_inert_digest_without = plan_inert_digest_without.clone();
+        e2_artifacts.timings = E2Timings {
+            cache_load_wall_s: format!("{:.6}", analysis.cache_load_wall_s),
+            origin_derivation_wall_s: format!("{:.6}", analysis.origin_derivation_wall_s),
+            pb_web_wall_s: format!("{:.6}", lifetime_eligibility.web_wall_s()),
+            eligibility_wall_s: format!("{:.6}", lifetime_eligibility.derive_wall_s()),
+            finalization_wall_s: format!("{finalization_wall_s:.6}"),
+            seam_wall_s: format!("{seam_wall_s:.6}"),
+            ast_placement_wall_s: "pending".to_owned(),
+            receipt_render_wall_s: format!("{:.6}", receipt_started.elapsed().as_secs_f64()),
+            compiler_verification_wall_s: "pending".to_owned(),
+        };
+        let raw_boundary_receipt_started = std::time::Instant::now();
+        let raw_boundary_artifacts = RawBoundaryArtifacts {
+            // R459-3: filled at the first failing verify round, not here.
+            first_failing_verify_tree: String::new(),
+            flexible_tail_receipts: table.flexible_tails.receipts_tsv(),
+            counted_void_call_receipts: counted_void_call_receipts(tcx, &table),
+            entry_window_receipts: decision::cursor_native::entry_window_receipts(
+                tcx,
+                &sign,
+                &table.entries,
+            ),
+            box_param_receipts: table.box_params.receipts_tsv(),
+            return_certificate_receipts: table.return_certificates.receipts_tsv()
+                + &decision::return_certificate::receiver_receipts_tsv(tcx, &table),
+            field_load_exemption_receipts: field_load_exemption_receipts_tsv(
+                tcx,
+                &table.seams.field_load_exemptions,
+            ),
+            allocator_contract_receipts: table.allocator_contracts.receipts_tsv(),
+            premise_view_sites: String::new(),
+            pair_premise_receipts: a5_site_proofs
+                .pair_certificates()
+                .map(|certificates| certificates.premise_receipts_tsv(tcx))
+                .unwrap_or_default(),
+            settled_hold_receipts: decision::settled_holds::receipts_tsv(tcx, &table),
+            // R1305-1: filled with the subject seed, on the census path only.
+            subject_facts: String::new(),
+            a5_hold_views: String::new(),
+            ownership_native: native_ownership_candidates.audit(tcx, &slots, &model, &table),
+            shared_permissions: table.seams.shared_required.clone(),
+            shared_pair_receipts: String::new(),
+            io_domain_budget_exhausted,
+            void_pointee_held: void_pointee_subjects.len(),
+            #[cfg(test)]
+            bridge_custody_export: Default::default(),
+            pending_sibling_receipts: Vec::new(),
+            sibling_coverage_gaps: Vec::new(),
+            sibling_audit_rows: Vec::new(),
+            custody_expectations: Vec::new(),
+            additive_family_receipts: family_receipts,
+            exposure: exposure.receipts_tsv(),
+            configured_unmatched: exposure.unmatched.clone(),
+            configured_ambiguous: exposure.ambiguous.clone(),
+            field_transactions: table.field_transactions.receipt_tsv(tcx),
+            d4_edges: coconv.edge_receipts_tsv(tcx, &subjects),
+            pairs: coconv.pair_receipts_tsv(tcx),
+            addresses: raw_boundary.addresses_tsv(tcx),
+            arm_outcomes: arm_outcomes_tsv(tcx, &subjects, &table, &coconv, &raw_boundary),
+            edit_keys: String::from("edit_key\n"),
+            sites: raw_boundary_sites.to_tsv(),
+            retention: retention.to_tsv(),
+            child_access: retention.child_access.clone(),
+            // EMPTY here on purpose: the graft that records this runs later,
+            // inside `verify_and_revert`'s emission rounds, so the decision
+            // stage has nothing to read. Reading it here is what made every
+            // `twin-placement` table header-only through batch 27; the two
+            // outcome constructors fill it.
+            twin_placement: String::new(),
+            dispositions: raw_boundary.receipts_tsv(),
+            subjects: raw_boundary_subjects_tsv(tcx, &hypothetical, &table, &coconv, &raw_boundary),
+            atoms: raw_boundary.atoms_tsv(),
+            atom_outcomes: {
+                let mut out = String::from("outcome\treason\tatoms\n");
+                for (atom, reason) in &table.seams.raw_boundary_edit_region_owned {
+                    out.push_str(&format!("edit-region-owned\t{reason}\t{atom}\n"));
+                }
+                out
+            },
+            final_reverts: String::from("kind\tidentity\tclass_id\n"),
+            bridge_events: Vec::new(),
+            unsafe_context_events: Vec::new(),
+            mechanical_events: Vec::new(),
+            a5_proof_site_fallback_rows: Vec::new(),
+            slice_construction_rows: Vec::new(),
+            slice_use_rows: Vec::new(),
+            option_rows: Vec::new(),
+            declaration_rows: Vec::new(),
+            outbound_return_required: Vec::new(),
+            outbound_return_rows: Vec::new(),
+            outbound_return_error: None,
+            class_costs: bridge_receipt::class_cost_header(),
+            class_collisions: bridge_receipt::class_collision_header(),
+            unresolved_classes: bridge_receipt::unresolved_class_header(),
+            class_held_drops: bridge_receipt::class_held_drop_header(),
+            contract_candidate_declines: contract_extent_candidates
+                .declines_tsv(tcx, &subjects, &model, &slots, &fat),
+            licensed_lifts: decision::licensed_lift::receipts_tsv(&table.licensed_lifts),
+            premise_receipts: decision::call_result_option::premise_receipts_tsv(
+                &table
+                    .seams
+                    .premise_receipts
+                    .iter()
+                    .cloned()
+                    // R842-2: P10's receipts.
+                    .chain(decision::retained_access::exposed_premise_receipts(
+                        tcx,
+                        &retained_access,
+                        &subjects,
+                    ))
+                    // R1314-1: P12's receipts.
+                    .chain(decision::retained_access::file_buffer_premise_receipts(
+                        tcx,
+                        &retained_access,
+                        &subjects,
+                    ))
+                    .collect::<Vec<_>>(),
+            ),
+            p12_receipts: decision::retained_access::p12_receipts_tsv(
+                tcx,
+                &retained_access,
+                &subjects,
+            ),
+            byte_view_receipts: decision::cast_offset::receipts_tsv(tcx, &table),
+            cast_strip_receipts: decision::identity_cast::receipts_tsv(tcx, &facts, &table),
+            root_extents: decision::root_extent::receipts_tsv(&table.root_extents),
+            sized_assignments: decision::sized_assignment::receipts_tsv(&table.sized_assignments),
+            interface_inventory: table.seams.interface_inventory_tsv(tcx),
+            sites_from_non_subject_arguments: table.seams.sites_from_non_subject_arguments(),
+            converted_callee_without_site_receipt: table
+                .seams
+                .converted_callee_without_site_receipt(),
+            degraded_output_receipt: "not-applicable".to_owned(),
+            per_arm_timers_status: "queued-no-free-column".to_owned(),
+            attribution_hits: AttributionHits::default(),
+            signature_class_count: 0,
+            class_bisect_probes: 0,
+            revert_found_form_late_classes: 0,
+            class_verify_rounds: 0,
+            verify_wall_s: "pending".to_owned(),
+            emit_budget_s: "900".to_owned(),
+            timings: RawBoundaryTimings {
+                site_derivation_wall_s: format!("{raw_boundary_site_derivation_wall_s:.6}"),
+                retention_fixpoint_wall_s: format!("{retention_fixpoint_wall_s:.6}"),
+                certificate_replay_wall_s: format!(
+                    "{:.6}",
+                    raw_boundary.certificate_replay_wall_s()
+                ),
+                decision_wall_s: format!("{raw_boundary_decision_wall_s:.6}"),
+                render_wall_s: format!("{raw_boundary_render_wall_s:.6}"),
+                receipt_wall_s: format!(
+                    "{:.6}",
+                    raw_boundary_receipt_started.elapsed().as_secs_f64()
+                ),
+                initial_verify_wall_s: "pending".to_owned(),
+                atom_reverify_wall_s: "0.000000".to_owned(),
+            },
+            // Filled at the END of the session by `with_session_receipts`, on the
+            // compiler thread; empty here by construction.
+            session_graft_held_table: String::new(),
+            session_graft_refusals: 0,
+            session_stale_replans: 0,
+            session_raw_cause_ledger: None,
+        };
+
+        // C.2: the in-process coverage gate is GONE. Its replacement is the
+        // harness reconciliation in `coverage_recon`, driven from outside this
+        // module — see `recon_fixtures` (C.1) and the corpus mode (C.4).
+        //
+        // Deleted rather than demoted to a smoke check: a weakened gate that still
+        // READS like a coverage gate is the hazard itself. Four rounds of this
+        // milestone were spent on apparatus that claimed more than it checked, and
+        // leaving a demoted version behind preserves the claim while removing the
+        // substance.
+        let context = DecideCtx {
+            slots,
+            model,
+            mut_facts,
+            facts,
+            coconv,
+            lifetime_eligibility,
+            escapes,
+            subjects,
+            hypothetical,
+            retained_copy_plans,
+            overlap_receipt,
+            analysis,
+            a5_site_proofs,
+            box_facts,
+            constructions: ctors,
+            raw_boundary_sites,
+            retention,
+            raw_boundary,
+            exposure,
+            raw_boundary_artifacts,
+            e2_artifacts,
+            subject_fatness,
+        };
+        table.sibling_overlap_inventory =
+            decision::sibling_overlap::collect_inventory_with_expressions(
+                tcx,
+                &context,
+                &table.seams.outbound_expressions,
+            );
+        crate::phase_log::mark("finish_decide", "end", &format!("rounds={phase_round}"));
+        return Ok((table, context));
+    }
+}
+
+/// Feed a late seam's exact A5 raw-view obligation back to the ordinary
+/// parameter-role ladder. This reads compiler call facts, never receipt text.
+fn learn_a5_fallback_roles(
+    facts: &decision::emitability::EmitabilityFacts,
+    subjects: &[decision::Subject],
+    table: &mut decision::DecisionTable,
+) -> Vec<(
+    decision::co_conversion::PairSiteDecision,
+    decision::seam::A5PositionProof,
+)> {
+    use decision::{
+        Decision, SubjectKind,
+        co_conversion::{PairRole, PairTier},
+        seam::A5ProofSiteFallback,
+    };
+    let mut learned = Vec::new();
+    for proof in &mut table.seams.overlap_proofs {
+        if !matches!(proof.fallback, A5ProofSiteFallback::T2RawView { .. }) {
+            continue;
+        }
+        if proof.proof_site_key.is_none() {
+            proof.fallback = A5ProofSiteFallback::Held {
+                reason: "a5-fallback-unrenderable:proof-key-absent".into(),
+            };
+            continue;
+        }
+        let Some(subject) = subjects.iter().find(|subject| subject.fn_did == proof.callee
+            && matches!(subject.kind, SubjectKind::Param { hir_index } if hir_index == proof.index))
+        else {
+            proof.fallback = A5ProofSiteFallback::Held { reason: "a5-fallback-unrenderable:parameter-absent".into() };
+            continue;
+        };
+        let Some((_, current)) = table.entries.iter().find(|(candidate, _)| {
+            candidate.fn_did == subject.fn_did && candidate.hir_id == subject.hir_id
+        }) else {
+            continue;
+        };
+        match current {
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. } => {}
+            // Already-raw targets need a materialized call view but no new
+            // parameter presentation. Owning admission is never changed here.
+            Decision::Degraded(_) => continue,
+            // **R483-3(c).** A cursor formal used to be held here, which is
+            // the circularity slicecursor reported: the fallback refused
+            // precisely where the parameter was already the form it wanted,
+            // so `cursor_native::promote` never got asked. The renderer now
+            // has the arm (`pair_raw_view_expression`, the slice rule in
+            // slicecursor's vocabulary), so a cursor takes the same path
+            // every other safe form takes — including the R-B refusal a
+            // SHARED cursor still meets there.
+            Decision::Cursor { .. } => {}
+            Decision::Box(_) => {
+                proof.fallback = A5ProofSiteFallback::Held {
+                    reason: "a5-fallback-unrenderable:owning-parameter".into(),
+                };
+                continue;
+            }
+        }
+        let (caller, index, span) = (proof.caller, proof.index, proof.span.source_callsite());
+        let matches = facts
+            .call_args
+            .get(&proof.callee)
+            .into_iter()
+            .flatten()
+            .filter(|site| site.caller == caller)
+            .flat_map(|site| {
+                site.args
+                    .iter()
+                    .filter(move |argument| {
+                        argument.index == index && argument.span.source_callsite() == span
+                    })
+                    .map(move |argument| (site, argument))
+            })
+            .collect::<Vec<_>>();
+        let [(site, argument)] = matches.as_slice() else {
+            proof.fallback = A5ProofSiteFallback::Held {
+                reason: "a5-fallback-unrenderable:call-site-not-unique".into(),
+            };
+            continue;
+        };
+        let Some(target) = argument.target.clone() else {
+            proof.fallback = A5ProofSiteFallback::Held {
+                reason: "a5-fallback-unrenderable:raw-target-absent".into(),
+            };
+            continue;
+        };
+        learned.push((
+            decision::co_conversion::PairSiteDecision {
+                caller: proof.caller,
+                callee: proof.callee,
+                argument_index: proof.index,
+                span: proof.span,
+                call_span: site.span,
+                subject: (subject.fn_did, subject.hir_id),
+                source_node: argument.shape.place_root().map(|root| (site.caller, root)),
+                target: Some(target),
+                source_shape: argument.shape.key(),
+                role: PairRole::RawView,
+                tier: PairTier::T2,
+                verdict: proof.verdict,
+                reason: "a5-fallback-raw-view-role".into(),
+                peer_receipts: proof.peer_receipts.clone(),
+                unproven_peers: proof.unproven_peers.clone(),
+                a5_fallback: proof.proof_site_key,
+            },
+            proof.clone(),
+        ));
+    }
+    learned
+}
+
+fn a5_role_target_hypothesis(
+    tcx: TyCtxt<'_>,
+    original: &decision::DecisionTable,
+    roles: &[decision::co_conversion::PairSiteDecision],
+) -> decision::DecisionTable {
+    let mut adjusted = original.clone();
+    for (subject, choice) in &mut adjusted.entries {
+        if !roles.iter().any(|role| {
+            role.subject == (subject.fn_did, subject.hir_id)
+                && role.role == decision::co_conversion::PairRole::RawView
+        }) {
+            continue;
+        }
+        match choice {
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Cursor { .. }
+            | decision::Decision::NestedSlice { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. } => {
+                *choice = decision::Decision::Degraded(decision::Degradation {
+                    subject: subject.identity_key(&tcx.def_path_str(subject.fn_did.to_def_id())),
+                    site: decision::emitability::EmitabilityFacts::site(
+                        tcx,
+                        subject.attribution_span(),
+                    ),
+                    reason: decision::DegradeReason::PairRawView,
+                });
+            }
+            decision::Decision::Box(_) | decision::Decision::Degraded(_) => {}
+        }
+    }
+    adjusted
+}
+
+fn a5_role_operand_span(argument: &decision::emitability::Arg) -> rustc_span::Span {
+    use decision::emitability::ArgShape;
+    match argument.shape {
+        ArgShape::AddrOfCast { inner, .. } | ArgShape::CastOfLocal { inner, .. } => inner,
+        _ => argument.span,
+    }
+}
+
+fn restore_a5_role_obligations(
+    tcx: TyCtxt<'_>,
+    mut_facts: &crate::analyses::borrow_ownership::mutability_facts::MutFacts,
+    facts: &decision::emitability::EmitabilityFacts,
+    roles: &[decision::co_conversion::PairSiteDecision],
+    originals: &[decision::seam::A5PositionProof],
+    coconv: &decision::co_conversion::CoConv,
+    table: &mut decision::DecisionTable,
+) {
+    use decision::{
+        co_conversion::{PairRole, PairTier},
+        seam::{A5ProofSiteFallback, Form},
+    };
+    for (role, original) in roles.iter().zip(originals) {
+        let mut proof = original.clone();
+        proof.expected_form = Form::Raw;
+        let active = coconv.pair_sites().iter().find(|candidate| {
+            candidate.caller == role.caller
+                && candidate.callee == role.callee
+                && candidate.argument_index == role.argument_index
+                && candidate.call_span == role.call_span
+        });
+        let target_raw = table
+            .entries
+            .iter()
+            .find(|(subject, _)| (subject.fn_did, subject.hir_id) == role.subject)
+            .is_some_and(|(_, choice)| decision::seam::form_of(choice) == Form::Raw);
+        let built = (|| {
+            if !target_raw
+                || !active
+                    .is_some_and(|pair| pair.role == PairRole::RawView && pair.tier == PairTier::T2)
+            {
+                return Err("a5-fallback-unrenderable:raw-role-not-settled".to_owned());
+            }
+            let source_form = role
+                .source_node
+                .and_then(|node| {
+                    table
+                        .entries
+                        .iter()
+                        .find(|(subject, _)| (subject.fn_did, subject.hir_id) == node)
+                        .map(|(_, choice)| decision::seam::form_of(choice))
+                })
+                .unwrap_or(Form::Raw);
+            let found = decision::seam::a5_argument_expression_form(role.source_shape, source_form)
+                .unwrap_or(Form::Raw);
+            // Proof identity owns the whole argument. Rendering uses the
+            // same peeled operand as discovery, including address/local casts.
+            let arguments = facts
+                .call_args
+                .get(&role.callee)
+                .into_iter()
+                .flatten()
+                .filter(|site| site.caller == role.caller && site.span == role.call_span)
+                .flat_map(|site| {
+                    site.args.iter().filter(|argument| {
+                        argument.index == role.argument_index
+                            && argument.span.source_callsite() == role.span.source_callsite()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let [argument] = arguments.as_slice() else {
+                return Err("a5-fallback-unrenderable:argument-source-not-unique".to_owned());
+            };
+            let text = tcx
+                .sess
+                .source_map()
+                .span_to_snippet(a5_role_operand_span(argument))
+                .map_err(|_| "a5-fallback-unrenderable:argument-source-unavailable".to_owned())?;
+            let key = proof
+                .proof_site_key
+                .ok_or("a5-fallback-unrenderable:proof-key-absent")?;
+            let view = decision::seam::build_a5_raw_view(
+                tcx,
+                mut_facts,
+                role.caller,
+                role.callee,
+                role.argument_index,
+                Form::Raw,
+                found,
+                &text,
+                role.source_shape,
+                role.target.as_ref(),
+                key,
+                role.source_node,
+            )
+            .map_err(|why| format!("a5-fallback-unrenderable:{}", why.key()))?;
+            Ok(view)
+        })();
+        match built {
+            Ok(view) => {
+                proof.found_form = view.found_form;
+                proof.candidate_template = view.template.clone();
+                proof.fallback = A5ProofSiteFallback::T2RawView {
+                    template: view.template.clone(),
+                    negative_write: view.negative_write,
+                };
+                let index = table.seams.a5_raw_calls.iter().position(|call| {
+                    call.caller == role.caller
+                        && call.callee == role.callee
+                        && call.call_span == role.call_span
+                });
+                let call = if let Some(index) = index {
+                    &mut table.seams.a5_raw_calls[index]
+                } else {
+                    table
+                        .seams
+                        .a5_raw_calls
+                        .push(decision::seam::A5RawViewCall {
+                            owner_class: bridge_receipt::SignatureClassId::of(role.callee),
+                            caller: role.caller,
+                            callee: role.callee,
+                            call_span: role.call_span,
+                            views: Vec::new(),
+                        });
+                    table.seams.a5_raw_calls.last_mut().unwrap()
+                };
+                if let Some(old) = call
+                    .views
+                    .iter_mut()
+                    .find(|old| old.proof_site_key == view.proof_site_key)
+                {
+                    *old = view;
+                } else {
+                    call.views.push(view);
+                }
+            }
+            Err(reason) => {
+                proof.fallback = A5ProofSiteFallback::Held { reason };
+            }
+        }
+        if let Some(old) = table
+            .seams
+            .overlap_proofs
+            .iter_mut()
+            .find(|old| old.proof_site_key == proof.proof_site_key)
+        {
+            *old = proof;
+        } else {
+            table.seams.overlap_proofs.push(proof);
+        }
+    }
+}
+
+/// wave-6v2 (R442-4): the counted-void call plans, each with the whole-call
+/// replacements that cover it. Read after the A5 fallback resolution, so the
+/// `a5_raw_view` column is final.
+fn counted_void_call_receipts(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
+    let mut out = String::from(
+        "caller\tcallee\troute\tcount_index\tcall_span\ta5_raw_view\tpair_raw_view\tc9_mark\n",
+    );
+    for call in &table.seams.counted_void_calls {
+        let span = call.call_span.source_callsite();
+        let covered = |hit: bool| if hit { "yes" } else { "no" };
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{:?}\t{}\t{}\t{}\n",
+            tcx.def_path_str(call.caller.to_def_id()),
+            tcx.def_path_str(call.callee.to_def_id()),
+            call.route.key(),
+            call.count_index,
+            span,
+            covered(
+                table
+                    .seams
+                    .a5_raw_calls
+                    .iter()
+                    .any(|other| other.call_span.source_callsite() == span)
+            ),
+            covered(
+                table
+                    .seams
+                    .pair_raw_calls
+                    .iter()
+                    .any(|other| other.call_span.source_callsite() == span)
+            ),
+            covered(
+                table
+                    .c9_marks
+                    .iter()
+                    .any(|mark| mark.call_span.source_callsite() == span)
+            ),
+        ));
+    }
+    out
+}
+
+fn append_surface_declaration_plans(
+    tcx: TyCtxt<'_>,
+    exposure: &decision::exposure::ExposurePolicy,
+    table: &mut decision::DecisionTable,
+) {
+    use bridge_receipt::SignatureClassId;
+    use decision::{exposure::ExposureSurfacePlan, lifetime::FnSignatureSlot};
+
+    let (surface_arguments, failures) = decision::surface_argument::plan(tcx, exposure, table);
+    table.seams.surface_arguments = surface_arguments;
+    table.seams.surface_argument_failures = failures;
+
+    for function in exposure.functions() {
+        if !matches!(
+            function.plan,
+            ExposureSurfacePlan::PositiveSeedShim | ExposureSurfacePlan::FnPtrRawWrapper
+        ) {
+            continue;
+        }
+        let owner = SignatureClassId::of(function.did);
+        let unsafe_fn = tcx
+            .fn_sig(function.did.to_def_id())
+            .skip_binder()
+            .skip_binder()
+            .safety
+            .is_unsafe();
+        let presentation = mechanical_receipt::UnsafeContextPresentation {
+            unsafe_fn,
+            wrapper_inserted: !unsafe_fn,
+            edition: 2018,
+            requires_unsafe: true,
+        };
+        let raw_signature = format!(
+            "{:?}",
+            tcx.fn_sig(function.did.to_def_id())
+                .skip_binder()
+                .skip_binder()
+        );
+        table
+            .seams
+            .explicit_declarations
+            .push(decision::seam::ExplicitDeclarationSite {
+                owner_class: owner,
+                caller: function.did,
+                node: None,
+                span: None,
+                category: "wrapper",
+                emitted_type: raw_signature,
+                replacement: None,
+                arm: "surface",
+            });
+
+        if unsafe_fn {
+            table
+                .seams
+                .zero_bridges
+                .push(decision::seam::ZeroBridgeSite {
+                    owner_class: owner,
+                    caller: function.did,
+                    span: None,
+                    arm: "surface",
+                    position: "generated-wrapper-inner-call".to_owned(),
+                    bridge_kind: "surface-unsafe-context-inner-call",
+                    expected_form: "raw-wrapper",
+                    found_form: "unsafe-safe-inner",
+                    argument_kind: "generated-wrapper-call",
+                    retention: bridge_receipt::BridgeRetentionTier::None,
+                    waiver_id: None,
+                    unsafe_context: Some(presentation),
+                });
+        }
+
+        let return_plan_digest = table
+            .lifetime_plan
+            .function(function.did)
+            .filter(|plan| plan.lifetime_for(FnSignatureSlot::RETURN).is_some())
+            .map(decision::lifetime::FunctionPlan::digest);
+        if let Some(return_plan_digest) = return_plan_digest {
+            let signature = tcx
+                .fn_sig(function.did.to_def_id())
+                .skip_binder()
+                .skip_binder();
+            if let TyKind::RawPtr(pointee, mutability) = *signature.output().kind() {
+                let return_interface = table.return_interfaces.functions.get(&function.did);
+                let emitted_type = return_interface
+                    .map(decision::return_interface::ReturnInterface::temporary_type)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "&{}{}",
+                            if mutability == Mutability::Mut {
+                                "mut "
+                            } else {
+                                ""
+                            },
+                            decision::declaration::pointee_source(tcx, pointee),
+                        )
+                    });
+                let return_form = return_interface.map(|interface| interface.form);
+                let return_form_key = match return_form {
+                    Some(
+                        form @ (decision::seam::Form::Opt { .. }
+                        | decision::seam::Form::Slice { .. }
+                        | decision::seam::Form::Cursor { .. }
+                        | decision::seam::Form::NestedSlice { .. }),
+                    ) => form.key(),
+                    Some(decision::seam::Form::Ref { .. } | decision::seam::Form::Raw) | None => {
+                        "ref"
+                    }
+                };
+                table
+                    .seams
+                    .explicit_declarations
+                    .push(decision::seam::ExplicitDeclarationSite {
+                        owner_class: owner,
+                        caller: function.did,
+                        node: None,
+                        span: None,
+                        category: "return-temp",
+                        emitted_type,
+                        replacement: None,
+                        arm: "surface",
+                    });
+                table
+                    .seams
+                    .zero_bridges
+                    .push(decision::seam::ZeroBridgeSite {
+                        owner_class: owner,
+                        caller: function.did,
+                        span: None,
+                        arm: "surface",
+                        position: format!(
+                            "return:form=ref-to-raw:lifetime_plan={return_plan_digest}"
+                        ),
+                        bridge_kind: "return-ref-to-raw",
+                        expected_form: "raw",
+                        found_form: return_form_key,
+                        argument_kind: "return-seam",
+                        retention: bridge_receipt::BridgeRetentionTier::T1,
+                        waiver_id: None,
+                        unsafe_context: None,
+                    });
+            }
+        }
+    }
+
+    for seed in exposure.static_fnptr_seeds() {
+        if !matches!(
+            exposure.plan(seed.function),
+            ExposureSurfacePlan::PositiveSeedShim | ExposureSurfacePlan::FnPtrRawWrapper
+        ) {
+            continue;
+        }
+        table
+            .seams
+            .explicit_declarations
+            .push(decision::seam::ExplicitDeclarationSite {
+                owner_class: SignatureClassId::of(seed.function),
+                caller: seed.owner,
+                node: None,
+                span: Some(seed.span),
+                category: "static",
+                emitted_type: format!(
+                    "{}",
+                    tcx.type_of(seed.owner.to_def_id()).instantiate_identity()
+                ),
+                replacement: None,
+                arm: "surface",
+            });
+    }
+}
+
+/// R410-9 (b): an unannotated local built from a string-literal construction
+/// is typed by that construction — `&[T]` at the declaration, the same
+/// explicit-declaration seam the inferred receivers use.
+fn append_literal_local_declaration_plans(
+    tcx: TyCtxt<'_>,
+    ctors: &decision::construction::ConstructionFacts,
+    table: &mut decision::DecisionTable,
+) {
+    use bridge_receipt::SignatureClassId;
+
+    let mut declarations = Vec::new();
+    for plan in &table.slice_constructions {
+        // Another producer (wave-6a's W6A-B1 constructor typing) may already
+        // type this local; one explicit declaration per node.
+        if table
+            .seams
+            .explicit_declarations
+            .iter()
+            .any(|site| site.category == "local" && site.node == Some(plan.node))
+        {
+            continue;
+        }
+        if plan.replacement.is_none()
+            || !matches!(
+                ctors.by_binding.get(&plan.node),
+                Some(decision::construction::Construction::StringLiteral { .. })
+            )
+        {
+            continue;
+        }
+        let Some((subject, _)) = table
+            .entries
+            .iter()
+            .find(|(subject, _)| (subject.fn_did, subject.hir_id) == plan.node)
+        else {
+            continue;
+        };
+        if subject.ty_span.is_some() {
+            continue;
+        }
+        let Some(name) = subject.param_name.as_deref() else { continue };
+        // The element is the initializer's own pointee (`*const c_char`), the
+        // declaration having none to read.
+        let TyKind::RawPtr(pointee, _) =
+            *tcx.typeck(subject.fn_did).node_type(plan.init_hir).kind()
+        else {
+            continue;
+        };
+        let emitted_type = format!("&[{}]", decision::declaration::pointee_source(tcx, pointee));
+        let binding_prefix = if subject.mut_binding { "mut " } else { "" };
+        declarations.push(decision::seam::ExplicitDeclarationSite {
+            owner_class: SignatureClassId::of(subject.fn_did),
+            caller: subject.fn_did,
+            node: Some(plan.node),
+            span: Some(subject.binding_span),
+            category: "local",
+            replacement: Some(format!("{binding_prefix}{name}: {emitted_type}")),
+            emitted_type,
+            arm: "surface",
+        });
+    }
+    table.seams.explicit_declarations.extend(declarations);
+}
+
+fn append_inferred_local_declaration_plans(tcx: TyCtxt<'_>, table: &mut decision::DecisionTable) {
+    use bridge_receipt::SignatureClassId;
+
+    let mut declarations = Vec::new();
+    let mut receives = Vec::new();
+    for (subject, decision) in &table.entries {
+        let node = (subject.fn_did, subject.hir_id);
+        let receiver = table.return_receivers.plans.get(&node).filter(|receiver| {
+            !table.return_receivers.failures.contains_key(&node)
+                && table.return_interfaces.functions.get(&receiver.callee)
+                    == Some(&receiver.candidate_interface)
+                && decision::seam::form_of(decision) == receiver.receiver_form
+        });
+        let Some(name) = subject.param_name.as_deref() else { continue };
+        let (callee, emitted_type, expected_form) = if let Some(receiver) = receiver {
+            (
+                receiver.callee,
+                receiver.receiver_type(),
+                receiver.receiver_form.key(),
+            )
+        } else {
+            let (mutable, callee) = match decision {
+                decision::Decision::InferredRef { mutable, callee } => (mutable, callee),
+                decision::Decision::Ref { .. }
+                | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_)
+                | decision::Decision::Degraded(_) => continue,
+            };
+            let signature = tcx.fn_sig(callee.to_def_id()).skip_binder().skip_binder();
+            let TyKind::RawPtr(pointee, _) = *signature.output().kind() else { continue };
+            (
+                *callee,
+                // wave-6l: a cast receiver holds a reference of the CAST's pointee.
+                decision::native_result_expression::cast_receiver_type(tcx, subject, *mutable)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "&{}{}",
+                            if *mutable { "mut " } else { "" },
+                            decision::declaration::pointee_source(tcx, pointee)
+                        )
+                    }),
+                "ref",
+            )
+        };
+        let owner_class = SignatureClassId::of(callee);
+        let binding_prefix = if receiver.is_some()
+            && table.option_mut_bindings.contains(&node)
+            && !subject.mut_binding
+        {
+            "mut "
+        } else {
+            ""
+        };
+        if receiver.is_none_or(|receiver| {
+            receiver.declaration == decision::return_receiver::ReceiverDeclaration::Inferred
+        }) {
+            declarations.push(decision::seam::ExplicitDeclarationSite {
+                owner_class,
+                caller: subject.fn_did,
+                node: Some((subject.fn_did, subject.hir_id)),
+                span: Some(subject.binding_span),
+                category: "local",
+                replacement: Some(format!("{binding_prefix}{name}: {emitted_type}")),
+                emitted_type: emitted_type.clone(),
+                arm: "glue",
+            });
+        }
+        if let Some(digest) = table
+            .lifetime_plan
+            .function(callee)
+            .map(decision::lifetime::FunctionPlan::digest)
+        {
+            receives.push(decision::seam::ZeroBridgeSite {
+                owner_class,
+                caller: subject.fn_did,
+                span: Some(subject.binding_span),
+                arm: "glue",
+                position: format!("caller-receive:type={emitted_type}:lifetime_plan={digest}"),
+                bridge_kind: "return-caller-receive-ref",
+                expected_form,
+                found_form: receiver
+                    .map_or("raw", |receiver| receiver.candidate_interface.form.key()),
+                argument_kind: "return-call-result",
+                retention: bridge_receipt::BridgeRetentionTier::None,
+                waiver_id: None,
+                unsafe_context: None,
+            });
+        }
+    }
+    table.seams.explicit_declarations.extend(declarations);
+    table.seams.zero_bridges.extend(receives);
+    table
+        .seams
+        .explicit_declarations
+        .extend(decision::cursor_native::explicit_declarations(table));
+}
+
+/// wave-6f (W6F-3), TEST ONLY: slot-kind overrides by name, so a fixture can
+/// carry a coming analysis frame's verdicts (owned fields, Box locals) before
+/// that frame lands. Keyed by struct name / field index and by subject label.
+#[cfg(test)]
+pub(crate) mod test_model_override {
+    use std::sync::Mutex;
+
+    use rustc_hash::FxHashMap;
+
+    use crate::analyses::borrow_ownership::{
+        SlotKind, crate_slots::CrateSlots, slots::StructFieldSlot, solver::SlotRef,
+    };
+
+    /// `(marker, fields, locals)`: the override applies only to a program whose
+    /// source carries `marker` verbatim — the compiler runs its callback on
+    /// its own thread and the suite runs fixtures concurrently, so a global
+    /// override must name its fixture.
+    type Override = (
+        String,
+        Vec<(String, usize, SlotKind)>,
+        Vec<(String, SlotKind)>,
+        Vec<(String, usize)>,
+    );
+    static OVERRIDE: Mutex<Option<Override>> = Mutex::new(None);
+
+    pub(crate) fn set(
+        marker: &str,
+        fields: Vec<(String, usize, SlotKind)>,
+        locals: Vec<(String, SlotKind)>,
+    ) {
+        *OVERRIDE.lock().unwrap() = Some((marker.to_owned(), fields, locals, Vec::new()));
+    }
+
+    /// The frame's allocator contract: `(fn path, argument)` pairs that free
+    /// their argument exactly once through a custom deallocator.
+    pub(crate) fn set_with_contract(
+        marker: &str,
+        fields: Vec<(String, usize, SlotKind)>,
+        locals: Vec<(String, SlotKind)>,
+        deallocators: Vec<(String, usize)>,
+    ) {
+        *OVERRIDE.lock().unwrap() = Some((marker.to_owned(), fields, locals, deallocators));
+    }
+
+    pub(crate) fn contract_deallocator(
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        callee: rustc_hir::def_id::LocalDefId,
+        argument: usize,
+    ) -> bool {
+        let Some((marker, _, _, deallocators)) = OVERRIDE.lock().unwrap().clone() else {
+            return false;
+        };
+        let marked = tcx
+            .sess
+            .source_map()
+            .files()
+            .iter()
+            .any(|file| file.src.as_ref().is_some_and(|src| src.contains(&marker)));
+        marked
+            && deallocators.iter().any(|(path, index)| {
+                *index == argument && tcx.def_path_str(callee.to_def_id()) == *path
+            })
+    }
+
+    pub(crate) fn clear() {
+        *OVERRIDE.lock().unwrap() = None;
+    }
+
+    /// **The ONE lock every test that touches shared frame state should hold**
+    /// (R525-2, wave-6l 046).
+    ///
+    /// The standing set's NAMES rotate: `w6a_a1e_an_owned_field_refuses_the_
+    /// certificate`, `w6a_a1e_the_heman_cascade_root_is_one_lend` and
+    /// `w6f_lodepng_slice_field_with_size_delivers` are a coupled group over
+    /// shared BO model-cache state, and thread order decides which member
+    /// loses — so a gate that compares NAMES reports a phantom pair about half
+    /// the time. A per-file mutex cannot fix that, because the two lanes'
+    /// files each had their own; this one is crate-wide so both can hold it.
+    ///
+    /// It is deliberately NOT `#[cfg(test)]`-gated the way a private helper
+    /// would be: the point is that any test file can name it.
+    pub(crate) fn frame_lock() -> std::sync::MutexGuard<'static, ()> {
+        static FRAME: Mutex<()> = Mutex::new(());
+        FRAME
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn apply(
+        tcx: rustc_middle::ty::TyCtxt<'_>,
+        program: &crate::utils::rustc::RustProgram<'_>,
+        slots: &CrateSlots,
+        subjects: &[super::decision::Subject],
+        mut model: FxHashMap<SlotRef, SlotKind>,
+    ) -> FxHashMap<SlotRef, SlotKind> {
+        let Some((marker, fields, locals, _)) = OVERRIDE.lock().unwrap().clone() else {
+            return model;
+        };
+        let marked = tcx
+            .sess
+            .source_map()
+            .files()
+            .iter()
+            .any(|file| file.src.as_ref().is_some_and(|src| src.contains(&marker)));
+        if !marked {
+            return model;
+        }
+        for &struct_did in &program.structs {
+            let name = tcx.item_name(struct_did.to_def_id()).to_string();
+            for (struct_name, field_index, kind) in &fields {
+                if *struct_name != name {
+                    continue;
+                }
+                let slot = StructFieldSlot {
+                    struct_did,
+                    field_index: *field_index,
+                };
+                if let Some(id) = slots.field_slots.slot_for_field_depth(slot, 0) {
+                    model.insert(SlotRef::Field(id), *kind);
+                }
+            }
+        }
+        for subject in subjects {
+            for (label, kind) in &locals {
+                if *label != subject.label {
+                    continue;
+                }
+                if let Some(id) = slots
+                    .fn_local_slots
+                    .get(&subject.fn_did)
+                    .and_then(|universe| universe.slot_for_local_depth(subject.local, 0))
+                {
+                    model.insert(SlotRef::Local(subject.fn_did, id), *kind);
+                }
+            }
+        }
+        model
+    }
+}
+
+/// wave-6f: a local loaded from a converting field receives its explicit
+/// declaration exactly as an inferred local receives its callee's type.
+/// One explicit declaration per node (R410-2(a)): a load local another
+/// producer already declared (the raw-place-value reborrow, a construction
+/// plan, a Box owner) is skipped here — its declared type must be the
+/// decision's, which is what this hook would have written too; a
+/// disagreement is an error, never a second declaration.
+fn append_field_load_declaration_plans(table: &mut decision::DecisionTable) -> Result<(), String> {
+    use bridge_receipt::SignatureClassId;
+
+    let mut declarations = Vec::new();
+    // W6F-5: a local that decays an inline array field to a pointer needs the
+    // same explicit declaration as a field-load local — the surface placement
+    // has no pointee span to splice without one.
+    let decayed: Vec<&(decision::field_reference::NodeKey, String)> = table
+        .field_transactions
+        .decayed_array_locals
+        .iter()
+        .collect();
+    for pairs in table
+        .field_transactions
+        .applied
+        .iter()
+        .map(|transaction| transaction.load_locals.iter().collect::<Vec<_>>())
+        .chain(std::iter::once(decayed))
+    {
+        for (node, emitted_type) in pairs {
+            if let Some(existing) = table
+                .seams
+                .explicit_declarations
+                .iter()
+                .find(|site| site.category == "local" && site.node == Some(*node))
+            {
+                if existing.emitted_type != *emitted_type {
+                    return Err(format!(
+                        "field-load-declaration-type-mismatch:{}:{}:{}!={}",
+                        node.0.local_def_index.as_u32(),
+                        node.1.local_id.as_u32(),
+                        existing.emitted_type,
+                        emitted_type
+                    ));
+                }
+                continue;
+            }
+            let Some((subject, _)) = table
+                .entries
+                .iter()
+                .find(|(subject, _)| (subject.fn_did, subject.hir_id) == *node)
+            else {
+                continue;
+            };
+            let Some(name) = subject.param_name.as_deref() else { continue };
+            declarations.push(decision::seam::ExplicitDeclarationSite {
+                owner_class: SignatureClassId::of(node.0),
+                caller: node.0,
+                node: Some(*node),
+                span: Some(subject.binding_span),
+                category: "local",
+                replacement: Some(format!("{name}: {emitted_type}")),
+                emitted_type: emitted_type.clone(),
+                arm: "glue",
+            });
+        }
+    }
+    table.seams.explicit_declarations.extend(declarations);
+    Ok(())
+}
+
+fn derive_arm_requirements(
+    subjects: &[decision::Subject],
+    table: &decision::DecisionTable,
+    coconv: &decision::co_conversion::CoConv,
+    raw_boundary: &decision::raw_boundary::RawBoundaryDispositionIndex,
+    exposure: &decision::exposure::ExposurePolicy,
+) -> rustc_hash::FxHashMap<
+    (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+    decision::RequiredArmSet,
+> {
+    use decision::{Arm, SubjectKind};
+    subjects
+        .iter()
+        .map(|subject| {
+            let key = (subject.fn_did, subject.hir_id);
+            let mut required = coconv.required_arms(key);
+            let emits_signature = table.entries.iter().any(|(candidate, decision)| {
+                candidate.fn_did == subject.fn_did
+                    && candidate.hir_id == subject.hir_id
+                    && match decision {
+                        decision::Decision::Ref { .. }
+                        | decision::Decision::InferredRef { .. }
+                        | decision::Decision::Cursor { .. }
+                        | decision::Decision::NestedSlice { .. }
+                        | decision::Decision::Slice { .. }
+                        | decision::Decision::Opt { .. }
+                        | decision::Decision::Box(_) => true,
+                        decision::Decision::Degraded(_) => false,
+                    }
+            });
+            if matches!(subject.kind, SubjectKind::Param { .. })
+                && emits_signature
+                && !matches!(
+                    exposure.plan(subject.fn_did),
+                    decision::exposure::ExposureSurfacePlan::NotApplicable
+                )
+            {
+                required.insert(Arm::Surface);
+            }
+            if raw_boundary
+                .address_sites()
+                .iter()
+                .any(|site| site.node == key)
+            {
+                required.insert(Arm::Addr);
+            }
+            if table.entries.iter().any(|(candidate, decision)| {
+                candidate.fn_did == subject.fn_did
+                    && candidate.hir_id == subject.hir_id
+                    && match decision {
+                        decision::Decision::Cursor { plan, .. } => plan
+                            .uses
+                            .iter()
+                            .any(|edit| edit.bridge_kind.starts_with("raw-op-")),
+                        decision::Decision::NestedSlice { uses, .. }
+                        | decision::Decision::Slice { uses, .. }
+                        | decision::Decision::Opt { uses, .. } => uses
+                            .iter()
+                            .any(|edit| edit.bridge_kind.starts_with("raw-op-")),
+                        decision::Decision::Ref { .. }
+                        | decision::Decision::InferredRef { .. }
+                        | decision::Decision::Box(_)
+                        | decision::Decision::Degraded(_) => false,
+                    }
+            }) {
+                required.insert(Arm::Addr);
+            }
+            if let SubjectKind::Param { hir_index } = subject.kind
+                && table.seams.a5_raw_calls.iter().any(|call| {
+                    call.callee == subject.fn_did
+                        && call
+                            .views
+                            .iter()
+                            .any(|view| view.argument_index == hir_index)
+                })
+            {
+                required.insert(Arm::Pair);
+            }
+            (key, required)
+        })
+        .collect()
+}
+
+/// **R544-3 — a blocked class's D4 on a degraded partner is paid when every
+/// converting sibling carries a pair certificate against that partner.**
+///
+/// `CoConv::required_arms` charges D4 to a subject whose class is BLOCKED, and
+/// [`plan::finalize_signature_classes`] then holds the partner's whole function:
+/// "a form-changing arm on a degraded partner still holds". The hazard that
+/// hold guards is aliasing — the raw partner written through beside a
+/// converting sibling's safe view, two live views of one storage — and that is
+/// exactly what a pair-disjointness certificate between the two discharges
+/// (wave-6p's route (a), [`decision::pair_disjointness::PairDisjointnessIndex::
+/// certify_bindings`]). So D4 is removed only for a degraded partner that is
+/// its class's SOLE member (the D4 comes from the block alone, not from
+/// co-conversion coupling) in a function with at least one converting sibling,
+/// every one of which is certified against it. Every other D4 stays, and the
+/// partner's other arms are untouched. An unavailable index discharges nothing.
+fn discharge_d4_by_pair_certificates(
+    table: &decision::DecisionTable,
+    coconv: &decision::co_conversion::CoConv,
+    certificates: Option<&decision::pair_disjointness::PairDisjointnessIndex>,
+    requirements: &mut rustc_hash::FxHashMap<
+        (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+        decision::RequiredArmSet,
+    >,
+) -> Vec<String> {
+    let Some(certificates) = certificates else {
+        return Vec::new();
+    };
+    let converts = |decision: &decision::Decision| match decision {
+        decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Cursor { .. }
+        | decision::Decision::NestedSlice { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Box(_) => true,
+        decision::Decision::Degraded(_) => false,
+    };
+    let mut receipts = Vec::new();
+    for (partner, decision) in &table.entries {
+        let key = (partner.fn_did, partner.hir_id);
+        if converts(decision)
+            || !requirements
+                .get(&key)
+                .is_some_and(|required| required.contains(decision::Arm::D4))
+            || !coconv.class_of(key).is_some_and(|id| {
+                let class = &coconv.classes()[id];
+                class.blocked.is_some() && class.members == [key]
+            })
+        {
+            continue;
+        }
+        let siblings = table
+            .entries
+            .iter()
+            .filter(|(sibling, decision)| {
+                sibling.fn_did == partner.fn_did
+                    && sibling.hir_id != partner.hir_id
+                    && converts(decision)
+            })
+            .map(|(sibling, _)| sibling)
+            .collect::<Vec<_>>();
+        if siblings.is_empty() {
+            continue;
+        }
+        let certified = siblings
+            .iter()
+            .map(|sibling| {
+                certificates
+                    .certify_bindings(partner.fn_did, sibling.hir_id, partner.hir_id)
+                    .map(|kind| format!("{}:{}", sibling.label, kind.key()))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(certified) = certified else {
+            continue;
+        };
+        if let Some(required) = requirements.get_mut(&key) {
+            required.remove(decision::Arm::D4);
+        }
+        receipts.push(format!(
+            "d4-paid-by-pair-certificate:{} siblings={}",
+            partner.label,
+            certified.join(",")
+        ));
+    }
+    receipts
+}
+
+fn arm_outcomes_tsv(
+    tcx: TyCtxt<'_>,
+    subjects: &[decision::Subject],
+    table: &decision::DecisionTable,
+    coconv: &decision::co_conversion::CoConv,
+    raw_boundary: &decision::raw_boundary::RawBoundaryDispositionIndex,
+) -> String {
+    use decision::{Arm, ArmState, Decision, SubjectKind};
+
+    let decisions = table
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut rows = Vec::new();
+    for subject in subjects {
+        let key = (subject.fn_did, subject.hir_id);
+        let required = table
+            .arm_requirements
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
+
+        let mut ready = required;
+        let mut blocked_arm = None;
+        let mut blocked_reason = "-".to_owned();
+        if coconv.node_block(key).is_some() && !coconv.is_pair_raw_view(key) {
+            let arm = if coconv.pair_sites().iter().any(|row| {
+                row.subject == key && row.role == decision::co_conversion::PairRole::Blocked
+            }) {
+                Arm::Pair
+            } else {
+                Arm::D4
+            };
+            ready.remove(arm);
+            blocked_arm = Some(arm);
+            blocked_reason = coconv
+                .node_block(key)
+                .map_or_else(|| "-".to_owned(), |reason| reason.key().to_owned());
+        }
+        if let SubjectKind::Param { hir_index } = subject.kind
+            && let Some(block) = table
+                .seams
+                .blocked
+                .iter()
+                .find(|block| block.callee == subject.fn_did && block.index == hir_index)
+        {
+            let arm = if block.block == decision::seam::SeamBlock::SiteOverlap {
+                Arm::Pair
+            } else {
+                Arm::Glue
+            };
+            ready.remove(arm);
+            if blocked_arm.is_none() {
+                blocked_arm = Some(arm);
+                blocked_reason = block.block.key().to_owned();
+            }
+        }
+        if let Some(reason) = raw_boundary.block_reason(key) {
+            ready.remove(Arm::C);
+            if blocked_arm.is_none() {
+                blocked_arm = Some(Arm::C);
+                blocked_reason = reason.key().to_owned();
+            }
+        }
+        let decision = decisions.get(&key).copied();
+        let decision_degraded = decision.is_some_and(|decision| match decision {
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Cursor { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_) => false,
+            Decision::Degraded(_) => true,
+        });
+        if decision_degraded && blocked_arm.is_none() {
+            let arm = Arm::ALL
+                .into_iter()
+                .find(|&arm| required.contains(arm))
+                .unwrap_or(Arm::D4);
+            ready.remove(arm);
+            blocked_arm = Some(arm);
+            blocked_reason = "decision-degraded".to_owned();
+        }
+        let terminal = if blocked_arm.is_some() {
+            "blocked"
+        } else if decision_degraded {
+            "typed-excluded"
+        } else {
+            "planned"
+        };
+        let states = Arm::ALL
+            .into_iter()
+            .map(|arm| {
+                if !required.contains(arm) {
+                    ArmState::NotRequired
+                } else if ready.contains(arm) {
+                    ArmState::Ready
+                } else {
+                    ArmState::Blocked
+                }
+                .key()
+            })
+            .collect::<Vec<_>>();
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let identity = subject.identity_key(&owner);
+        rows.push((
+            identity.clone(),
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                identity,
+                owner,
+                required.render(),
+                ready.render(),
+                ready.render(),
+                states[0],
+                states[1],
+                states[2],
+                states[3],
+                states[4],
+                states[5],
+                terminal,
+                blocked_arm.map_or("-", Arm::key),
+                blocked_reason,
+            ),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut out = String::from(
+        "subject_identity\towner\trequired_arms\tready_arms\tapplied_arms\tsurface_state\td4_state\tc_state\tpair_state\tglue_state\taddr_state\tterminal\tblocking_arm\tblocking_reason\tblocking_reason_ordinals\n",
+    );
+    for (_, row) in rows {
+        out.push_str(&row);
+    }
+    out
+}
+
+fn atomic_arm_outcomes_tsv(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    plan: &plan::Plan,
+) -> String {
+    use decision::{Arm, ArmState, Decision};
+
+    let mut rows = Vec::new();
+    for (subject, decision) in &table.entries {
+        let id = bridge_receipt::SignatureClassId::of(subject.fn_did);
+        let required = table
+            .arm_requirements
+            .get(&(subject.fn_did, subject.hir_id))
+            .copied()
+            .unwrap_or_default();
+        let class = plan.class_finalization.classes.get(&id);
+        let class_ready = class.is_some_and(plan::SignatureClassPlan::is_ready);
+        let decision_degraded = match decision {
+            Decision::Ref { .. }
+            | Decision::InferredRef { .. }
+            | Decision::Cursor { .. }
+            | Decision::NestedSlice { .. }
+            | Decision::Slice { .. }
+            | Decision::Opt { .. }
+            | Decision::Box(_) => false,
+            Decision::Degraded(_) => true,
+        };
+        let applied = if class_ready && !decision_degraded {
+            required
+        } else {
+            decision::RequiredArmSet::default()
+        };
+        let states = Arm::ALL
+            .into_iter()
+            .map(|arm| {
+                if !required.contains(arm) {
+                    ArmState::NotRequired
+                } else if class_ready && !decision_degraded {
+                    ArmState::Ready
+                } else {
+                    ArmState::Blocked
+                }
+                .key()
+            })
+            .collect::<Vec<_>>();
+        let terminal = if class.is_some_and(|class| !class.is_ready()) {
+            "blocked"
+        } else if decision_degraded {
+            "typed-excluded"
+        } else {
+            "planned"
+        };
+        let blocked_reason = class
+            .filter(|class| !class.is_ready())
+            .map(|class| class.hold_reasons().join(";"))
+            .unwrap_or_else(|| "-".to_owned());
+        // **Row (iv) (R471-2)** — the same reasons in RECORD order, each with the
+        // ordinal `hold_terminal_class` stamped it at. Additive beside
+        // `blocking_reason`, which stays sorted for its existing readers.
+        let blocked_reason_ordinals = class
+            .filter(|class| !class.is_ready())
+            .map(|class| {
+                class
+                    .hold_ordinals()
+                    .iter()
+                    .map(|(ordinal, reason)| format!("{reason}@{ordinal}"))
+                    .collect::<Vec<_>>()
+                    .join(";")
+            })
+            .filter(|rendered| !rendered.is_empty())
+            .unwrap_or_else(|| "-".to_owned());
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let identity = subject.identity_key(&owner);
+        rows.push((
+            identity.clone(),
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                identity,
+                owner,
+                required.render(),
+                applied.render(),
+                applied.render(),
+                states[0],
+                states[1],
+                states[2],
+                states[3],
+                states[4],
+                states[5],
+                terminal,
+                if terminal == "blocked" { "class" } else { "-" },
+                blocked_reason,
+                blocked_reason_ordinals,
+            ),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut out = String::from(
+        "subject_identity\towner\trequired_arms\tready_arms\tapplied_arms\tsurface_state\td4_state\tc_state\tpair_state\tglue_state\taddr_state\tterminal\tblocking_arm\tblocking_reason\n",
+    );
+    for (_, row) in rows {
+        out.push_str(&row);
+    }
+    out
+}
+
+fn raw_boundary_subjects_tsv(
+    tcx: TyCtxt<'_>,
+    hypothetical: &decision::DecisionTable,
+    settled: &decision::DecisionTable,
+    coconv: &decision::co_conversion::CoConv,
+    raw_boundary: &decision::raw_boundary::RawBoundaryDispositionIndex,
+) -> String {
+    let decision_key = |decision: &decision::Decision| match decision {
+        decision::Decision::Ref { .. } => "ref",
+        decision::Decision::InferredRef { .. } => "inferred-ref",
+        decision::Decision::Cursor { .. } => "cursor",
+        decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => "slice",
+        decision::Decision::Opt { .. } => "optional",
+        decision::Decision::Box(_) => "box",
+        decision::Decision::Degraded(_) => "degraded",
+    };
+    let settled = settled
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut rows = Vec::new();
+    for (subject, hypothetical_decision) in &hypothetical.entries {
+        let node = (subject.fn_did, subject.hir_id);
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let identity = subject.identity_key(&owner);
+        let direct = raw_boundary.node_dispositions(node);
+        let tiers = direct
+            .iter()
+            .map(|(_, disposition)| disposition.tier())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join(";");
+        let class_block = coconv.class_block(node).map_or("-", |reason| reason.key());
+        let node_block = coconv.node_block(node).map_or("-", |reason| reason.key());
+        let settled_decision = settled.get(&node).copied();
+        rows.push((
+            identity.clone(),
+            format!(
+                "{identity}\t{owner}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                subject.local.as_u32(),
+                match subject.kind {
+                    decision::SubjectKind::Param { .. } => "param",
+                    decision::SubjectKind::Local => "local",
+                },
+                decision_key(hypothetical_decision),
+                settled_decision.map_or("missing", |decision| decision_key(decision)),
+                direct.len(),
+                if tiers.is_empty() { "-" } else { &tiers },
+                u8::from(raw_boundary.opens_node(node)),
+                coconv
+                    .class_of(node)
+                    .map_or_else(|| "-".to_owned(), |id| id.to_string()),
+                u8::from(coconv.admits(node)),
+                class_block,
+                node_block,
+                subject.ptr_depth,
+            ),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut out = String::from(
+        "subject_identity\towner\tmir_local\tsubject_kind\thypothetical\tsettled\tdirect_site_count\tdirect_tiers\traw_open\tclass_id\tclass_admits\tclass_block\tnode_block\tptr_depth\n",
+    );
+    for (_, row) in rows {
+        out.push_str(&row);
+    }
+    out
+}
+
+/// **R1 — the pipeline's by-products, returned instead of recomputed.**
+///
+/// `facts_join_tsv` used to re-derive all of this itself, which meant the recon
+/// worker ran the **BO solve twice per program**. That was affordable until the
+/// fatness pass landed on top of it and three programs blew the 3,000 s cap.
+/// The duplicate is removed by handing the caller what the pipeline already
+/// built, not by making the second copy cheaper.
+pub(crate) struct DecideCtx {
+    slots: CrateSlots,
+    model: rustc_hash::FxHashMap<SlotRef, SlotKind>,
+    mut_facts: MutFacts,
+    facts: decision::emitability::EmitabilityFacts,
+    /// **S3.6-1 task 2.** Carried out with the table rather than recomputed by
+    /// the census exporter, for R1's reason: the second derivation is what made
+    /// the recon worker solve BO twice per program.
+    #[allow(dead_code)]
+    coconv: decision::co_conversion::CoConv,
+    #[allow(dead_code)]
+    lifetime_eligibility: decision::lifetime::LifetimeEligibility,
+    /// The escape shapes, measured **separately and deliberately not gated**.
+    ///
+    /// The handoff's boundary, kept: the pinned-callee flow is the hazard this
+    /// slice CREATES and is gated in `co_conversion`; a `static mut` store, a
+    /// field store and a return are **pre-existing and orthogonal** — the
+    /// already-emitting 562 carry the same shape, since a parameter of an
+    /// uncalled function escapes just as readily. S3.6-1 multiplies the
+    /// population ~4× but does not introduce the class. Measured here so it is
+    /// neither folded in silently nor omitted silently.
+    #[allow(dead_code)]
+    escapes: Vec<decision::co_conversion::Escape>,
+    /// **P2 measurement.** The inputs the class builder consumed, kept so an
+    /// alternative overlap rule can be priced without a second front-end pass —
+    /// R1's rule, the one that stopped the recon worker solving BO twice.
+    subjects: Vec<decision::Subject>,
+    hypothetical: decision::DecisionTable,
+    retained_copy_plans: Vec<PlannedCopyMark>,
+    overlap_receipt: String,
+    analysis: DecisionAnalysisCarrier,
+    a5_site_proofs: decision::a5_site_proof::A5SeamProofIndex,
+    #[allow(dead_code)]
+    box_facts: decision::box_facts::BoxOwnershipFacts,
+    constructions: decision::construction::ConstructionFacts,
+    pub(crate) raw_boundary_sites: decision::raw_boundary::RawBoundarySiteFacts,
+    pub(crate) retention: decision::raw_boundary::RetentionSummaries,
+    #[allow(dead_code)]
+    pub(crate) raw_boundary: decision::raw_boundary::RawBoundaryDispositionIndex,
+    #[allow(dead_code)]
+    exposure: decision::exposure::ExposurePolicy,
+    raw_boundary_artifacts: RawBoundaryArtifacts,
+    e2_artifacts: E2Artifacts,
+    /// R1305-1: the fatness verdict of each subject's local (`FatFacts::render`),
+    /// kept for the per-subject writer; nothing decides on it here.
+    subject_fatness: rustc_hash::FxHashMap<(rustc_hir::def_id::LocalDefId, Local), &'static str>,
+}
+
+impl DecideCtx {
+    /// The escape records, for the witness that each shape is recognised.
+    ///
+    /// A test accessor rather than a `pub` field: the production consumer is
+    /// `coconv_tsv`, and widening the field would invite a second reader that
+    /// counts them a second way.
+    #[cfg(test)]
+    pub(crate) fn escapes_for_test(&self) -> &[decision::co_conversion::Escape] {
+        &self.escapes
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct BoxPlanArtifact {
+    pub(crate) tsv: String,
+    pub(crate) bridges: String,
+    pub(crate) default_fill_candidates: String,
+}
+
+fn box_mir_drop_policies(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    unplaceable: &[plan::Unplaceable],
+) -> Vec<verify::BoxMirDropPolicy> {
+    let unplaceable = unplaceable
+        .iter()
+        .map(|row| row.subject.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut policies = table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let plan = match decision {
+                decision::Decision::Box(plan) => plan,
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Degraded(_) => return None,
+            };
+            let function = tcx.def_path_str(subject.fn_did.to_def_id());
+            let subject_key = subject.identity_key(&function);
+            if unplaceable.contains(subject_key.as_str()) {
+                return None;
+            }
+            Some(verify::BoxMirDropPolicy {
+                subject: subject_key,
+                function,
+                local_name: subject.param_name.clone(),
+                overwrite_sites: plan
+                    .overwrite_spans
+                    .iter()
+                    .map(|span| decision::emitability::EmitabilityFacts::site(tcx, *span))
+                    .collect(),
+                retained_sink: plan.retained_sink,
+                optional: plan.optional,
+                implicit_scope_close: plan.implicit_scope_close,
+                // R802-3: a receiver's exit rows are on its plan; a
+                // certificate's returned owner's live null returns are on the
+                // certificate (its plan's own line was stripped).
+                reseats: usize::from(plan.receipts.iter().any(|receipt| {
+                    receipt == decision::return_certificate::RESEAT_OVER_DECLARED_NONE
+                })),
+                scope_exit_closes: plan
+                    .receipts
+                    .iter()
+                    .filter(|receipt| receipt.starts_with("waiver-drop(scope-exit)"))
+                    .count()
+                    + table
+                        .return_certificates
+                        .callees
+                        .get(&subject.fn_did)
+                        .filter(|c| c.returned == Some((subject.fn_did, subject.hir_id)))
+                        .map_or(0, |c| {
+                            c.receipts
+                                .iter()
+                                .filter(|receipt| receipt.starts_with("waiver-drop(scope-exit)"))
+                                .count()
+                        }),
+            })
+        })
+        .collect::<Vec<_>>();
+    policies.sort_by(|left, right| left.subject.cmp(&right.subject));
+    policies
+}
+
+#[cfg(test)]
+pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, String> {
+    let (table, ctx) = decide_table_with_ctx(tcx)?;
+    let bridges = ctx.box_facts.construction_bridges_tsv(
+        tcx,
+        &ctx.subjects,
+        &ctx.slots,
+        &ctx.constructions,
+        &ctx.model,
+    );
+    let default_fill_candidates = ctx.box_facts.default_fill_candidates_tsv(
+        tcx,
+        &ctx.subjects,
+        &ctx.slots,
+        &ctx.constructions,
+        &ctx.model,
+    );
+    let decisions = table
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.local), decision))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut rows = Vec::new();
+    let mut subject_rows = Vec::new();
+    for subject in ctx
+        .subjects
+        .iter()
+        .filter(|subject| e1_subject_model_kind(&ctx, subject) == Some(SlotKind::Owning))
+    {
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let subject_slot = ctx.slots.fn_local_slots[&subject.fn_did]
+            .slot_for_local_depth(subject.local, 0)
+            .expect("Owning subject has a depth-0 slot");
+        let subject_slot =
+            decision::box_facts::slot_label(SlotRef::Local(subject.fn_did, subject_slot));
+        subject_rows.push((
+            subject.identity_key(&owner),
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                subject.identity_key(&owner),
+                owner,
+                subject.local.as_u32(),
+                match subject.kind {
+                    decision::SubjectKind::Param { hir_index } => (hir_index + 1).to_string(),
+                    decision::SubjectKind::Local => "-".to_owned(),
+                },
+                subject.ptr_depth,
+                subject_slot,
+            ),
+        ));
+        let decision = decisions[&(subject.fn_did, subject.local)];
+        let (outcome, reason, shape, optional, edits, deletes, fabricated, receipts) =
+            match decision {
+                decision::Decision::Box(plan) => (
+                    "planned",
+                    "-",
+                    match plan.shape {
+                        decision::box_facts::BoxShape::Sized => "sized",
+                        decision::box_facts::BoxShape::Slice => "slice",
+                    },
+                    u8::from(plan.optional),
+                    plan.expr_edits.len(),
+                    plan.delete_statements.len(),
+                    u8::from(plan.fabricated_extent),
+                    plan.receipts.join(" | "),
+                ),
+                decision::Decision::Degraded(record) => (
+                    "filtered",
+                    record.reason.key(),
+                    "-",
+                    0,
+                    0,
+                    0,
+                    0,
+                    record.reason.detail(),
+                ),
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. } => {
+                    return Err(format!(
+                        "Owning subject {} received non-Box safe form",
+                        subject.label
+                    ));
+                }
+            };
+        rows.push((
+            subject.identity_key(&owner),
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                subject.identity_key(&owner),
+                owner,
+                subject.local.as_u32(),
+                u8::from(matches!(subject.kind, decision::SubjectKind::Param { .. })),
+                subject.ptr_depth,
+                outcome,
+                reason,
+                shape,
+                optional,
+                edits,
+                deletes,
+                fabricated,
+            ) + &format!("\t{}", receipts.replace(['\t', '\r', '\n'], " ")),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut output = String::from(
+        "subject_key\towner_fn\tmir_local\tis_param\tptr_depth\toutcome\treason\tshape\toptional\texpr_edits\tstatement_deletes\tfabricated_extent\treceipts\n",
+    );
+    for (_, row) in rows {
+        output.push_str(&row);
+        output.push('\n');
+    }
+    subject_rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut subjects =
+        String::from("subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tslot\n");
+    for (_, row) in subject_rows {
+        subjects.push_str(&row);
+        subjects.push('\n');
+    }
+    Ok(BoxPlanArtifact {
+        tsv: output,
+        bridges,
+        default_fill_candidates,
+    })
+}
+
+fn e1_subject_model_kind(ctx: &DecideCtx, subject: &decision::Subject) -> Option<SlotKind> {
+    let universe = ctx.slots.fn_local_slots.get(&subject.fn_did)?;
+    let slot = universe.slot_for_local_depth(subject.local, 0)?;
+    ctx.model
+        .get(&SlotRef::Local(subject.fn_did, slot))
+        .copied()
+}
+
+fn e1_subject_family(
+    model: Option<SlotKind>,
+    decision: &decision::Decision,
+    hypothetical: Option<&decision::Decision>,
+) -> &'static str {
+    match model {
+        Some(SlotKind::Raw) => "raw",
+        Some(SlotKind::Owning) => "box",
+        None => "unmodeled",
+        Some(SlotKind::Ref) => {
+            let form = match decision {
+                decision::Decision::Ref { .. } | decision::Decision::InferredRef { .. } => {
+                    Some("ref")
+                }
+                decision::Decision::Cursor { .. } => Some("cursor"),
+                decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => {
+                    Some("slice")
+                }
+                decision::Decision::Opt { .. } => Some("optional"),
+                decision::Decision::Box(_) => Some("box"),
+                decision::Decision::Degraded(_) => match hypothetical {
+                    Some(decision::Decision::Ref { .. })
+                    | Some(decision::Decision::InferredRef { .. }) => Some("ref"),
+                    Some(decision::Decision::Cursor { .. }) => Some("cursor"),
+                    Some(
+                        decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. },
+                    ) => Some("slice"),
+                    Some(decision::Decision::Opt { .. }) => Some("optional"),
+                    Some(decision::Decision::Box(_)) => Some("box"),
+                    Some(decision::Decision::Degraded(_)) | None => None,
+                },
+            };
+            form.unwrap_or_else(|| match decision {
+                decision::Decision::Degraded(record) => match record.reason {
+                    decision::DegradeReason::SliceUseUnsupported
+                    | decision::DegradeReason::SliceNegOrUnknownOffset
+                    | decision::DegradeReason::SliceLocalConstruction => "slice",
+                    decision::DegradeReason::NullInit
+                    | decision::DegradeReason::OptUseUnsupported
+                    | decision::DegradeReason::OptLocalConstruction
+                    | decision::DegradeReason::OptNeedsMutBinding => "optional",
+                    _ => "ref",
+                },
+                decision::Decision::Ref { .. }
+                | decision::Decision::InferredRef { .. }
+                | decision::Decision::Cursor { .. }
+                | decision::Decision::NestedSlice { .. }
+                | decision::Decision::Slice { .. }
+                | decision::Decision::Opt { .. }
+                | decision::Decision::Box(_) => unreachable!("emitting form mapped above"),
+            })
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum E2TerminalDisposition<'a> {
+    Planned,
+    Failure(decision::lifetime::LifetimeFailure),
+    SecondaryDegradation(&'a decision::Degradation),
+    NotE2,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct E2DispositionInvariant<'a> {
+    record: &'a decision::Degradation,
+}
+
+impl E2DispositionInvariant<'_> {
+    fn key(self) -> &'static str {
+        "lifetime-invariant-permitted-own-primary"
+    }
+
+    fn payload(self) -> (String, String) {
+        (
+            self.record.reason.key().to_owned(),
+            self.record.reason.detail(),
+        )
+    }
+
+    fn message(self, subject_key: &str) -> String {
+        let (reason, detail) = self.payload();
+        format!(
+            "{}: subject={subject_key} reason={reason} detail={detail} site={}",
+            self.key(),
+            self.record.site.replace(['\t', '\r', '\n'], " "),
+        )
+    }
+}
+
+impl E2TerminalDisposition<'_> {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Failure(failure) => failure.key(),
+            Self::SecondaryDegradation(_) => "lifetime-secondary-degradation",
+            Self::NotE2 => "not-e2",
+        }
+    }
+
+    fn secondary_payload(self) -> (String, String) {
+        match self {
+            Self::SecondaryDegradation(record) => {
+                (record.reason.key().to_owned(), record.reason.detail())
+            }
+            Self::Planned | Self::Failure(_) | Self::NotE2 => ("-".to_owned(), "-".to_owned()),
+        }
+    }
+}
+
+fn e2_terminal_disposition<'a>(
+    planned: bool,
+    has_lifetime_permit: bool,
+    failure: Option<decision::lifetime::LifetimeFailure>,
+    final_decision: &'a decision::Decision,
+) -> Result<E2TerminalDisposition<'a>, E2DispositionInvariant<'a>> {
+    use decision::lifetime::LifetimeFailure as F;
+
+    // Fixed classification order: tranche holds and origin failures through
+    // conflict are known before the final decision. A secondary blocker first
+    // exists after that decision, and therefore precedes AST/seam placement.
+    if let Some(
+        failure @ (F::FieldHeld
+        | F::ExternalContractAbsent
+        | F::FnPtrWebHeld
+        | F::OriginUnknown
+        | F::OriginAbsent
+        | F::OriginConflict),
+    ) = failure
+    {
+        return Ok(E2TerminalDisposition::Failure(failure));
+    }
+
+    // ClassBlocked is collateral by construction: `via` belongs to a
+    // classmate. Hoist it above the row-local permit test so a permit-less
+    // class member preserves the secondary reason and payload.
+    let class_coupling = match final_decision {
+        decision::Decision::Degraded(record)
+            if matches!(record.reason, decision::DegradeReason::ClassBlocked { .. }) =>
+        {
+            Some(record)
+        }
+        decision::Decision::Degraded(_)
+        | decision::Decision::Ref { .. }
+        | decision::Decision::InferredRef { .. }
+        | decision::Decision::Cursor { .. }
+        | decision::Decision::NestedSlice { .. }
+        | decision::Decision::Slice { .. }
+        | decision::Decision::Opt { .. }
+        | decision::Decision::Box(_) => None,
+    };
+    if let Some(record) = class_coupling {
+        return Ok(E2TerminalDisposition::SecondaryDegradation(record));
+    }
+
+    if has_lifetime_permit {
+        match final_decision {
+            decision::Decision::Degraded(record) => match &record.reason {
+                decision::DegradeReason::SilentCoercion {
+                    via: decision::co_conversion::BlockReason::EscapesViaReturn,
+                } => return Err(E2DispositionInvariant { record }),
+                // `ClassBlocked { via }` is class coupling: `via` belongs to a
+                // classmate, so this row always reports a secondary blocker.
+                _ => return Ok(E2TerminalDisposition::SecondaryDegradation(record)),
+            },
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Cursor { .. }
+            | decision::Decision::NestedSlice { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => {}
+        }
+    }
+
+    if let Some(failure @ (F::AstUnplaceable | F::SeamIncompatible)) = failure {
+        return Ok(E2TerminalDisposition::Failure(failure));
+    }
+    if planned {
+        Ok(E2TerminalDisposition::Planned)
+    } else {
+        Ok(E2TerminalDisposition::NotE2)
+    }
+}
+
+/// **A6/A7 — the decision vector, rendered for byte comparison.**
+///
+/// One line per subject, `identity\tdecision-form`, sorted by identity so the
+/// rendering does not depend on subject iteration order. This is the object the
+/// rider is about: if the lifetime pass decides nothing, two runs that differ
+/// only in whether it was supplied render the same bytes.
+pub(crate) fn decision_vector_render(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
+    let mut lines = table
+        .entries
+        .iter()
+        .map(|(subject, decision)| {
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            let form = match decision {
+                decision::Decision::Ref { .. } => "ref".to_owned(),
+                decision::Decision::InferredRef { .. } => "inferred-ref".to_owned(),
+                decision::Decision::Cursor { .. } => "cursor".to_owned(),
+                decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => {
+                    "slice".to_owned()
+                }
+                decision::Decision::Opt { .. } => "optional".to_owned(),
+                decision::Decision::Box(_) => "box".to_owned(),
+                decision::Decision::Degraded(record) => {
+                    format!("degraded:{}", record.reason.key())
+                }
+            };
+            format!("{}\t{form}\n", subject.identity_key(&owner))
+        })
+        .collect::<Vec<_>>();
+    lines.sort();
+    lines.concat()
+}
+
+fn digest_of(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+fn e2_artifacts_from_table(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    ordinary: &decision::DecisionTable,
+    eligibility: &decision::lifetime::LifetimeEligibility,
+) -> Result<E2Artifacts, String> {
+    let ordinary = ordinary
+        .entries
+        .iter()
+        .map(|(subject, decision)| ((subject.fn_did, subject.hir_id), decision))
+        .collect::<rustc_hash::FxHashMap<_, _>>();
+    let mut subject_rows = Vec::new();
+    let mut failure_rows = Vec::new();
+    for (subject, final_decision) in &table.entries {
+        let key = (subject.fn_did, subject.hir_id);
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let subject_key = subject.identity_key(&owner);
+        let plan = table.lifetime_plan.function(subject.fn_did);
+        let has_lifetime_permit = eligibility.return_permit(key).is_some()
+            || eligibility.inferred_permit(key).is_some()
+            || eligibility.is_output_source(key);
+        let planned = plan.is_some() && has_lifetime_permit;
+        let fallback_failure = match final_decision {
+            decision::Decision::Degraded(record) => match &record.reason {
+                decision::DegradeReason::SilentCoercion { via }
+                | decision::DegradeReason::ClassBlocked { via } => match via {
+                    decision::co_conversion::BlockReason::EscapesViaFieldStore => {
+                        Some(decision::lifetime::LifetimeFailure::FieldHeld)
+                    }
+                    decision::co_conversion::BlockReason::EscapesViaForeignArg
+                    | decision::co_conversion::BlockReason::BorrowedIntoRawParam => {
+                        Some(decision::lifetime::LifetimeFailure::ExternalContractAbsent)
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        let failure = eligibility.failure(key).or(fallback_failure);
+        let disposition =
+            e2_terminal_disposition(planned, has_lifetime_permit, failure, final_decision)
+                .map_err(|invariant| invariant.message(&subject_key))?;
+        let (secondary_reason, secondary_detail) = disposition.secondary_payload();
+        let ordinary_decision = ordinary.get(&key).copied();
+        let ordinary_key = match ordinary_decision {
+            Some(decision::Decision::Ref { .. }) => "ref",
+            Some(decision::Decision::InferredRef { .. }) => "inferred-ref",
+            Some(decision::Decision::Cursor { .. }) => "cursor",
+            Some(decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. }) => {
+                "slice"
+            }
+            Some(decision::Decision::Opt { .. }) => "optional",
+            Some(decision::Decision::Box(_)) => "box",
+            Some(decision::Decision::Degraded(record)) => record.reason.key(),
+            None => "missing",
+        };
+        let final_key = match final_decision {
+            decision::Decision::Ref { .. } => "ref",
+            decision::Decision::InferredRef { .. } => "inferred-ref",
+            decision::Decision::Cursor { .. } => "cursor",
+            decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => "slice",
+            decision::Decision::Opt { .. } => "optional",
+            decision::Decision::Box(_) => "box",
+            decision::Decision::Degraded(record) => record.reason.key(),
+        };
+        let digest = plan.map_or_else(|| "-".to_owned(), |plan| plan.digest());
+        let justification = if planned {
+            plan::Justification::LifetimePlan {
+                digest: digest.clone(),
+            }
+        } else {
+            plan::Justification::KindDecision { kind: "none" }
+        };
+        let justification_key = match justification {
+            plan::Justification::LifetimePlan { .. } => "lifetime-plan",
+            _ => "-",
+        };
+        let construction = subject
+            .ctor
+            .as_ref()
+            .map_or("-", decision::construction::Construction::key);
+        subject_rows.push(format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            subject_key,
+            owner,
+            subject.local.as_u32(),
+            subject.ptr_depth,
+            construction,
+            ordinary_key,
+            final_key,
+            disposition.key(),
+            justification_key,
+            digest,
+            secondary_reason,
+            secondary_detail,
+        ));
+        if let Some(failure) = failure {
+            failure_rows.push(format!(
+                "{}\t{}\t{}\t{}",
+                subject_key,
+                owner,
+                failure.key(),
+                construction,
+            ));
+        }
+    }
+    subject_rows.sort();
+    failure_rows.sort();
+
+    let mut function_rows = table
+        .lifetime_plan
+        .functions()
+        .map(|(did, function)| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}",
+                tcx.def_path_str(did.to_def_id()),
+                function.digest(),
+                function.sccs.len(),
+                function.outlives.len(),
+                function.receipt().replace('\n', " | "),
+            )
+        })
+        .collect::<Vec<_>>();
+    function_rows.sort();
+    let mut pb_rows = Vec::new();
+    for root in eligibility.web_roots() {
+        pb_rows.push(format!("root\t{root}\tadjusted-fnptr"));
+    }
+    for (member, reason) in eligibility.web_members() {
+        pb_rows.push(format!("closure\t{member}\t{reason}"));
+    }
+    pb_rows.sort();
+
+    Ok(E2Artifacts {
+        subjects: format!(
+            "subject_key\towner_fn\tmir_local\tptr_depth\tconstruction\tordinary_decision\tfinal_decision\te2_disposition\tjustification\tlifetime_plan_digest\tsecondary_reason\tsecondary_reason_detail\n{}{}",
+            subject_rows.join("\n"),
+            if subject_rows.is_empty() { "" } else { "\n" },
+        ),
+        functions: format!(
+            "function\tlifetime_plan_digest\tsccs\toutlives\tplan_receipt\n{}{}",
+            function_rows.join("\n"),
+            if function_rows.is_empty() { "" } else { "\n" },
+        ),
+        failures: format!(
+            "subject_key\towner_fn\tfailure\tconstruction\n{}{}",
+            failure_rows.join("\n"),
+            if failure_rows.is_empty() { "" } else { "\n" },
+        ),
+        seams: seam_tsv_from_table(tcx, table),
+        // Filled by the caller, which holds the two control runs.
+        plan_inert_digest_with: String::new(),
+        plan_inert_digest_without: String::new(),
+        pb_web: format!(
+            "unit\tfunction\treason\n{}{}",
+            pb_rows.join("\n"),
+            if pb_rows.is_empty() { "" } else { "\n" },
+        ),
+        timings: E2Timings::default(),
+    })
+}
+
+/// R219 descriptors come from the same immutable decisions consumed by emission.
+/// Held subjects remain in this independent inventory so a false zero placement
+/// bit cannot hide a safe declaration from the custody comparator.
+fn delivery_expectations(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    emission_plan: &plan::Plan,
+) -> Vec<DeliveryExpectation> {
+    let unplaced = emission_plan
+        .unplaceable
+        .iter()
+        .map(|row| (row.subject.as_str(), row.reason))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    table
+        .entries
+        .iter()
+        .filter_map(|(subject, decided)| {
+            let expected_form = delivery_form(decided)?;
+            // A withdrawn Box decision is degraded, never an expectation.
+            if decision::ownership_fields_native::withdrawn_box_reason(
+                decided,
+                emission_plan,
+                bridge_receipt::SignatureClassId::of(subject.fn_did),
+                unplaced
+                    .get(
+                        subject
+                            .identity_key(&tcx.def_path_str(subject.fn_did.to_def_id()))
+                            .as_str(),
+                    )
+                    .copied(),
+            )
+            .is_some()
+            {
+                return None;
+            }
+            let owner_fn = tcx.def_path_str(subject.fn_did.to_def_id());
+            let emitted_owner = match table.exposure.as_ref().map(|e| e.plan(subject.fn_did)) {
+                Some(
+                    decision::exposure::ExposureSurfacePlan::PositiveSeedShim
+                    | decision::exposure::ExposureSurfacePlan::FnPtrRawWrapper,
+                ) => match owner_fn.rsplit_once("::") {
+                    Some((parent, name)) => format!("{parent}::__crat_safe_{name}"),
+                    None => format!("__crat_safe_{owner_fn}"),
+                },
+                Some(
+                    decision::exposure::ExposureSurfacePlan::ClosedWorldDirect
+                    | decision::exposure::ExposureSurfacePlan::NotApplicable,
+                )
+                | None => owner_fn.clone(),
+            };
+            Some(DeliveryExpectation {
+                subject_key: subject.identity_key(&owner_fn),
+                owner_fn,
+                emitted_owner,
+                source_file: file_key(
+                    &tcx.sess
+                        .source_map()
+                        .lookup_source_file(subject.attribution_span().lo())
+                        .name,
+                )
+                .map(|key| format!("{key:?}")),
+                binding: subject.param_name.clone().unwrap_or_default(),
+                parameter_index: match subject.kind {
+                    decision::SubjectKind::Param { hir_index } => Some(hir_index + 1),
+                    decision::SubjectKind::Local => None,
+                },
+                expected_form,
+            })
+        })
+        .collect()
+}
+
+/// Addendum 90's identity seed, produced inside the one E1 compiler callback
+/// from the exact table and plan that emission consumes.  Classification of
+/// first-pass reverts happens after verification, but no subject or model fact
+/// is re-derived there.
+/// **R1305-1 (relay main/367) — the per-subject facts beside the seed.** One row
+/// per decided subject, keyed by the seed's `subject_key`: the subject's name and
+/// owner kind, the fatness verdict of its local, its decision's mutability where
+/// the decision has one, the raw-only operations at its uses, whether it is
+/// compared as a pointer, and whether it is initialized from a null literal. Read
+/// from facts the decision already used; it decides nothing.
+fn e1_subject_facts_tsv(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    ctx: &DecideCtx,
+) -> String {
+    let mut rows = Vec::new();
+    for (subject, decision) in &table.entries {
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let node = (subject.fn_did, subject.hir_id);
+        let owner_kind = match subject.kind {
+            decision::SubjectKind::Param { .. } => "param",
+            decision::SubjectKind::Local => "local",
+        };
+        let mutable = match decision {
+            decision::Decision::Ref { mutable }
+            | decision::Decision::InferredRef { mutable, .. }
+            | decision::Decision::Cursor { mutable, .. }
+            | decision::Decision::Slice { mutable, .. }
+            | decision::Decision::NestedSlice { mutable, .. } => {
+                if *mutable {
+                    "mut"
+                } else {
+                    "shared"
+                }
+            }
+            decision::Decision::Opt { .. }
+            | decision::Decision::Box(_)
+            | decision::Decision::Degraded(_) => "-",
+        };
+        let mut ops = std::collections::BTreeMap::<&str, usize>::new();
+        for (op, _) in ctx.facts.raw_only_uses.get(&node).into_iter().flatten() {
+            *ops.entry(op.as_str()).or_default() += 1;
+        }
+        let ops = if ops.is_empty() {
+            "-".to_owned()
+        } else {
+            ops.iter()
+                .map(|(op, n)| format!("{op}:{n}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let null_initializer = ctx.constructions.init_hirs.get(&node).is_some_and(|hir| {
+            decision::emitability::is_zero_literal(tcx.hir_node(*hir).expect_expr())
+        });
+        rows.push(format!(
+            "{}\t{}\t{owner_kind}\t{}\t{mutable}\t{}\t{}\t{}\n",
+            subject.identity_key(&owner),
+            subject.label.replace(['\t', '\r', '\n'], " "),
+            ctx.subject_fatness
+                .get(&(subject.fn_did, subject.local))
+                .copied()
+                .unwrap_or("-"),
+            ops.replace(['\t', '\r', '\n'], " "),
+            u8::from(ctx.facts.ptr_comparisons.contains_key(&node)),
+            u8::from(null_initializer),
+        ));
+    }
+    rows.sort();
+    let mut out = String::from(
+        "subject_key\tlabel\towner_kind\tfatness\tmutable\traw_only_ops\tptr_comparison\tnull_initializer\n",
+    );
+    out.extend(rows);
+    out
+}
+
+fn e1_subject_seed_tsv(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    ctx: &DecideCtx,
+    emission_plan: &plan::Plan,
+) -> Result<String, String> {
+    let mut unplaced = emission_plan
+        .unplaceable
+        .iter()
+        .map(|row| (row.subject.as_str(), row.reason))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let hypothetical = ctx
+        .hypothetical
+        .entries
+        .iter()
+        .map(|(subject, decision)| {
+            (
+                (subject.fn_did.local_def_index.as_u32(), subject.local),
+                decision,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    for (subject, decision) in &table.entries {
+        let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+        let key = subject.identity_key(&owner);
+        let model = e1_subject_model_kind(ctx, subject);
+        let family = e1_subject_family(
+            model,
+            decision,
+            hypothetical
+                .get(&(subject.fn_did.local_def_index.as_u32(), subject.local))
+                .copied(),
+        );
+        let model_key = match model {
+            Some(SlotKind::Raw) => "raw",
+            Some(SlotKind::Ref) => "ref",
+            Some(SlotKind::Owning) => "owning",
+            None => "unmodeled",
+        };
+        let (decision_key, reason, reason_detail, site) = match decision {
+            decision::Decision::Ref { .. } => (
+                "ref",
+                "-",
+                "-".to_owned(),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
+            decision::Decision::InferredRef { callee, .. } => (
+                "inferred-ref",
+                "-",
+                tcx.def_path_str(callee.to_def_id()),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
+            decision::Decision::Cursor { .. } => (
+                "cursor",
+                "-",
+                "-".to_owned(),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
+            decision::Decision::NestedSlice { .. } | decision::Decision::Slice { .. } => (
+                "slice",
+                "-",
+                "-".to_owned(),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
+            decision::Decision::Opt { .. } => (
+                "optional",
+                "-",
+                "-".to_owned(),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
+            decision::Decision::Box(_) => (
+                "box",
+                "-",
+                "-".to_owned(),
+                decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            ),
+            decision::Decision::Degraded(record) => (
+                "degraded",
+                record.reason.key(),
+                record.reason.detail(),
+                record.site.clone(),
+            ),
+        };
+        let unplaced_reason = unplaced.remove(key.as_str());
+        let class = bridge_receipt::SignatureClassId::of(subject.fn_did);
+        // R402-2(b): a Box decision withdrawn at emission is reported degraded
+        // with its withdrawal reason, never as a placed box row.
+        let (decision_key, reason, reason_detail) =
+            match decision::ownership_fields_native::withdrawn_box_reason(
+                decision,
+                emission_plan,
+                class,
+                unplaced_reason,
+            ) {
+                Some(withdrawal) => ("degraded", "box-withdrawn-at-emission", withdrawal),
+                None => (decision_key, reason, reason_detail),
+            };
+        let live = emission_plan
+            .class_finalization
+            .classes
+            .get(&class)
+            .is_some_and(plan::SignatureClassPlan::is_ready);
+        let applied = terminal_application(decision, live).is_some();
+        let placed = applied && unplaced_reason.is_none() && decision_key != "degraded";
+        let exclusion = unplaced_reason
+            .map(|reason| format!("unplaceable:{reason}"))
+            .or_else(|| {
+                (terminal_application(decision, true).is_some() && !live).then(|| {
+                    format!(
+                        "terminal-not-applied:{}",
+                        emission_plan
+                            .class_hold_reason(class)
+                            .unwrap_or_else(|| "missing-owner-class".to_owned())
+                    )
+                })
+            })
+            .unwrap_or_else(|| "-".to_owned());
+        let arg_index = match subject.kind {
+            decision::SubjectKind::Param { hir_index } => (hir_index + 1).to_string(),
+            decision::SubjectKind::Local => "-".to_owned(),
+        };
+        rows.push((
+            key.clone(),
+            format!(
+                "{key}\t{owner}\t{}\t{arg_index}\t{}\t{family}\t{model_key}\t{decision_key}\t{reason}\t{}\t{}\t{}\t{exclusion}",
+                subject.local.as_u32(),
+                subject.ptr_depth,
+                reason_detail.replace(['\t', '\r', '\n'], " "),
+                site.replace(['\t', '\r', '\n'], " "),
+                u8::from(placed),
+            ),
+        ));
+    }
+    if !unplaced.is_empty() {
+        return Err(format!(
+            "unplaceable subject(s) absent from decision table: {}",
+            unplaced.keys().copied().collect::<Vec<_>>().join(",")
+        ));
+    }
+
+    let universe = decision::universe::classify(tcx);
+    for subject in universe.excluded_subjects {
+        let owner = tcx.def_path_str(subject.did.to_def_id());
+        let key = format!("{owner}::arg#{}@d0", subject.arg_index);
+        rows.push((
+            key.clone(),
+            format!(
+                "{key}\t{owner}\t{}\t{}\t{}\tunmodeled\tunmodeled\texcluded\t-\t-\t-\t0\t{}",
+                subject.arg_index, subject.arg_index, subject.ptr_depth, subject.reason
+            ),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut seen = std::collections::BTreeSet::new();
+    for (key, _) in &rows {
+        if !seen.insert(key) {
+            return Err(format!("duplicate E1 subject seed identity {key}"));
+        }
+    }
+    let sole_flags = e1_sole_blocker_flags(rows.iter().map(|(_, row)| row.as_str()));
+    let mut out = String::from(
+        "subject_key\towner_fn\tmir_local\targ_index\tptr_depth\tfamily\tmodel_kind\tdecision\treason\treason_detail\tsite\tplaced\texclusion\tsole_blocker\n",
+    );
+    for ((_, row), sole) in rows.iter().zip(sole_flags) {
+        out.push_str(row);
+        out.push('\t');
+        out.push_str(&sole);
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// **R261-2 — the sole-blocker column.**
+///
+/// `decide_one` returns at the FIRST failing predicate, so `reason` names the
+/// earliest test that fired, not the cause that would still block if that test
+/// were repaired. Reading a family's population off `reason` alone therefore
+/// overstates its market whenever the family is merely co-located with a deeper
+/// blocker: of the 34 J-double-prime functions holding a `ptr-comparison`
+/// subject, 24 also hold another degraded family. This column carries the
+/// distinction into every consumer instead of leaving it to be rediscovered.
+///
+/// A degraded row is a sole blocker when its owner function has exactly one
+/// distinct degraded reason. Rows that are not degraded carry `-`.
+pub(crate) fn e1_sole_blocker_flags<'a>(
+    rows: impl Iterator<Item = &'a str> + Clone,
+) -> Vec<String> {
+    const OWNER: usize = 1;
+    const REASON: usize = 8;
+    let mut reasons_by_owner =
+        std::collections::BTreeMap::<&str, std::collections::BTreeSet<&str>>::new();
+    for row in rows.clone() {
+        let cols = row.split('\t').collect::<Vec<_>>();
+        let (Some(owner), Some(reason)) = (cols.get(OWNER), cols.get(REASON)) else { continue };
+        if *reason == "-" {
+            continue;
+        }
+        reasons_by_owner.entry(owner).or_default().insert(reason);
+    }
+    rows.map(|row| {
+        let cols = row.split('\t').collect::<Vec<_>>();
+        match (cols.get(OWNER), cols.get(REASON)) {
+            (Some(owner), Some(reason)) if *reason != "-" => u8::from(
+                reasons_by_owner
+                    .get(owner)
+                    .is_some_and(|reasons| reasons.len() == 1),
+            )
+            .to_string(),
+            _ => "-".to_owned(),
+        }
+    })
+    .collect()
+}
+
+#[cfg(test)]
+/// **S3.2′-0 — the FACTS-SIDE JOIN.** One TSV row per subject, reporting the
+/// analysis facts *directly*, before `decide_one`'s ordering collapses them.
+///
+/// # Why the artifact cannot answer these questions
+///
+/// `decide_one` returns at the **first** failing predicate, so its reason names
+/// the earliest test that fired, not the set of facts that hold. Any
+/// reason-field measurement therefore inherits that ordering and is blind to
+/// every population filtered earlier — which is how a predicate reads as "never
+/// fires" when it is merely never reached. That is the shape the locals-A1
+/// defect wore, and the same trap made `degrade_reason == "kind-owning"` a
+/// circular instrument for the box-candidate split.
+///
+/// | column | question |
+/// |---|---|
+/// | `is_param`, `annotated` | which population the subject belongs to |
+/// | `slot` | does BO have a depth-0 slot — the **`no-slot`** cell, measured zero in **all four** populations |
+/// | `kind` | BO's verdict, independent of whether the decision reached it |
+/// | `raw_op` | the raw-only operation — the **op split** `key()` collapses |
+/// | `ptr_cmp` | whether a comparison fact exists — the **`ptr-comparison` × locals** cell |
+/// | `arg_shapes`, `arg_sites` | **S3.6-1**: what direct call sites supply at this parameter's position, and how many do. `-`/0 for locals and for uncalled functions |
+///
+/// `raw_op` and `ptr_cmp` are both reported per subject, so masking is readable
+/// rather than inferred: the order-swap probe showed masking is real for
+/// parameters and absent for locals, and this makes that visible per row.
+///
+/// MEASUREMENT ONLY. Nothing branches on it; no gate reads it.
+#[allow(
+    dead_code,
+    reason = "S3.2'-0 measurement instrument; consumed by the corpus worker \
+              behind an env var and by the test that pins its header. Not part \
+              of the pipeline."
+)]
+pub(crate) fn facts_join_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
+    let (table, ctx) = decide_table_with_ctx(tcx)?;
+    let ctors = decision::construction::collect(tcx, &collect_program(tcx).functions);
+
+    let mut out = String::from(
+        "fn_path\tmir_local\tis_param\tannotated\tslot\tkind\traw_op\tptr_cmp\treferenced\tref_kinds\tref_class\tctor\tlen_class\tsize_expr\targ_shapes\targ_sites\n",
+    );
+    for (s, _decision) in &table.entries {
+        let slot = ctx
+            .slots
+            .fn_local_slots
+            .get(&s.fn_did)
+            .and_then(|u| u.slot_for_local_depth(s.local, 0));
+        let kind = slot
+            .and_then(|id| ctx.model.get(&SlotRef::Local(s.fn_did, id)))
+            .map(|k| match k {
+                SlotKind::Ref => "ref",
+                SlotKind::Raw => "raw",
+                SlotKind::Owning => "owning",
+            })
+            .unwrap_or("-");
+        let raw_op = ctx
+            .facts
+            .raw_only_uses
+            .get(&(s.fn_did, s.hir_id))
+            // FIRST, as before: the reported op and site are unchanged byte for
+            // byte by the vector change.
+            .and_then(|uses| uses.first())
+            .map(|(op, _)| op.as_str())
+            .unwrap_or("-");
+        let is_param = matches!(s.kind, decision::SubjectKind::Param { .. });
+        // **S3.6-1 task 0.** What the call sites actually supply at THIS
+        // subject's parameter position, reported per subject and independent of
+        // whether the decision reached the gate — the same discipline
+        // `referenced` is reported under, and for the same reason: the reason
+        // field names the earliest gate, never the whole blocker set.
+        //
+        // Locals get `-`/0: a local is not a parameter position, so no call
+        // site supplies it. That is a different fact from "no call sites", and
+        // conflating them would read 283 blocked locals as an adaptation market.
+        let (arg_shapes, arg_sites) = match s.kind {
+            decision::SubjectKind::Param { hir_index } => {
+                let mut shapes: Vec<&'static str> = Vec::new();
+                let mut sites = 0usize;
+                for site in ctx.facts.call_args.get(&s.fn_did).into_iter().flatten() {
+                    if let Some(arg) = site.args.iter().find(|a| a.index == hir_index) {
+                        shapes.push(arg.shape.key());
+                        sites += 1;
+                    }
+                }
+                shapes.sort_unstable();
+                shapes.dedup();
+                let rendered = if shapes.is_empty() {
+                    "-".to_owned()
+                } else {
+                    shapes.join(",")
+                };
+                (rendered, sites)
+            }
+            decision::SubjectKind::Local => ("-".to_owned(), 0),
+        };
+        let ctor = ctors.by_binding.get(&(s.fn_did, s.hir_id));
+        let (ctor_key, len_class, size_expr) = match (is_param, ctor) {
+            (true, _) => ("param", "param-no-site", String::new()),
+            (false, Some(c)) => (
+                c.key(),
+                c.len_class(),
+                match c {
+                    decision::construction::Construction::Alloc { size, count, .. } => count
+                        .clone()
+                        .map_or_else(|| size.clone(), |n| format!("{n} x {size}")),
+                    _ => String::new(),
+                },
+            ),
+            (false, None) => ("-", "no-init", String::new()),
+        };
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{kind}\t{raw_op}\t{}\t{}\t{}\t{}\t{ctor_key}\t{len_class}\t{size_expr}\t{arg_shapes}\t{arg_sites}\n",
+            tcx.def_path_str(s.fn_did.to_def_id()),
+            s.local.as_u32(),
+            u8::from(is_param),
+            u8::from(s.ty_span.is_some()),
+            u8::from(slot.is_some()),
+            u8::from(ctx.facts.ptr_comparisons.contains_key(&(s.fn_did, s.hir_id))),
+            // **S3.2′-2 task 1.** A1's `referenced` gate, reported per subject
+            // and INDEPENDENT of whether the decision reached it.
+            //
+            // It fires after `raw-pointer-operation`, so for the whole slice
+            // market the reason field is silent about it and the market's true
+            // size is unknowable from the artifact — which is exactly where the
+            // raw-form reference blindness (291 params decided `Ref` behind
+            // foreign-`DefId` extern blocks) hid. Measured, not inferred.
+            //
+            // A per-FUNCTION fact, restated per subject: the gate degrades every
+            // subject of a referenced function, so a subject-level column is the
+            // form the market join needs.
+            u8::from(ctx.facts.referenced.contains_key(&s.fn_did)),
+            // **S3.6-0** — the split, exported beside the boolean rather than
+            // replacing it: every pinned number and every prior analysis of
+            // `referenced` keeps meaning what it meant.
+            match ctx.facts.referenced.get(&s.fn_did) {
+                None => "-".to_owned(),
+                Some(refs) => {
+                    let mut kinds: Vec<_> = refs
+                        .iter()
+                        .map(|(k, _)| k.key())
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    kinds.sort_unstable();
+                    kinds.join(",")
+                }
+            },
+            match ctx.facts.referenced.get(&s.fn_did) {
+                None => "-",
+                Some(refs) if decision::emitability::RefKind::is_adaptable(refs) => "adaptable",
+                Some(_) => "pinned",
+            },
+        ));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+/// **S3.6-1 task 2 — the CO-CONVERSION CLASS CENSUS.**
+///
+/// One row per class **member**, not per class. The per-class view is a
+/// grouping of this one; the reverse is not true, and a per-class row carrying
+/// a member list would either truncate a 104-node class or be unreadable —
+/// silent caps being the thing this project's own rails forbid.
+///
+/// | column | question |
+/// |---|---|
+/// | `class_id`, `class_size` | which component, and how big |
+/// | `admissible` | does the whole class convert |
+/// | `class_block` | the reason the CLASS carries — one blocked member blocks it |
+/// | `node_block` | the reason THIS member contributed, `-` if it contributed none |
+/// | `sites` | how many direct call sites supply this parameter position |
+/// | `escapes` | the escape shapes this member's binding carries, measured and **not gated** |
+///
+/// The two block columns are separate because they answer different questions:
+/// the class one says why the component cannot convert, the node one says which
+/// member is responsible. A census with only the first cannot be acted on, and
+/// one with only the second cannot be summed.
+///
+/// MEASUREMENT ONLY. Nothing branches on it; no gate reads it.
+#[allow(
+    dead_code,
+    reason = "S3.6-1 task 2 measurement instrument; consumed by the corpus \
+              worker behind the artifact dir and by the test that pins its \
+              header. Not part of the pipeline."
+)]
+pub(crate) fn coconv_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
+    let (table, ctx) = decide_table_with_ctx(tcx)?;
+    let mut escapes_of: rustc_hash::FxHashMap<_, Vec<&'static str>> =
+        rustc_hash::FxHashMap::default();
+    for escape in &ctx.escapes {
+        let bucket = escapes_of.entry(escape.subject).or_default();
+        if !bucket.contains(&escape.kind.key()) {
+            bucket.push(escape.kind.key());
+        }
+    }
+    // **P2 measurement columns.** The two candidate overlap rules, priced at
+    // CLASS level by re-running the whole builder under each — not estimated
+    // from position counts, because blocking a node blocks its class and a
+    // per-node count is not a bound on a per-class outcome (the 831 → 788
+    // lesson, banked).
+    //
+    // `storage_aliases` is deliberately absent: it is a MUST-alias relation, so
+    // it can confirm an overlap and never refute one. Using it to PASS a pair
+    // would be unsound, and was refused in advance by ruling.
+    let blind_only = decision::co_conversion::build(
+        &ctx.facts,
+        &ctx.subjects,
+        &ctx.hypothetical,
+        &ctx.escapes,
+        decision::co_conversion::OverlapRule::BlindOnly,
+    );
+    let all_pairs = decision::co_conversion::build(
+        &ctx.facts,
+        &ctx.subjects,
+        &ctx.hypothetical,
+        &ctx.escapes,
+        decision::co_conversion::OverlapRule::AllPairs,
+    );
+    let mut out = String::from(
+        "fn_path\tmir_local\tis_param\tclass_id\tclass_size\tadmissible\tclass_block\tnode_block\tmember_admissible\tedge_routes\trequired_arms\tsites\tescapes\tp2_blind_only\tp2_all_pairs\n",
+    );
+    for (s, _decision) in &table.entries {
+        let key = (s.fn_did, s.hir_id);
+        // Every subject gets a row, node or not: "this subject is not in any
+        // class" is a fact the market join needs, and dropping such rows would
+        // make the census's denominator its own node set — an instrument that
+        // can only ever report full coverage of itself.
+        let (class_id, class_size, admissible, class_block) = match ctx.coconv.class_of(key) {
+            Some(id) => {
+                let class = &ctx.coconv.classes()[id];
+                (
+                    id.to_string(),
+                    class.members.len().to_string(),
+                    u8::from(class.blocked.is_none()).to_string(),
+                    class.blocked.map_or("-", |r| r.key()).to_owned(),
+                )
+            }
+            None => (
+                "-".to_owned(),
+                "0".to_owned(),
+                "-".to_owned(),
+                "-".to_owned(),
+            ),
+        };
+        let sites = match s.kind {
+            decision::SubjectKind::Param { hir_index } => {
+                ctx.facts.call_args.get(&s.fn_did).map_or(0, |sites| {
+                    sites
+                        .iter()
+                        .filter(|site| site.args.iter().any(|a| a.index == hir_index))
+                        .count()
+                })
+            }
+            decision::SubjectKind::Local => 0,
+        };
+        let mut escapes = escapes_of.get(&key).cloned().unwrap_or_default();
+        escapes.sort_unstable();
+        // `-` where the subject is not a node under the production build, so
+        // the two columns are never read as a verdict on a non-member.
+        let verdict = |c: &decision::co_conversion::CoConv| match c.class_of(key) {
+            Some(_) => u8::from(c.admits(key)).to_string(),
+            None => "-".to_owned(),
+        };
+        let (p2_blind, p2_all) = (verdict(&blind_only), verdict(&all_pairs));
+        let member_admissible = ctx.coconv.class_of(key).map_or_else(
+            || "-".to_owned(),
+            |_| u8::from(ctx.coconv.admits(key)).to_string(),
+        );
+        let edge_routes = ctx.coconv.edge_routes(key);
+        let edge_routes = if edge_routes.is_empty() {
+            "-".to_owned()
+        } else {
+            edge_routes.join(",")
+        };
+        let required_arms = ctx.coconv.required_arms(key).render();
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{class_id}\t{class_size}\t{admissible}\t{class_block}\t{}\t{member_admissible}\t{edge_routes}\t{required_arms}\t{sites}\t{}\t{p2_blind}\t{p2_all}\n",
+            tcx.def_path_str(s.fn_did.to_def_id()),
+            s.local.as_u32(),
+            u8::from(matches!(s.kind, decision::SubjectKind::Param { .. })),
+            ctx.coconv.node_block(key).map_or("-", |r| r.key()),
+            if escapes.is_empty() {
+                "-".to_owned()
+            } else {
+                escapes.join(",")
+            },
+        ));
+    }
+    Ok(out)
+}
+
+/// **R541-6** — the census table of wave-6v's field-load exemptions (R538-7).
+fn field_load_exemption_receipts_tsv(
+    tcx: TyCtxt<'_>,
+    exemptions: &[decision::counted_void::FieldLoadExemption],
+) -> String {
+    let mut out = String::from("caller\tsite\targument_index\treceipt\n");
+    for exemption in exemptions {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\n",
+            tcx.def_path_str(exemption.caller.to_def_id()),
+            decision::emitability::EmitabilityFacts::site(tcx, exemption.call_span),
+            exemption.index,
+            exemption.key(),
+        ));
+    }
+    out
+}
+
+/// Diagnostic-only view of the exact raw-boundary facts consumed by the final
+/// decision. It returns production's carried artifacts; it does not re-derive
+/// a site or read a control file.
+#[cfg(test)]
+pub(crate) fn raw_boundary_trace_artifacts(
+    tcx: TyCtxt<'_>,
+) -> Result<RawBoundaryArtifacts, String> {
+    decide_table_with_ctx(tcx).map(|(_, ctx)| ctx.raw_boundary_artifacts)
+}
+
+const DEALLOCATORS: &[&str] = &["free", "xfree", "cfree", "g_free"];
+
+/// Free sites, from HIR alone.
+///
+/// Split out of `freed_slots_tsv` so the substrate sanity census can ask
+/// "do the deallocator recognizers still resolve?" **without** paying for a BO
+/// solve — and, more importantly, so it asks that question of THIS recognizer
+/// rather than a second copy of the name table that could drift from it.
+pub(crate) struct FreeSites {
+    /// `(hir_id_of_resolved_local, had_cast, call_span)` and the unresolved
+    /// tally.
+    ///
+    /// The span is the **free call's**, not the binding's: it is what the
+    /// freed-slot gate attributes a degradation to, exactly as A1's other gates
+    /// attribute to the offending use rather than to the declaration.
+    pub(crate) resolved: Vec<(rustc_hir::HirId, bool, rustc_span::Span)>,
+    pub(crate) unresolved: Vec<UnresolvedFree>,
+}
+
+/// A free whose argument did not resolve to a binding — `free((*s).f)`,
+/// `free(arr[i])`, `free(g())`.
+///
+/// Carries the bindings referenced **anywhere inside** the argument expression,
+/// which is what the overlap check measures: the resolved arm can only see
+/// arguments that *are* a binding, so a subject reachable through a field or an
+/// index projection would otherwise be invisible to it. Collected here rather
+/// than by a second walk so the overlap check and the census cannot disagree
+/// about which sites are unresolved.
+pub(crate) struct UnresolvedFree {}
+
+pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId]) -> FreeSites {
+    use rustc_hir::intravisit::Visitor;
+
+    /// Every binding a subexpression resolves to, in source order.
+    struct V<'a> {
+        out: &'a mut FreeSites,
+        /// R763 — the program's deallocator function pointers ([`deallocator_statics`]).
+        dealloc_statics: &'a rustc_hash::FxHashSet<rustc_hir::def_id::DefId>,
+    }
+    impl V<'_> {
+        fn unresolved(&mut self) {
+            self.out.unresolved.push(UnresolvedFree {});
+        }
+    }
+    impl<'tcx> Visitor<'tcx> for V<'_> {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Call(callee, args) = &e.kind
+                && (matches!(&callee.kind,
+                rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, p))
+                    if p.segments.last().is_some_and(|seg| {
+                        DEALLOCATORS.contains(&seg.ident.name.to_string().as_str())
+                    }))
+                    || deallocator_pointer_call(callee, self.dealloc_statics))
+                && let Some(arg) = args.first()
+            {
+                let mut inner = arg;
+                let mut cast = false;
+                while let rustc_hir::ExprKind::Cast(i, _) = &inner.kind {
+                    cast = true;
+                    inner = i;
+                }
+                match &inner.kind {
+                    rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => {
+                        if let rustc_hir::def::Res::Local(hid) = path.res {
+                            self.out.resolved.push((hid, cast, e.span));
+                        } else {
+                            self.unresolved();
+                        }
+                    }
+                    rustc_hir::ExprKind::Field(..) => self.unresolved(),
+                    rustc_hir::ExprKind::Index(..) => self.unresolved(),
+                    _ => self.unresolved(),
+                }
+            }
+            rustc_hir::intravisit::walk_expr(self, e);
+        }
+    }
+
+    let mut sites = FreeSites {
+        resolved: Vec::new(),
+        unresolved: Vec::new(),
+    };
+    let dealloc_statics = deallocator_statics(tcx, fns);
+    for &fn_did in fns {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
+        let mut v = V {
+            out: &mut sites,
+            dealloc_statics: &dealloc_statics,
+        };
+        v.visit_body(tcx.hir_body(body_id));
+    }
+    sites
+}
+
+/// **R763 (relay 252 item 2; wave-6o 095 STOP 1) — the program's deallocator
+/// function pointers.** A `static` every assignment of which, in the bodies walked,
+/// is a deallocator: `Some(free [as ..])` (a [`DEALLOCATORS`] name) or a bare formal
+/// of the assigning function (an allocator setter's formal: binn's
+/// `binn_set_alloc_functions(.., new_free)` → `free_fn = new_free`, the role the
+/// program's API gives it). At least one assignment is required; one assignment of
+/// anything else disqualifies the static. binn's `free_fn`.
+fn deallocator_statics(
+    tcx: TyCtxt<'_>,
+    fns: &[rustc_hir::def_id::LocalDefId],
+) -> rustc_hash::FxHashSet<rustc_hir::def_id::DefId> {
+    use rustc_hir::intravisit::Visitor;
+
+    fn static_of(expr: &rustc_hir::Expr<'_>) -> Option<rustc_hir::def_id::DefId> {
+        match &expr.kind {
+            rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) => match path.res {
+                rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Static { .. }, did) => Some(did),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn deallocator_value(expr: &rustc_hir::Expr<'_>, params: &[rustc_hir::HirId]) -> bool {
+        let mut expr = expr;
+        while let rustc_hir::ExprKind::Cast(inner, _) = &expr.kind {
+            expr = inner;
+        }
+        match &expr.kind {
+            rustc_hir::ExprKind::Call(ctor, [value]) => {
+                matches!(&ctor.kind,
+                    rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path))
+                        if path.segments.last().is_some_and(|seg| seg.ident.name.as_str() == "Some"))
+                    && deallocator_value(value, &[])
+            }
+            rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) => match path.res {
+                rustc_hir::def::Res::Local(local) => params.contains(&local),
+                _ => path
+                    .segments
+                    .last()
+                    .is_some_and(|seg| DEALLOCATORS.contains(&seg.ident.name.as_str())),
+            },
+            _ => false,
+        }
+    }
+    struct Assignments<'a> {
+        params: Vec<rustc_hir::HirId>,
+        verdicts: &'a mut rustc_hash::FxHashMap<rustc_hir::def_id::DefId, bool>,
+    }
+    impl<'tcx> Visitor<'tcx> for Assignments<'_> {
+        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Assign(lhs, rhs, _) = &e.kind
+                && let Some(did) = static_of(lhs)
+            {
+                let ok = deallocator_value(rhs, &self.params);
+                *self.verdicts.entry(did).or_insert(true) &= ok;
+            }
+            rustc_hir::intravisit::walk_expr(self, e);
+        }
+    }
+    let mut verdicts = rustc_hash::FxHashMap::default();
+    for &fn_did in fns {
+        let Some(body_id) = tcx.hir_node_by_def_id(fn_did).body_id() else {
+            continue;
+        };
+        let body = tcx.hir_body(body_id);
+        let mut walk = Assignments {
+            params: body.params.iter().map(|param| param.pat.hir_id).collect(),
+            verdicts: &mut verdicts,
+        };
+        walk.visit_body(body);
+    }
+    verdicts
+        .into_iter()
+        .filter_map(|(did, ok)| ok.then_some(did))
+        .collect()
+}
+
+/// **R763** — a call through one of [`deallocator_statics`]: `S.expect(..)(arg)`,
+/// `S.unwrap()(arg)` or `S(arg)`.
+fn deallocator_pointer_call(
+    callee: &rustc_hir::Expr<'_>,
+    dealloc_statics: &rustc_hash::FxHashSet<rustc_hir::def_id::DefId>,
+) -> bool {
+    let receiver = match &callee.kind {
+        rustc_hir::ExprKind::MethodCall(segment, receiver, _, _)
+            if matches!(segment.ident.name.as_str(), "expect" | "unwrap") =>
+        {
+            receiver
+        }
+        _ => callee,
+    };
+    matches!(&receiver.kind,
+        rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path))
+            if matches!(path.res,
+                rustc_hir::def::Res::Def(rustc_hir::def::DefKind::Static { .. }, did)
+                    if dealloc_statics.contains(&did)))
+}
+
+/// The golden inputs, for the out-of-module reconciliation harness (C.1).
+///
+/// Exposed as `(name, source)` pairs rather than by making `goldens` public:
+/// the harness needs the INPUTS, not the golden machinery, and a narrower
+/// surface is a narrower coupling.
+#[cfg(test)]
+pub(crate) fn goldens_for_reconciliation() -> Vec<(&'static str, &'static str)> {
+    goldens::GOLDENS.iter().map(|g| (g.name, g.input)).collect()
+}
+
+/// Every subject's decision with `ty_span` ERASED on the collector's real
+/// output — the dissolution's terminal veto, driven through the real pipeline.
+///
+/// The veto is **corpus-unreachable by construction**: a parameter always has a
+/// declared type, and an unannotated local cannot reach an emitting `Slice` or
+/// `Opt` because the two local-construction gates fire first. That is exactly
+/// why it needs a hook. A guard whose only evidence is that nothing has ever
+/// hit it is not a guard, and the veto exists precisely so that "zero decision
+/// flips" does not rest on those two gates staying where they are.
+///
+/// Injected at the phase boundary on `Subject`, like the span swap above,
+/// rather than through a production seam — same reasoning, same zero
+/// production-code cost.
+#[cfg(test)]
+pub(crate) fn decisions_with_ty_span_erased(
+    tcx: TyCtxt<'_>,
+) -> Result<Vec<crate::coverage_recon::schema::Row>, String> {
+    decide_table_perturbed(tcx, |subjects| {
+        for s in subjects {
+            s.ty_span = None;
+        }
+    })
+    .map(|(table, _ctx)| artifact::rows(tcx, &table))
+}
+
+#[cfg(test)]
+/// **S3.6-1 — the SEAM COLUMN** (ruling item 3, 2026-08-11): every adapter site
+/// and every refused one, with its reason.
+///
+/// A separate artifact rather than a column on `a.jsonl`, deliberately. A seam
+/// is a property of an argument POSITION, not of a subject: one subject can be
+/// served by many call sites and one site adapts many positions. Folding it into
+/// the per-subject row would need an aggregation that discards exactly the thing
+/// the ruling asks to see, and it would couple this to the reconciliation schema
+/// producer B is compared against.
+///
+/// **Per-subject accounting is unchanged**, which this artifact makes checkable:
+/// glue settles no subject, so a raw argument's own subject still reads
+/// `degraded` with its own reason in `a.jsonl` while appearing here as an
+/// adapted position.
+pub(crate) fn seam_tsv(tcx: TyCtxt<'_>) -> Result<String, String> {
+    let (table, _ctx) = decide_table_with_ctx(tcx)?;
+    Ok(seam_tsv_from_table(tcx, &table))
+}
+
+/// Render adapter receipts from the table production already accepted. E1
+/// calls this inside its sole compiler callback, so receipt production cannot
+/// trigger a second analysis or solve.
+fn seam_tsv_from_table(tcx: TyCtxt<'_>, table: &decision::DecisionTable) -> String {
+    let sm = tcx.sess.source_map();
+    // R346-1. The adapter receipt carries the callee parameter's SUBJECT KEY,
+    // so a consumer joins on an identity rather than re-deriving one from
+    // `owner_fn` + `param_index`. A parameter's MIR local is its zero-based
+    // index plus one; anything that does not resolve stays "-" rather than
+    // guessing.
+    let parameter_subject_keys = table
+        .entries
+        .iter()
+        .map(|(subject, _)| {
+            let owner = tcx.def_path_str(subject.fn_did.to_def_id());
+            (
+                (owner.clone(), subject.local.as_u32()),
+                subject.identity_key(&owner),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let subject_key_for = |owner: &str, param_index: usize| -> String {
+        // Return seams and address observations carry `usize::MAX` because they
+        // name no parameter at all. That is not an index to convert: `as u32`
+        // would truncate it and the `+ 1` would then wrap to local 0 — the
+        // return place — and hand back a NEIGHBOURING subject's identity.
+        // Convert fallibly and let the sentinel fall through to "-".
+        let Some(local) = param_index
+            .checked_add(1)
+            .and_then(|local| u32::try_from(local).ok())
+        else {
+            return "-".to_owned();
+        };
+        parameter_subject_keys
+            .get(&(owner.to_owned(), local))
+            .cloned()
+            .unwrap_or_else(|| "-".to_owned())
+    };
+    let mut out = String::from(
+        "kind\towner_fn\tfamily_or_reason\tsite\tlen_arm\tglue_shape\tcaller\tparam_index\ttemplate\tnull_arm\textent_arm\tadapter_key\tsource_shape\tcontext\tdestination\texpected_form\tfound_form\tcandidate_template\tpeer_pairs\troot_identity\tblind\toverlap_verdict\toverlap_reason\tresolved_call_location\ta5_peer_proofs\toverlap_a5_world\toverlap_a5_abi_guard\tlifetime_plan_digest\tparameter_subject_key\n",
+    );
+    for edit in &table.seams.edits {
+        let family = match edit.family {
+            decision::seam::SeamFamily::Safe => "safe",
+            decision::seam::SeamFamily::Reborrow => "reborrow",
+        };
+        // The evidence arm rides the PLACED row (ruling B): the
+        // bound-verification follow-up certifies or corrects each selection,
+        // and it can only be surgical if a `following` selection is
+        // distinguishable from a `preceding` one without re-deriving it.
+        let arm = edit.len_arm.map_or("-", |a| a.key());
+        // The glue SHAPE, so the placed population is countable by FORM and not
+        // only by family. Without it "does the unwrap arm ever fire?" is
+        // unanswerable from the census, and a golden could ratify a form with
+        // zero market -- the -4/-5 precedent.
+        //
+        // **CARRIED, not inferred** — condition 5 of the option-A ruling
+        // (2026-08-13). This was ten `starts_with`/`contains` tests over
+        // `edit.replacement`, which is a string the ARGUMENT's own text
+        // contributes to: an `Index0` adapter over an argument spelled `*q`
+        // renders `Some(&*q[0])`, and the prefix test called that
+        // `some_reborrow`. Same column, same ten-word vocabulary, and the shape
+        // is now read from the decision rather than recovered from a rendering
+        // of it. **Schema semantics changed; the column did not** — see
+        // `GlueSpec::shape_key`, which reproduces the classifier's two ordering
+        // quirks deliberately so the movement is only where it was wrong.
+        let shape = edit.spec.shape_key();
+        let site = sm.span_to_diagnostic_string(edit.span);
+        let adapter_key = format!(
+            "{}=>{}#{}@{}",
+            edit.caller_fn, edit.owner_fn, edit.param_index, site
+        );
+        out.push_str(&format!(
+            "placed\t{}\t{}\t{}\t{arm}\t{shape}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tcall-argument\tparam:{}\t{}\t{}\t{}\t-\t{}\t{}",
+            edit.owner_fn,
+            family,
+            site,
+            edit.caller_fn,
+            edit.param_index,
+            edit.spec.template_key(),
+            edit.spec.null_arm_key(),
+            edit.spec.extent_arm_key(),
+            adapter_key,
+            edit.source_shape,
+            edit.param_index,
+            edit.expected.key(),
+            edit.found.key(),
+            edit.spec.template_key(),
+            edit.root_identity,
+            u8::from(edit.blind),
+        ));
+        push_overlap_columns(
+            &mut out,
+            edit.overlap.as_ref(),
+            edit.lifetime_plan_digest.as_deref().unwrap_or("-"),
+            &subject_key_for(&edit.owner_fn, edit.param_index),
+        );
+    }
+    // **`owner_fn` is the REVERT KEY on every row kind** (2026-08-12). It was
+    // the callee on `placed` rows and the CALLER on these, so the two kinds
+    // disagreed about what the column meant and no consumer could ask "which
+    // functions would gain if this refusal went away" — the refusal costs the
+    // CALLEE's conversion, which is why `SeamEdit::owner_fn` is the callee.
+    // The caller is real information and moves to its own column rather than
+    // being dropped.
+    for blocked in &table.seams.blocked {
+        let caller = tcx.def_path_str(blocked.caller.to_def_id());
+        // Wave-6o (relay 122): the revert key of a caller-held block is the caller.
+        let callee = tcx.def_path_str(
+            if blocked.block.held_at_caller() {
+                blocked.caller
+            } else {
+                blocked.callee
+            }
+            .to_def_id(),
+        );
+        let site = sm.span_to_diagnostic_string(blocked.span);
+        let adapter_key = format!("{caller}=>{callee}#{}@{site}", blocked.index);
+        let peers = if blocked.peers.is_empty() {
+            "-".to_owned()
+        } else {
+            blocked
+                .peers
+                .iter()
+                .map(decision::seam::PeerConflict::key)
+                .collect::<Vec<_>>()
+                .join(";")
+        };
+        out.push_str(&format!(
+            "blocked\t{}\t{}\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tcall-argument\tparam:{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            callee,
+            blocked.block.key(),
+            site,
+            caller,
+            blocked.index,
+            blocked.candidate_template,
+            blocked.null_arm,
+            blocked.extent_arm,
+            adapter_key,
+            blocked.source_shape,
+            blocked.index,
+            blocked.expected.map_or("-", decision::seam::Form::key),
+            blocked.found.map_or("-", decision::seam::Form::key),
+            blocked.candidate_template,
+            peers,
+            blocked.root_identity,
+            u8::from(blocked.blind),
+        ));
+        push_overlap_columns(
+            &mut out,
+            blocked.overlap.as_ref(),
+            "-",
+            &subject_key_for(&callee, blocked.index),
+        );
+    }
+    for edit in &table.seams.body_edits {
+        let family = match edit.family {
+            decision::seam::SeamFamily::Safe => "safe",
+            decision::seam::SeamFamily::Reborrow => "reborrow",
+        };
+        let site = sm.span_to_diagnostic_string(edit.span);
+        let adapter_key = format!("{}#{}@{}", edit.owner_fn, edit.context.key(), site);
+        out.push_str(&format!(
+            "body-placed\t{}\t{}\t{}\t-\t{}\t{}\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}",
+            edit.owner_fn,
+            family,
+            site,
+            edit.spec.shape_key(),
+            edit.owner_fn,
+            edit.spec.template_key(),
+            edit.spec.null_arm_key(),
+            edit.spec.extent_arm_key(),
+            adapter_key,
+            edit.source_shape,
+            edit.context.key(),
+            edit.destination,
+            edit.expected.key(),
+            edit.found.key(),
+            edit.spec.template_key(),
+            edit.root_identity,
+            u8::from(edit.blind),
+        ));
+        push_overlap_columns(&mut out, None, "-", "-");
+    }
+    for blocked in &table.seams.body_blocked {
+        let site = sm.span_to_diagnostic_string(blocked.span);
+        let adapter_key = format!("{}#{}@{}", blocked.owner_fn, blocked.context.key(), site);
+        out.push_str(&format!(
+            "body-blocked\t{}\t{}\t{}\t-\t-\t{}\t-\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}",
+            blocked.owner_fn,
+            blocked.block.key(),
+            site,
+            blocked.owner_fn,
+            blocked.candidate_template.unwrap_or("-"),
+            adapter_key,
+            blocked.source_shape,
+            blocked.context.key(),
+            blocked.destination,
+            blocked.expected.key(),
+            blocked.found.map_or("-", decision::seam::Form::key),
+            blocked.candidate_template.unwrap_or("-"),
+            blocked.root_identity,
+            u8::from(blocked.blind),
+        ));
+        push_overlap_columns(&mut out, None, "-", "-");
+    }
+    // S8: the body rule's typed skips (no class held).
+    for blocked in &table.seams.body_skipped {
+        let site = sm.span_to_diagnostic_string(blocked.span);
+        let adapter_key = format!("{}#{}@{}", blocked.owner_fn, blocked.context.key(), site);
+        out.push_str(&format!(
+            "body-skipped\t{}\t{}\t{}\t-\t-\t{}\t-\t{}\t-\t-\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t-\t{}\t{}",
+            blocked.owner_fn,
+            blocked.block.key(),
+            site,
+            blocked.owner_fn,
+            blocked.candidate_template.unwrap_or("-"),
+            adapter_key,
+            blocked.source_shape,
+            blocked.context.key(),
+            blocked.destination,
+            blocked.expected.key(),
+            blocked.found.map_or("-", decision::seam::Form::key),
+            blocked.candidate_template.unwrap_or("-"),
+            blocked.root_identity,
+            u8::from(blocked.blind),
+        ));
+        push_overlap_columns(&mut out, None, "-", "-");
+    }
+    // Item 4a: companion-length coverage, one row per LENGTH-GATED POSITION.
+    for (callee, index, evidence) in &table.seams.length_evidence {
+        out.push_str(&format!(
+            "lengated\t{callee}\t{}\t#{index}\t-\t-\t-\t{index}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-",
+            evidence.key()
+        ));
+        push_overlap_columns(&mut out, None, "-", "-");
+    }
+    // Rule 1 (2026-08-11): a pair that fired with no census row is REPORTED.
+    // The census is a prioritization overlay and has already been shown
+    // incomplete twice; a silent adaptation would hide the third case.
+    for (found, expected) in &table.seams.uncensused {
+        out.push_str(&format!(
+            "uncensused\t-\t{found:?} -> {expected:?}\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-"
+        ));
+        push_overlap_columns(&mut out, None, "-", "-");
+    }
+    for proof in &table.seams.overlap_proofs {
+        let caller = tcx.def_path_str(proof.caller.to_def_id());
+        let callee = tcx.def_path_str(proof.callee.to_def_id());
+        let site = sm.span_to_diagnostic_string(proof.span);
+        let adapter_key = format!("{caller}=>{callee}#{}@{site}", proof.index);
+        let fallback_template = match &proof.fallback {
+            decision::seam::A5ProofSiteFallback::T2RawView { template, .. } => template.as_str(),
+            _ => proof.candidate_template.as_str(),
+        };
+        // The proof carries the two forms the site was judged at, and the row
+        // reported them as "-". A consumer asking "which form did this position
+        // want, and which did it have" had to read them in-process, from a
+        // structure the receipt already had in hand — so the receipt was not a
+        // substitute for the run, which is the only thing it is for.
+        out.push_str(&format!(
+            "overlap-proof\t{callee}\t{}\t{site}\t-\t-\t{caller}\t{}\t{}\t-\t-\t{adapter_key}\t-\tcall-argument\tparam:{}\t{}\t{}\t{}\t-\t-\t-",
+            proof.fallback.key(),
+            proof.index,
+            fallback_template,
+            proof.index,
+            proof.expected_form.key(),
+            proof.found_form.key(),
+            fallback_template,
+        ));
+        push_overlap_columns(
+            &mut out,
+            Some(proof),
+            "-",
+            &subject_key_for(&callee, proof.index),
+        );
+    }
+    out
+}
+
+fn push_overlap_columns(
+    output: &mut String,
+    proof: Option<&decision::seam::A5PositionProof>,
+    lifetime_plan_digest: &str,
+    parameter_subject_key: &str,
+) {
+    if let Some(proof) = proof {
+        output.push_str(&format!(
+            "\t{}\t{}\t{}\t{}\t{}\t{}\t{lifetime_plan_digest}\t{parameter_subject_key}\n",
+            proof.verdict.key(),
+            proof.reason,
+            proof.locations,
+            proof.peer_receipts,
+            proof.world,
+            proof.guard,
+        ));
+    } else {
+        output.push_str(&format!(
+            "\t-\t-\t-\t-\t-\t-\t{lifetime_plan_digest}\t{parameter_subject_key}\n"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod raw_boundary_atom_tests {
+    use super::{
+        AtomSelectionKind, EditSite, atom_surviving_edit_ids, bridge_receipt, edit_sites,
+        select_atoms_on_original_lines, verify,
+    };
+
+    fn diag(line: usize, code: &str, related: &[usize]) -> verify::Diag {
+        verify::Diag {
+            file: "fixture.rs".to_owned(),
+            line,
+            column: 1,
+            end_line: line,
+            end_column: 1,
+            message: "fixture diagnostic".to_owned(),
+            direction: verify::Direction::Other,
+            code: Some(code.to_owned()),
+            related: related
+                .iter()
+                .map(|line| verify::RelatedDiag {
+                    file: "fixture.rs".to_owned(),
+                    line: *line,
+                    column: 1,
+                    end_line: *line,
+                    end_column: 1,
+                    message: "related fixture span".to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    fn site(line: usize, id: &str, group: &[&str], covered: bool) -> EditSite {
+        EditSite {
+            owner_class: Some(bridge_receipt::SignatureClassId::of(
+                rustc_hir::def_id::CRATE_DEF_ID,
+            )),
+            file: "fixture.rs".to_owned(),
+            fn_path: "crate::f".to_owned(),
+            lo_line: line,
+            lo_column: 1,
+            hi_line: line,
+            hi_column: usize::MAX,
+            edit_id: id.to_owned(),
+            site_kind: "raw-boundary-atom",
+            atom_ids: group.iter().map(|id| (*id).to_owned()).collect(),
+            atom_covered: covered,
+        }
+    }
+
+    /// RB-W11: an exact failure removes its dependency group and preserves an
+    /// independent raw-boundary atom in the same function.
+    #[test]
+    fn rb_w11_exact_atom_preserves_independent_atom() {
+        let sites = vec![
+            site(2, "a-edit", &["a-site"], true),
+            site(3, "b-edit", &["b-site"], true),
+        ];
+        let selected = select_atoms_on_original_lines(&[diag(2, "E0308", &[])], &sites);
+        assert_eq!(selected.kind, AtomSelectionKind::Exact);
+        assert_eq!(selected.atoms, ["a-site".to_owned()].into_iter().collect());
+        assert_eq!(
+            atom_surviving_edit_ids(&sites, &selected.atoms),
+            ["b-edit".to_owned()].into_iter().collect()
+        );
+    }
+
+    /// RB-W12: alias diagnostics consume primary and related spans as one
+    /// canonically sorted group, never one side selected by traversal order.
+    #[test]
+    fn rb_w12_alias_diagnostic_reverts_related_atoms_as_one_group() {
+        let sites = vec![
+            site(2, "left", &["left-site"], true),
+            site(5, "right", &["right-site"], true),
+        ];
+        let selected = select_atoms_on_original_lines(&[diag(2, "E0499", &[5])], &sites);
+        assert_eq!(selected.kind, AtomSelectionKind::GroupAtomic);
+        assert_eq!(
+            selected.atoms,
+            ["left-site".to_owned(), "right-site".to_owned()]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    /// RB-N4: an unowned or uncovered diagnostic cannot guess an atom.
+    #[test]
+    fn rb_n4_ambiguous_atom_routes_to_function_fallback() {
+        let sites = vec![site(2, "known", &["known-site"], true)];
+        let selected = select_atoms_on_original_lines(&[diag(9, "E0308", &[])], &sites);
+        assert_eq!(selected.kind, AtomSelectionKind::Fallback);
+        assert_eq!(selected.reason, "atom-attribution-ambiguous");
+        assert!(selected.atoms.is_empty());
+    }
+
+    #[test]
+    fn atom_w2_same_line_groups_use_one_deterministic_bisection() {
+        let sites = vec![
+            site(2, "a-edit", &["a-site"], true),
+            site(2, "b-edit", &["b-site"], true),
+        ];
+        let selected = select_atoms_on_original_lines(&[diag(2, "E0308", &[])], &sites);
+        assert_eq!(selected.kind, AtomSelectionKind::BisectGroup);
+        assert_eq!(selected.atoms, ["a-site".to_owned()].into_iter().collect());
+        assert_eq!(selected.reason, "atom-bounded-group-bisection");
+    }
+
+    /// **C5 killer — `lifetime-ast-unplaceable` is recorded, never dropped.**
+    ///
+    /// The teeth are the `planned = true` case. `e2_terminal_disposition`
+    /// classifies AST/seam placement failures *after* the tranche holds and
+    /// *before* the `planned` fallthrough; delete that arm and a subject whose
+    /// annotation could not be placed is reported as `Planned` — the failure
+    /// vanishes and the census counts a delivery that does not exist.
+    #[test]
+    fn c5_an_unplaceable_lifetime_is_recorded_and_never_reported_as_planned() {
+        use super::{
+            E2TerminalDisposition, decision::lifetime::LifetimeFailure as F,
+            e2_terminal_disposition,
+        };
+        let decided = super::decision::Decision::Ref { mutable: false };
+        for planned in [true, false] {
+            let disposition =
+                e2_terminal_disposition(planned, true, Some(F::AstUnplaceable), &decided)
+                    .expect("a placement failure is not an invariant violation");
+            assert!(
+                matches!(
+                    disposition,
+                    E2TerminalDisposition::Failure(F::AstUnplaceable)
+                ),
+                "planned={planned}: {disposition:?}"
+            );
+        }
+        assert_eq!(F::AstUnplaceable.key(), "lifetime-ast-unplaceable");
+    }
+
+    /// **C6 killer — `lifetime-seam-incompatible` reverts the owner with a
+    /// receipt.** Same shape, same teeth: the receipt is the typed disposition,
+    /// and it must survive `planned`.
+    #[test]
+    fn c6_an_incompatible_seam_is_recorded_and_never_reported_as_planned() {
+        use super::{
+            E2TerminalDisposition, decision::lifetime::LifetimeFailure as F,
+            e2_terminal_disposition,
+        };
+        let decided = super::decision::Decision::Ref { mutable: true };
+        for planned in [true, false] {
+            let disposition =
+                e2_terminal_disposition(planned, true, Some(F::SeamIncompatible), &decided)
+                    .expect("a seam failure is not an invariant violation");
+            assert!(
+                matches!(
+                    disposition,
+                    E2TerminalDisposition::Failure(F::SeamIncompatible)
+                ),
+                "planned={planned}: {disposition:?}"
+            );
+        }
+        assert_eq!(F::SeamIncompatible.key(), "lifetime-seam-incompatible");
+    }
+
+    /// The ordering the two killers above depend on: a tranche hold is
+    /// classified *before* a placement failure, so this pair is not accidentally
+    /// insensitive to the arm it is testing.
+    #[test]
+    fn c5_c6_a_tranche_hold_still_outranks_a_placement_failure() {
+        use super::{
+            E2TerminalDisposition, decision::lifetime::LifetimeFailure as F,
+            e2_terminal_disposition,
+        };
+        let decided = super::decision::Decision::Ref { mutable: false };
+        let disposition = e2_terminal_disposition(true, true, Some(F::FieldHeld), &decided)
+            .expect("a tranche hold is not an invariant violation");
+        assert!(matches!(
+            disposition,
+            E2TerminalDisposition::Failure(F::FieldHeld)
+        ));
+        // And with no failure at all, `planned` is what it reports — the
+        // fallthrough the two killers must not reach.
+        let disposition = e2_terminal_disposition(true, true, None, &decided)
+            .expect("no failure is not an invariant violation");
+        assert!(matches!(disposition, E2TerminalDisposition::Planned));
+    }
+
+    #[test]
+    fn atom_w1_edit_key_carries_subject_arms_kind_interval_and_digest() {
+        use std::collections::BTreeMap;
+
+        use crate::bo_rewriter::plan::{Edit, FileKey, Justification, Plan};
+
+        let file = FileKey::Virtual("fixture.rs".to_owned());
+        let mut plan = Plan::default();
+        plan.by_file.insert(
+            file.clone(),
+            vec![Edit {
+                lo: 0,
+                hi: 1,
+                replacement: "y".to_owned(),
+                justification: Justification::KindDecision { kind: "Ref" },
+                owner_class: Some(bridge_receipt::SignatureClassId::of(
+                    rustc_hir::def_id::CRATE_DEF_ID,
+                )),
+                owner_path: "crate::f".to_owned(),
+                bridge: None,
+                atom_ids: vec!["atom-1".to_owned()],
+                subject_id: "crate::f::p#1".to_owned(),
+                required_arms: "d4+c+pair".to_owned(),
+                edit_kind: "subject-declaration",
+            }],
+        );
+        let rows = edit_sites(&plan, &BTreeMap::from([(file, "x".to_owned())]));
+        let key = &rows[0].edit_id;
+        assert!(
+            key.contains("owner=crate::f|subject=crate::f::p#1"),
+            "{key}"
+        );
+        assert!(
+            key.contains("arms=d4+c+pair|kind=subject-declaration"),
+            "{key}"
+        );
+        assert!(key.contains("interval=fixture.rs:0:1"), "{key}");
+        assert!(key.contains("replacement_sha256="), "{key}");
+    }
+
+    #[test]
+    fn raw_boundary_atom_reverify_is_bounded_to_one() {
+        assert_eq!(super::MAX_ATOM_REVERIFIES, 1);
+    }
+}
+
+/// **The session boundary (R531, main 077).** `rustc_interface::run_compiler` runs its
+/// closure on a thread it spawns, so a `thread_local!` written during the rewrite is
+/// invisible once it returns. Four census columns read such cells after the capture
+/// had returned and so could only ever read zero; a fifth table ignored a field the
+/// session already carried. These three witnesses pin the boundary, the copy that
+/// crosses it, and the one channel that already worked.
+#[cfg(test)]
+mod session_receipts_tests {
+    /// The boundary itself. If this ever reads `true`, the snapshot below is merely
+    /// redundant; while it reads `false`, a census that reads a cell instead of a
+    /// carried field reads a permanent zero.
+    #[test]
+    fn the_compiler_callback_runs_on_another_thread() {
+        thread_local! { static CELL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) }; }
+        let outer = std::thread::current().id();
+        let inner = ::utils::compilation::run_compiler_on_str("pub fn f() {}", |_tcx| {
+            CELL.with(|c| c.set(7));
+            std::thread::current().id()
+        })
+        .unwrap();
+        assert_ne!(outer, inner, "the callback ran on the caller's thread");
+        assert_eq!(
+            CELL.with(|c| c.get()),
+            0,
+            "a cell written in the session leaked out"
+        );
+    }
+
+    /// The copy: `with_session_receipts` reads the cells on the thread that wrote them
+    /// and puts them on the outcome, which is what crosses the boundary.
+    #[test]
+    fn with_session_receipts_carries_the_four_cells() {
+        super::ast_transform::reset_graft_held();
+        super::ast_transform::reset_graft_refusals();
+        super::ast_transform::record_graft_held(
+            super::ast_transform::GraftHeldReceipt {
+                visitor: super::ast_transform::GraftVisitor::C9,
+                caller: 3,
+                class: 3,
+                reason: "a5-raw",
+                lo: 10,
+                hi: 20,
+            },
+            super::bridge_receipt::SignatureClassId::of(rustc_hir::def_id::CRATE_DEF_ID),
+        );
+        let outcome =
+            super::with_session_receipts(super::OutcomeFacts::default().degraded("fixture".into()));
+        let artifacts = match &outcome {
+            super::RewriteOutcome::Emitted {
+                raw_boundary_artifacts,
+                ..
+            }
+            | super::RewriteOutcome::Degraded {
+                raw_boundary_artifacts,
+                ..
+            } => raw_boundary_artifacts,
+        };
+        assert_eq!(
+            artifacts.session_graft_held_table.lines().count(),
+            2,
+            "the held graft must travel on the outcome, header plus one row:\n{}",
+            artifacts.session_graft_held_table
+        );
+        assert!(artifacts.session_graft_held_table.contains("\t10\t20\t"));
+        super::ast_transform::reset_graft_held();
+    }
+
+    /// The channel that already worked end to end, and that the census now writes:
+    /// a certificate admitted in the session reaches `return_certificate_receipts`.
+    /// quadtree's `quadtree_node_new` is certificate-emitted as `Box`, so its table
+    /// cannot be header-only — which is exactly what every batch-29 table was.
+    #[test]
+    fn a_certificate_admitted_in_the_session_reaches_the_carried_receipts() {
+        let out = super::wave6a_allocation_tests::emitted(
+            "session-cert",
+            super::wave6a_allocation_tests::QUADTREE_NODE_NEW,
+        );
+        assert!(
+            out.artifacts
+                .return_certificate_receipts
+                .lines()
+                .skip(1)
+                .any(|row| row.contains("\tadmitted\t")),
+            "the certificate's admission must be on the carried receipts:\n{}",
+            out.artifacts.return_certificate_receipts
+        );
+        // The copy must actually run: the session's one successful exit is wrapped.
+        // Cut at THIS module: the needle below is also in this test's own text, and a
+        // witness that finds itself passes its own fault (the fifth time that shape
+        // has bitten a scan in this crate).
+        let this = include_str!("mod.rs");
+        let this = &this[..this
+            .find("mod session_receipts_tests")
+            .expect("this module is in the file")];
+        assert!(
+            this.contains("Ok(with_session_receipts(verify_and_revert("),
+            "the session's exit must pass through with_session_receipts, or the cells stay behind"
+        );
+    }
+}
+
+/// **R556-4 joint (c).** Retire each Box owner's element edit whose argument took
+/// the owner's raw view at its base (`SeamPlan::box_base_view_retirements`): the
+/// element stays raw arithmetic over that view. Applied to the decision table
+/// itself, which both the planner and the AST pass read, so the two cannot
+/// disagree; idempotent across re-syntheses.
+/// **R798-3** — where a local binding's value comes from and where it is
+/// read: the `let` initializer and every path that resolves to it, in its
+/// owner's body. Empty for a binding the walk does not find (a parameter has
+/// no initializer, and its uses are still found).
+fn subject_footprint(
+    tcx: TyCtxt<'_>,
+    owner: rustc_hir::def_id::LocalDefId,
+    binding: rustc_hir::HirId,
+) -> Vec<rustc_span::Span> {
+    use rustc_hir::intravisit::{self, Visitor};
+    struct Footprint {
+        binding: rustc_hir::HirId,
+        spans: Vec<rustc_span::Span>,
+    }
+    impl<'tcx> Visitor<'tcx> for Footprint {
+        fn visit_local(&mut self, local: &'tcx rustc_hir::LetStmt<'tcx>) {
+            if local.pat.hir_id == self.binding
+                && let Some(init) = local.init
+            {
+                self.spans.push(init.span);
+            }
+            intravisit::walk_local(self, local);
+        }
+
+        fn visit_expr(&mut self, expr: &'tcx rustc_hir::Expr<'tcx>) {
+            if let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(None, path)) = expr.kind
+                && path.res == rustc_hir::def::Res::Local(self.binding)
+            {
+                self.spans.push(expr.span);
+            }
+            intravisit::walk_expr(self, expr);
+        }
+    }
+    let Some(body) = tcx.hir_maybe_body_owned_by(owner) else {
+        return Vec::new();
+    };
+    let mut footprint = Footprint {
+        binding,
+        spans: Vec::new(),
+    };
+    footprint.visit_body(body);
+    footprint.spans
+}
+
+fn retire_box_edits_under_base_views(table: &mut decision::DecisionTable) {
+    let retirements = table.seams.box_base_view_retirements.clone();
+    for decision::seam::BoxBaseViewRetirement {
+        node: (owner, root),
+        element,
+        ..
+    } in retirements
+    {
+        let mut retired = Vec::new();
+        for (subject, decision) in &mut table.entries {
+            let decision::Decision::Box(plan) = decision else {
+                continue;
+            };
+            if subject.fn_did != owner || subject.hir_id != root {
+                continue;
+            }
+            let before = plan.expr_edits.len();
+            plan.expr_edits.retain(|edit| {
+                let kept = edit.span.source_callsite() != element.source_callsite();
+                if !kept {
+                    retired.push(edit.span);
+                }
+                kept
+            });
+            if plan.expr_edits.len() != before {
+                plan.receipts
+                    .push("box-expression:retired-under-base-view".to_owned());
+            }
+        }
+        // Relay 327 (main 222 §2.1, brotli's class #1498): a use K21 composed into
+        // a retired container is spelled nowhere else — its subject takes its own
+        // edit back (`*clusters.offset(j_0 as isize)` inside the base view's
+        // `.offset(..)` operand).
+        for record in
+            decision::composed_inner_edits(&mut table.composed_use_edits, (owner, root), &retired)
+        {
+            let Some((_, decision)) = table
+                .entries
+                .iter_mut()
+                .find(|(subject, _)| (subject.fn_did, subject.hir_id) == record.inner)
+            else {
+                continue;
+            };
+            if let (decision::ComposedInner::Box(_), decision::Decision::Box(plan)) =
+                (&record.edit, &mut *decision)
+            {
+                plan.receipts
+                    .push("box-expression:restored-from-retired-container".to_owned());
+            }
+            record.edit.restore(decision);
+        }
+    }
+}
+
+/// **R575-6 — the aliased-storage withdrawal, read off the settled synthesis.** A callee
+/// whose calls `counted_void::aliased_storage_twin` refused (a converted position
+/// beside a raw alias of its storage root, and no leaf for the pristine twin) is
+/// held on every such call. When the callee's class has exactly ONE safe subject
+/// and every refused call converts only that subject, the hold protects nothing
+/// that delivers: the subject is withdrawn to raw, and its callers' arguments
+/// coerce to it exactly as the input's did. Returns whether a subject was newly
+/// withdrawn, so the caller re-derives once.
+fn record_aliased_storage_withdrawals(
+    tcx: TyCtxt<'_>,
+    table: &decision::DecisionTable,
+    withdrawn: &mut rustc_hash::FxHashMap<
+        (rustc_hir::def_id::LocalDefId, rustc_hir::HirId),
+        String,
+    >,
+) -> bool {
+    let mut by_callee = std::collections::BTreeMap::<
+        u32,
+        (
+            rustc_hir::def_id::LocalDefId,
+            Vec<&decision::seam::AliasedTwinRefusal>,
+        ),
+    >::new();
+    for refusal in &table.seams.aliased_twin_refusals {
+        by_callee
+            .entry(refusal.callee.local_def_index.as_u32())
+            .or_insert((refusal.callee, Vec::new()))
+            .1
+            .push(refusal);
+    }
+    let mut grew = false;
+    for (callee, refusals) in by_callee.into_values() {
+        let mut safe = table.entries.iter().filter(|(subject, decision)| {
+            subject.fn_did == callee
+                && match decision {
+                    decision::Decision::Degraded(_) => false,
+                    decision::Decision::Ref { .. }
+                    | decision::Decision::InferredRef { .. }
+                    | decision::Decision::Cursor { .. }
+                    | decision::Decision::NestedSlice { .. }
+                    | decision::Decision::Slice { .. }
+                    | decision::Decision::Opt { .. }
+                    | decision::Decision::Box(_) => true,
+                }
+        });
+        let (Some((only, _)), None) = (safe.next(), safe.next()) else {
+            continue;
+        };
+        if !refusals.iter().all(|refusal| {
+            !refusal.converted.is_empty()
+                && refusal
+                    .converted
+                    .iter()
+                    .all(|(_, hir_id)| *hir_id == only.hir_id)
+        }) {
+            continue;
+        }
+        let seams = refusals
+            .iter()
+            .map(|refusal| {
+                format!(
+                    "{}@{}",
+                    tcx.def_path_str(refusal.caller.to_def_id()),
+                    decision::emitability::EmitabilityFacts::site(tcx, refusal.call_span)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(";");
+        grew |= withdrawn
+            .insert((only.fn_did, only.hir_id), seams)
+            .is_none();
+    }
+    grew
+}
+
+/// **R575-6** — the withdrawals recorded so far, applied to a freshly decided
+/// table before anything is planned from it.
+fn apply_aliased_storage_withdrawals(
+    tcx: TyCtxt<'_>,
+    table: &mut decision::DecisionTable,
+    withdrawn: &rustc_hash::FxHashMap<(rustc_hir::def_id::LocalDefId, rustc_hir::HirId), String>,
+) {
+    for (subject, decision) in &mut table.entries {
+        let Some(seams) = withdrawn.get(&(subject.fn_did, subject.hir_id)) else {
+            continue;
+        };
+        // A subject degraded on its own reason keeps that reason.
+        match decision {
+            decision::Decision::Degraded(_) => continue,
+            decision::Decision::Ref { .. }
+            | decision::Decision::InferredRef { .. }
+            | decision::Decision::Cursor { .. }
+            | decision::Decision::NestedSlice { .. }
+            | decision::Decision::Slice { .. }
+            | decision::Decision::Opt { .. }
+            | decision::Decision::Box(_) => {}
+        }
+        *decision = decision::Decision::Degraded(decision::Degradation {
+            subject: subject.label.clone(),
+            site: decision::emitability::EmitabilityFacts::site(tcx, subject.attribution_span()),
+            reason: decision::DegradeReason::AliasedStorageWithdrawn {
+                seams: seams.clone(),
+            },
+        });
+    }
+}

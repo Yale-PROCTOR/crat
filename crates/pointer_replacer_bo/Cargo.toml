@@ -1,0 +1,35 @@
+[package]
+name = "pointer_replacer_bo"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+utils = { path = "../utils" }
+pointer_replacer = { path = "../pointer_replacer" }
+points_to = { path = "../points_to" }
+itertools = "0.14.0"
+petgraph = "0.8.2"
+regex = "1.12.2"
+anyhow = "1.0"
+indexmap = "2.2.6"
+cadical = "0.1"
+z3 = "0.19.7"
+tracing.workspace = true
+etrace.workspace = true
+typed-arena.workspace = true
+serde.workspace = true
+# The model cache's contract and the analysis's evidence exports encode JSON
+# (cache_contract, portable_export, *_evidence).
+serde_json.workspace = true
+sha2.workspace = true
+
+[build-dependencies]
+sha2.workspace = true
+
+[dev-dependencies]
+quote = "1.0.45"
+similar = "2.7.0"
+syn = { version = "2.0.117", features = ["full", "visit"] }
+
+[package.metadata.rust-analyzer]
+rustc_private = true

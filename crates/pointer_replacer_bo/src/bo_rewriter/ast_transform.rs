@@ -1,0 +1,11089 @@
+//! **Phase 3 — the edit vocabulary as NODE TRANSFORMS.**
+//!
+//! Arm 1 is declaration type replacement: `*mut T` → `&mut T`, `*const T` →
+//! `&T`, on the subjects the decision layer settled `Decision::Ref`.
+//!
+//! # What changes, and what conspicuously does not
+//!
+//! The decision layer is untouched — this module consumes a `DecisionTable` and
+//! decides nothing. What changes is that an edit stops being
+//! `(lo, hi, replacement: String)` and becomes a mutation of a `TyKind`.
+//!
+//! **The pointee is not copied, it is KEPT.** The span layer had to reproduce
+//! the pointee's source text (`plan` copied `pointee_span`'s snippet); here the
+//! pointee is a subtree that moves across unchanged. Whole classes of question —
+//! is the pointee text renderable, does it contain a macro, is its span
+//! contained in the declaration's — stop existing rather than being answered.
+//!
+//! # Parity mode
+//!
+//! Capability unlocks are OFF. This arm reproduces what the span layer produces
+//! for the same subjects and nothing more; the differential against the pinned
+//! oracle (`b4294374`, digest `4ed9d2a6…`) is what says so.
+
+use rustc_ast::{
+    AngleBracketedArg, AngleBracketedArgs, DUMMY_NODE_ID, GenericArg, GenericArgs, GenericBound,
+    GenericParam, GenericParamKind, Lifetime, MutTy, Mutability, NodeId, Path, PathSegment, Ty,
+    TyKind, mut_visit::MutVisitor, ptr::P,
+};
+use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hir::HirId;
+use rustc_span::{DUMMY_SP, Ident, Symbol, def_id::LocalDefId, symbol::sym};
+use thin_vec::ThinVec;
+
+// The length's provenance is a DECISION-layer type: `finish_len` is the only
+// place in this file that branches on it, and it branches on the carried value
+// rather than on a re-derivation of it.
+use super::decision::seam::{Form, SeamLen};
+
+/// **ARM 2 — which declared form a decision asks for.**
+///
+/// The three emitting dispositions, carried as a shape rather than as the
+/// decision itself: this module consumes verdicts and decides nothing, so the
+/// enum names *what to build*, not *why*.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeclForm {
+    NestedSlice {
+        inner_mutable: bool,
+    },
+    /// Legacy wrapper for bidirectional access, or the existing base/index tuple.
+    Cursor {
+        wrapper: bool,
+        optional: bool,
+    },
+    /// `&T` / `&mut T` — arm 1.
+    Ref,
+    /// `&[T]` / `&mut [T]`.
+    Slice,
+    /// `Option<&T>` and its three twins; `slice` selects the fat one.
+    Opt {
+        slice: bool,
+    },
+    /// `Box<T>` / `Box<[T]>`, optionally wrapped for nullable ownership.
+    Box {
+        slice: bool,
+        optional: bool,
+        pointee_override: Option<super::decision::box_facts::BoxPointeeOverride>,
+    },
+}
+
+/// Wrap `inner` in `Option<…>`, **structurally**.
+///
+/// Built as a path node rather than parsed from `format!("Option<{…}>")` for
+/// the reason §3c gives for declining `ty!` in arm 1: a text round-trip would
+/// have to re-render the pointee, and the pointee is a subtree that must move
+/// across untouched. Here it stays a subtree through the wrap as well.
+///
+/// Every span is [`DUMMY_SP`] and every id [`DUMMY_NODE_ID`] — the
+/// synthetic-span invariant. Nothing keys on a constructed node's span; the
+/// differential keys on the *declaration's* span, which is the original's and
+/// is not replaced.
+fn wrapper_of(name: &str, inner: P<Ty>) -> TyKind {
+    let args = AngleBracketedArgs {
+        span: DUMMY_SP,
+        args: ThinVec::from_iter([AngleBracketedArg::Arg(GenericArg::Type(inner))]),
+    };
+    let segment = PathSegment {
+        ident: Ident::new(Symbol::intern(name), DUMMY_SP),
+        id: DUMMY_NODE_ID,
+        args: Some(P(GenericArgs::AngleBracketed(args))),
+    };
+    TyKind::Path(
+        None,
+        Path {
+            span: DUMMY_SP,
+            segments: ThinVec::from_iter([segment]),
+            tokens: None,
+        },
+    )
+}
+
+fn option_of(inner: P<Ty>) -> TyKind {
+    wrapper_of("Option", inner)
+}
+
+#[cfg(test)]
+/// Build the declared type for `form`, **keeping `pointee` as a subtree**.
+///
+/// The eight `(form, mutable)` combinations render exactly the four spellings
+/// [`super::plan::plan`] writes as text, optionally wrapped in `Option<…>`.
+/// That correspondence is the arm's whole parity obligation at the declaration
+/// position, and it is pinned by `declared_forms_render_the_span_layers_text`
+/// so a corpus diff is attributable to the walk rather than to the renderer.
+pub(crate) fn decl_ty_kind(form: DeclForm, mutable: bool, pointee: P<Ty>) -> TyKind {
+    decl_ty_kind_with_lifetime(form, mutable, pointee, None)
+}
+
+pub(crate) fn ast_lifetime(name: &str) -> Lifetime {
+    Lifetime {
+        id: DUMMY_NODE_ID,
+        ident: Ident::new(
+            Symbol::intern(&format!("'{}", name.trim_start_matches('\''))),
+            DUMMY_SP,
+        ),
+    }
+}
+
+pub(crate) fn decl_ty_kind_with_lifetime(
+    form: DeclForm,
+    mutable: bool,
+    mut pointee: P<Ty>,
+    lifetime: Option<&str>,
+) -> TyKind {
+    if let DeclForm::Cursor {
+        wrapper: true,
+        optional,
+    } = form
+    {
+        let name = if mutable {
+            "SliceCursorMut"
+        } else {
+            "SliceCursor"
+        };
+        let args = AngleBracketedArgs {
+            span: DUMMY_SP,
+            args: ThinVec::from_iter([
+                AngleBracketedArg::Arg(GenericArg::Lifetime(ast_lifetime(lifetime.unwrap_or("_")))),
+                AngleBracketedArg::Arg(GenericArg::Type(pointee)),
+            ]),
+        };
+        let kind = TyKind::Path(
+            None,
+            Path {
+                span: DUMMY_SP,
+                segments: ThinVec::from_iter([
+                    PathSegment::from_ident(Ident::new(Symbol::intern("crate"), DUMMY_SP)),
+                    PathSegment::from_ident(Ident::new(Symbol::intern("slice_cursor"), DUMMY_SP)),
+                    PathSegment {
+                        ident: Ident::new(Symbol::intern(name), DUMMY_SP),
+                        id: DUMMY_NODE_ID,
+                        args: Some(P(GenericArgs::AngleBracketed(args))),
+                    },
+                ]),
+                tokens: None,
+            },
+        );
+        return if optional {
+            option_of(P(Ty {
+                id: DUMMY_NODE_ID,
+                kind,
+                span: DUMMY_SP,
+                tokens: None,
+            }))
+        } else {
+            kind
+        };
+    }
+    if let DeclForm::NestedSlice { inner_mutable } = form {
+        let TyKind::Ptr(inner) = &pointee.kind else {
+            unreachable!("native nested plan requires a raw pointer element");
+        };
+        let inner = P(Ty {
+            id: DUMMY_NODE_ID,
+            kind: decl_ty_kind_with_lifetime(
+                DeclForm::Slice,
+                inner_mutable,
+                inner.ty.clone(),
+                None,
+            ),
+            span: DUMMY_SP,
+            tokens: None,
+        });
+        return decl_ty_kind_with_lifetime(DeclForm::Slice, mutable, inner, lifetime);
+    }
+    if let DeclForm::Box {
+        pointee_override: Some(override_kind),
+        ..
+    } = form
+    {
+        pointee = P(::utils::ast::parse_ty(
+            override_kind.source_name().to_owned(),
+        ));
+    }
+    let mutbl = if mutable {
+        Mutability::Mut
+    } else {
+        Mutability::Not
+    };
+    let referent = match form {
+        DeclForm::Ref | DeclForm::Opt { slice: false } | DeclForm::Box { slice: false, .. } => {
+            pointee
+        }
+        DeclForm::NestedSlice { .. }
+        | DeclForm::Slice
+        | DeclForm::Cursor { .. }
+        | DeclForm::Opt { slice: true }
+        | DeclForm::Box { slice: true, .. } => P(Ty {
+            id: DUMMY_NODE_ID,
+            kind: TyKind::Slice(pointee),
+            span: DUMMY_SP,
+            tokens: None,
+        }),
+    };
+    match form {
+        DeclForm::Cursor { .. } => TyKind::Tup(ThinVec::from_iter([
+            P(Ty {
+                id: DUMMY_NODE_ID,
+                kind: TyKind::Ref(
+                    lifetime.map(ast_lifetime),
+                    MutTy {
+                        ty: referent,
+                        mutbl,
+                    },
+                ),
+                span: DUMMY_SP,
+                tokens: None,
+            }),
+            P(::utils::ast::parse_ty(
+                "::core::primitive::usize".to_owned(),
+            )),
+        ])),
+        DeclForm::Ref | DeclForm::NestedSlice { .. } | DeclForm::Slice | DeclForm::Opt { .. } => {
+            let reference = TyKind::Ref(
+                lifetime.map(ast_lifetime),
+                MutTy {
+                    ty: referent,
+                    mutbl,
+                },
+            );
+            match form {
+                DeclForm::Ref | DeclForm::NestedSlice { .. } | DeclForm::Slice => reference,
+                DeclForm::Opt { .. } => option_of(P(Ty {
+                    id: DUMMY_NODE_ID,
+                    kind: reference,
+                    span: DUMMY_SP,
+                    tokens: None,
+                })),
+                DeclForm::Box { .. } | DeclForm::Cursor { .. } => unreachable!(),
+            }
+        }
+        DeclForm::Box { optional, .. } => {
+            let boxed = wrapper_of("Box", referent);
+            if optional {
+                option_of(P(Ty {
+                    id: DUMMY_NODE_ID,
+                    kind: boxed,
+                    span: DUMMY_SP,
+                    tokens: None,
+                }))
+            } else {
+                boxed
+            }
+        }
+    }
+}
+
+pub(crate) fn generated_lifetime_param(
+    name: &str,
+    outlives: impl Iterator<Item = String>,
+) -> GenericParam {
+    GenericParam {
+        id: DUMMY_NODE_ID,
+        ident: ast_lifetime(name).ident,
+        attrs: Default::default(),
+        bounds: outlives
+            .map(|shorter| GenericBound::Outlives(ast_lifetime(&shorter)))
+            .collect(),
+        is_placeholder: false,
+        kind: GenericParamKind::Lifetime,
+        colon_span: None,
+    }
+}
+
+fn rewrite_raw_layer(ty: &mut Ty, depth: u8, lifetime: &str) -> bool {
+    if depth == 0 {
+        let TyKind::Ptr(mut_ty) = &ty.kind else {
+            return false;
+        };
+        let pointee = mut_ty.ty.clone();
+        let mutbl = mut_ty.mutbl;
+        ty.kind = TyKind::Ref(Some(ast_lifetime(lifetime)), MutTy { ty: pointee, mutbl });
+        return true;
+    }
+    let TyKind::Ptr(mut_ty) = &mut ty.kind else {
+        return false;
+    };
+    rewrite_raw_layer(&mut mut_ty.ty, depth - 1, lifetime)
+}
+
+struct ResolvedRawSignature {
+    inputs: Vec<Option<String>>,
+    output: Option<String>,
+}
+
+fn expand_signature_alias(ty: &mut Ty, depth: u8, resolved: Option<&str>) -> bool {
+    let mut layer = &*ty;
+    let mut needs_expansion = false;
+    for current in 0..=depth {
+        match &layer.kind {
+            TyKind::Path(..) => {
+                needs_expansion = true;
+                break;
+            }
+            TyKind::Ptr(inner) if current < depth => layer = &inner.ty,
+            _ => break,
+        }
+    }
+    if !needs_expansion {
+        return true;
+    }
+    let Some(resolved) = resolved else { return false };
+    let Ok(parsed) = graft_ty(resolved) else { return false };
+    if !matches!(parsed.kind, TyKind::Ptr(_)) {
+        return false;
+    }
+    // Retain the original signature node's identity and attribution span.
+    ty.kind = parsed.kind.clone();
+    true
+}
+
+/// Structural E2 signature pass. It owns generated lifetime parameters,
+/// return layers, and nested output-storage layers. Depth-zero input layers
+/// remain owned by [`RefDeclVisitor`], which receives the same plan below.
+struct LifetimeSignatureVisitor<'a> {
+    global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+    plans: &'a super::decision::lifetime::LifetimePlan,
+    return_interfaces: &'a super::decision::return_interface::ReturnInterfaces,
+    reverted_fns: &'a FxHashSet<LocalDefId>,
+    resolved_signatures: &'a FxHashMap<LocalDefId, ResolvedRawSignature>,
+    unplaceable: Vec<(LocalDefId, super::decision::lifetime::FnSignatureSlot)>,
+}
+
+impl LifetimeSignatureVisitor<'_> {
+    fn rewrite_return_layer(
+        &self,
+        did: LocalDefId,
+        ty: &mut Ty,
+        depth: u8,
+        lifetime: &str,
+    ) -> bool {
+        if depth == 0
+            && let Some(interface) = self.return_interfaces.functions.get(&did)
+        {
+            let shape = match interface.form {
+                Form::Slice { mutable } => Some((DeclForm::Slice, mutable)),
+                Form::Opt { mutable, slice } => Some((DeclForm::Opt { slice }, mutable)),
+                Form::Raw | Form::Ref { .. } | Form::Cursor { .. } | Form::NestedSlice { .. } => {
+                    None
+                }
+            };
+            if let Some((form, mutable)) = shape {
+                let TyKind::Ptr(inner) = &ty.kind else { return false };
+                ty.kind =
+                    decl_ty_kind_with_lifetime(form, mutable, inner.ty.clone(), Some(lifetime));
+                return true;
+            }
+        }
+        rewrite_raw_layer(ty, depth, lifetime)
+    }
+
+    fn apply_function(&mut self, did: LocalDefId, function: &mut rustc_ast::Fn) {
+        if self.reverted_fns.contains(&did) {
+            return;
+        }
+        let Some(plan) = self.plans.function(did) else {
+            return;
+        };
+
+        let mut insert_at = function
+            .generics
+            .params
+            .iter()
+            .position(|param| !matches!(param.kind, GenericParamKind::Lifetime))
+            .unwrap_or(function.generics.params.len());
+        for name in plan.generated_names() {
+            let bounds = plan
+                .outlives
+                .iter()
+                .filter(|(longer, _)| longer == name)
+                .map(|(_, shorter)| shorter.clone());
+            function
+                .generics
+                .params
+                .insert(insert_at, generated_lifetime_param(name, bounds));
+            insert_at += 1;
+        }
+
+        let mut layers = plan
+            .lifetimes()
+            .map(|(slot, lifetime)| (*slot, lifetime.to_owned()))
+            .collect::<Vec<_>>();
+        // Deepest first: converting an outer raw pointer to a reference must
+        // not hide a still-raw nested layer from this pass.
+        layers.sort_by_key(|(slot, _)| std::cmp::Reverse(slot.deref_depth + slot.depth));
+        let mut expanded = FxHashSet::default();
+        for (slot, lifetime) in layers {
+            let effective_depth = slot.deref_depth.saturating_add(slot.depth);
+            let placed = match slot.root {
+                super::decision::lifetime::FnSignatureRoot::Return => {
+                    match &mut function.sig.decl.output {
+                        rustc_ast::FnRetTy::Default(_) => false,
+                        rustc_ast::FnRetTy::Ty(ty) => {
+                            (!expanded.insert(None)
+                                || expand_signature_alias(
+                                    ty,
+                                    effective_depth,
+                                    self.resolved_signatures
+                                        .get(&did)
+                                        .and_then(|signature| signature.output.as_deref()),
+                                ))
+                                && self.rewrite_return_layer(did, ty, effective_depth, &lifetime)
+                        }
+                    }
+                }
+                super::decision::lifetime::FnSignatureRoot::Arg(local) => {
+                    let Some(input) = local.checked_sub(1).map(|index| index as usize) else {
+                        self.unplaceable.push((did, slot));
+                        continue;
+                    };
+                    // Depth zero is placed by RefDeclVisitor from the same map.
+                    effective_depth == 0
+                        || function
+                            .sig
+                            .decl
+                            .inputs
+                            .get_mut(input)
+                            .is_some_and(|param| {
+                                (!expanded.insert(Some(input))
+                                    || expand_signature_alias(
+                                        &mut param.ty,
+                                        effective_depth,
+                                        self.resolved_signatures
+                                            .get(&did)
+                                            .and_then(|signature| signature.inputs.get(input))
+                                            .and_then(|ty| ty.as_deref()),
+                                    ))
+                                    && rewrite_raw_layer(&mut param.ty, effective_depth, &lifetime)
+                            })
+                }
+            };
+            if !placed {
+                self.unplaceable.push((did, slot));
+            }
+        }
+    }
+}
+
+impl MutVisitor for LifetimeSignatureVisitor<'_> {
+    fn visit_item(&mut self, item: &mut rustc_ast::Item) {
+        if let rustc_ast::ItemKind::Fn(function) = &mut item.kind
+            && let Some(&did) = self.global_map.get(&item.id)
+        {
+            self.apply_function(did, function);
+        }
+        rustc_ast::mut_visit::walk_item(self, item);
+    }
+
+    fn visit_assoc_item(
+        &mut self,
+        item: &mut rustc_ast::AssocItem,
+        ctxt: rustc_ast::visit::AssocCtxt,
+    ) {
+        if let rustc_ast::AssocItemKind::Fn(function) = &mut item.kind
+            && let Some(&did) = self.global_map.get(&item.id)
+        {
+            self.apply_function(did, function);
+        }
+        rustc_ast::mut_visit::walk_assoc_item(self, item, ctxt);
+    }
+}
+
+/// One refused claim, naming **both** parties.
+///
+/// Requirement added at the arm-2 review (2026-08-13). A refusal row that named
+/// only the node would hand a STOP diagnosis half the story: `refused = 1 @
+/// node 4713` says a collision happened and not who collided, and the two
+/// transforms live in different passes over a 900-line module. Both sides are
+/// recorded so the diagnosis holds both parties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    pub node: NodeId,
+    /// The transform that already owns the node — its claim STANDS.
+    pub holder: &'static str,
+    /// The transform refused. See [`Composition`]: this one, not both.
+    pub challenger: &'static str,
+}
+
+/// **ARM 3 — the glue shapes**, as the span layer's `format!` set classifies
+/// them.
+///
+/// Five of the ten shapes `seam_tsv`'s classifier knows are realized on the
+/// frozen corpus (`from_raw_parts` 273, `some_wrap` 78, `some_reborrow` 37,
+/// `from_ref_mut` 29, `some_from_raw_parts` 4 = 421). The other five —
+/// `reborrow` alone, `unwrap`, `as_mut_unwrap`, `index` alone,
+/// `some_from_ref_mut` — have market **0**.
+///
+/// `Reborrow` and `Index0` are built because they are inner forms. Wave 3 also
+/// builds `Unwrap`/`AsMutUnwrap` through the carried method-chain layer and
+/// replaces the unsafe `Index0` reverse conversion with nonempty-gated
+/// `first`/`first_mut`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GlueShape {
+    /// `&mut *X` / `&*X`
+    Reborrow,
+    /// `&mut X[0]` / `&X[0]`
+    Index0,
+    /// `&mut X[OFFSET..]` / `&X[OFFSET..]`
+    Suffix { offset: u64 },
+    /// `core::slice::from_raw_parts{_mut}(X, (LEN) as usize)`
+    FromRawParts,
+    /// `core::slice::from_mut(X)` / `core::slice::from_ref(X)`
+    FromRefMut,
+    /// `Some(X)` — the wrapper; the `some_*` shapes are this over an inner form.
+    Some_,
+}
+
+/// The type `usize`, synthesized rather than parsed.
+///
+/// See the call site: a parsed fragment carries spans from a fresh `ParseSess`
+/// that alias real offsets in this crate, and the synthetic-span invariant says
+/// nodes this layer manufactures carry `DUMMY_SP`.
+fn usize_ty() -> Ty {
+    Ty {
+        id: DUMMY_NODE_ID,
+        kind: TyKind::Path(
+            None,
+            Path {
+                span: DUMMY_SP,
+                segments: ThinVec::from_iter([PathSegment {
+                    ident: Ident::new(Symbol::intern("usize"), DUMMY_SP),
+                    id: DUMMY_NODE_ID,
+                    args: None,
+                }]),
+                tokens: None,
+            },
+        ),
+        span: DUMMY_SP,
+        tokens: None,
+    }
+}
+
+/// A path expression `core::slice::<name>`.
+fn slice_path(name: &str) -> rustc_ast::Expr {
+    let seg = |n: &str| PathSegment {
+        ident: Ident::new(Symbol::intern(n), DUMMY_SP),
+        id: DUMMY_NODE_ID,
+        args: None,
+    };
+    rustc_ast::Expr {
+        id: DUMMY_NODE_ID,
+        kind: rustc_ast::ExprKind::Path(
+            None,
+            Path {
+                span: DUMMY_SP,
+                segments: ThinVec::from_iter([seg("core"), seg("slice"), seg(name)]),
+                tokens: None,
+            },
+        ),
+        span: DUMMY_SP,
+        attrs: Default::default(),
+        tokens: None,
+    }
+}
+
+fn expr(kind: rustc_ast::ExprKind) -> P<rustc_ast::Expr> {
+    P(rustc_ast::Expr {
+        id: DUMMY_NODE_ID,
+        kind,
+        span: DUMMY_SP,
+        attrs: Default::default(),
+        tokens: None,
+    })
+}
+
+/// **Build one glue expression, KEEPING `arg` as a subtree.**
+///
+/// This is the ruled (c)-extension in code: *structural where a subtree already
+/// exists; parse-and-graft where the text is genuinely new.* The argument is
+/// the existing call-argument node and moves across untouched — arm 1's §3c
+/// precedent, which declined a text round-trip for the pointee. The **length**
+/// is the one genuinely new part, has no subtree behind it, and is therefore
+/// handed in already parsed via [`graft_expr`].
+///
+/// Returns `None` when a length-bearing shape has no length. After the
+/// fabrication ruling the decision layer no longer *gates* on a missing length —
+/// it fabricates a tagged one — but the principle this arm encodes is unchanged
+/// and is now the whole of it: **no layer below the gate invents a length**, and
+/// neither does this.
+/// **Finish a `from_raw_parts` length expression — the ONE place the two arms
+/// diverge in the AST layer** (R8: a decidable mapping, lifted out).
+///
+/// A licensed companion becomes `(LEN) as usize`, because the C spelling may be
+/// `size_t`/`c_int`/`c_ulong` and `from_raw_parts` takes `usize`. A **fabricated**
+/// extent is left bare: the named const is already `usize`, and casting it would
+/// make a fabricated site textually indistinguishable from a licensed one whose
+/// companion happened to be a path.
+///
+/// Extracted rather than written inline in the visitor because the arm-3
+/// differential renders through this too. Building the cast in the test harness
+/// instead would have made the harness a **second implementation** of the
+/// production rule — the class this milestone's parity work exists to prevent,
+/// and the shape M28/M40 were banked for.
+///
+/// The `usize` is HAND-BUILT with `DUMMY_SP`, never parsed: `parse_ty` opens a
+/// fresh `ParseSess` whose `BytePos` values start at zero and therefore alias
+/// real offsets in this crate's first source file — the hazard `SpanEraser` was
+/// landed for at task 0, invisible to that witness because it collects `Expr`
+/// spans only.
+pub(crate) fn finish_len(seam_len: &SeamLen, parsed: rustc_ast::Expr) -> P<rustc_ast::Expr> {
+    match seam_len {
+        SeamLen::Licensed(_)
+        | SeamLen::MaskDerived(_)
+        // wave-6l relay 067: a proven companion is a licensed one.
+        | SeamLen::Proven { .. }
+        // wave-6l relay 077: the NUL-walk's `strlen + 1` is a licensed length.
+        | SeamLen::NulWalk { .. }
+        // R500-8: rendered as the companion it is; the receipt carries the guess.
+        | SeamLen::PositionalSibling { .. } => expr(rustc_ast::ExprKind::Cast(
+            expr(rustc_ast::ExprKind::Paren(P(parsed))),
+            P(usize_ty()),
+        )),
+        SeamLen::Fabricated | SeamLen::Refused(_) => P(parsed),
+    }
+}
+
+pub(crate) fn glue_expr(
+    shape: GlueShape,
+    mutable: bool,
+    arg: P<rustc_ast::Expr>,
+    len: Option<P<rustc_ast::Expr>>,
+) -> Option<rustc_ast::ExprKind> {
+    use rustc_ast::{BorrowKind, ExprKind};
+    let mutbl = if mutable {
+        Mutability::Mut
+    } else {
+        Mutability::Not
+    };
+    Some(match shape {
+        GlueShape::Reborrow => ExprKind::AddrOf(
+            BorrowKind::Ref,
+            mutbl,
+            expr(ExprKind::Unary(rustc_ast::UnOp::Deref, arg)),
+        ),
+        GlueShape::Index0 => {
+            let zero = expr(ExprKind::Lit(rustc_ast::token::Lit {
+                kind: rustc_ast::token::LitKind::Integer,
+                symbol: Symbol::intern("0"),
+                suffix: None,
+            }));
+            ExprKind::AddrOf(
+                BorrowKind::Ref,
+                mutbl,
+                expr(ExprKind::Index(arg, zero, DUMMY_SP)),
+            )
+        }
+        GlueShape::Suffix { offset } => {
+            let start = expr(ExprKind::Lit(rustc_ast::token::Lit {
+                kind: rustc_ast::token::LitKind::Integer,
+                symbol: Symbol::intern(&offset.to_string()),
+                suffix: None,
+            }));
+            let range = expr(ExprKind::Range(
+                Some(start),
+                None,
+                rustc_ast::RangeLimits::HalfOpen,
+            ));
+            ExprKind::AddrOf(
+                BorrowKind::Ref,
+                mutbl,
+                expr(ExprKind::Index(arg, range, DUMMY_SP)),
+            )
+        }
+        GlueShape::FromRawParts => {
+            let len = len?;
+            let ctor = if mutable {
+                "from_raw_parts_mut"
+            } else {
+                "from_raw_parts"
+            };
+            // **`len` arrives FINISHED** (2026-08-12): the caller applied
+            // `(LEN) as usize` for a licensed companion and left a fabricated
+            // extent bare, because only the caller holds the provenance that
+            // decides between them. Building the cast here would have cast the
+            // named const too, making a fabricated site textually
+            // indistinguishable from a licensed one.
+            //
+            // The hand-built `usize` (now at the caller) stays hand-built with
+            // `DUMMY_SP`: `parse_ty` opens a fresh `ParseSess` whose `BytePos`
+            // values start at zero and therefore **alias real offsets in this
+            // crate's first source file** — the hazard `SpanEraser` was landed
+            // for at task 0, invisible to that witness because it collects
+            // `Expr` spans only. Found by the adversarial review; preserved
+            // across the move.
+            ExprKind::Call(P(slice_path(ctor)), ThinVec::from_iter([arg, len]))
+        }
+        GlueShape::FromRefMut => {
+            let ctor = if mutable { "from_mut" } else { "from_ref" };
+            ExprKind::Call(P(slice_path(ctor)), ThinVec::from_iter([arg]))
+        }
+        GlueShape::Some_ => ExprKind::Call(
+            expr(ExprKind::Path(
+                None,
+                Path {
+                    span: DUMMY_SP,
+                    segments: ThinVec::from_iter([PathSegment {
+                        ident: Ident::new(Symbol::intern("Some"), DUMMY_SP),
+                        id: DUMMY_NODE_ID,
+                        args: None,
+                    }]),
+                    tokens: None,
+                },
+            )),
+            ThinVec::from_iter([arg]),
+        ),
+    })
+}
+
+/// **THE FAIL-CLOSED COMPOSITION GUARD.**
+///
+/// Built beside the FIRST arm by ruling (2026-08-12, item 5), not deferred to
+/// the unlock that eventually relaxes it, and **in force in parity mode**.
+///
+/// # What it does and does not replace
+///
+/// The `seam-site-overlap` gate's *byte-range conflict* dissolves with the
+/// representation — two node transforms at one call site compose, where two
+/// byte ranges could not. **The soundness hazard it guarded does not dissolve.**
+/// What that gate stands between is the inversion finding: `two_mut(&mut *p,
+/// &mut *p)` through a raw base compiles with **zero diagnostics** where the
+/// same shape on a real local is `E0499`. The compiler is blind exactly where
+/// the reborrow family places its borrows, so refusing unreviewed composition
+/// is the only thing between a composed transform and silent UB.
+///
+/// This guard is the STRUCTURAL half: two transforms may not claim one node.
+/// The semantic half stays in the decision layer, where it already lives.
+///
+/// **Fail-closed:** a second claim on a node is REFUSED and counted. It is
+/// never resolved by precedence, because a precedence rule is a decision, and
+/// deciding here is what the phase separation forbids.
+///
+/// # What "refused" means exactly — CORRECTED at arm 2
+///
+/// This doc previously said a second claim refuses **both** transforms. It does
+/// not, and cannot as built: the first claimant has already mutated its node by
+/// the time the second arrives, so what the guard delivers is *the second is
+/// refused and counted*, with the first standing. Through arm 1 the difference
+/// was unobservable — one transform cannot conflict, so `refused` was a
+/// uniformly-zero predicate and the claim was never exercised.
+///
+/// The distinction is recorded rather than repaired because a nonzero `refused`
+/// is **pre-classified STOP** in parity mode: the corpus expectation is zero, and
+/// a genuine both-refusal (rollback, or a claim pass separated from a transform
+/// pass) is work that belongs to whichever unlock first makes composition
+/// legal. What must not happen is prose promising a rollback the code does not
+/// perform.
+///
+/// **The preserved invariant is NO SILENT PRECEDENCE** (ruling 2026-08-13). The
+/// first claim standing is not a precedence *rule* — it is the order the walk
+/// happened to run in, and the guard's job is to ensure that order is never
+/// quietly load-bearing. Every refusal is a typed [`Refusal`] row naming both
+/// parties and is STOP-class at parity, so a collision cannot be resolved by
+/// walk order without a human seeing it.
+#[derive(Default)]
+pub(crate) struct Composition {
+    claimed: FxHashMap<NodeId, &'static str>,
+    /// **THE CHANGED-SET, recorded where the change is claimed.**
+    ///
+    /// A function is reprinted iff one of these spans falls inside it. Recorded
+    /// at `claim` rather than derived later, because "which functions changed"
+    /// is exactly the kind of fact that grows a second derivation and drifts —
+    /// and the alternative here (compare reprint text against the original) is
+    /// the derivation the fix ruling explicitly forbade.
+    edited: Vec<rustc_span::Span>,
+    /// **THE CLAIMANT OF EACH `edited` SPAN, index-parallel to it.**
+    ///
+    /// Exists so a diagnostic can report an edit's KIND (`decl:*` / `use` /
+    /// `seam`) without re-deriving that classification from the AST. Production
+    /// already decides it at [`Composition::claim`]; a second derivation in an
+    /// instrument is this module's founding defect class, and putting it inside
+    /// the thing you debug WITH is the worst place for it (ruled 2026-08-18).
+    ///
+    /// Parallel rather than a `Vec<(Span, &str)>` so `edited_spans` stays a
+    /// borrow of a contiguous slice and the retain filter is untouched. The
+    /// pairing is therefore an INVARIANT, not a type guarantee — hence the
+    /// `debug_assert` at the single push site.
+    claimants: Vec<&'static str>,
+    /// Refusals, each naming the node and both claimants.
+    pub refused: Vec<Refusal>,
+}
+
+impl Composition {
+    /// `true` when this transform may proceed. `false` means another transform
+    /// already owns the node, and THIS one is refused — see the struct doc for
+    /// why that is not the same as refusing both.
+    ///
+    /// `claimant` is a stable label for the transform, not for the subject: it
+    /// is what a STOP diagnosis reads to learn which two passes collided.
+    pub(crate) fn claim(
+        &mut self,
+        node: NodeId,
+        span: rustc_span::Span,
+        claimant: &'static str,
+    ) -> bool {
+        match self.claimed.get(&node) {
+            None => {
+                self.claimed.insert(node, claimant);
+                self.edited.push(span);
+                self.claimants.push(claimant);
+                // The two vectors are index-parallel by construction; this is
+                // the ONLY site that grows either, so the invariant is local.
+                debug_assert_eq!(
+                    self.edited.len(),
+                    self.claimants.len(),
+                    "edited spans and their claimants must stay index-parallel"
+                );
+                true
+            }
+            Some(&holder) => {
+                self.refused.push(Refusal {
+                    node,
+                    holder,
+                    challenger: claimant,
+                });
+                false
+            }
+        }
+    }
+
+    /// Admit the one ruled same-node composition: a seam wrapping an exact
+    /// subject-use graft. The use pass has already replaced the expression;
+    /// this handoff lets the seam consume that rewritten subtree without
+    /// converting ordinary collision order into precedence.
+    ///
+    /// A missing use claim, or any different holder, remains a counted refusal.
+    pub(crate) fn claim_seam_after_exact_use(
+        &mut self,
+        node: NodeId,
+        span: rustc_span::Span,
+    ) -> bool {
+        let holder = self.claimed.get(&node).copied();
+        if holder != Some("use") {
+            self.refused.push(Refusal {
+                node,
+                holder: holder.unwrap_or("missing-exact-use"),
+                challenger: "seam",
+            });
+            return false;
+        }
+        let Some(index) = self
+            .edited
+            .iter()
+            .zip(&self.claimants)
+            .rposition(|(edited, claimant)| *edited == span && *claimant == "use")
+        else {
+            self.refused.push(Refusal {
+                node,
+                holder: "use-claim-without-edit",
+                challenger: "seam",
+            });
+            return false;
+        };
+        self.claimed.insert(node, "use+seam");
+        self.claimants[index] = "use+seam";
+        true
+    }
+
+    /// The transform that owns `node`, if any (R410-2(d): a family that finds
+    /// its target replaced asks who replaced it before yielding).
+    pub(crate) fn holder(&self, node: NodeId) -> Option<&'static str> {
+        self.claimed.get(&node).copied()
+    }
+
+    #[cfg(test)]
+    /// The spans this transform actually edited. Empty means the transform
+    /// changed nothing — and then nothing is reprinted, which is the correct
+    /// answer, not a degenerate one.
+    pub(crate) fn edited_spans(&self) -> &[rustc_span::Span] {
+        &self.edited
+    }
+
+    /// The same edits, each carrying the claimant that made it.
+    ///
+    /// Diagnostic-only: nothing in the emission path reads this, so it cannot
+    /// change what is spliced. It reports the classification production
+    /// already made rather than recomputing one.
+    pub(crate) fn edited_with_claimants(
+        &self,
+    ) -> impl Iterator<Item = (rustc_span::Span, &'static str)> + '_ {
+        self.edited
+            .iter()
+            .copied()
+            .zip(self.claimants.iter().copied())
+    }
+
+    #[cfg(test)]
+    /// Refusals whose CHALLENGER carries this label — the pass that was turned
+    /// away. Derived from the labels rather than by subtracting one pass's
+    /// tally from the guard's total, which would mis-attribute the moment a
+    /// third transform lands.
+    pub(crate) fn refused_by(&self, claimant: &str) -> usize {
+        self.refused
+            .iter()
+            .filter(|r| r.challenger == claimant)
+            .count()
+    }
+}
+
+/// What the declaration pass rewrote, so the differential has a population to
+/// compare.
+///
+/// The three form counters are kept **apart** rather than summed: `rewritten`
+/// is arm 1's pinned 780 and must stay readable as that number after arm 2
+/// lands. A single total would have made the must-not-move list uncheckable.
+#[derive(Default)]
+pub(crate) struct RefDeclStats {
+    /// Declarations rewritten `*mut T`/`*const T` → `&mut T`/`&T`. **Arm 1.**
+    pub rewritten: usize,
+    /// **Arm 2** — declarations rewritten to `&[T]` / `&mut [T]`.
+    pub slice_rewritten: usize,
+    /// **Arm 2** — declarations rewritten to an `Option<…>` form.
+    pub opt_rewritten: usize,
+    /// Box wave-1 declarations rewritten to `Box<T>` / `Box<[T]>`.
+    pub box_rewritten: usize,
+    /// Subjects the table settled `Ref` whose declaration was NOT a syntactic
+    /// pointer in the AST. Counted, never silently skipped: a decided subject
+    /// the transform cannot reach is a ledger movement.
+    pub not_a_pointer_decl: usize,
+    /// Refused by the composition guard.
+    pub refused: usize,
+    /// An exact alias carrier could not be parsed without recovery or loss.
+    pub type_parse_failed: usize,
+    /// **THE IDENTITIES the walk actually rewrote**, one per realized rewrite.
+    ///
+    /// A `Vec` and not a set on purpose: the *duplicate* is itself a failure
+    /// class (one key rewritten twice), and a set would absorb it silently at
+    /// the point of collection — which is the shape the count-based ledger was
+    /// faulted for. The de-duplication happens at the reconciliation, where the
+    /// difference between the two lengths is a reported row.
+    pub placed_ids: Vec<(LocalDefId, HirId)>,
+    /// Decided subjects the **site** revert check declined. Diagnostic, and the
+    /// denominator that makes `reverted_placed`'s zero mean something: a zero
+    /// here would mean the check never ran, and the observability the F2 repair
+    /// bought would be back to a construction.
+    ///
+    /// ⚠ **A COUNT, and the claim no longer rests on it** (round 4). Codex's
+    /// round-3 [high]: if two AST declarations resolve to reverted subject `A`
+    /// while subject `B` is never reached, this scalar still equals the two
+    /// oracle lines — so *"every reverted subject's declaration was reached"* was
+    /// never established by it. The identities are in
+    /// [`Self::withheld_ids`]; this stays as the term the oracle's LINE COUNT is
+    /// checked against, which is a different source from `reverted_ids`.
+    pub reverted_withheld: usize,
+    /// **THE IDENTITIES the site revert check declined**, one per decline.
+    ///
+    /// A `Vec` for [`Self::placed_ids`]' reason and it is the same reason: the
+    /// duplicate is itself the failure class — the exact compensating pair that
+    /// keeps the scalar equal while the *set* is wrong — and a set would absorb
+    /// it at the point of collection.
+    pub withheld_ids: Vec<(LocalDefId, HirId)>,
+    /// **THE ORPHAN CLASS — a subject whose declaration the walk reached with
+    /// no owning function.**
+    ///
+    /// [`MutVisitor::visit_item`] sets `current_fn` only on a top-level
+    /// `ItemKind::Fn`, and `visit_assoc_item` is **not** overridden — so an
+    /// `impl` method's params arrive here with `current_fn` unset and used to
+    /// return with no trace. Exact rather than approximate: it counts only
+    /// bindings whose `HirId` is a KNOWN SURVIVOR, which the hir-only index
+    /// makes decidable without the `fn_did` half of the key.
+    ///
+    /// Corpus-zero would be **structural, not evidential**, so it ships with an
+    /// injection witness (`an_impl_method_subject_is_counted_not_skipped`)
+    /// rather than an argument.
+    pub orphan_subject: usize,
+    /// `(byte offset of the declaration's type, rendered type)` per rewrite —
+    /// the text differential's left-hand side. Keyed by offset because that is
+    /// what the span layer's `Edit` is keyed by, so the join needs no name
+    /// matching and cannot silently pair the wrong two things.
+    pub rendered: Vec<(u32, String)>,
+    /// The same, for **arm 2's** declaration renders. Split from
+    /// [`Self::rendered`] so arm 1's pinned differential stays computable over
+    /// exactly the population it was pinned on.
+    pub rendered_arm2: Vec<(u32, String)>,
+}
+
+/// Arm 1's visitor: rewrite the declared type of every `Decision::Ref` subject.
+pub(crate) struct RefDeclVisitor<'a> {
+    /// AST `NodeId` → HIR `HirId`, the forward direction a tree walk wants.
+    ///
+    /// The `UnordMap` is used DIRECTLY rather than copied into an `FxHashMap`:
+    /// a lookup is order-free, `get` is all a tree walk needs, and converting
+    /// would mean iterating a container that hides iteration on purpose.
+    pub local_map: &'a rustc_ast::node_id::NodeMap<HirId>,
+    /// `(fn_did, hir_id)` → which form this subject's declaration becomes, and
+    /// whether it is mutable.
+    pub decisions: &'a FxHashMap<(LocalDefId, HirId), (DeclForm, bool, Option<String>)>,
+    pub declaration_pointees: &'a super::decision::declaration::DeclarationPointees,
+    /// Option bindings whose selected borrowed uses require a mutable binding.
+    /// The declaration must be placed before its binding is changed.
+    pub mutable_option_bindings: &'a FxHashSet<(LocalDefId, HirId)>,
+    /// AST `NodeId` → `LocalDefId`, used to set `current_fn` at each item.
+    pub global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+    /// **THE REVERT SET, CONSULTED AT THE SITE** — the F2 repair.
+    ///
+    /// Phase 4's whole property is *"a reverted subtree is not transformed"*,
+    /// and the first repair could not observe it: `decisions` was built WITH the
+    /// revert filter, so `placed ⊆ survivors` held **by construction** and
+    /// `reverted_placed` was empty for a reason no bug could disturb. The
+    /// reconciliation was comparing a lookup key against itself.
+    ///
+    /// Moving the filter here makes the withholding a **checked behaviour**
+    /// instead of a pre-filtered population: the walk now sees every decided
+    /// subject and declines the reverted ones at this line. Delete that check
+    /// and `reverted_placed` fires — which is what "observable" means.
+    ///
+    /// **Behaviour is unchanged**: previously a reverted subject missed the
+    /// `decisions` lookup and returned; now it is found and declined. Neither
+    /// path rewrites, claims a node, or renders — so the emitted AST is
+    /// identical and every phase-3 line is untouched.
+    ///
+    /// Empty for [`transform_inner`], which applies no revert set.
+    pub reverted_fns: &'a FxHashSet<LocalDefId>,
+    /// **The survivors' `HirId`s alone** — the half of the decision key that is
+    /// available when `current_fn` is not.
+    ///
+    /// **No longer derivable from [`Self::decisions`]** now that the revert
+    /// filter moved to the site: `decisions` carries every decided subject
+    /// while this carries only the ones a placement is OWED for. The
+    /// maintainability review flagged the old shape as a projection recomputed
+    /// at each construction site; the two sets are genuinely different now, so
+    /// passing both is information rather than duplication.
+    ///
+    /// Sound as an identity because a binding's `HirId.owner` **is** its body
+    /// owner: for a param or local of `F`, the owner is `F`, so a `HirId` in
+    /// this index determines the `fn_did` half it came with. That is what makes
+    /// [`RefDeclStats::orphan_subject`] an exact count rather than a heuristic
+    /// over "raw-pointer declarations we did not transform".
+    pub subject_hirs: &'a FxHashSet<HirId>,
+    /// The function currently being walked, from the global map.
+    pub current_fn: Option<LocalDefId>,
+    pub guard: &'a mut Composition,
+    pub stats: RefDeclStats,
+}
+
+impl RefDeclVisitor<'_> {
+    /// Rewrite one declaration's type node, if its binding is a `Ref` subject.
+    ///
+    /// `binding` is the PATTERN's node — that is what the map keys on, because
+    /// `map_pat_to_pat` sends an AST `PatKind::Ident` to `hir::PatKind::Binding`
+    /// and a subject's `hir_id` is its binding pattern's.
+    fn rewrite_decl(&mut self, binding: NodeId, ty: &mut Ty) {
+        // **THE HIR LOOKUP MOVED AHEAD OF THE OWNER LOOKUP**, and the reorder is
+        // the whole point: with `current_fn` checked first, an `impl` method's
+        // subject returned before anything could tell it apart from the many
+        // declarations that are simply not subjects. Both paths still return —
+        // this is instrument-only — but the orphan class is now decidable.
+        let Some(&hir_id) = self.local_map.get(&binding) else {
+            // A `local_map` miss cannot be attributed here: without a `HirId`
+            // there is no key to test membership with. It is not left
+            // unmeasured — the identity reconciliation reports the exact
+            // subject that went missing, by name, and
+            // `missing_unattributed` is the residue after the classes that CAN
+            // be named at the site are subtracted.
+            return;
+        };
+        let Some(fn_did) = self.current_fn else {
+            if self.subject_hirs.contains(&hir_id) {
+                self.stats.orphan_subject += 1;
+            }
+            return;
+        };
+        let Some((form, mutable, lifetime)) = self.decisions.get(&(fn_did, hir_id)) else {
+            return;
+        };
+        let (form, mutable) = (*form, *mutable);
+        // **THE REVERT CHECK, AT THE SITE.** Before the shape check and before
+        // the claim, so a withheld declaration behaves exactly as it did when
+        // the population was pre-filtered: untouched, unclaimed, unrendered.
+        // The difference is that it is now a CHECK a mutation can break, rather
+        // than a set membership no bug could disturb.
+        if self.reverted_fns.contains(&fn_did) {
+            self.stats.reverted_withheld += 1;
+            // **THE IDENTITY, beside the count.** The count alone cannot say
+            // WHICH subjects were reached; round 4's item 2, and the mirror of
+            // what `placed_ids` does three returns below.
+            self.stats.withheld_ids.push((fn_did, hir_id));
+            return;
+        }
+        // **The shape check runs BEFORE the claim** (arm-2 review). Claiming
+        // first meant a declaration this pass cannot transform still took
+        // OWNERSHIP of the node, so a later transform that legitimately wanted
+        // it would be refused on behalf of work that never happened. Ownership
+        // now follows the transform rather than the attempt.
+        let pointee = match &ty.kind {
+            TyKind::Ptr(mut_ty) if !self.declaration_pointees.contains_key(&(fn_did, hir_id)) => {
+                mut_ty.ty.clone()
+            }
+            TyKind::Ptr(..) | TyKind::Path(..) => {
+                let Some(carrier) = self.declaration_pointees.get(&(fn_did, hir_id)) else {
+                    self.stats.not_a_pointer_decl += 1;
+                    return;
+                };
+                match graft_ty(&carrier.pointee) {
+                    Ok(pointee) => pointee,
+                    Err(_) => {
+                        self.stats.type_parse_failed += 1;
+                        return;
+                    }
+                }
+            }
+            _ => {
+                self.stats.not_a_pointer_decl += 1;
+                return;
+            }
+        };
+        let claimant = match form {
+            DeclForm::Cursor { .. } => "decl:cursor",
+            DeclForm::Ref => "decl:ref",
+            DeclForm::NestedSlice { .. } | DeclForm::Slice => "decl:slice",
+            DeclForm::Opt { .. } => "decl:opt",
+            DeclForm::Box { .. } => "decl:box",
+        };
+        if !self.guard.claim(ty.id, ty.span, claimant) {
+            self.stats.refused += 1;
+            return;
+        }
+        // Written pointer pointees retain their subtree. An alias uses only
+        // its exact, compiler-resolved and span-erased declaration carrier.
+        ty.kind = decl_ty_kind_with_lifetime(form, mutable, pointee, lifetime.as_deref());
+        let render = (ty.span.lo().0, rustc_ast_pretty::pprust::ty_to_string(ty));
+        // **RECORDED AT THE REALIZED REWRITE, not at the attempt.** Every early
+        // return above is a non-placement, so this list and the three form
+        // counters move together or the instrument is broken — an equality the
+        // gate asserts rather than assumes.
+        self.stats.placed_ids.push((fn_did, hir_id));
+        match form {
+            DeclForm::Ref => {
+                self.stats.rewritten += 1;
+                self.stats.rendered.push(render);
+            }
+            DeclForm::NestedSlice { .. } | DeclForm::Slice | DeclForm::Cursor { .. } => {
+                self.stats.slice_rewritten += 1;
+                self.stats.rendered_arm2.push(render);
+            }
+            DeclForm::Opt { .. } => {
+                self.stats.opt_rewritten += 1;
+                self.stats.rendered_arm2.push(render);
+            }
+            DeclForm::Box { .. } => {
+                self.stats.box_rewritten += 1;
+                self.stats.rendered_arm2.push(render);
+            }
+        }
+    }
+
+    fn rewrite_option_binding(&self, pat: &mut rustc_ast::Pat, previous_placements: usize) {
+        if self.stats.placed_ids.len() != previous_placements + 1 {
+            return;
+        }
+        let Some(node) = self.stats.placed_ids.last() else { return };
+        if self.mutable_option_bindings.contains(node)
+            && matches!(
+                self.decisions.get(node),
+                Some((DeclForm::Opt { .. } | DeclForm::Cursor { .. }, _, _))
+            )
+            && let rustc_ast::PatKind::Ident(mode, _, _) = &mut pat.kind
+        {
+            mode.1 = Mutability::Mut;
+        }
+    }
+}
+
+impl MutVisitor for RefDeclVisitor<'_> {
+    fn visit_item(&mut self, item: &mut rustc_ast::Item) {
+        // The enclosing function's `LocalDefId` is half the decision key.
+        // SAVED AND RESTORED rather than overwritten: a nested item would
+        // otherwise leave the outer function's params keyed to the inner one,
+        // which is the same wrong-owner class the seam `owner_fn` defect was.
+        let saved = self.current_fn;
+        if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+            self.current_fn = self.global_map.get(&item.id).copied();
+        }
+        rustc_ast::mut_visit::walk_item(self, item);
+        self.current_fn = saved;
+    }
+
+    fn visit_param(&mut self, param: &mut rustc_ast::Param) {
+        let binding = param.pat.id;
+        let previous_placements = self.stats.placed_ids.len();
+        self.rewrite_decl(binding, &mut param.ty);
+        self.rewrite_option_binding(&mut param.pat, previous_placements);
+        rustc_ast::mut_visit::walk_param(self, param);
+    }
+
+    fn visit_local(&mut self, local: &mut rustc_ast::Local) {
+        let binding = local.pat.id;
+        if let Some(ty) = local.ty.as_mut() {
+            let previous_placements = self.stats.placed_ids.len();
+            self.rewrite_decl(binding, ty);
+            self.rewrite_option_binding(&mut local.pat, previous_placements);
+        }
+        rustc_ast::mut_visit::walk_local(self, local);
+    }
+}
+
+/// Inserts explicit types on previously inferred locals. These sites are
+/// carried by the converted callee's signature class, so the visitor consumes
+/// the final type text selected upstream and performs no type inference.
+struct ExplicitLocalDeclVisitor<'a> {
+    local_map: &'a rustc_ast::node_id::NodeMap<HirId>,
+    global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+    sites: &'a FxHashMap<(LocalDefId, HirId), String>,
+    mutable_option_bindings: &'a FxHashSet<(LocalDefId, HirId)>,
+    current_fn: Option<LocalDefId>,
+    guard: &'a mut Composition,
+    placed: FxHashSet<(LocalDefId, HirId)>,
+    refused: usize,
+}
+
+impl MutVisitor for ExplicitLocalDeclVisitor<'_> {
+    fn visit_item(&mut self, item: &mut rustc_ast::Item) {
+        let saved = self.current_fn;
+        if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+            self.current_fn = self.global_map.get(&item.id).copied();
+        }
+        rustc_ast::mut_visit::walk_item(self, item);
+        self.current_fn = saved;
+    }
+
+    fn visit_local(&mut self, local: &mut rustc_ast::Local) {
+        let Some(fn_did) = self.current_fn else {
+            rustc_ast::mut_visit::walk_local(self, local);
+            return;
+        };
+        let Some(&hir_id) = self.local_map.get(&local.pat.id) else {
+            rustc_ast::mut_visit::walk_local(self, local);
+            return;
+        };
+        let key = (fn_did, hir_id);
+        let Some(ty) = self.sites.get(&key) else {
+            rustc_ast::mut_visit::walk_local(self, local);
+            return;
+        };
+        // R419-1/3: a Box-decided local keeps the source's own annotation
+        // (`let mut ret: *mut ti_buffer = …`) unless it is REPLACED here —
+        // the ledger then counts a delivery the declaration inventory has no
+        // row for (tulip `ti_buffer_new::ret#14`). The site's type IS the
+        // decision's; another producer's competing type is the planner's
+        // `declaration-type-conflict`, never this visitor's.
+        let replaces_annotation = local.ty.is_some() && ty.starts_with("::std::boxed::Box<");
+        if (local.ty.is_some() && !replaces_annotation)
+            || !self
+                .guard
+                .claim(local.pat.id, local.pat.span, "decl:explicit")
+        {
+            self.refused += 1;
+            return;
+        }
+        local.ty = Some(P(::utils::ast::parse_ty(ty.clone())));
+        if self.mutable_option_bindings.contains(&key)
+            && let rustc_ast::PatKind::Ident(binding, _, _) = &mut local.pat.kind
+        {
+            binding.1 = Mutability::Mut;
+        }
+        self.placed.insert(key);
+        rustc_ast::mut_visit::walk_local(self, local);
+    }
+}
+
+/// **ARM 2's SECOND HALF — the use-site rewrites, as grafted nodes.**
+///
+/// `Slice` and `Opt` are the first dispositions that are not declaration-only:
+/// `p.offset(i)` has no image on `&[T]` and `p.is_null()` none on an `Option`,
+/// so the declaration edit alone yields an ill-typed crate. The decision layer
+/// computes each rewrite as TEXT and hands it over as data; under the (c)
+/// ruling that text reaches a file only through **parse → graft → print**.
+#[derive(Default)]
+pub(crate) struct UseGraftStats {
+    pub grafted: usize,
+    /// wave-6l: use grafts composed over a native-result view at the same
+    /// node (the outer store carries the re-rendered inner).
+    pub composed_over_inner: usize,
+    /// Replacements [`graft_expr`] refused. **A checked corpus expectation of
+    /// zero**, per R7.4 — a failure here names a template the enumeration
+    /// missed, with its text attached.
+    pub parse_failed: usize,
+    /// The offending templates, **capped** for the artifact. Never the count.
+    pub parse_failures: Vec<String>,
+    /// Use edits whose span matched no AST expression. Counted, because a use
+    /// edit that evaporates leaves a converted declaration with a raw use under
+    /// it — an ill-typed crate, not a partial rewrite.
+    pub unmatched: usize,
+    /// Refused by the composition guard.
+    pub refused: usize,
+    /// **One use key matched by MORE THAN ONE AST node.**
+    ///
+    /// The composition guard cannot see this: it keys on `NodeId`, and two
+    /// distinct nodes sharing a span have distinct ids, so both claims are
+    /// admitted and both graft. `unmatched` cannot see it either — `consumed`
+    /// is a set, so the second match re-inserts and the key still reads as
+    /// reached. Without this counter the shape is invisible to every existing
+    /// instrument, which is why it is counted rather than argued about.
+    ///
+    /// Macro-expanded nodes are the realistic source: they carry the call
+    /// site's range and differ only in `SyntaxContext`, which the `(lo, hi)`
+    /// key drops. Corpus expectation is 0 and it is GATED.
+    pub multi_matched: usize,
+    /// `(offset, rendered text)` per graft — the text differential's left-hand
+    /// side, keyed exactly as the declaration renders are.
+    pub rendered: Vec<(u32, String)>,
+    pub statements_deleted: usize,
+    pub statement_unmatched: usize,
+    pub statement_refused: usize,
+}
+
+/// Grafts each use rewrite onto the node whose span the decision layer named.
+///
+/// # Why the key is `(lo, hi)` and not `lo`
+///
+/// `p.offset(i)` and `p.offset(i) as usize` share a start offset, and
+/// `*p.offset(i)` differs from `p.offset(i)` only at the start. Keying on one
+/// endpoint would let the walk graft a replacement onto a node the decision
+/// layer did not name — silently, and only on some shapes. The full span pair
+/// makes the wrong pairing unrepresentable rather than merely unlikely.
+pub(crate) struct UseGraftVisitor<'a> {
+    uses: &'a FxHashMap<(u32, u32), String>,
+    guard: &'a mut Composition,
+    stats: UseGraftStats,
+    /// Keys the walk actually reached, so `unmatched` is a **subtraction over
+    /// identities** rather than a difference of two counts that could agree by
+    /// coincidence.
+    consumed: FxHashSet<(u32, u32)>,
+    /// wave-6l (nested-edit composition): native-result views planned at the
+    /// SAME node as a use graft (an optional store over a call whose callee
+    /// this lane adapts). The use text was rendered over the ORIGINAL call
+    /// text; the view is rendered over the node first and spliced into the
+    /// use text in the call's place, so the outer store carries the inner.
+    inner_views: FxHashMap<
+        (u32, u32),
+        &'a super::decision::native_result_expression::NativeResultExpressionPlan,
+    >,
+    /// **R483-2** — the inner nodes' ORIGINAL source spellings, keyed by the same span
+    /// key the use grafts are keyed on. Consulted only when the inner's current text is
+    /// not what the outer plan carries, i.e. when another family has rewritten it.
+    originals: FxHashMap<(u32, u32), String>,
+    /// Keys the composition consumed; the receiver-input pass skips them.
+    pub(crate) composed: FxHashSet<(u32, u32)>,
+}
+
+impl<'a> UseGraftVisitor<'a> {
+    pub(crate) fn new(uses: &'a FxHashMap<(u32, u32), String>, guard: &'a mut Composition) -> Self {
+        Self {
+            uses,
+            guard,
+            stats: UseGraftStats::default(),
+            consumed: FxHashSet::default(),
+            inner_views: FxHashMap::default(),
+            originals: FxHashMap::default(),
+            composed: FxHashSet::default(),
+        }
+    }
+
+    /// R483-2: the original spellings of the nodes the composition may need to find.
+    pub(crate) fn with_originals(mut self, originals: FxHashMap<(u32, u32), String>) -> Self {
+        self.originals = originals;
+        self
+    }
+
+    pub(crate) fn with_inner_views(
+        mut self,
+        inner_views: FxHashMap<
+            (u32, u32),
+            &'a super::decision::native_result_expression::NativeResultExpressionPlan,
+        >,
+    ) -> Self {
+        self.inner_views = inner_views;
+        self
+    }
+
+    /// The use text with the node's original text replaced by the view
+    /// rendered over it. The use text came from the source file and the node
+    /// prints through `pprust`, so the match ignores whitespace and the
+    /// splice is done on the use text's own bytes.
+    fn compose_over_inner(text: &str, original: &str, inner: &str) -> Option<String> {
+        let (start, end) = find_ignoring_whitespace(text, original)?;
+        Some(format!("{}{inner}{}", &text[..start], &text[end..]))
+    }
+
+    /// **R483-2** — the same composition, with the inner node's ORIGINAL SOURCE spelling
+    /// as a fallback.
+    ///
+    /// The outer plan's text is rendered from the original source; the inner node prints
+    /// through `pprust` AFTER other families have rewritten it. When another family
+    /// rewrites the inner subject, the current spelling is no longer what the outer
+    /// carries and the search fails — and a failure here degrades the WHOLE program
+    /// (`nested-composition:inner-text-not-found`). heman's `heman_color_from_cpcf` is
+    /// that case: the Option family's `texture` rewrite lands inside the slice local's
+    /// outer product.
+    ///
+    /// The current text is tried FIRST, so nothing that composes today moves; the
+    /// original is consulted only where the composition would otherwise be refused.
+    fn compose_over_inner_with_original(
+        text: &str,
+        current: &str,
+        original: Option<&str>,
+        inner: &str,
+    ) -> Option<String> {
+        if let Some(composed) = Self::compose_over_inner(text, current, inner) {
+            return Some(composed);
+        }
+        let original = original?;
+        // An empty or whitespace-only original would match anywhere; `find_ignoring_
+        // whitespace` already refuses an empty needle, and this keeps the intent local.
+        if original.trim().is_empty() || original == current {
+            return None;
+        }
+        Self::compose_over_inner(text, original, inner)
+    }
+
+    /// **R491-3 — compose over the PRODUCT the outer already produced.** An
+    /// outer `Decision::Cursor` edit embeds the call it renders, with THIS
+    /// family's argument adapters already applied
+    /// (`heman_image_texel(texture.as_mut().unwrap(), ..)` where the node still
+    /// reads `heman_image_texel(texture, ..)`), so the verbatim search above
+    /// cannot find the original text. `NativeResultExpressionPlan::render`
+    /// wants exactly that adapted call — "the input is the call after its own
+    /// argument adapters" — so the call is located in the outer replacement by
+    /// its callee head and the parenthesis that balances it, and the view is
+    /// rendered over that product. A head that is absent, or parentheses that do
+    /// not balance, returns `None` and the caller holds the class (wave-6l's
+    /// floor) exactly as before; nothing here can abort a program.
+    fn compose_over_adapted_call(
+        text: &str,
+        original: &str,
+        view: &super::decision::native_result_expression::NativeResultExpressionPlan,
+    ) -> Option<String> {
+        let (start, end) = adapted_call_span(text, original, original)?;
+        Some(format!(
+            "{}{}{}",
+            &text[..start],
+            view.render(&text[start..end]),
+            &text[end..]
+        ))
+    }
+
+    #[cfg(test)]
+    /// Close the walk, deriving `unmatched` from what was never reached.
+    pub(crate) fn finish(mut self) -> UseGraftStats {
+        self.stats.unmatched = self
+            .uses
+            .keys()
+            .filter(|k| !self.consumed.contains(k))
+            .count();
+        self.stats
+    }
+
+    /// Close the walk keeping the composed keys. A composition this pass could
+    /// not locate is no longer carried out of here as a failure: it is held at
+    /// the site, receipted in `graft-held.tsv` and reverted with its class.
+    fn finish_composed(mut self) -> (UseGraftStats, FxHashSet<(u32, u32)>) {
+        self.stats.unmatched = self
+            .uses
+            .keys()
+            .filter(|k| !self.consumed.contains(k))
+            .count();
+        let composed = std::mem::take(&mut self.composed);
+        (self.stats, composed)
+    }
+}
+
+/// `needle`'s occurrence in `hay` ignoring whitespace on both sides, as a
+/// byte range of `hay`. Used by the nested-edit composition to find a node's
+/// source text inside a use text rendered from the same source.
+/// Every position in `hay` at which `head` occurs, whitespace-insensitively.
+fn head_occurrences(hay: &str, head: &str) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    let mut base = 0usize;
+    while let Some((lo, hi)) = find_ignoring_whitespace(&hay[base..], head) {
+        found.push((base + lo, base + hi));
+        base += hi;
+    }
+    found
+}
+
+/// **R491-3 / R494-1(a)** — the call as the OUTER replacement spells it, matched
+/// by OCCURRENCE INDEX.
+///
+/// The replacement is the outer node's original text with argument adapters
+/// applied in place, so occurrences of a callee head keep their number and their
+/// order: the view's call is the k-th head in the original and therefore the
+/// k-th head in the replacement. Balancing parentheses from there gives the
+/// adapted call, which is what `NativeResultExpressionPlan::render` documents as
+/// its input ("the input is the call after its own argument adapters").
+///
+/// **Refuse only when the counts differ.** An adapter that added or removed a
+/// head is the one case where the index is not evidence; then the caller holds
+/// the class (wave-6l's floor). An earlier form refused ANY second occurrence
+/// (`42e63e2e1`) — right for one view, fatal for its class: heman's class 729
+/// carries all five views, and one refusal took the admission's whole +96
+/// (R494-1(a)).
+fn adapted_call_span(text: &str, origin: &str, call: &str) -> Option<(usize, usize)> {
+    let head = call.find('(').map(|open| &call[..=open])?;
+    let in_origin = head_occurrences(origin, head);
+    let in_text = head_occurrences(text, head);
+    if in_origin.is_empty() || in_origin.len() != in_text.len() {
+        return None;
+    }
+    // Which occurrence is the view's call: the head at which `call` begins
+    // inside the outer node's original text.
+    let call_start = find_ignoring_whitespace(origin, call).map_or(0, |(lo, _)| lo);
+    let k = in_origin
+        .iter()
+        .position(|(lo, _)| *lo >= call_start)
+        .unwrap_or(0);
+    let (start, after_head) = *in_text.get(k)?;
+    let mut depth = 1usize;
+    for (offset, character) in text[after_head..].char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((start, after_head + offset + character.len_utf8()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+pub(crate) fn find_ignoring_whitespace(hay: &str, needle: &str) -> Option<(usize, usize)> {
+    let needle: Vec<char> = needle.chars().filter(|c| !c.is_whitespace()).collect();
+    if needle.is_empty() {
+        return None;
+    }
+    let hay_chars: Vec<(usize, char)> = hay
+        .char_indices()
+        .filter(|(_, c)| !c.is_whitespace())
+        .collect();
+    for start in 0..hay_chars.len() {
+        if hay_chars.len() - start < needle.len() {
+            break;
+        }
+        if (0..needle.len()).all(|i| hay_chars[start + i].1 == needle[i]) {
+            let (lo, _) = hay_chars[start];
+            let (last, c) = hay_chars[start + needle.len() - 1];
+            return Some((lo, last + c.len_utf8()));
+        }
+    }
+    None
+}
+
+/// **wave-6l (R615-7): a slice construction WRAPPED around its initializer.**
+///
+/// A local callee's raw result is typed by a sealed constructor. As a use
+/// graft its text would REPLACE the initializer before the seam pass and the
+/// raw-view / C-9 / receiver passes run, and a replaced subtree keeps none of
+/// the spans they are keyed on. This visitor runs after all of them,
+/// post-order, and wraps the already-rewritten node in the
+/// constructor's prefix and suffix, the node itself moved inside them. The
+/// node and its descendants keep their spans, so nothing keyed on them is
+/// disturbed. A key it never
+/// meets leaves the raw value under the slice declaration, which the verify
+/// loop reports as a type error for that class alone.
+struct ConstructionBracketVisitor<'a> {
+    brackets: &'a FxHashMap<(u32, u32), (String, String)>,
+    applied: FxHashSet<(u32, u32)>,
+    /// Relay 066 (R666-2, STOP 2): the next FRESH `NodeId` for an outer
+    /// wrapper, above every id already assigned in the crate.
+    next_id: u32,
+}
+
+/// The first fresh `NodeId` for the bracket's wrappers.
+/// Above every id still referenced: the tree's, those the guard holds claims
+/// on, and the capture maps' (relay 066 review, A4: a use graft replaces
+/// `e.kind`, and the dropped children's ids stay in both).
+fn first_fresh_node_id(
+    tree_max: u32,
+    guard: &Composition,
+    others: impl Iterator<Item = NodeId>,
+) -> u32 {
+    guard
+        .claimed
+        .keys()
+        .copied()
+        .chain(others)
+        .filter(|id| *id != rustc_ast::DUMMY_NODE_ID)
+        .map(|id| id.as_u32())
+        .fold(tree_max, u32::max)
+        + 1
+}
+
+/// The largest assigned `NodeId` in a crate (`DUMMY_NODE_ID` aside).
+struct MaxNodeId(u32);
+
+impl MutVisitor for MaxNodeId {
+    fn visit_id(&mut self, id: &mut NodeId) {
+        if *id != rustc_ast::DUMMY_NODE_ID {
+            self.0 = self.0.max(id.as_u32());
+        }
+    }
+}
+
+impl MutVisitor for ConstructionBracketVisitor<'_> {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        rustc_ast::mut_visit::walk_expr(self, e);
+        if e.span.is_dummy() {
+            return;
+        }
+        let key = (e.span.lo().0, e.span.hi().0);
+        let Some((open, close)) = self.brackets.get(&key) else {
+            return;
+        };
+        if self.applied.contains(&key) {
+            return;
+        }
+        // The constructor is parsed around a HOLE and the node itself is moved
+        // into it: every descendant keeps its span, so the passes keyed on
+        // them that run after this one (`wave5r_helper_path::qualify`'s callee
+        // spans) still find them. Codex review (wave-6l 055): a re-parse of
+        // the node's text left an imported helper call unqualified (E0425).
+        let Ok(mut wrapper) = graft_expr(&format!("{open}{BRACKET_HOLE}{close}")) else {
+            return;
+        };
+        let mut filler = BracketHoleFiller {
+            node: Some(e.clone()),
+        };
+        filler.visit_expr(&mut wrapper);
+        if filler.node.is_none() {
+            e.kind = wrapper.kind;
+            // The moved node keeps its id; the wrapper, which keeps the span,
+            // takes a fresh one, so no id-keyed pass sees one node twice.
+            e.id = NodeId::from_u32(self.next_id);
+            self.next_id += 1;
+            self.applied.insert(key);
+        }
+    }
+}
+
+/// The placeholder the bracket's constructor text is parsed around.
+const BRACKET_HOLE: &str = "__crat_construction_bracket_hole";
+
+/// Replaces the single `BRACKET_HOLE` path in a parsed constructor with the
+/// wrapped node; `node` is `None` afterwards exactly when the hole was found.
+struct BracketHoleFiller {
+    node: Option<rustc_ast::Expr>,
+}
+
+impl MutVisitor for BracketHoleFiller {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        if let rustc_ast::ExprKind::Path(None, path) = &e.kind
+            && let [segment] = path.segments.as_slice()
+            && segment.ident.name.as_str() == BRACKET_HOLE
+            && let Some(node) = self.node.take()
+        {
+            *e = node;
+            return;
+        }
+        rustc_ast::mut_visit::walk_expr(self, e);
+    }
+}
+
+impl MutVisitor for UseGraftVisitor<'_> {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        let key = (e.span.lo().0, e.span.hi().0);
+        // A normalized (grafted) node can never be a target: `DUMMY_SP` is not
+        // a position in this crate, and skipping it explicitly means the
+        // erasure cannot manufacture a match of its own.
+        if e.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, e);
+            return;
+        }
+        // **The BRACKET form** (relay wave-6a/020 (ii)): a producer that must
+        // not CLAIM a node's text — because another class edits inside it —
+        // names the node by two zero-width keys at its boundaries instead of
+        // one key over the whole span. The children are walked FIRST, so every
+        // inner edit is applied, and the node's own re-rendered text is then
+        // wrapped. This is the same composition the outer-over-inner arm makes
+        // for a replacement, expressed so that the outer claims no interval.
+        let bracket = (
+            self.uses.get(&(key.0, key.0)),
+            self.uses.get(&(key.1, key.1)),
+        );
+        if let (Some(open), Some(close)) = bracket
+            && key.0 != key.1
+        {
+            let (open, close) = (open.clone(), close.clone());
+            self.consumed.insert((key.0, key.0));
+            self.consumed.insert((key.1, key.1));
+            if !self.guard.claim(e.id, e.span, "use") {
+                self.stats.refused += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, e);
+            // **wave-6a 160 (wave-5d 150o §2).** The wrapper is parsed around a HOLE
+            // and the walked node itself is moved into it, as the construction
+            // bracket does (`ConstructionBracketVisitor`): every descendant keeps its
+            // span, so the passes after this one still find their targets inside —
+            // the seam pass's `&mut *m` at the allocator call's manager argument
+            // (brotli's `BrotliAllocate(m, ..)`, E0308 at 58 when the node's text was
+            // re-parsed). The wrapper carries the parser's erased span and id, so no
+            // span- or id-keyed pass meets the node twice. A hole the parse does not
+            // yield falls back to the text re-parse.
+            if let Ok(mut wrapper) = graft_expr(&format!("{open}{BRACKET_HOLE}{close}")) {
+                let mut filler = BracketHoleFiller {
+                    node: Some(e.clone()),
+                };
+                filler.visit_expr(&mut wrapper);
+                if filler.node.is_none() {
+                    *e = wrapper;
+                    self.stats.grafted += 1;
+                    self.stats
+                        .rendered
+                        .push((key.0, rustc_ast_pretty::pprust::expr_to_string(e)));
+                    return;
+                }
+            }
+            let inner = rustc_ast_pretty::pprust::expr_to_string(e);
+            match graft_expr(&format!("{open}{inner}{close}")) {
+                Ok(parsed) => {
+                    e.kind = parsed.kind;
+                    self.stats.grafted += 1;
+                    self.stats
+                        .rendered
+                        .push((key.0, rustc_ast_pretty::pprust::expr_to_string(e)));
+                }
+                Err(offending) => {
+                    self.stats.parse_failed += 1;
+                    if self.stats.parse_failures.len() < 10 {
+                        self.stats.parse_failures.push(offending);
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(text) = self.uses.get(&key) {
+            // `insert` returns false when the key was already reached — a
+            // SECOND AST node carrying the same span. Counted here because
+            // neither the guard (which keys on `NodeId`) nor `unmatched`
+            // (a set membership) can observe it.
+            if !self.consumed.insert(key) {
+                self.stats.multi_matched += 1;
+            }
+            if !self.guard.claim(e.id, e.span, "use") {
+                self.stats.refused += 1;
+                return;
+            }
+            let composed;
+            let text = if let Some(view) = self.inner_views.get(&key) {
+                let original = rustc_ast_pretty::pprust::expr_to_string(e);
+                let inner = view.render(&original);
+                match Self::compose_over_inner_with_original(
+                    text,
+                    &original,
+                    self.originals.get(&key).map(String::as_str),
+                    &inner,
+                )
+                .or_else(|| Self::compose_over_adapted_call(text, &original, view))
+                {
+                    Some(composed_text) => {
+                        composed = composed_text;
+                        self.composed.insert(key);
+                        self.stats.composed_over_inner += 1;
+                        composed.as_str()
+                    }
+                    None => {
+                        // **THE FLOOR'S FIFTH ARM (W6L-FLOOR, R515-1 ruling 3).**
+                        // The outer edit's text does not contain this node's
+                        // printed form -- the outer renderer embedded it with
+                        // its arguments already adapted -- so there is nothing
+                        // to splice the view into. This pushed a failure that
+                        // `transform_with` turned into `Err` and `mod.rs` into
+                        // `round-0 emit failed`: wave-5d 055 lost heman's whole
+                        // emission to five views switching on at once. It is
+                        // ONE class's problem, exactly as a refused `claim` is.
+                        //
+                        // The node keeps its input text, the hold is receipted
+                        // with its span pair, and the view's owner class is
+                        // reverted WHOLE on the next round -- the same second
+                        // half the four arms have, and it is load-bearing here
+                        // too: this class's other edits would otherwise ship
+                        // around a node that never received its own.
+                        record_graft_held(
+                            GraftHeldReceipt {
+                                visitor: GraftVisitor::Composition,
+                                caller: view.caller.local_def_index.as_u32(),
+                                class: view.owner_class().order_key(),
+                                reason: "inner-text-not-found",
+                                lo: key.0,
+                                hi: key.1,
+                            },
+                            view.owner_class(),
+                        );
+                        return;
+                    }
+                }
+            } else {
+                text.as_str()
+            };
+            match graft_expr(text) {
+                Ok(parsed) => {
+                    // **Only `kind` is replaced.** The node keeps its own id and
+                    // its own span, so the differential joins on the offset the
+                    // decision layer named and the synthetic-span invariant
+                    // holds: no consumer keys on a grafted subtree's spans,
+                    // which come from the fragment's own `SourceMap`.
+                    e.kind = parsed.kind;
+                    self.stats.grafted += 1;
+                    self.stats
+                        .rendered
+                        .push((key.0, rustc_ast_pretty::pprust::expr_to_string(e)));
+                    // NOT walked: the children are the fragment's now. An edit
+                    // that was nested under this one therefore never gets
+                    // consumed and surfaces in `unmatched` — which is the
+                    // reporting the decision layer's own nesting gate assumes.
+                    return;
+                }
+                Err(offending) => {
+                    self.stats.parse_failed += 1;
+                    if self.stats.parse_failures.len() < 10 {
+                        self.stats.parse_failures.push(offending);
+                    }
+                    // The node is LEFT INTACT and the walk continues into it.
+                }
+            }
+        }
+        rustc_ast::mut_visit::walk_expr(self, e);
+    }
+}
+
+#[derive(Default)]
+struct StatementDeleteStats {
+    deleted: usize,
+    unmatched: usize,
+    refused: usize,
+}
+
+struct StatementDeleteVisitor<'a> {
+    targets: &'a FxHashSet<(u32, u32)>,
+    consumed: FxHashSet<(u32, u32)>,
+    guard: &'a mut Composition,
+    stats: StatementDeleteStats,
+}
+
+impl<'a> StatementDeleteVisitor<'a> {
+    fn new(targets: &'a FxHashSet<(u32, u32)>, guard: &'a mut Composition) -> Self {
+        Self {
+            targets,
+            consumed: FxHashSet::default(),
+            guard,
+            stats: StatementDeleteStats::default(),
+        }
+    }
+
+    fn finish(mut self) -> StatementDeleteStats {
+        self.stats.unmatched = self
+            .targets
+            .iter()
+            .filter(|target| !self.consumed.contains(target))
+            .count();
+        self.stats
+    }
+}
+
+impl MutVisitor for StatementDeleteVisitor<'_> {
+    fn flat_map_stmt(
+        &mut self,
+        statement: rustc_ast::Stmt,
+    ) -> smallvec::SmallVec<[rustc_ast::Stmt; 1]> {
+        let key = (statement.span.lo().0, statement.span.hi().0);
+        if self.targets.contains(&key) {
+            self.consumed.insert(key);
+            if self
+                .guard
+                .claim(statement.id, statement.span, "box-statement-delete")
+            {
+                self.stats.deleted += 1;
+                return smallvec::SmallVec::new();
+            }
+            self.stats.refused += 1;
+        }
+        rustc_ast::mut_visit::walk_flat_map_stmt(self, statement)
+    }
+}
+
+/// What the seam pass placed, declined, and rendered.
+///
+/// Every decline is a **typed counter** rather than a skip, on the same rule
+/// arm 2 landed under: an adapter that evaporates leaves the callee converted
+/// and the call site raw, which is precisely the `E0308` the whole slice exists
+/// to remove.
+#[derive(Default)]
+pub(crate) struct SeamGraftStats {
+    pub grafted: usize,
+    pub safe: usize,
+    pub reborrow: usize,
+    /// Slice seams whose `{len}` was parsed and grafted. **The one genuinely
+    /// new expression in arm 3** — it has no subtree behind it, which is why
+    /// the split rule sends it through [`graft_expr`] rather than a builder.
+    pub len_grafted: usize,
+    /// **Fabricated lengths actually PLACED** — not built (repaired 2026-08-15,
+    /// adversarial finding ADV-FAB-04).
+    ///
+    /// It was incremented in `build`, beside `len_grafted`, where a node can
+    /// still be refused by the claim guard afterwards. That over-count was
+    /// benign while it was telemetry; it stopped being benign when it became the
+    /// condition for emitting a **crate-level item**, because a built-then-
+    /// refused fabricated seam would have produced a const with no reference —
+    /// the dead item the whole derivation exists to prevent. `arm3_refused` is
+    /// deliberately NOT zero-gated (its zero is a corpus fact, not a structure),
+    /// so this could not rest on it.
+    ///
+    /// A subset, not a sibling: the exhaustive
+    /// `len_grafted + len_parse_failed + len_absent == len_shapes` identity is
+    /// deliberately untouched, so this counter cannot drift the ledger. It
+    /// exists because "how many of the placed lengths were invented" must be
+    /// answerable from **this** layer's own stats and not only from the seam
+    /// census — the ruling's separate-count requirement, applied where the
+    /// expression is actually built.
+    pub len_fabricated: usize,
+    /// `{len}` texts [`graft_expr`] refused. A checked corpus expectation of
+    /// zero, per R7.4 — never an abort, never a silent skip.
+    pub len_parse_failed: usize,
+    pub len_parse_failures: Vec<String>,
+    /// A `FromRawParts` spec that reached the builder with no length at all.
+    /// Unreachable through `glue`, which returns `SeamBlock::LengthUnknown`
+    /// first — counted because **no layer below the gate may invent a length**,
+    /// and a builder that silently dropped the shape would be doing exactly
+    /// that in the other direction.
+    pub len_absent: usize,
+    /// Length-bearing SHAPES that reached the length step — the denominator
+    /// [`Self::len_grafted`] did not have.
+    ///
+    /// Exactly one of `len_grafted` / `len_parse_failed` / `len_absent` follows
+    /// each one, so this closes an exhaustive identity the corpus gate reads.
+    /// Without it `len_grafted` was telemetry: it could drop to zero, or drift
+    /// from the `from_raw_parts` placements it tracks, with every gated counter
+    /// still clean — this track's own founding failure class, raised against
+    /// this change by the past-learnings pass.
+    pub len_shapes: usize,
+    /// Seam edits whose span matched no AST expression.
+    pub unmatched: usize,
+    /// wave-6l: outer seams built over an already-grafted contained seam (an
+    /// L07 containment): the adapter's text carries the inner's.
+    pub composed_over_inner: usize,
+    pub refused: usize,
+    /// One seam key matched by MORE THAN ONE AST node — invisible to both the
+    /// guard (which keys on `NodeId`) and to `unmatched` (a set membership),
+    /// exactly as at the use pass.
+    pub multi_matched: usize,
+    /// Two seam edits carrying the SAME span, one overwriting the other in the
+    /// lookup map. The join in this file that would otherwise have no collision
+    /// counter — arm 2's finding 7, applied before it can bite.
+    pub key_collisions: usize,
+    /// A spec the builder deliberately does not build.
+    ///
+    /// Wave 3 builds the ruled required-unwrap family. The remaining deliberate
+    /// case is `Bare` with neither an unwrap nor a wrapper: it renders the
+    /// argument unchanged, `glue` cannot produce it, and building it would be a
+    /// no-op indistinguishable from success.
+    pub unsupported: usize,
+    /// `arg_span` named a subtree the matched node does not contain.
+    pub arg_not_found: usize,
+    /// Seams whose surviving subtree is NESTED inside the replaced node — the
+    /// two cast shapes. **Measured, not gated**: whether the frozen corpus
+    /// places a seam on a cast is a fact about the corpus.
+    pub arg_peeled: usize,
+    /// `(offset, rendered text)` per placement, keyed exactly as arms 1 and 2's
+    /// renders are.
+    pub rendered: Vec<(u32, String)>,
+}
+
+/// The first node at or under `e` whose span is exactly `want`.
+///
+/// Used only on the cast shapes, where the decision layer built its replacement
+/// from the cast's OPERAND while the replaced range is the whole argument. A
+/// pattern match on `ExprKind::Cast` would look equivalent and is not: a
+/// `Paren` between the cast and its operand shifts the node without shifting
+/// the span, so the search is by the coordinate the decision layer actually
+/// recorded.
+pub(super) fn find_by_span(
+    e: &rustc_ast::Expr,
+    want: rustc_span::Span,
+) -> Option<&rustc_ast::Expr> {
+    struct Find<'a> {
+        want: rustc_span::Span,
+        hit: Option<&'a rustc_ast::Expr>,
+    }
+    impl<'a> rustc_ast::visit::Visitor<'a> for Find<'a> {
+        fn visit_expr(&mut self, e: &'a rustc_ast::Expr) {
+            if self.hit.is_some() {
+                return;
+            }
+            if e.span == self.want {
+                self.hit = Some(e);
+                return;
+            }
+            rustc_ast::visit::walk_expr(self, e);
+        }
+    }
+    let mut f = Find { want, hit: None };
+    rustc_ast::visit::Visitor::visit_expr(&mut f, e);
+    f.hit
+}
+
+/// Build the §29 checked optional wrapper while retaining the original
+/// argument and the already-built payload as AST subtrees. Only the fixed
+/// wrapper syntax is parsed; the two placeholders are each replaced exactly
+/// once, so a template typo is a typed build refusal rather than a textual
+/// rewrite of the argument.
+fn checked_optional(
+    argument: rustc_ast::Expr,
+    payload: rustc_ast::Expr,
+    binding_type: &str,
+) -> Option<rustc_ast::ExprKind> {
+    const ARG: &str = "__CRAT_E_ADAPT_ARG";
+    const PAYLOAD: &str = "__CRAT_E_ADAPT_PAYLOAD";
+    let text = format!(
+        "{{ let __crat_call_adapter_ptr: {binding_type} = {ARG}; \
+         if __crat_call_adapter_ptr.is_null() {{ None }} \
+         else {{ Some({PAYLOAD}) }} }}"
+    );
+    let mut parsed = graft_expr(&text).ok()?;
+
+    struct Replace {
+        argument: rustc_ast::Expr,
+        payload: rustc_ast::Expr,
+        arg_hits: usize,
+        payload_hits: usize,
+    }
+    impl Replace {
+        fn is_path(expr: &rustc_ast::Expr, name: &str) -> bool {
+            matches!(
+                &expr.kind,
+                rustc_ast::ExprKind::Path(None, path)
+                    if path.segments.len() == 1
+                        && path.segments[0].ident.name == Symbol::intern(name)
+            )
+        }
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if Self::is_path(expr, ARG) {
+                *expr = self.argument.clone();
+                self.arg_hits += 1;
+                return;
+            }
+            if Self::is_path(expr, PAYLOAD) {
+                *expr = self.payload.clone();
+                self.payload_hits += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut replace = Replace {
+        argument,
+        payload,
+        arg_hits: 0,
+        payload_hits: 0,
+    };
+    replace.visit_expr(&mut parsed);
+    (replace.arg_hits == 1 && replace.payload_hits == 1).then_some(parsed.kind)
+}
+
+/// **wave-6l R825-4a.** `match (ARGUMENT, LENGTH) { (__crat_field_base,
+/// __crat_field_len) => if __crat_field_base.is_null() { &[] } else { PAYLOAD }
+/// }`: both nodes move in once and are evaluated, in their order, before
+/// anything is bound; a null base is the empty slice.
+fn field_base_guarded(
+    argument: rustc_ast::Expr,
+    length: rustc_ast::Expr,
+    payload: rustc_ast::Expr,
+    mutable: bool,
+) -> Option<rustc_ast::ExprKind> {
+    const ARG: &str = "__CRAT_FIELD_BASE_ARG";
+    const LEN: &str = "__CRAT_FIELD_BASE_LEN";
+    const PAYLOAD: &str = "__CRAT_FIELD_BASE_PAYLOAD";
+    let text = format!(
+        "match ({ARG}, {LEN}) {{ ({base}, {len}) => if {base}.is_null() {{ {empty} }} else {{ {PAYLOAD} }}, }}",
+        base = crate::bo_rewriter::decision::seam::FIELD_BASE,
+        len = crate::bo_rewriter::decision::seam::FIELD_LEN,
+        empty = if mutable { "&mut []" } else { "&[]" },
+    );
+    let mut parsed = graft_expr(&text).ok()?;
+    struct Replace {
+        argument: rustc_ast::Expr,
+        length: rustc_ast::Expr,
+        payload: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if let rustc_ast::ExprKind::Path(None, path) = &expr.kind
+                && path.segments.len() == 1
+            {
+                let name = path.segments[0].ident.name;
+                if name == Symbol::intern(ARG) {
+                    *expr = self.argument.clone();
+                    self.hits += 1;
+                    return;
+                }
+                if name == Symbol::intern(LEN) {
+                    *expr = self.length.clone();
+                    self.hits += 1;
+                    return;
+                }
+                if name == Symbol::intern(PAYLOAD) {
+                    *expr = self.payload.clone();
+                    self.hits += 1;
+                    return;
+                }
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+    let mut replace = Replace {
+        argument,
+        length,
+        payload,
+        hits: 0,
+    };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 3).then_some(parsed.kind)
+}
+
+/// **wave-6l relay 077.** `{ let __crat_nul_walk_base = ARGUMENT; PAYLOAD }`:
+/// the argument node moves in once, and the payload's `strlen + 1` reads the
+/// binding.
+fn nul_walk_bound(
+    argument: rustc_ast::Expr,
+    payload: rustc_ast::Expr,
+) -> Option<rustc_ast::ExprKind> {
+    const ARG: &str = "__CRAT_NUL_WALK_ARG";
+    const PAYLOAD: &str = "__CRAT_NUL_WALK_PAYLOAD";
+    let text = format!(
+        "{{ let {base} = {ARG}; {PAYLOAD} }}",
+        base = crate::bo_rewriter::decision::seam::NUL_WALK_BASE
+    );
+    let mut parsed = graft_expr(&text).ok()?;
+    struct Replace {
+        argument: rustc_ast::Expr,
+        payload: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if let rustc_ast::ExprKind::Path(None, path) = &expr.kind
+                && path.segments.len() == 1
+            {
+                let name = path.segments[0].ident.name;
+                if name == Symbol::intern(ARG) {
+                    *expr = self.argument.clone();
+                    self.hits += 1;
+                    return;
+                }
+                if name == Symbol::intern(PAYLOAD) {
+                    *expr = self.payload.clone();
+                    self.hits += 1;
+                    return;
+                }
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+    let mut replace = Replace {
+        argument,
+        payload,
+        hits: 0,
+    };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 2).then_some(parsed.kind)
+}
+
+/// Wrap one already-built inbound bridge payload in an explicit `unsafe`
+/// block while retaining that payload as an AST subtree. Only the fixed block
+/// syntax is parsed; the operand is neither printed nor reparsed.
+fn unsafe_payload(payload: rustc_ast::Expr, enclosing_unsafe_fn: bool) -> Option<rustc_ast::Expr> {
+    if enclosing_unsafe_fn {
+        return Some(payload);
+    }
+    const PAYLOAD: &str = "__CRAT_UNSAFE_BRIDGE_PAYLOAD";
+    let mut parsed = graft_expr(&format!("unsafe {{ {PAYLOAD} }}")).ok()?;
+
+    struct Replace {
+        payload: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if matches!(
+                &expr.kind,
+                rustc_ast::ExprKind::Path(None, path)
+                    if path.segments.len() == 1
+                        && path.segments[0].ident.name == Symbol::intern(PAYLOAD)
+            ) {
+                *expr = self.payload.clone();
+                self.hits += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut replace = Replace { payload, hits: 0 };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 1).then_some(parsed)
+}
+
+fn raw_option_expr(
+    argument: rustc_ast::Expr,
+    mutable: bool,
+    enclosing_unsafe_fn: bool,
+) -> Option<rustc_ast::ExprKind> {
+    const ARG: &str = "__CRAT_RAW_OPTION_ARG";
+    let method = if mutable { "as_mut" } else { "as_ref" };
+    let rendered = format!("{ARG}.{method}()");
+    let mut parsed = if enclosing_unsafe_fn {
+        graft_expr(&rendered).ok()?
+    } else {
+        graft_expr(&format!("unsafe {{ {rendered} }}")).ok()?
+    };
+
+    struct Replace {
+        argument: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if matches!(
+                &expr.kind,
+                rustc_ast::ExprKind::Path(None, path)
+                    if path.segments.len() == 1
+                        && path.segments[0].ident.name == Symbol::intern(ARG)
+            ) {
+                *expr = self.argument.clone();
+                self.hits += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut replace = Replace { argument, hits: 0 };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 1).then_some(parsed.kind)
+}
+
+pub(super) fn method_chain_expr(
+    argument: rustc_ast::Expr,
+    suffix: &str,
+) -> Option<rustc_ast::Expr> {
+    const ARG: &str = "__CRAT_METHOD_CHAIN_ARG";
+    let mut parsed = graft_expr(&format!("{ARG}{suffix}")).ok()?;
+
+    struct Replace {
+        argument: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if matches!(
+                &expr.kind,
+                rustc_ast::ExprKind::Path(None, path)
+                    if path.segments.len() == 1
+                        && path.segments[0].ident.name == Symbol::intern(ARG)
+            ) {
+                *expr = self.argument.clone();
+                self.hits += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+
+    let mut replace = Replace { argument, hits: 0 };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 1).then_some(parsed)
+}
+
+fn raw_boundary_expr(
+    argument: rustc_ast::Expr,
+    raw: &super::decision::seam::RawBoundaryGlue,
+) -> Option<rustc_ast::ExprKind> {
+    const ARG: &str = "__CRAT_RAW_BOUNDARY_ARG";
+    let argument = super::wave6r_shared_root::graft_argument(argument, raw);
+    let rendered = if raw.force_explicit {
+        raw.template.render_explicit(
+            ARG,
+            raw.target_mutability,
+            raw.box_slice,
+            raw.cast_pointee.as_deref(),
+        )
+    } else {
+        raw.template.render(
+            ARG,
+            raw.target_mutability,
+            raw.box_slice,
+            raw.cast_pointee.as_deref(),
+        )
+    };
+    let rendered = match rendered.ok()? {
+        super::decision::raw_boundary::BridgeRender::Edit(rendered) => rendered,
+        super::decision::raw_boundary::BridgeRender::ZeroSyntax
+        | super::decision::raw_boundary::BridgeRender::Lifecycle => return None,
+    };
+    let mut parsed = graft_expr(&rendered).ok()?;
+    struct Replace {
+        argument: rustc_ast::Expr,
+        hits: usize,
+    }
+    impl MutVisitor for Replace {
+        fn visit_expr(&mut self, expr: &mut rustc_ast::Expr) {
+            if matches!(
+                &expr.kind,
+                rustc_ast::ExprKind::Path(None, path)
+                    if path.segments.len() == 1
+                        && path.segments[0].ident.name == Symbol::intern(ARG)
+            ) {
+                *expr = self.argument.clone();
+                self.hits += 1;
+                return;
+            }
+            rustc_ast::mut_visit::walk_expr(self, expr);
+        }
+    }
+    let mut replace = Replace { argument, hits: 0 };
+    replace.visit_expr(&mut parsed);
+    (replace.hits == 1).then_some(parsed.kind)
+}
+
+/// **ARM 3 — the seam pass.** The THIRD span-keyed walk over one crate, and the
+/// first whose targets share a syntactic category with another pass's.
+///
+/// # The split rule, in code
+///
+/// *Structural where a subtree already exists; parse-and-graft where the text is
+/// genuinely new.* The wrapper is built by [`glue_expr`] around the argument's
+/// own node — arm 1's §3c precedent, which declined a text round-trip for the
+/// pointee — and only the `{len}` expression, which has no subtree behind it,
+/// goes through [`graft_expr`].
+///
+/// # Why this runs LAST
+///
+/// A seam's argument may contain a use rewrite, so the use pass must have
+/// finished grafting before the seam pass moves the subtree. Task 0 measured
+/// `use_contains_seam = 0` over 181,844 pairs, so no seam is currently hidden
+/// under a grafted node — but the ordering is what makes that a corpus fact
+/// rather than a dependency.
+pub(crate) struct SeamGraftVisitor<'a> {
+    seams: &'a FxHashMap<(u32, u32), SeamTarget>,
+    guard: &'a mut Composition,
+    global_map: Option<&'a rustc_ast::node_id::NodeMap<LocalDefId>>,
+    current_fn: Option<LocalDefId>,
+    current_unsafe_fn: bool,
+    stats: SeamGraftStats,
+    consumed: FxHashSet<(u32, u32)>,
+}
+
+/// What the AST layer needs from one [`SeamEdit`] — the spec, the argument's
+/// coordinate, and the family. Copied out of the decision layer's edit so the
+/// walk borrows nothing from the table it is keyed by.
+pub(crate) struct SeamTarget {
+    pub spec: super::decision::seam::GlueSpec,
+    pub arg_span: rustc_span::Span,
+    pub reborrow: bool,
+    /// This seam owns the same AST expression as one already-selected use
+    /// graft. The only legal order is use first, then seam around the rewritten
+    /// value; every other same-node collision remains refused.
+    pub exact_use_composition: bool,
+}
+
+impl SeamTarget {
+    /// Project one [`SeamEdit`] onto what the walk needs.
+    ///
+    /// A named function rather than three lines inside the map-building loop,
+    /// for the reason `text_span_of` is one: that loop needs a `TyCtxt` and a
+    /// decision table to run, so the projection could only be exercised by a
+    /// corpus sweep — and mutation M40 (making `reborrow` uniformly `false`)
+    /// left the whole suite green while the sweep's 107/314 split would have
+    /// collapsed to 421/0. **A mapping only a corpus sweep can exercise is a
+    /// mapping with no witness**, which this boundary has now learned twice.
+    ///
+    /// The family match is EXHAUSTIVE, not `matches!`: a third family would
+    /// silently become `safe`, and `safe` is the column meaning
+    /// "compiler-checked end to end" — so the default a `matches!` picks is the
+    /// flattering one.
+    fn of(edit: &super::decision::seam::SeamEdit, exact_use_composition: bool) -> Self {
+        use super::decision::seam::SeamFamily;
+        Self {
+            spec: edit.spec.clone(),
+            arg_span: edit.arg_span,
+            reborrow: match edit.family {
+                SeamFamily::Reborrow => true,
+                SeamFamily::Safe => false,
+            },
+            exact_use_composition,
+        }
+    }
+
+    fn of_input(
+        input: &super::decision::seam::SeamInputRendering,
+        arg_span: rustc_span::Span,
+        exact_use_composition: bool,
+    ) -> Option<Self> {
+        use super::decision::seam::{SeamFamily, SeamInputRendering};
+        let SeamInputRendering::Adapter { spec, family, .. } = input else {
+            return None;
+        };
+        Some(Self {
+            spec: spec.clone(),
+            arg_span,
+            reborrow: match family {
+                SeamFamily::Reborrow => true,
+                SeamFamily::Safe => false,
+            },
+            exact_use_composition,
+        })
+    }
+
+    fn of_body(edit: &super::decision::seam::BodyEdit, exact_use_composition: bool) -> Self {
+        use super::decision::seam::SeamFamily;
+        Self {
+            spec: edit.spec.clone(),
+            arg_span: edit.arg_span,
+            reborrow: match edit.family {
+                SeamFamily::Reborrow => true,
+                SeamFamily::Safe => false,
+            },
+            exact_use_composition,
+        }
+    }
+}
+
+impl<'a> SeamGraftVisitor<'a> {
+    pub(crate) fn new(
+        seams: &'a FxHashMap<(u32, u32), SeamTarget>,
+        guard: &'a mut Composition,
+    ) -> Self {
+        Self {
+            seams,
+            guard,
+            global_map: None,
+            current_fn: None,
+            current_unsafe_fn: false,
+            stats: SeamGraftStats::default(),
+            consumed: FxHashSet::default(),
+        }
+    }
+
+    pub(crate) fn new_with_global_map(
+        seams: &'a FxHashMap<(u32, u32), SeamTarget>,
+        guard: &'a mut Composition,
+        global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+    ) -> Self {
+        Self {
+            global_map: Some(global_map),
+            ..Self::new(seams, guard)
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> SeamGraftStats {
+        self.stats.unmatched = self
+            .seams
+            .keys()
+            .filter(|k| !self.consumed.contains(k))
+            .count();
+        self.stats
+    }
+
+    /// Does another seam target lie strictly inside this one's span?
+    fn contains_seam(&self, outer: (u32, u32)) -> bool {
+        self.seams.keys().any(|inner| {
+            *inner != outer
+                && outer.0 <= inner.0
+                && inner.1 <= outer.1
+                && (outer.0 < inner.0 || inner.1 < outer.1)
+        })
+    }
+
+    /// Build the adapter around `e`'s own subtree, or decline with a typed row.
+    fn build(&mut self, e: &rustc_ast::Expr, target: &SeamTarget) -> Option<rustc_ast::ExprKind> {
+        use super::decision::seam::{GlueCore, NullArm};
+        let spec = &target.spec;
+        if let Some(counted) = spec.counted_byte {
+            return super::decision::counted_void::bridge_ast(spec, counted, e);
+        }
+        if let Some(region) = &spec.void_region {
+            let argument = if target.arg_span == e.span {
+                e.clone()
+            } else {
+                find_by_span(e, target.arg_span)?.clone()
+            };
+            // wave-6b × wave-6s: a width read over a computed suffix view takes
+            // the view's shaped subtree, then the prefix.
+            let argument =
+                super::slice_forms_ast::argument(argument, spec.forward_slice.as_ref(), None)?;
+            return super::decision::void_region::bridge_ast(
+                region,
+                spec.mutable,
+                &argument,
+                self.current_unsafe_fn,
+            );
+        }
+        if let Some(address) = &spec.shared_address {
+            return super::shared_pair_ast::build(e, address);
+        }
+        if let Some(weakening) = &spec.shared_weakening {
+            return super::decision::shared_weakening::build(e, weakening);
+        }
+        // R583-8 wall 1 (wave-6a): an optional owner's own view.
+        if let Some(mutable) = spec.option_view {
+            let argument = if target.arg_span == e.span {
+                e.clone()
+            } else {
+                find_by_span(e, target.arg_span)?.clone()
+            };
+            return Some(rustc_ast::ExprKind::MethodCall(Box::new(
+                rustc_ast::MethodCall {
+                    seg: rustc_ast::PathSegment::from_ident(Ident::from_str(if mutable {
+                        "as_deref_mut"
+                    } else {
+                        "as_deref"
+                    })),
+                    receiver: P(argument),
+                    args: ThinVec::new(),
+                    span: e.span,
+                },
+            )));
+        }
+        if let Some(raw) = spec.raw_boundary.as_ref() {
+            let argument = if target.arg_span == e.span {
+                e.clone()
+            } else {
+                find_by_span(e, target.arg_span)?.clone()
+            };
+            let argument =
+                super::slice_forms_ast::argument(argument, spec.forward_slice.as_ref(), None)?;
+            return raw_boundary_expr(
+                rustc_ast::Expr {
+                    id: DUMMY_NODE_ID,
+                    kind: argument.kind,
+                    span: argument.span,
+                    attrs: Default::default(),
+                    tokens: None,
+                },
+                raw,
+            );
+        }
+        if spec.null_arm == NullArm::LiteralNone {
+            return graft_expr("None").ok().map(|parsed| parsed.kind);
+        }
+        let shape = match spec.core {
+            GlueCore::Bare => None,
+            GlueCore::Reborrow => Some(GlueShape::Reborrow),
+            GlueCore::RawOption => None,
+            GlueCore::First => None,
+            GlueCore::Index0 => Some(GlueShape::Index0),
+            GlueCore::Suffix { offset } => Some(GlueShape::Suffix { offset }),
+            GlueCore::FromRawParts => Some(GlueShape::FromRawParts),
+            GlueCore::FromRefMut => Some(GlueShape::FromRefMut),
+        };
+        // A bare core with no wrapper renders the argument unchanged, so
+        // "building" it would be a no-op that reads as a placement.
+        if shape.is_none()
+            && !spec.optional
+            && spec.forward_slice.is_none()
+            && spec.unwrap.is_none()
+            && !matches!(spec.core, GlueCore::First)
+            && !super::wave5r_cast::is_bare_cast_peel(spec, e, target.arg_span)
+        {
+            self.stats.unsupported += 1;
+            return None;
+        }
+
+        // ---- the argument: a SUBTREE, never re-parsed ----
+        let arg: P<rustc_ast::Expr> = if target.arg_span == e.span {
+            P(rustc_ast::Expr {
+                id: DUMMY_NODE_ID,
+                kind: e.kind.clone(),
+                span: e.span,
+                // **NOT cloned onto both nodes.** `e` keeps its own attributes
+                // and stays the node the walk and the differential know; giving
+                // the wrapped subtree a copy would print the attribute twice.
+                // The outer node is the one that survives with an identity, so
+                // it is the one that keeps them — the same choice arm 2's graft
+                // makes by replacing only `kind`.
+                attrs: Default::default(),
+                tokens: None,
+            })
+        } else {
+            // A cast shape: the replacement's text came from the cast's
+            // operand, so the operand is what must survive inside the adapter.
+            let Some(inner) = find_by_span(e, target.arg_span) else {
+                self.stats.arg_not_found += 1;
+                return None;
+            };
+            // Counted AFTER the lookup succeeds. Incrementing first made a
+            // failed peel land in both counters, so `arg_peeled` meant
+            // "attempted" while its doc said "realized" — and the corpus could
+            // not show the difference, because `arg_not_found` is zero there.
+            self.stats.arg_peeled += 1;
+            P(inner.clone())
+        };
+
+        // R465-5: the unwrap opens the BASE BINDING before the view indexes
+        // it — an `Option` has no index, and the base is the subtree the view
+        // keeps, not the arithmetic around it. The text renderer
+        // (`decision::seam::GlueSpec::render_in_context`) makes the same
+        // choice, and the two must not disagree.
+        let unwrap_consumed = spec.unwrap.is_some() && spec.forward_slice.is_some();
+        let arg = P(super::slice_forms_ast::argument(
+            (*arg).clone(),
+            spec.forward_slice.as_ref(),
+            spec.unwrap.filter(|_| unwrap_consumed),
+        )?);
+
+        // ---- the length: the ONE genuinely new expression ----
+        //
+        // Counted HERE, after the argument resolved and before the outcome is
+        // known, so that exactly one of the three length outcomes follows every
+        // increment and the identity is exhaustive rather than approximate.
+        if matches!(spec.core, GlueCore::FromRawParts) {
+            self.stats.len_shapes += 1;
+        }
+        // **The length expression is finished HERE, not in `glue_expr`**
+        // (2026-08-12). A licensed companion is `(TEXT) as usize` because the C
+        // spelling may be `size_t`/`c_int`/`c_ulong`; a FABRICATED extent is the
+        // named const, already `usize`, and casting it would make a fabricated
+        // site textually indistinguishable from a licensed one whose companion
+        // happened to be a path. Two renderings, so the builder that knows WHICH
+        // is the one that must decide — `glue_expr` receives a finished node.
+        let len = match spec.len.as_ref() {
+            None => None,
+            Some(seam_len) => match graft_expr(seam_len.text()) {
+                Ok(parsed) => {
+                    self.stats.len_grafted += 1;
+                    Some(finish_len(seam_len, parsed))
+                }
+                Err(offending) => {
+                    self.stats.len_parse_failed += 1;
+                    if self.stats.len_parse_failures.len() < 10 {
+                        self.stats.len_parse_failures.push(offending);
+                    }
+                    return None;
+                }
+            },
+        };
+
+        let source_arg = (*arg).clone();
+        if matches!(spec.core, GlueCore::RawOption) {
+            return raw_option_expr(source_arg, spec.mutable, self.current_unsafe_fn);
+        }
+        let arg = match spec.unwrap {
+            Some(found_mutable) if !unwrap_consumed => {
+                let suffix = if found_mutable {
+                    ".as_mut().unwrap()"
+                } else {
+                    ".unwrap()"
+                };
+                P(method_chain_expr((*arg).clone(), suffix)?)
+            }
+            Some(_) | None => arg,
+        };
+        if matches!(spec.core, GlueCore::First) {
+            let suffix = if spec.mutable {
+                ".first_mut().unwrap()"
+            } else {
+                ".first().unwrap()"
+            };
+            return Some(method_chain_expr((*arg).clone(), suffix)?.kind);
+        }
+        let core_arg = if spec.null_arm == NullArm::Checked {
+            P(graft_expr("__crat_call_adapter_ptr").expect("fixed adapter path parses"))
+        } else {
+            arg
+        };
+        // wave-6l relay 077: a NUL-walk length reads the bound base, so the
+        // construction binds it once around the call (the text renderer does
+        // the same).
+        let nul_walk_base = spec
+            .len
+            .as_ref()
+            .is_some_and(|len| {
+                len.text()
+                    .contains(crate::bo_rewriter::decision::seam::NUL_WALK_BASE)
+            })
+            .then(|| core_arg.clone());
+        let core_arg = if nul_walk_base.is_some() {
+            P(
+                graft_expr(crate::bo_rewriter::decision::seam::NUL_WALK_BASE)
+                    .expect("fixed binding path parses"),
+            )
+        } else {
+            core_arg
+        };
+        // wave-6l R825-4a: a field-allocated construction evaluates its base
+        // and its length once, before anything is bound (so the bindings
+        // capture no name either reads), and renders a null base as the empty
+        // slice (the text renderer does the same).
+        let (field_base, len) = match (spec.null_base_empty && nul_walk_base.is_none(), len) {
+            (true, Some(len)) => (
+                Some((core_arg.clone(), len)),
+                Some(P(graft_expr(crate::bo_rewriter::decision::seam::FIELD_LEN)
+                    .expect("fixed binding path parses"))),
+            ),
+            (_, len) => (None, len),
+        };
+        let core_arg = if field_base.is_some() {
+            P(graft_expr(crate::bo_rewriter::decision::seam::FIELD_BASE)
+                .expect("fixed binding path parses"))
+        } else {
+            core_arg
+        };
+        let core = match shape {
+            None => core_arg,
+            Some(shape) => {
+                // R1128-1: the non-null raw-to-reference bridge takes the switch's spelling (the
+                // text renderer's condition: no unwrapped optional, not a `Some(..)` form).
+                let spelled = (matches!(shape, GlueShape::Reborrow)
+                    && spec.raw_operand
+                    && !spec.optional
+                    && spec.unwrap.is_none()
+                    && spec.null_arm != NullArm::Checked)
+                    .then(|| super::bridge_spelling::expr_kind(core_arg.clone(), spec.mutable));
+                let kind = match spelled {
+                    Some(kind) => kind,
+                    None => {
+                        let Some(kind) = glue_expr(shape, spec.mutable, core_arg, len) else {
+                            // `glue_expr` declines exactly one way: a length-bearing
+                            // shape with no length.
+                            self.stats.len_absent += 1;
+                            return None;
+                        };
+                        kind
+                    }
+                };
+                expr(kind)
+            }
+        };
+        let core = match nul_walk_base {
+            Some(base) => expr(nul_walk_bound((*base).clone(), (*core).clone())?),
+            None => core,
+        };
+        let core = match field_base {
+            Some((base, len)) => expr(field_base_guarded(
+                (*base).clone(),
+                (*len).clone(),
+                (*core).clone(),
+                spec.mutable,
+            )?),
+            None => core,
+        };
+        let core = if matches!(spec.core, GlueCore::Reborrow | GlueCore::FromRawParts) {
+            P(unsafe_payload((*core).clone(), self.current_unsafe_fn)?)
+        } else {
+            core
+        };
+        Some(if spec.null_arm == NullArm::Checked {
+            checked_optional(
+                source_arg,
+                (*core).clone(),
+                spec.checked_binding_type.as_deref()?,
+            )?
+        } else if spec.optional {
+            glue_expr(GlueShape::Some_, spec.mutable, core, None)
+                .expect("the `Some` wrapper is length-free and cannot decline")
+        } else {
+            core.kind
+        })
+    }
+}
+
+impl MutVisitor for SeamGraftVisitor<'_> {
+    fn visit_item(&mut self, item: &mut rustc_ast::Item) {
+        let previous_fn = self.current_fn;
+        let previous_unsafe = self.current_unsafe_fn;
+        if let rustc_ast::ItemKind::Fn(function) = &item.kind {
+            self.current_fn = self
+                .global_map
+                .and_then(|global_map| global_map.get(&item.id).copied());
+            self.current_unsafe_fn =
+                matches!(function.sig.header.safety, rustc_ast::Safety::Unsafe(_));
+        }
+        rustc_ast::mut_visit::walk_item(self, item);
+        self.current_fn = previous_fn;
+        self.current_unsafe_fn = previous_unsafe;
+    }
+
+    fn visit_assoc_item(
+        &mut self,
+        item: &mut rustc_ast::AssocItem,
+        ctxt: rustc_ast::visit::AssocCtxt,
+    ) {
+        let previous_fn = self.current_fn;
+        let previous_unsafe = self.current_unsafe_fn;
+        if let rustc_ast::AssocItemKind::Fn(function) = &item.kind {
+            self.current_fn = self
+                .global_map
+                .and_then(|global_map| global_map.get(&item.id).copied());
+            self.current_unsafe_fn =
+                matches!(function.sig.header.safety, rustc_ast::Safety::Unsafe(_));
+        }
+        rustc_ast::mut_visit::walk_assoc_item(self, item, ctxt);
+        self.current_fn = previous_fn;
+        self.current_unsafe_fn = previous_unsafe;
+    }
+
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        // A grafted node's spans are the fragment's own and alias real offsets
+        // in this crate's first source file — the hazard task 0 landed the
+        // erasure for, and arm 3 is the pass that could have been bitten by it.
+        if e.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, e);
+            return;
+        }
+        let key = (e.span.lo().0, e.span.hi().0);
+        if let Some(target) = self.seams.get(&key) {
+            if !self.consumed.insert(key) {
+                self.stats.multi_matched += 1;
+            }
+            // **THE FIRST CLAIM THAT CAN GENUINELY COLLIDE.** A seam targets a
+            // call-argument expression, the same syntactic category the use
+            // pass claims, so `refused` stops being a structural zero here and
+            // becomes a corpus fact.
+            //
+            // **BUILD FIRST, CLAIM SECOND.** The claim used to come first, so a
+            // spec this pass cannot build still took ownership of the node and
+            // left it unclaimable by anyone else — which is arm 2's review
+            // finding 5 ("`guard.claim` ran BEFORE the shape check"), already
+            // repaired once in the declaration pass and reintroduced here.
+            // Found by the adversarial review.
+            //
+            // The cost is stated rather than hidden: a node built and then
+            // refused has already counted its peel and its length, so those two
+            // rows can exceed the placements. That is unreachable while
+            // `refused` is zero, and a nonzero `refused` is STOP-class, so the
+            // over-count can only appear on a path a human is already reading.
+            // wave-6l (nested-edit composition): a seam the plan admitted
+            // INSIDE this one (an L07 containment — the shared reborrow of a
+            // raw-returning call over the weakening of one of its arguments)
+            // is grafted first, so the adapter below is built over the
+            // argument-adapted subtree and its text carries the inner's.
+            // Without a contained seam the walk order is unchanged.
+            if self.contains_seam(key) {
+                rustc_ast::mut_visit::walk_expr(self, e);
+                self.stats.composed_over_inner += 1;
+            }
+            let Some(kind) = self.build(e, target) else {
+                // Declined with a typed row; the node is left intact AND
+                // claimable, which is the invariant that matters.
+                if !self.contains_seam(key) {
+                    rustc_ast::mut_visit::walk_expr(self, e);
+                }
+                return;
+            };
+            let claimed = if target.exact_use_composition {
+                self.guard.claim_seam_after_exact_use(e.id, e.span)
+            } else {
+                self.guard.claim(e.id, e.span, "seam")
+            };
+            if !claimed {
+                self.stats.refused += 1;
+                return;
+            }
+            {
+                e.kind = kind;
+                self.stats.grafted += 1;
+                // **COUNTED AT THE PLACEMENT, past the claim guard** — the
+                // condition for emitting the crate-level const, so it may not
+                // count a node that was built and then refused (ADV-FAB-04).
+                if target
+                    .spec
+                    .len
+                    .as_ref()
+                    .is_some_and(super::decision::seam::SeamLen::is_fabricated)
+                {
+                    self.stats.len_fabricated += 1;
+                }
+                if target.reborrow {
+                    self.stats.reborrow += 1;
+                } else {
+                    self.stats.safe += 1;
+                }
+                self.stats
+                    .rendered
+                    .push((key.0, rustc_ast_pretty::pprust::expr_to_string(e)));
+                // NOT walked: the children are the adapter's now, and the
+                // argument moved across as a subtree rather than being revisited.
+                return;
+            }
+        }
+        rustc_ast::mut_visit::walk_expr(self, e);
+    }
+}
+
+/// Call-level same-object raw-view consumer. Ordinary argument seams run
+/// first; this wrapper then snapshots every selected raw view before the call,
+/// so no generated raw-pointer construction occurs after a surviving `&mut`.
+struct PairRawGraftVisitor<'a> {
+    calls: &'a FxHashMap<(u32, u32), &'a super::decision::seam::PairRawViewCall>,
+    reverts: &'a RevertSet,
+    guard: &'a mut Composition,
+    consumed: FxHashSet<(u32, u32)>,
+    /// **Keys this arm YIELDED (R515-1 ruling 3).** Every arm inserts into
+    /// `consumed` only on success, so without this a held key looks exactly
+    /// like a key the walk never reached -- and the `unmatched` check below
+    /// would abort the program for the very hold the floor just granted.
+    held: FxHashSet<(u32, u32)>,
+    failure: Option<String>,
+}
+
+struct A5RawGraftVisitor<'a> {
+    calls: &'a FxHashMap<(u32, u32), &'a super::decision::seam::A5RawViewCall>,
+    reverts: &'a RevertSet,
+    guard: &'a mut Composition,
+    consumed: FxHashSet<(u32, u32)>,
+    /// **(α), relay 033.** Argument spans another class's `c`-arm seam owns.
+    /// The seam pass runs BEFORE this one, so such an argument's subtree is
+    /// already the inner's product; the wrapper's raw value is that product
+    /// rather than a re-rendering of the original text.
+    inner_arguments: &'a FxHashSet<(u32, u32)>,
+    inner_products_taken: usize,
+    /// **Keys this arm YIELDED (R515-1 ruling 3).** Every arm inserts into
+    /// `consumed` only on success, so without this a held key looks exactly
+    /// like a key the walk never reached -- and the `unmatched` check below
+    /// would abort the program for the very hold the floor just granted.
+    held: FxHashSet<(u32, u32)>,
+    failure: Option<String>,
+}
+
+impl MutVisitor for A5RawGraftVisitor<'_> {
+    fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+        if expression.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        }
+        let key = (expression.span.lo().0, expression.span.hi().0);
+        let Some(call) = self.calls.get(&key).copied() else {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        };
+        if !matches!(expression.kind, rustc_ast::ExprKind::Call(..)) {
+            self.failure = Some(format!(
+                "A5 raw-view call at {}..{} resolved to a non-call AST node",
+                key.0, key.1
+            ));
+            return;
+        }
+        rustc_ast::mut_visit::walk_expr(self, expression);
+        let source = rustc_ast_pretty::pprust::expr_to_string(expression);
+        for view in &call.views {
+            if view
+                .source_node
+                .is_some_and(|(owner, hir)| !self.reverts.keeps_subject(owner, hir))
+                && view.input_rendering.is_none()
+            {
+                self.failure = Some(format!(
+                    "A5 input-form rendering unavailable at {}",
+                    view.proof_site_key.receipt_key(),
+                ));
+                return;
+            }
+        }
+        // (α): the CURRENT text of each argument, after the seam pass grafted
+        // whatever another class owns there. `args[i].span` keeps the original
+        // interval even when the node's `kind` was replaced, so the lookup is
+        // exact rather than textual.
+        let mut argument_products: FxHashMap<usize, String> = FxHashMap::default();
+        if let rustc_ast::ExprKind::Call(_, arguments) = &expression.kind {
+            for (index, argument) in arguments.iter().enumerate() {
+                let span = (argument.span.lo().0, argument.span.hi().0);
+                if self.inner_arguments.contains(&span) {
+                    argument_products
+                        .insert(index, rustc_ast_pretty::pprust::expr_to_string(argument));
+                }
+            }
+        }
+        let mut taken = 0usize;
+        let views = call
+            .views
+            .iter()
+            .map(|view| {
+                if let Some(product) = argument_products.get(&view.argument_index) {
+                    taken += 1;
+                    return (
+                        view.argument_index,
+                        product.clone(),
+                        view.target_type.clone(),
+                        view.adapted_expression.clone(),
+                        view.extent_expression.clone(),
+                    );
+                }
+                let input = view
+                    .source_node
+                    .is_some_and(|(owner, hir)| !self.reverts.keeps_subject(owner, hir));
+                if input {
+                    let rendering = view
+                        .input_rendering
+                        .as_ref()
+                        .expect("A5 input rendering checked above");
+                    (
+                        view.argument_index,
+                        rendering.raw_expression.clone(),
+                        rendering.target_type.clone(),
+                        rendering.adapted_expression.clone(),
+                        rendering.extent_expression.clone(),
+                    )
+                } else {
+                    (
+                        view.argument_index,
+                        view.raw_expression.clone(),
+                        view.target_type.clone(),
+                        view.adapted_expression.clone(),
+                        view.extent_expression.clone(),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        self.inner_products_taken += taken;
+        let stem = format!("__crat_a5_raw_{}", call.call_span.lo().0);
+        let rendered = match super::c9::render_a5_raw_view_source(&source, &stem, &views) {
+            Ok(rendered) => rendered,
+            Err(why) => {
+                self.failure = Some(format!(
+                    "could not render A5 raw-view call at {}..{}: {why}",
+                    key.0, key.1
+                ));
+                return;
+            }
+        };
+        let parsed = match graft_expr(&rendered) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                self.failure = Some(format!(
+                    "A5 raw-view call at {}..{} did not round-trip",
+                    key.0, key.1
+                ));
+                return;
+            }
+        };
+        if !self.guard.claim(expression.id, expression.span, "a5-raw") {
+            // **THE FLOOR (R515-1 ruling 3).** A collision is ONE class's problem,
+            // never the program's. This read `self.failure = Some(..)`, which the
+            // apply site turns into `Err` and `mod.rs` turns into
+            // `round-0 emit failed` for the WHOLE program -- batch 26 and batch 27
+            // both lost brotli's entire emission (795 realized rows) to a single
+            // colliding mark. The node keeps the holder's edit, this arm yields,
+            // its class is reverted whole on the next round so nothing
+            // half-composed ships, and the hold is receipted with both parties.
+            record_graft_held(
+                GraftHeldReceipt {
+                    visitor: GraftVisitor::A5Raw,
+                    caller: call.caller.local_def_index.as_u32(),
+                    class: call.owner_class.order_key(),
+                    reason: self.guard.holder(expression.id).unwrap_or("unknown-holder"),
+                    lo: key.0,
+                    hi: key.1,
+                },
+                call.owner_class,
+            );
+            self.held.insert(key);
+            return;
+        }
+        self.consumed.insert(key);
+        expression.kind = parsed.kind;
+    }
+}
+
+impl MutVisitor for PairRawGraftVisitor<'_> {
+    fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+        if expression.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        }
+        let key = (expression.span.lo().0, expression.span.hi().0);
+        let Some(call) = self.calls.get(&key).copied() else {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        };
+        if !matches!(expression.kind, rustc_ast::ExprKind::Call(..)) {
+            self.failure = Some(format!(
+                "PAIR raw-view call at {}..{} resolved to a non-call AST node",
+                key.0, key.1
+            ));
+            return;
+        }
+        for view in &call.views {
+            if view
+                .source_node
+                .is_some_and(|(owner, hir)| !self.reverts.keeps_subject(owner, hir))
+                && view.input_rendering.is_none()
+            {
+                self.failure = Some(format!(
+                    "PAIR input-form rendering unavailable at {}..{} argument {}",
+                    key.0, key.1, view.argument_index,
+                ));
+                return;
+            }
+        }
+        // First realize any argument-level seams nested in this call. Their
+        // rendered forms are what the call wrapper must preserve.
+        rustc_ast::mut_visit::walk_expr(self, expression);
+        let source = rustc_ast_pretty::pprust::expr_to_string(expression);
+        let views = call
+            .views
+            .iter()
+            .map(|view| {
+                if view
+                    .source_node
+                    .is_some_and(|(owner, hir)| !self.reverts.keeps_subject(owner, hir))
+                {
+                    let input = view
+                        .input_rendering
+                        .as_ref()
+                        .expect("PAIR input rendering checked above");
+                    (
+                        view.argument_index,
+                        input.raw_expression.clone(),
+                        input.target_type.clone(),
+                    )
+                } else {
+                    (
+                        view.argument_index,
+                        view.raw_expression.clone(),
+                        view.target_type.clone(),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        let stem = format!("__crat_pair_raw_{}", call.call_span.lo().0);
+        let rendered = match super::c9::render_pair_raw_view_source(&source, &stem, &views) {
+            Ok(rendered) => rendered,
+            Err(why) => {
+                self.failure = Some(format!(
+                    "could not render PAIR raw-view call at {}..{}: {why}",
+                    key.0, key.1
+                ));
+                return;
+            }
+        };
+        let mut parsed = match graft_expr(&rendered) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                self.failure = Some(format!(
+                    "PAIR raw-view call at {}..{} did not round-trip",
+                    key.0, key.1
+                ));
+                return;
+            }
+        };
+        if !self.guard.claim(expression.id, expression.span, "pair-raw") {
+            // **THE FLOOR (R515-1 ruling 3).** A collision is ONE class's problem,
+            // never the program's. This read `self.failure = Some(..)`, which the
+            // apply site turns into `Err` and `mod.rs` turns into
+            // `round-0 emit failed` for the WHOLE program -- batch 26 and batch 27
+            // both lost brotli's entire emission (795 realized rows) to a single
+            // colliding mark. The node keeps the holder's edit, this arm yields,
+            // its class is reverted whole on the next round so nothing
+            // half-composed ships, and the hold is receipted with both parties.
+            record_graft_held(
+                GraftHeldReceipt {
+                    visitor: GraftVisitor::PairRaw,
+                    caller: call.caller.local_def_index.as_u32(),
+                    class: call.owner_class.order_key(),
+                    reason: self.guard.holder(expression.id).unwrap_or("unknown-holder"),
+                    lo: key.0,
+                    hi: key.1,
+                },
+                call.owner_class,
+            );
+            self.held.insert(key);
+            return;
+        }
+        if let rustc_ast::ExprKind::Call(callee, _) = &expression.kind {
+            move_callee_into(&mut parsed, callee.clone());
+        }
+        self.consumed.insert(key);
+        expression.kind = parsed.kind;
+    }
+}
+
+/// **The node-moving discipline for a re-rendered call (main 131e; wave-5d 098
+/// STOP 1).** The PAIR arm prints the call, renders its temporaries around the
+/// text and re-parses it, so the rendered call's callee is a new node with a new
+/// span. `wave5r_helper_path::qualify` finds a surfaced helper's calls by their
+/// callee span, so a call to an imported helper stayed unqualified (E0425), the
+/// defect the construction bracket fixed the same way (wave-6l 055, C10). The
+/// original callee node is moved into the rendered call when exactly one call
+/// there has a callee that prints the same; otherwise the rendering stands as is.
+fn move_callee_into(rendered: &mut rustc_ast::Expr, callee: P<rustc_ast::Expr>) {
+    struct Callees<'a> {
+        text: &'a str,
+        matches: usize,
+        callee: Option<P<rustc_ast::Expr>>,
+    }
+    impl MutVisitor for Callees<'_> {
+        fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            if let rustc_ast::ExprKind::Call(callee, _) = &mut expression.kind
+                && rustc_ast_pretty::pprust::expr_to_string(callee) == self.text
+            {
+                self.matches += 1;
+                if let Some(original) = self.callee.take() {
+                    *callee = original;
+                }
+            }
+        }
+    }
+    let text = rustc_ast_pretty::pprust::expr_to_string(&callee);
+    let mut count = Callees {
+        text: &text,
+        matches: 0,
+        callee: None,
+    };
+    count.visit_expr(rendered);
+    if count.matches == 1 {
+        Callees {
+            text: &text,
+            matches: 0,
+            callee: Some(callee),
+        }
+        .visit_expr(rendered);
+    }
+}
+
+/// Structural consumer for retained C-9 call-site marks.
+///
+/// This runs after the use and seam grafts so the snapshot block captures the
+/// already-rewritten shared argument. A retained mark is mandatory: an
+/// unmatched span, a non-call target, a parse failure, or a composition
+/// refusal aborts emission instead of silently producing the both-Ref model
+/// without its companion temp.
+struct C9GraftVisitor<'a> {
+    marks: &'a FxHashMap<
+        (u32, u32),
+        &'a crate::analyses::borrow_ownership::overlap_producer::PlannedCopyMark,
+    >,
+    guard: &'a mut Composition,
+    consumed: FxHashSet<(u32, u32)>,
+    /// **Keys this arm YIELDED (R515-1 ruling 3).** Every arm inserts into
+    /// `consumed` only on success, so without this a held key looks exactly
+    /// like a key the walk never reached -- and the `unmatched` check below
+    /// would abort the program for the very hold the floor just granted.
+    held: FxHashSet<(u32, u32)>,
+    failure: Option<String>,
+}
+
+impl MutVisitor for C9GraftVisitor<'_> {
+    fn visit_expr(&mut self, e: &mut rustc_ast::Expr) {
+        if e.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, e);
+            return;
+        }
+        let key = (e.span.lo().0, e.span.hi().0);
+        let Some(mark) = self.marks.get(&key).copied() else {
+            rustc_ast::mut_visit::walk_expr(self, e);
+            return;
+        };
+        if !matches!(e.kind, rustc_ast::ExprKind::Call(..)) {
+            self.failure = Some(format!(
+                "retained C-9 mark at {}..{} resolved to a non-call AST node",
+                key.0, key.1
+            ));
+            return;
+        }
+        let source = rustc_ast_pretty::pprust::expr_to_string(e);
+        let rendered = match super::c9::render_marked_source(&mark.key, &source) {
+            Ok(rendered) => rendered,
+            Err(why) => {
+                self.failure = Some(format!(
+                    "could not render retained C-9 mark at {}..{}: {why}",
+                    key.0, key.1
+                ));
+                return;
+            }
+        };
+        let parsed = match graft_expr(&rendered) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                self.failure = Some(format!(
+                    "retained C-9 mark at {}..{} did not round-trip as an expression",
+                    key.0, key.1
+                ));
+                return;
+            }
+        };
+        if !self.guard.claim(e.id, e.span, "c9") {
+            // **THE FLOOR (R515-1 ruling 3).** A collision is ONE class's problem,
+            // never the program's. This read `self.failure = Some(..)`, which the
+            // apply site turns into `Err` and `mod.rs` turns into
+            // `round-0 emit failed` for the WHOLE program -- batch 26 and batch 27
+            // both lost brotli's entire emission (795 realized rows) to a single
+            // colliding mark. The node keeps the holder's edit, this arm yields,
+            // its class is reverted whole on the next round so nothing
+            // half-composed ships, and the hold is receipted with both parties.
+            //
+            // **This arm is the one brotli hits.** The mark's companion temp is
+            // not emitted when the graft yields, so the both-Ref model would
+            // ship without it -- which is why the hold must REVERT the class
+            // and not merely skip the node. `owner_did`'s class is the same key
+            // the apply site filters marks by, so the revert takes exactly the
+            // marks this one belongs to.
+            let class = super::bridge_receipt::SignatureClassId::of(mark.owner_did);
+            record_graft_held(
+                GraftHeldReceipt {
+                    visitor: GraftVisitor::C9,
+                    caller: mark.owner_did.local_def_index.as_u32(),
+                    class: class.order_key(),
+                    reason: self.guard.holder(e.id).unwrap_or("unknown-holder"),
+                    lo: key.0,
+                    hi: key.1,
+                },
+                class,
+            );
+            self.held.insert(key);
+            return;
+        }
+        self.consumed.insert(key);
+        e.kind = parsed.kind;
+    }
+}
+
+/// Restore an input-form receiver while preserving the already-adapted call.
+/// The producer excludes whole-call carriers at this exact initializer; the
+/// ordinary composition guard remains authoritative for all other collisions.
+#[derive(Clone, Copy)]
+enum ReceiverGraft<'a> {
+    Outbound(&'a super::decision::outbound_expression::OutboundExpressionPlan),
+    Expression(&'a super::decision::native_result_expression::NativeResultExpressionPlan),
+    /// wave-6l: the cast a view sits in, reborrowed for its inferred-reference
+    /// receiver (`let n: &U = &*(… as *mut U)`); grafted at the CAST node
+    /// after its children, so the view is already in the text.
+    CastReceiver(&'a super::decision::native_result_expression::NativeResultExpressionPlan),
+    Retired(&'a super::decision::receiver_input::ReceiverInputPlan),
+    Raw(&'a super::decision::raw_receiver::RawReceiverPlan),
+    SharedOption(&'a super::decision::return_receiver::ReceiverPlan),
+    /// wave-6b: an accessor's raw result received as a typed region slice.
+    Region(&'a super::decision::void_region::Receiver),
+}
+
+impl ReceiverGraft<'_> {
+    fn render(self, call: &str) -> String {
+        match self {
+            Self::Retired(input) => input.render(call),
+            Self::Raw(input) => input.render(call),
+            Self::Outbound(input) => input.render(call),
+            Self::Expression(input) => input.render(call),
+            Self::CastReceiver(input) => input
+                .render_cast_receiver(call)
+                .expect("a cast-receiver graft is planned only with its receiver"),
+            Self::SharedOption(input) => input.render_coercion(call),
+            Self::Region(receiver) => receiver.render(call),
+        }
+    }
+
+    /// The callee whose adapted return this graft restores an input form for.
+    /// **The class gate every variant already keys on** — see
+    /// `RawReceiverPlan::active`, which is `!classes.contains(&of(self.callee))`.
+    fn callee(self) -> rustc_span::def_id::LocalDefId {
+        match self {
+            Self::Retired(input) => input.receiver.callee,
+            Self::Raw(input) => input.callee,
+            Self::Outbound(input) => input.source_callee,
+            Self::Expression(input) | Self::CastReceiver(input) => input.callee,
+            Self::SharedOption(input) => input.callee,
+            Self::Region(receiver) => receiver.callee,
+        }
+    }
+
+    /// wave-6b: a byte view wraps the local's CAST initializer (`p as *mut u8`),
+    /// not a call — the one graft whose carrier is not a call.
+    fn wraps_cast(self) -> bool {
+        matches!(self, Self::Region(receiver) if receiver.parameter.is_some())
+    }
+}
+
+struct ReceiverInputGraftVisitor<'a> {
+    inputs: &'a FxHashMap<(u32, u32), ReceiverGraft<'a>>,
+    guard: &'a mut Composition,
+    consumed: FxHashSet<(u32, u32)>,
+    /// **Keys this arm YIELDED (R515-1 ruling 3).** Every arm inserts into
+    /// `consumed` only on success, so without this a held key looks exactly
+    /// like a key the walk never reached -- and the `unmatched` check below
+    /// would abort the program for the very hold the floor just granted.
+    held: FxHashSet<(u32, u32)>,
+    failure: Option<String>,
+}
+
+impl MutVisitor for ReceiverInputGraftVisitor<'_> {
+    fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+        if expression.span.is_dummy() {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        }
+        let key = (expression.span.lo().0, expression.span.hi().0);
+        let Some(input) = self.inputs.get(&key).copied() else {
+            rustc_ast::mut_visit::walk_expr(self, expression);
+            return;
+        };
+        if self.consumed.contains(&key) {
+            // wave-6l: a view the use pass already composed under its store
+            // at this node (the node is the store's product now).
+            if matches!(input, ReceiverGraft::Expression(_)) {
+                rustc_ast::mut_visit::walk_expr(self, expression);
+                return;
+            }
+            self.failure = Some(format!(
+                "receiver-input-invariant:duplicate-ast:{}..{}",
+                key.0, key.1
+            ));
+            return;
+        }
+        let expected_call = !matches!(input, ReceiverGraft::CastReceiver(_));
+        if expected_call
+            && !matches!(expression.kind, rustc_ast::ExprKind::Call(..))
+            && !input.wraps_cast()
+        {
+            self.failure = Some(format!(
+                "receiver-input-invariant:non-call:{}..{}",
+                key.0, key.1
+            ));
+            return;
+        }
+        if !expected_call && !matches!(expression.kind, rustc_ast::ExprKind::Cast(..)) {
+            self.failure = Some(format!(
+                "receiver-input-invariant:non-cast:{}..{}",
+                key.0, key.1
+            ));
+            return;
+        }
+        rustc_ast::mut_visit::walk_expr(self, expression);
+        if self.failure.is_some() {
+            return;
+        }
+        let source = rustc_ast_pretty::pprust::expr_to_string(expression);
+        let rendered = input.render(&source);
+        let parsed = match graft_expr(&rendered) {
+            Ok(parsed) => parsed,
+            Err(why) => {
+                self.failure = Some(format!(
+                    "receiver-input-invariant:parse:{}..{}:{why}",
+                    key.0, key.1
+                ));
+                return;
+            }
+        };
+        if !self
+            .guard
+            .claim(expression.id, expression.span, "receiver-input")
+        {
+            // **THE FLOOR (R515-1 ruling 3).** A collision is ONE class's problem,
+            // never the program's. This read `self.failure = Some(..)`, which the
+            // apply site turns into `Err` and `mod.rs` turns into
+            // `round-0 emit failed` for the WHOLE program -- batch 26 and batch 27
+            // both lost brotli's entire emission (795 realized rows) to a single
+            // colliding mark. The node keeps the holder's edit, this arm yields,
+            // its class is reverted whole on the next round so nothing
+            // half-composed ships, and the hold is receipted with both parties.
+            //
+            // **The class here is the CALLEE's**, not the caller's: every
+            // receiver plan's own `active`/`selection` gate keys on the callee's
+            // signature class (`RawReceiverPlan::active` is the plainest case),
+            // because a receiver graft exists to restore an input form the
+            // CALLEE's adapted return produced. Holding the caller's class would
+            // leave the adapted call in place with no receiver restored, which
+            // is precisely the half-composed call the floor must not ship.
+            let class = super::bridge_receipt::SignatureClassId::of(input.callee());
+            record_graft_held(
+                GraftHeldReceipt {
+                    visitor: GraftVisitor::Receiver,
+                    caller: input.callee().local_def_index.as_u32(),
+                    class: class.order_key(),
+                    reason: self.guard.holder(expression.id).unwrap_or("unknown-holder"),
+                    lo: key.0,
+                    hi: key.1,
+                },
+                class,
+            );
+            self.held.insert(key);
+            return;
+        }
+        self.consumed.insert(key);
+        // Keep the authoritative outer identity and source span. Parsed
+        // descendants have graft_expr's synthetic identities and spans.
+        expression.kind = parsed.kind;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// heman's five, verbatim from wave-5d 055's probe (`2026-09-21-wave-5d-r488`).
+    /// Each pair is (the OUTER replacement, the node's ORIGINAL text).
+    const HEMAN_FIVE: [(&str, &str); 5] = [
+        (
+            "core::slice::from_raw_parts(heman_image_texel(texture.as_mut().unwrap(), u as libc::c_int, v as libc::c_int), crate::FALLBACK_SLICE_EXTENT)",
+            "heman_image_texel(texture, u as libc::c_int, v as libc::c_int)",
+        ),
+        (
+            "core::slice::from_raw_parts_mut(heman_image_texel(&mut *target, i_0, j), crate::FALLBACK_SLICE_EXTENT)",
+            "heman_image_texel(target, i_0, j)",
+        ),
+        (
+            "core::slice::from_raw_parts_mut(heman_image_texel(&mut *dst, dstx + x_0, y), crate::FALLBACK_SLICE_EXTENT)",
+            "heman_image_texel(dst, dstx + x_0, y)",
+        ),
+        (
+            "core::slice::from_raw_parts_mut(heman_image_texel(&mut *result2, i_0, j), crate::FALLBACK_SLICE_EXTENT)",
+            "heman_image_texel(result2, i_0, j)",
+        ),
+        (
+            "core::slice::from_raw_parts(heman_image_texel(&mut *mapping, i, j), crate::FALLBACK_SLICE_EXTENT)",
+            "heman_image_texel(mapping, i, j)",
+        ),
+    ];
+
+    /// **W-CUR-PRODUCT** (R491-3) — the locator finds, in each outer
+    /// replacement, the call as THAT text spells it: the callee head through the
+    /// parenthesis that balances it, arguments already adapted. This is the text
+    /// `NativeResultExpressionPlan::render` wants ("the input is the call after
+    /// its own argument adapters"), so the view composes over the product the
+    /// outer produced instead of over a text that is no longer there.
+    #[test]
+    fn slicecursor_the_product_locator_finds_hemans_five() {
+        let expected = [
+            "heman_image_texel(texture.as_mut().unwrap(), u as libc::c_int, v as libc::c_int)",
+            "heman_image_texel(&mut *target, i_0, j)",
+            "heman_image_texel(&mut *dst, dstx + x_0, y)",
+            "heman_image_texel(&mut *result2, i_0, j)",
+            "heman_image_texel(&mut *mapping, i, j)",
+        ];
+        for ((outer, original), want) in HEMAN_FIVE.iter().zip(expected) {
+            let (start, end) = adapted_call_span(outer, original, original)
+                .unwrap_or_else(|| panic!("not located: {outer}"));
+            assert_eq!(&outer[start..end], want, "in {outer}");
+        }
+    }
+
+    /// **F-CUR-PRODUCT-VERBATIM** — the fault this rule exists for: the verbatim
+    /// search finds none of the five, which is why the composition failed and
+    /// (before wave-6l's floor) aborted heman at round 0. If this ever starts
+    /// finding them, the rule above is dead code and should go.
+    #[test]
+    fn slicecursor_the_verbatim_search_cannot_find_hemans_five() {
+        for (outer, original) in HEMAN_FIVE {
+            assert!(
+                find_ignoring_whitespace(outer, original).is_none(),
+                "the verbatim search found {original} in {outer}"
+            );
+        }
+    }
+
+    /// **F-CUR-PRODUCT-REFUSALS** — the arm answers `None` rather than guessing:
+    /// a callee the outer renamed, a text whose parentheses do not balance, and
+    /// (R494-1(a)) an adapter that ADDED a head, where the occurrence index stops
+    /// being evidence. Each leaves the class hold in place.
+    #[test]
+    fn slicecursor_the_product_locator_refuses_what_it_cannot_prove() {
+        assert!(
+            adapted_call_span(
+                "core::slice::from_raw_parts(other_call(&mut *dst, i), crate::FALLBACK_SLICE_EXTENT)",
+                "heman_image_texel(dst, i)",
+                "heman_image_texel(dst, i)"
+            )
+            .is_none(),
+            "a different callee must not be taken for the call"
+        );
+        assert!(
+            adapted_call_span(
+                "core::slice::from_raw_parts(heman_image_texel(&mut *dst, i",
+                "heman_image_texel(dst, i)",
+                "heman_image_texel(dst, i)"
+            )
+            .is_none(),
+            "unbalanced parentheses must not be composed over"
+        );
+        assert!(
+            adapted_call_span(
+                "core::slice::from_raw_parts(heman_image_texel(&mut *dst, heman_image_texel(&mut *src, i)), crate::FALLBACK_SLICE_EXTENT)",
+                "heman_image_texel(dst, i)",
+                "heman_image_texel(dst, i)"
+            )
+            .is_none(),
+            "a head the adapters added must hold, not shift the index"
+        );
+    }
+
+    /// **W-CUR-PRODUCT-INDEX** (R494-1(a)) — two calls of the same callee in one
+    /// outer: the k-th head of the original is the k-th head of the replacement,
+    /// so each view composes over ITS OWN call. This is the shape `42e63e2e1`
+    /// refused, and heman's class 729 — which carries all five views — paid the
+    /// admission's whole +96 for that refusal.
+    #[test]
+    fn slicecursor_the_product_locator_matches_by_occurrence_index() {
+        let origin = "*heman_image_texel(dst, i, j) = *heman_image_texel(src, x, y)";
+        let text = "*heman_image_texel(&mut *dst, i, j) = *heman_image_texel(&mut *src, x, y)";
+        let (lo, hi) =
+            adapted_call_span(text, origin, "heman_image_texel(dst, i, j)").expect("k = 1");
+        assert_eq!(&text[lo..hi], "heman_image_texel(&mut *dst, i, j)");
+        let (lo, hi) =
+            adapted_call_span(text, origin, "heman_image_texel(src, x, y)").expect("k = 2");
+        assert_eq!(&text[lo..hi], "heman_image_texel(&mut *src, x, y)");
+    }
+
+    /// **RED WITNESS for the composition guard** (ruling item 5): a
+    /// deliberately conflicting pair, REFUSED.
+    ///
+    /// The guard is fail-closed, so the property under test is that a second
+    /// claim on one node returns `false` and is counted — not that the first
+    /// wins. A precedence rule would be a decision, and this phase decides
+    /// nothing.
+    ///
+    /// *Mutation-tested:* making `claim` return `true` unconditionally — the
+    /// shape a "just let it through" fix would take — fails both assertions.
+    /// **Relay 066 (R666-2, STOP 2) — the bracket's outer wrapper takes a FRESH
+    /// `NodeId`.** The constructor wraps the node and moves it into its hole;
+    /// the moved node keeps its id (the passes after this one key on it), and
+    /// the wrapper, which keeps the span, must not share it: the hoist
+    /// (wave-5d, after the bracket) claims by id and otherwise saw one node
+    /// twice.
+    #[test]
+    fn w6l_bracket_outer_wrapper_takes_a_fresh_node_id() {
+        rustc_span::create_session_globals_then(
+            rustc_span::edition::Edition::Edition2018,
+            &[],
+            None,
+            || {
+                // `graft_expr` normalizes spans to `DUMMY_SP`; the bracket keys on
+                // real ones, so the node is parsed with its spans kept.
+                let mut e = ::utils::ast::parse_expr("f(x)".to_owned());
+                e.id = NodeId::from_u32(40);
+                let key = (e.span.lo().0, e.span.hi().0);
+                let mut table = FxHashMap::default();
+                table.insert(key, ("wrap(".to_owned(), ")".to_owned()));
+                let mut brackets = ConstructionBracketVisitor {
+                    brackets: &table,
+                    applied: FxHashSet::default(),
+                    next_id: 41,
+                };
+                brackets.visit_expr(&mut e);
+                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
+                    panic!("the wrapper is a call: {e:?}");
+                };
+                assert_eq!(
+                    args[0].id,
+                    NodeId::from_u32(40),
+                    "the moved node keeps its id"
+                );
+                assert_eq!(args[0].span, e.span, "and the wrapper keeps the span");
+                assert_ne!(e.id, args[0].id, "the wrapper's id is fresh");
+                assert_ne!(e.id, rustc_ast::DUMMY_NODE_ID, "and a real one");
+            },
+        )
+    }
+
+    /// Relay 066 review (A4) — the fresh ids start above every id still
+    /// referenced: the tree's, and the ids a pass claimed or a map keys on even
+    /// where the node was since replaced (a use graft replaces `e.kind`, and
+    /// the dropped children's ids stay in `guard.claimed` and the capture
+    /// maps).
+    #[test]
+    fn w6l_bracket_fresh_ids_start_above_every_referenced_id() {
+        let mut guard = Composition::default();
+        assert!(guard.claim(NodeId::from_u32(900), rustc_span::DUMMY_SP, "use"));
+        let fresh = first_fresh_node_id(40, &guard, std::iter::once(NodeId::from_u32(500)));
+        assert!(fresh > 900, "{fresh}");
+    }
+
+    #[test]
+    fn two_transforms_may_not_claim_one_node() {
+        let mut g = Composition::default();
+        let node = NodeId::from_u32(7);
+        assert!(
+            g.claim(node, rustc_span::DUMMY_SP, "decl:slice"),
+            "the first claim must be admitted"
+        );
+        assert!(
+            !g.claim(node, rustc_span::DUMMY_SP, "use"),
+            "the SECOND claim on one node must be refused — this is the \
+             structural half of the barrier the site-overlap gate provides, \
+             and it does not lapse in parity mode"
+        );
+        assert_eq!(
+            g.refused,
+            vec![Refusal {
+                node,
+                holder: "decl:slice",
+                challenger: "use",
+            }],
+            "the refusal must be COUNTED and must name BOTH parties (ruling \
+             2026-08-13). A row carrying only the node hands a STOP diagnosis \
+             half the story — that a collision happened, but not who collided, \
+             across passes that live in different halves of the module"
+        );
+        assert_eq!(g.refused_by("use"), 1, "attributed to the CHALLENGER");
+        assert_eq!(
+            g.refused_by("decl:slice"),
+            0,
+            "the holder was not refused — its claim stands, which is exactly \
+             the asymmetry the guard's doc was corrected to state"
+        );
+    }
+
+    /// Distinct nodes compose freely — the guard refuses conflicts, not work.
+    ///
+    /// **Positive control**, and it is labelled as one: no deletion mutation
+    /// fails it, since a guard that admitted everything would pass it too. Its
+    /// job is to show the test above is not passing because `claim` rejects
+    /// everything.
+    #[test]
+    fn distinct_nodes_do_not_conflict() {
+        let mut g = Composition::default();
+        assert!(g.claim(NodeId::from_u32(1), rustc_span::DUMMY_SP, "decl:ref"));
+        assert!(g.claim(NodeId::from_u32(2), rustc_span::DUMMY_SP, "use"));
+        assert!(g.refused.is_empty(), "distinct nodes must not be refused");
+    }
+
+    /// Addendum-142 regression: the sole same-node exception is an exact use
+    /// followed by its seam. Mutation: replacing the handoff with `claim`
+    /// refuses the second step; admitting a missing/different first claimant
+    /// fails the two negative assertions.
+    #[test]
+    fn an_exact_use_claim_hands_off_to_its_seam_only() {
+        let node = NodeId::from_u32(7);
+        let span = rustc_span::DUMMY_SP;
+        let mut composed = Composition::default();
+        assert!(composed.claim(node, span, "use"));
+        assert!(composed.claim_seam_after_exact_use(node, span));
+        assert!(composed.refused.is_empty());
+        assert_eq!(
+            composed.edited_with_claimants().collect::<Vec<_>>(),
+            vec![(span, "use+seam")]
+        );
+
+        let mut missing = Composition::default();
+        assert!(!missing.claim_seam_after_exact_use(node, span));
+        assert_eq!(missing.refused[0].holder, "missing-exact-use");
+
+        let mut wrong = Composition::default();
+        assert!(wrong.claim(node, span, "decl:ref"));
+        assert!(!wrong.claim_seam_after_exact_use(node, span));
+        assert_eq!(wrong.refused[0].holder, "decl:ref");
+    }
+
+    /// Homonymous functions in distinct modules may share one textual rename
+    /// only when every definition with that name receives a surface. Mutation:
+    /// restoring the old duplicate-name rejection fails the first half; treating
+    /// a mixed population as safe fails the second.
+    #[test]
+    fn surface_name_population_allows_all_or_none_but_not_mixed() {
+        rustc_span::create_default_session_globals_then(|| {
+            let name = Symbol::intern("SortHuffmanTreeItems");
+            let all = [(
+                name,
+                SurfaceNamePopulation {
+                    functions: 2,
+                    surfaced: 2,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let names = finalize_surface_names(&all).expect("both homonyms are surfaced");
+            assert_eq!(
+                names.get(&name).copied(),
+                Some(Symbol::intern("__crat_safe_SortHuffmanTreeItems"))
+            );
+
+            let mixed = [(
+                name,
+                SurfaceNamePopulation {
+                    functions: 2,
+                    surfaced: 1,
+                },
+            )]
+            .into_iter()
+            .collect();
+            assert!(
+                finalize_surface_names(&mixed)
+                    .expect_err("a bare-name rewrite may not cross a mixed population")
+                    .contains("mixed surface function name")
+            );
+        });
+    }
+
+    /// **The claimant travels with its span, in order, and REFUSALS DO NOT
+    /// ENTER.**
+    ///
+    /// Both halves matter and they fail to different mutations. The spans are
+    /// DISTINCT on purpose: with `DUMMY_SP` everywhere, any mispairing still
+    /// compares equal, so the test would pass under its own defect.
+    ///
+    /// *Mutation-tested*, each reverted by `git checkout`:
+    /// - **M-A (pairing)** — `.zip(self.claimants.iter().rev().copied())`:
+    ///   claimants pair with the wrong spans. FAILS.
+    /// - **M-B (exclusion)** — hoist `claimants.push` out of the admitted arm:
+    ///   a REFUSED claim, which edited nothing, records a claimant, and the
+    ///   parallel invariant reports a changed-set longer than its edits. FAILS.
+    /// - **M-C (constant)** — push a fixed `"decl:ref"` instead of the
+    ///   parameter: every edit reports the same kind, which is what a
+    ///   diagnostic reading this would silently believe. FAILS.
+    ///
+    /// Note what is NOT a discriminating mutation: swapping the two `push`
+    /// calls. Both append, so the pairing is unchanged — recorded because it
+    /// was the first mutation reached for, and it witnesses nothing.
+    #[test]
+    fn each_edited_span_carries_the_claimant_that_made_it() {
+        use rustc_span::{BytePos, Span, SyntaxContext};
+        let sp =
+            |lo: u32, hi: u32| Span::new(BytePos(lo), BytePos(hi), SyntaxContext::root(), None);
+        let mut g = Composition::default();
+        let (a, b, c) = (sp(10, 20), sp(30, 40), sp(50, 60));
+        assert!(g.claim(NodeId::from_u32(1), a, "decl:ref"));
+        assert!(g.claim(NodeId::from_u32(2), b, "use"));
+        assert!(g.claim(NodeId::from_u32(3), c, "seam"));
+        // Refused: node 1 is already held, so this must add NOTHING.
+        assert!(!g.claim(NodeId::from_u32(1), sp(70, 80), "seam"));
+
+        assert_eq!(
+            g.edited_with_claimants().collect::<Vec<_>>(),
+            vec![(a, "decl:ref"), (b, "use"), (c, "seam")],
+            "each edited span must carry the claimant that made it, in the              order the claims were admitted, and a REFUSED claim must not              appear — it edited nothing"
+        );
+        assert_eq!(
+            g.edited_spans().len(),
+            g.edited_with_claimants().count(),
+            "the parallel vectors must agree in length — the invariant the              debug_assert in `claim` states"
+        );
+    }
+
+    /// **A difference is booked to the arm that produced it.**
+    ///
+    /// [`compare_renders`] is shared by three arms and buckets on a position
+    /// label. Until arm 3 that `match` ended in `_ => differing_use`, so every
+    /// seam difference would have been reported as an arm-2 *use* difference —
+    /// a published line — and attributed to a pass that never ran at that
+    /// offset. Mutation M34 restored the fold and the whole suite stayed green,
+    /// because nothing exercised the buckets directly.
+    ///
+    /// The whitespace split is asserted at the same time: `ws_real` carries the
+    /// parity claim for all three arms jointly (the arm-2 review's finding 9,
+    /// recorded as deliberate), and `ws_real_seam` is arm 3's share of it. A
+    /// difference that is only reformatting must land in `ws_equal` and leave
+    /// both real counters alone.
+    #[test]
+    fn a_differing_render_is_booked_to_the_arm_that_produced_it() {
+        let by_offset: FxHashMap<u32, String> = [
+            (10, "&mut *p".to_owned()),
+            (20, "&mut *p".to_owned()),
+            (30, "&mut * p".to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        let mut d = TextDiff::default();
+
+        compare_renders(&[(10, "&x[0]".to_owned())], &by_offset, "seam", &mut d);
+        assert_eq!(d.differing_seam, 1, "a seam difference is arm 3's");
+        assert_eq!(
+            d.differing_use, 0,
+            "and must NOT be attributed to the use pass, which never ran here"
+        );
+        assert_eq!(d.differing_decl, 0);
+        assert_eq!(d.ws_real, 1, "the joint parity line sees it");
+        assert_eq!(d.ws_real_seam, 1, "and so does arm 3's own share");
+
+        // A use difference at another offset lands in the other bucket.
+        compare_renders(&[(20, "p[1]".to_owned())], &by_offset, "use", &mut d);
+        assert_eq!(d.differing_use, 1);
+        assert_eq!(d.differing_seam, 1, "unchanged by the use pass");
+        assert_eq!(d.ws_real_seam, 1, "and arm 3's share does not move either");
+
+        // Reformatting only: `ws_equal`, and neither real counter moves.
+        compare_renders(&[(30, "&mut *p".to_owned())], &by_offset, "seam", &mut d);
+        assert_eq!(d.ws_equal, 1);
+        assert_eq!(d.ws_real, 2, "still only the two genuine differences");
+        assert_eq!(d.ws_real_seam, 1);
+    }
+
+    /// A label no arm owns is a PANIC, not a silent bucket.
+    ///
+    /// The positive control for the test above: it shows the exhaustive `match`
+    /// rejects rather than absorbs, so a fourth arm cannot inherit a third's
+    /// counter the way arm 3 would have inherited arm 2's.
+    #[test]
+    #[should_panic(expected = "unknown differential position")]
+    fn an_unnamed_position_cannot_borrow_another_arms_bucket() {
+        let by_offset: FxHashMap<u32, String> = [(10, "a".to_owned())].into_iter().collect();
+        let mut d = TextDiff::default();
+        compare_renders(&[(10, "b".to_owned())], &by_offset, "arm4", &mut d);
+    }
+}
+
+/// Inspect the already transformed signature structurally. A lifetime is
+/// orthogonal to mutability and to the slice/Option shape of a borrowed type.
+fn surface_borrowed_type(ty: &Ty) -> Option<(Form, &Ty)> {
+    let (optional, ty) = match &ty.kind {
+        TyKind::Path(None, path)
+            if path.segments.len() == 1 && path.segments[0].ident.name.as_str() == "Option" =>
+        {
+            let Some(args) = &path.segments[0].args else { return None };
+            let GenericArgs::AngleBracketed(args) = &**args else { return None };
+            let [AngleBracketedArg::Arg(GenericArg::Type(inner))] = args.args.as_slice() else {
+                return None;
+            };
+            (true, &**inner)
+        }
+        _ => (false, ty),
+    };
+    let TyKind::Ref(_, borrowed) = &ty.kind else { return None };
+    let mutable = borrowed.mutbl == Mutability::Mut;
+    let (slice, pointee) = match &borrowed.ty.kind {
+        TyKind::Slice(element) => (true, &**element),
+        _ => (false, &*borrowed.ty),
+    };
+    let form = if optional {
+        Form::Opt { mutable, slice }
+    } else if slice {
+        Form::Slice { mutable }
+    } else {
+        Form::Ref { mutable }
+    };
+    Some((form, pointee))
+}
+
+/// **R470-4** — the wrapper's own parameter keeps the C ABI's type, and where
+/// that type is a pointer to `c_void` the slice it builds for a delivered
+/// slice parameter has no element type to infer: `from_raw_parts_mut(extra,
+/// N)` at a `&mut [u8]` parameter is `expected *mut u8, found *mut c_void`
+/// (21 of brotli's 26 failing rows, `Addr/Head/TinyHash H40-H42` and their
+/// twins). The base is cast to the parameter's own element type first. The
+/// extent is untouched — this is a typing fix, not a length claim, so no
+/// receipt and no waiver moves (§77).
+fn void_base(outer_ty: Option<&str>) -> bool {
+    outer_ty.is_some_and(|ty| {
+        let pointee = ty
+            .strip_prefix("*mut ")
+            .or_else(|| ty.strip_prefix("*const "))
+            .map(str::trim);
+        pointee.is_some_and(|pointee| {
+            pointee
+                .rsplit("::")
+                .next()
+                .is_some_and(|segment| segment == "c_void")
+        })
+    })
+}
+
+fn surface_argument(
+    param: &rustc_ast::Param,
+    enclosing_unsafe_fn: bool,
+    outer_ty: Option<&str>,
+) -> Result<String, String> {
+    let rustc_ast::PatKind::Ident(_, ident, None) = &param.pat.kind else {
+        return Err("inbound-wrapper-unplaceable: non-identifier parameter".to_owned());
+    };
+    let name = ident.name.to_string();
+    let ty = rustc_ast_pretty::pprust::ty_to_string(&param.ty);
+    let borrowed = surface_borrowed_type(&param.ty);
+    let form = borrowed.map(|(form, _)| form);
+    // The base every slice construction below starts from: the wrapper's own
+    // parameter, cast to the element type when the C ABI handed it a `c_void`.
+    // The null guard of an optional form keeps the parameter itself — the cast
+    // changes no address and the guard is the C ABI's own test.
+    let base = match borrowed {
+        Some((Form::Slice { .. } | Form::Opt { slice: true, .. }, pointee))
+            if void_base(outer_ty) =>
+        {
+            format!(
+                "{name}.cast::<{}>()",
+                rustc_ast_pretty::pprust::ty_to_string(pointee)
+            )
+        }
+        _ => name.clone(),
+    };
+    let expression = if matches!(
+        form,
+        Some(Form::Opt {
+            mutable: true,
+            slice: true
+        })
+    ) {
+        let inner = super::mechanical_receipt::present_unsafe_text(
+            format!("core::slice::from_raw_parts_mut({base}, crate::FALLBACK_SLICE_EXTENT)"),
+            enclosing_unsafe_fn,
+        );
+        format!("if {name}.is_null() {{ None }} else {{ Some({inner}) }}")
+    } else if matches!(
+        form,
+        Some(Form::Opt {
+            mutable: false,
+            slice: true
+        })
+    ) {
+        let inner = super::mechanical_receipt::present_unsafe_text(
+            format!("core::slice::from_raw_parts({base}, crate::FALLBACK_SLICE_EXTENT)"),
+            enclosing_unsafe_fn,
+        );
+        format!("if {name}.is_null() {{ None }} else {{ Some({inner}) }}")
+    } else if matches!(
+        form,
+        Some(Form::Opt {
+            mutable: true,
+            slice: false
+        })
+    ) {
+        super::mechanical_receipt::present_unsafe_text(
+            format!("{name}.as_mut()"),
+            enclosing_unsafe_fn,
+        )
+    } else if matches!(
+        form,
+        Some(Form::Opt {
+            mutable: false,
+            slice: false
+        })
+    ) {
+        super::mechanical_receipt::present_unsafe_text(
+            format!("{name}.as_ref()"),
+            enclosing_unsafe_fn,
+        )
+    } else if matches!(form, Some(Form::Slice { mutable: true })) {
+        super::mechanical_receipt::present_unsafe_text(
+            format!("core::slice::from_raw_parts_mut({base}, crate::FALLBACK_SLICE_EXTENT)"),
+            enclosing_unsafe_fn,
+        )
+    } else if matches!(form, Some(Form::Slice { mutable: false })) {
+        super::mechanical_receipt::present_unsafe_text(
+            format!("core::slice::from_raw_parts({base}, crate::FALLBACK_SLICE_EXTENT)"),
+            enclosing_unsafe_fn,
+        )
+    } else if matches!(form, Some(Form::Ref { mutable: true })) {
+        super::mechanical_receipt::present_unsafe_text(
+            super::bridge_spelling::text(&name, true),
+            enclosing_unsafe_fn,
+        )
+    } else if matches!(form, Some(Form::Ref { mutable: false })) {
+        super::mechanical_receipt::present_unsafe_text(
+            super::bridge_spelling::text(&name, false),
+            enclosing_unsafe_fn,
+        )
+    } else if ty.starts_with("Box<") && !ty.starts_with("Box<[") {
+        // wave-6a W6A-T1: an owning parameter re-enters ownership from the raw
+        // allocation the C ABI carried (every in-crate producer is
+        // `Box::into_raw` at the allocating callee's wrapper).
+        super::mechanical_receipt::present_unsafe_text(
+            format!("Box::from_raw({name})"),
+            enclosing_unsafe_fn,
+        )
+    } else if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
+        return Err(format!(
+            "inbound-wrapper-unplaceable: owning parameter held by Arm B: {name}: {ty}"
+        ));
+    } else {
+        name
+    };
+    Ok(expression)
+}
+
+fn surface_return_pointee(ty: &str) -> Option<String> {
+    let parsed = graft_ty(ty).ok()?;
+    let (_, pointee) = surface_borrowed_type(&parsed)?;
+    Some(rustc_ast_pretty::pprust::ty_to_string(pointee))
+}
+
+#[cfg(test)]
+/// The wrapper builder with the ORIGINAL signature beside the converted one
+/// (R470-4: the argument constructor reads the C ABI's own parameter types).
+pub(super) fn surface_wrapper_block_with_outer(
+    inner_name: &str,
+    function: &rustc_ast::Fn,
+    return_temp_type: Option<&str>,
+    outer: &rustc_ast::FnDecl,
+) -> Result<P<rustc_ast::Block>, String> {
+    surface_wrapper_block_with_arguments(inner_name, function, return_temp_type, None, Some(outer))
+}
+
+#[cfg(test)]
+pub(super) fn surface_wrapper_block(
+    inner_name: &str,
+    function: &rustc_ast::Fn,
+    return_temp_type: Option<&str>,
+) -> Result<P<rustc_ast::Block>, String> {
+    surface_wrapper_block_with_arguments(inner_name, function, return_temp_type, None, None)
+}
+
+fn surface_wrapper_block_with_arguments(
+    inner_name: &str,
+    function: &rustc_ast::Fn,
+    return_temp_type: Option<&str>,
+    planned_arguments: Option<&std::collections::BTreeMap<usize, String>>,
+    outer: Option<&rustc_ast::FnDecl>,
+) -> Result<P<rustc_ast::Block>, String> {
+    if function.sig.decl.c_variadic() {
+        return Err("inbound-wrapper-unplaceable: variadic function".to_owned());
+    }
+    let enclosing_unsafe_fn = matches!(function.sig.header.safety, rustc_ast::Safety::Unsafe(_));
+    let arguments = function
+        .sig
+        .decl
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(index, parameter)| {
+            let outer_ty = outer
+                .and_then(|decl| decl.inputs.get(index))
+                .map(|param| rustc_ast_pretty::pprust::ty_to_string(&param.ty));
+            let outer_ty = outer_ty.as_deref();
+            if let Some(arguments) = planned_arguments {
+                if let Some(expression) = arguments.get(&index) {
+                    return Ok(expression.clone());
+                }
+                // wave-6a (relay wave-6a/013 §2, R423-7): an OWNING parameter
+                // has no borrowed-parameter plan (the surface-argument
+                // constructor plans `Form`s, and a Box has none); its
+                // ownership re-entry is the arm below.
+                let ty = rustc_ast_pretty::pprust::ty_to_string(&parameter.ty);
+                if ty.starts_with("Box<") || ty.starts_with("Option<Box<") {
+                    return surface_argument(parameter, enclosing_unsafe_fn, outer_ty);
+                }
+                let rustc_ast::PatKind::Ident(_, ident, None) = &parameter.pat.kind else {
+                    return Err("inbound-wrapper-unplaceable: non-identifier parameter".into());
+                };
+                // A reverted or unchanged input already has the original ABI.
+                return Ok(ident.name.to_string());
+            }
+            surface_argument(parameter, enclosing_unsafe_fn, outer_ty)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .join(", ");
+    let call = format!("{inner_name}({arguments})");
+    let body = match &function.sig.decl.output {
+        rustc_ast::FnRetTy::Default(_) => call,
+        rustc_ast::FnRetTy::Ty(ty) => {
+            let form = surface_borrowed_type(ty).map(|(form, _)| form);
+            let ty = rustc_ast_pretty::pprust::ty_to_string(ty);
+            if matches!(
+                form,
+                Some(Form::Opt {
+                    mutable: true,
+                    slice: true
+                })
+            ) {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                let pointee = surface_return_pointee(result_ty)
+                    .ok_or("inbound-wrapper-unplaceable: return pointee missing")?;
+                format!(
+                    "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null_mut::<{pointee}>(), |value| value.as_mut_ptr()) }}"
+                )
+            } else if matches!(
+                form,
+                Some(Form::Opt {
+                    mutable: false,
+                    slice: true
+                })
+            ) {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                let pointee = surface_return_pointee(result_ty)
+                    .ok_or("inbound-wrapper-unplaceable: return pointee missing")?;
+                format!(
+                    "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null::<{pointee}>(), |value| value.as_ptr()) }}"
+                )
+            } else if matches!(
+                form,
+                Some(Form::Opt {
+                    mutable: true,
+                    slice: false
+                })
+            ) {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                let pointee = surface_return_pointee(result_ty)
+                    .ok_or("inbound-wrapper-unplaceable: return pointee missing")?;
+                format!(
+                    "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null_mut::<{pointee}>(), core::ptr::from_mut) }}"
+                )
+            } else if matches!(
+                form,
+                Some(Form::Opt {
+                    mutable: false,
+                    slice: false
+                })
+            ) {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                let pointee = surface_return_pointee(result_ty)
+                    .ok_or("inbound-wrapper-unplaceable: return pointee missing")?;
+                format!(
+                    "{{ let __crat_result: {result_ty} = {call}; __crat_result.map_or(core::ptr::null::<{pointee}>(), core::ptr::from_ref) }}"
+                )
+            } else if matches!(form, Some(Form::Slice { mutable: true })) {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                format!("{{ let __crat_result: {result_ty} = {call}; __crat_result.as_mut_ptr() }}")
+            } else if matches!(form, Some(Form::Slice { mutable: false })) {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                format!("{{ let __crat_result: {result_ty} = {call}; __crat_result.as_ptr() }}")
+            } else if matches!(form, Some(Form::Ref { mutable: true })) {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                format!(
+                    "{{ let __crat_result: {result_ty} = {call}; core::ptr::from_mut(__crat_result) }}"
+                )
+            } else if matches!(form, Some(Form::Ref { mutable: false })) {
+                let result_ty = return_temp_type
+                    .ok_or("inbound-wrapper-unplaceable: return temp type missing")?;
+                format!(
+                    "{{ let __crat_result: {result_ty} = {call}; core::ptr::from_ref(__crat_result) }}"
+                )
+            } else if ty.starts_with("Box<") {
+                // wave-6a W6A-T1: an owning return crosses the C ABI as the
+                // raw allocation it always was; the caller side owns it again
+                // through `Box::from_raw` at the freeing callee's wrapper.
+                format!("Box::into_raw({call})")
+            } else if ty.starts_with("Option<Box<") {
+                // wave-6a W6A-A1: a nullable owning return crosses the C ABI as
+                // the raw allocation or null.
+                format!(
+                    "match {call} {{ Some(__crat_owned) => Box::into_raw(__crat_owned), None => core::ptr::null_mut() }}"
+                )
+            } else {
+                call
+            }
+        }
+    };
+    let expression = ::utils::ast::parse_expr(format!("{{ {body} }}"));
+    let rustc_ast::ExprKind::Block(block, _) = expression.kind else {
+        return Err("inbound-wrapper-unplaceable: wrapper body did not parse as block".to_owned());
+    };
+    Ok(block)
+}
+
+fn collect_original_functions(
+    items: &[P<rustc_ast::Item>],
+    out: &mut FxHashMap<NodeId, P<rustc_ast::Item>>,
+) {
+    for item in items {
+        if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+            out.insert(item.id, item.clone());
+        }
+        if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
+            &item.kind
+        {
+            collect_original_functions(inner, out);
+        }
+    }
+}
+
+struct SurfaceCallVisitor<'a> {
+    names: &'a FxHashMap<Symbol, Symbol>,
+}
+
+impl MutVisitor for SurfaceCallVisitor<'_> {
+    fn visit_expr(&mut self, expression: &mut rustc_ast::Expr) {
+        if let rustc_ast::ExprKind::Call(callee, _) = &mut expression.kind
+            && let rustc_ast::ExprKind::Path(None, path) = &mut callee.kind
+            && let Some(segment) = path.segments.last_mut()
+            && let Some(&replacement) = self.names.get(&segment.ident.name)
+        {
+            segment.ident = Ident::new(replacement, segment.ident.span);
+        }
+        rustc_ast::mut_visit::walk_expr(self, expression);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SurfaceNamePopulation {
+    functions: usize,
+    surfaced: usize,
+}
+
+fn collect_surface_name_populations(
+    items: &[P<rustc_ast::Item>],
+    global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+    exposure: &super::decision::exposure::ExposurePolicy,
+    reverted: &FxHashSet<LocalDefId>,
+    out: &mut FxHashMap<Symbol, SurfaceNamePopulation>,
+) {
+    for item in items {
+        if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
+            &item.kind
+        {
+            collect_surface_name_populations(inner, global_map, exposure, reverted, out);
+            continue;
+        }
+        let Some(&did) = global_map.get(&item.id) else {
+            continue;
+        };
+        let rustc_ast::ItemKind::Fn(function) = &item.kind else {
+            continue;
+        };
+        let population = out.entry(function.ident.name).or_default();
+        population.functions += 1;
+        if !reverted.contains(&did)
+            && !matches!(
+                exposure.plan(did),
+                super::decision::exposure::ExposureSurfacePlan::ClosedWorldDirect
+                    | super::decision::exposure::ExposureSurfacePlan::NotApplicable
+            )
+        {
+            population.surfaced += 1;
+        }
+    }
+}
+
+fn finalize_surface_names(
+    populations: &FxHashMap<Symbol, SurfaceNamePopulation>,
+) -> Result<FxHashMap<Symbol, Symbol>, String> {
+    let mut out = FxHashMap::default();
+    for (&original, population) in populations {
+        if population.surfaced == 0 {
+            continue;
+        }
+        if population.surfaced != population.functions {
+            return Err(format!(
+                "inbound-wrapper-unplaceable: mixed surface function name {original} \
+                 ({}/{})",
+                population.surfaced, population.functions,
+            ));
+        }
+        out.insert(original, Symbol::intern(&format!("__crat_safe_{original}")));
+    }
+    Ok(out)
+}
+
+fn apply_surface_plans_to_items(
+    items: &mut ThinVec<P<rustc_ast::Item>>,
+    originals: &FxHashMap<NodeId, P<rustc_ast::Item>>,
+    global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+    exposure: &super::decision::exposure::ExposurePolicy,
+    surface_names: &FxHashMap<Symbol, Symbol>,
+    return_temp_types: &FxHashMap<LocalDefId, String>,
+    surface_arguments: &FxHashMap<LocalDefId, std::collections::BTreeMap<usize, String>>,
+    nested: &FxHashMap<LocalDefId, &super::decision::nested_slice::Plan>,
+    reverted: &FxHashSet<LocalDefId>,
+    guard: &mut Composition,
+) -> Result<(), String> {
+    let existing_names = items
+        .iter()
+        .filter_map(|item| match &item.kind {
+            rustc_ast::ItemKind::Fn(function) => Some(function.ident.name),
+            _ => None,
+        })
+        .collect::<FxHashSet<_>>();
+    let mut rewritten = ThinVec::new();
+    for mut item in std::mem::take(items) {
+        if let rustc_ast::ItemKind::Mod(_, _, rustc_ast::ModKind::Loaded(inner, _, _, _)) =
+            &mut item.kind
+        {
+            apply_surface_plans_to_items(
+                inner,
+                originals,
+                global_map,
+                exposure,
+                surface_names,
+                return_temp_types,
+                surface_arguments,
+                nested,
+                reverted,
+                guard,
+            )?;
+            rewritten.push(item);
+            continue;
+        }
+        let Some(&did) = global_map.get(&item.id) else {
+            rewritten.push(item);
+            continue;
+        };
+        let plan = exposure.plan(did);
+        if reverted.contains(&did)
+            || matches!(
+                plan,
+                super::decision::exposure::ExposureSurfacePlan::ClosedWorldDirect
+                    | super::decision::exposure::ExposureSurfacePlan::NotApplicable
+            )
+        {
+            rewritten.push(item);
+            continue;
+        }
+        let Some(mut outer) = originals.get(&item.id).cloned() else {
+            return Err("inbound-wrapper-unplaceable: original function missing".to_owned());
+        };
+        let replacement_span = super::ast_bridge::item_span_with_attrs(&outer);
+        let rustc_ast::ItemKind::Fn(inner_fn) = &mut item.kind else {
+            return Err("inbound-wrapper-unplaceable: surface target is not function".to_owned());
+        };
+        let rustc_ast::ItemKind::Fn(outer_fn) = &mut outer.kind else {
+            return Err("inbound-wrapper-unplaceable: original target is not function".to_owned());
+        };
+        if !guard.claim(item.id, item.span, "surface") {
+            return Err("inbound-wrapper-unplaceable: surface composition refused".to_owned());
+        }
+        let inner_name = format!("__crat_safe_{}", inner_fn.ident.name);
+        if existing_names.contains(&Symbol::intern(&inner_name)) {
+            return Err(format!(
+                "inbound-wrapper-unplaceable: generated inner name collides: {inner_name}"
+            ));
+        }
+        if let Some(body) = inner_fn.body.as_mut() {
+            SurfaceCallVisitor {
+                names: surface_names,
+            }
+            .visit_block(body);
+        }
+        let no_arguments = std::collections::BTreeMap::new();
+        outer_fn.body = Some(surface_wrapper_block_with_arguments(
+            &inner_name,
+            inner_fn,
+            return_temp_types.get(&did).map(String::as_str),
+            Some(surface_arguments.get(&did).unwrap_or(&no_arguments)),
+            Some(&outer_fn.sig.decl),
+        )?);
+        if let Some(nested) = nested.get(&did) {
+            let expression = ::utils::ast::parse_expr(format!("{{ {} }}", nested.prefix()));
+            let rustc_ast::ExprKind::Block(mut block, _) = expression.kind else { unreachable!() };
+            block
+                .stmts
+                .extend(outer_fn.body.as_ref().unwrap().stmts.iter().cloned());
+            outer_fn.body = Some(block);
+        }
+        inner_fn.ident = Ident::new(Symbol::intern(&inner_name), inner_fn.ident.span);
+        item.attrs
+            .retain(|attr| !attr.has_name(sym::no_mangle) && !attr.has_name(sym::export_name));
+        outer.span = replacement_span;
+        item.span = replacement_span;
+        rewritten.push(outer);
+        rewritten.push(item);
+    }
+    *items = rewritten;
+    Ok(())
+}
+
+fn apply_surface_plans(
+    capture: &AstCapture,
+    table: &super::decision::DecisionTable,
+    reverts: &RevertSet,
+    krate: &mut rustc_ast::Crate,
+    guard: &mut Composition,
+) -> Result<(), String> {
+    let Some(exposure) = table.exposure.as_ref() else {
+        return Ok(());
+    };
+    let mut originals = FxHashMap::default();
+    collect_original_functions(&capture.krate.items, &mut originals);
+    let mut surface_name_populations = FxHashMap::default();
+    collect_surface_name_populations(
+        &capture.krate.items,
+        &capture.map.global_map,
+        exposure,
+        &reverts.fns,
+        &mut surface_name_populations,
+    );
+    let surface_names = finalize_surface_names(&surface_name_populations)?;
+    let return_temp_types = table
+        .seams
+        .explicit_declarations
+        .iter()
+        .filter(|site| site.category == "return-temp")
+        .map(|site| (site.owner_class.local_def_id(), site.emitted_type.clone()))
+        .collect::<FxHashMap<_, _>>();
+    // **R477-4 (nested 012 step 6)** — an owner dropped HERE is dropped silently: the
+    // consumer below only errors when the surface argument's own form is `NestedSlice`,
+    // so an owner missing from this map with an ordinarily-formed argument simply emits
+    // the ordinary argument. No revert, no hold, no diagnostic — which is exactly the
+    // signature nested reported. The reason is recorded so the drop is visible.
+    let mut nested_dropped: Vec<String> = Vec::new();
+    let nested = table
+        .nested_receipts
+        .iter()
+        .filter_map(|receipt| {
+            let plan = receipt.result.as_ref().ok()?;
+            let owner = format!("{:?}", plan.owner);
+            if reverts.fns.contains(&plan.owner) {
+                nested_dropped.push(format!("{owner}\tfunction-reverted"));
+                return None;
+            }
+            if !plan
+                .required_nodes()
+                .all(|h| reverts.keeps_subject(plan.owner, h))
+            {
+                nested_dropped.push(format!("{owner}\trequired-subject-reverted"));
+                return None;
+            }
+            for p in &plan.parameters {
+                // EXACTLY one, deliberately: zero means nothing renders this parameter
+                // and two means two producers would. Both are drops, and they are
+                // different findings, so they are counted apart.
+                let matches = table
+                    .seams
+                    .surface_arguments
+                    .iter()
+                    .filter(|a| {
+                        a.node == (plan.owner, p.hir)
+                            && reverts.keeps_edit(a.owner_class, &a.atom_ids)
+                    })
+                    .count();
+                if matches != 1 {
+                    nested_dropped.push(format!(
+                        "{owner}\tsurface-arguments-not-exactly-one:{matches}:hir={:?}",
+                        p.hir
+                    ));
+                    return None;
+                }
+            }
+            Some((plan.owner, plan))
+        })
+        .collect::<FxHashMap<_, _>>();
+    let mut surface_arguments =
+        FxHashMap::<LocalDefId, std::collections::BTreeMap<usize, String>>::default();
+    for argument in &table.seams.surface_arguments {
+        if !reverts.keeps_subject(argument.node.0, argument.node.1)
+            || !reverts.keeps_edit(argument.owner_class, &argument.atom_ids)
+        {
+            continue;
+        }
+        let unsafe_fn = argument
+            .bridge
+            .unsafe_context
+            .is_some_and(|context| context.unsafe_fn);
+        let expression = if matches!(argument.form, Form::NestedSlice { .. }) {
+            nested
+                .get(&argument.node.0)
+                .and_then(|plan| plan.argument(argument.parameter_index))
+                .ok_or("nested-surface-argument-withdrawn")?
+        } else {
+            argument
+                .spec
+                .render_in_context(&argument.base, unsafe_fn)
+                .ok_or("surface-argument-render-unavailable")?
+        };
+        let prior = surface_arguments
+            .entry(argument.owner_class.local_def_id())
+            .or_default()
+            .insert(argument.parameter_index, expression);
+        if prior.is_some() {
+            return Err("surface-argument-identity-duplicate".into());
+        }
+    }
+    apply_surface_plans_to_items(
+        &mut krate.items,
+        &originals,
+        &capture.map.global_map,
+        exposure,
+        &surface_names,
+        &return_temp_types,
+        &surface_arguments,
+        &nested,
+        &reverts.fns,
+        guard,
+    )?;
+    // Call-site adapters are planned against the safe inner's interface, not
+    // the raw wrapper retained for fn-pointer exposure.  Resolve those names
+    // only after final class reverts are known, so a held defining class never
+    // leaves a call to a generated item that was not emitted.
+    SurfaceCallVisitor {
+        names: &surface_names,
+    }
+    .visit_crate(krate);
+    Ok(())
+}
+
+/// **THE ONE AST CAPTURE PER SESSION** (M-2/A).
+///
+/// `expanded_ast` **panics once the HIR is built** — it clones a resolver that
+/// lowering has already consumed — and `make_ast_to_hir` builds the HIR. So this
+/// may be called **exactly once per compiler session, before any HIR/MIR
+/// query**, and the pristine krate it yields is the only one there will be.
+///
+/// That is why the verify/revert loop clones rather than re-captures: a second
+/// call is not expensive, it is a panic.
+pub(crate) struct AstCapture {
+    /// The pristine, untransformed crate. **Cloned per revert round**, never
+    /// mutated in place — the loop needs a fresh copy for each revert set, and
+    /// `rustc_ast::Crate: Clone` is what makes A possible at all.
+    pub krate: rustc_ast::Crate,
+    pub map: ::utils::ir::AstToHir,
+}
+
+pub(crate) fn capture_ast(tcx: rustc_middle::ty::TyCtxt<'_>) -> Result<AstCapture, String> {
+    let captured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut krate = ::utils::ast::expanded_ast(tcx);
+        let map = ::utils::ast::make_ast_to_hir(&mut krate, tcx);
+        AstCapture { krate, map }
+    }));
+    captured.map_err(|_| "AST capture panicked".to_owned())
+}
+
+/// One transform pass over a CLONE of the pristine capture, under one revert
+/// set. Called once per verify/revert round.
+fn transform_with<'tcx>(
+    tcx: rustc_middle::ty::TyCtxt<'tcx>,
+    capture: &AstCapture,
+    table: &super::decision::DecisionTable,
+    reverts: &RevertSet,
+    terminal_call_plans: Option<&super::decision::seam::TerminalCallPlans>,
+) -> Result<
+    (
+        RefDeclStats,
+        UseGraftStats,
+        SeamGraftStats,
+        usize,
+        usize,
+        usize,
+        SeamUseSurface,
+        rustc_ast::Crate,
+        // **THE CHANGED-SET, EACH EDIT WITH ITS CLAIMANT.** Carried as pairs
+        // rather than two parallel vectors so the pairing cannot come apart at
+        // this boundary; the emission sites project the spans back out, which
+        // is order-preserving and classifies nothing.
+        Vec<(rustc_span::Span, &'static str)>,
+    ),
+    String,
+> {
+    // **Per ROUND, not per program (R515-1 ruling 3).** The emission asks this
+    // walk "what did you hold, that the next round must revert?" -- carrying an
+    // earlier round's set into the answer would re-revert classes already taken
+    // out and make the round's own hold unreadable. The RECEIPTS accumulate
+    // across rounds and are reset per program in the census worker; only the
+    // class set is reset here, because only it is a question about this round.
+    reset_graft_held_classes();
+
+    // The finalizer's complete collections replace the earlier adapter plans.
+    // An origin-parameter atom also owns its generated return interface.
+    // Apply the same class closure as receipts and verification accounting.
+    let normalized_reverts;
+    let reverts = if reverts.atom_names.is_empty() && reverts.fns.is_empty() {
+        reverts
+    } else {
+        let atoms = reverts.atom_names.iter().cloned().collect();
+        let classes = reverts
+            .fns
+            .iter()
+            .copied()
+            .map(super::bridge_receipt::SignatureClassId::of)
+            .collect();
+        let effective = if let Some(plans) = terminal_call_plans {
+            plans.effective_reverted_classes(&classes, &atoms)
+        } else {
+            let edges = table
+                .seams
+                .interface_dependencies
+                .iter()
+                .chain(&table.seams.generated_item_dependencies)
+                .copied()
+                .collect::<Vec<_>>();
+            super::decision::lifetime::ReturnOriginAtomDependencies::derive(table, &edges)
+                .effective_reverted_classes(&classes, &atoms)
+        };
+        normalized_reverts = RevertSet {
+            fns: effective
+                .into_iter()
+                .map(|owner| owner.local_def_id())
+                .collect(),
+            ..reverts.clone()
+        };
+        &normalized_reverts
+    };
+    // In particular, a sealed empty collection must not resurrect an adapter
+    // from the decision table. The shared filters still own all revert rules.
+    let terminal_table = terminal_call_plans.map(|plans| {
+        let mut sealed = table.clone();
+        sealed.seams.a5_raw_calls.clone_from(&plans.a5_raw_calls);
+        sealed
+            .seams
+            .surface_arguments
+            .clone_from(&plans.surface_arguments);
+        sealed
+            .seams
+            .callee_parameter_inputs
+            .clone_from(&plans.callee_parameter_inputs);
+        sealed
+            .seams
+            .receiver_inputs
+            .clone_from(&plans.receiver_inputs);
+        sealed.seams.raw_receivers.clone_from(&plans.raw_receivers);
+        sealed
+            .seams
+            .outbound_expressions
+            .clone_from(&plans.outbound_expressions);
+        sealed
+            .seams
+            .pair_raw_calls
+            .clone_from(&plans.pair_raw_calls);
+        sealed.seams.edits.clone_from(&plans.seam_edits);
+        sealed
+            .seams
+            .revert_found_form_edits
+            .clone_from(&plans.revert_found_form_edits);
+        sealed
+    });
+    let table = terminal_table.as_ref().unwrap_or(table);
+    let mut krate = capture.krate.clone();
+    let map = &capture.map;
+    // Original signature type metadata supplies syntax for admitted aliases.
+    // Only layers already selected by the lifetime plan can be rewritten;
+    // resolving an alias here does not admit a return or change a decision.
+    let alias_owners = table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let node = (subject.fn_did, subject.hir_id);
+            (table.declaration_pointees.contains_key(&node)
+                && reverts.keeps_subject(node.0, node.1)
+                && super::terminal_application(decision, true).is_some())
+            .then_some(subject.fn_did)
+        })
+        .collect::<FxHashSet<_>>();
+    let resolved_signatures = alias_owners
+        .into_iter()
+        .map(|owner| {
+            let signature = tcx.fn_sig(owner).skip_binder().skip_binder();
+            let render = |ty: rustc_middle::ty::Ty<'tcx>| {
+                (matches!(ty.kind(), rustc_middle::ty::TyKind::RawPtr(..))
+                    && super::decision::declaration::pointee_is_nameable(tcx, owner, ty))
+                .then(|| super::decision::declaration::pointee_source(tcx, ty))
+            };
+            (
+                owner,
+                ResolvedRawSignature {
+                    inputs: signature.inputs().iter().map(|&ty| render(ty)).collect(),
+                    output: render(signature.output()),
+                },
+            )
+        })
+        .collect::<FxHashMap<_, _>>();
+    let mut lifetime_visitor = LifetimeSignatureVisitor {
+        global_map: &map.global_map,
+        plans: &table.lifetime_plan,
+        return_interfaces: &table.return_interfaces,
+        reverted_fns: &reverts.fns,
+        resolved_signatures: &resolved_signatures,
+        unplaceable: Vec::new(),
+    };
+    lifetime_visitor.visit_crate(&mut krate);
+    if !lifetime_visitor.unplaceable.is_empty() {
+        return Err(format!(
+            "lifetime-ast-unplaceable: {:?}",
+            lifetime_visitor.unplaceable
+        ));
+    }
+    let mut decisions: FxHashMap<(LocalDefId, HirId), (DeclForm, bool, Option<String>)> =
+        FxHashMap::default();
+    let mut uses: FxHashMap<(u32, u32), String> = FxHashMap::default();
+    let mut use_key_collisions = 0usize;
+    let mut decision_key_collisions = 0usize;
+    for (subject, decision) in &table.entries {
+        // Atom reverts are subject-granular. Function reverts remain visible to
+        // RefDeclVisitor's at-site control; atom reverts are filtered here
+        // because the visitor historically receives only a function set.
+        if reverts
+            .atom_subjects
+            .contains(&(subject.fn_did, subject.hir_id))
+        {
+            continue;
+        }
+        // EXHAUSTIVE — the denylist rejects the bypass shape, and the arm's
+        // population is defined by which disposition was reached.
+        let (form, mutable, use_edits) = match decision {
+            super::decision::Decision::Cursor { mutable, plan } => {
+                let form = if plan.wrapper && plan.parameter {
+                    if plan.optional {
+                        DeclForm::Opt { slice: true }
+                    } else {
+                        DeclForm::Slice
+                    }
+                } else {
+                    DeclForm::Cursor {
+                        wrapper: plan.wrapper,
+                        optional: plan.optional,
+                    }
+                };
+                (form, *mutable, Some(&plan.uses))
+            }
+            super::decision::Decision::Ref { mutable } => (DeclForm::Ref, *mutable, None),
+            // Its direct callee's rewritten return type supplies the inferred
+            // local type. No declaration splice exists or is synthesized.
+            super::decision::Decision::InferredRef { .. } => continue,
+            super::decision::Decision::NestedSlice {
+                mutable,
+                inner_mutable,
+                uses,
+            } => (
+                DeclForm::NestedSlice {
+                    inner_mutable: *inner_mutable,
+                },
+                *mutable,
+                Some(uses),
+            ),
+            super::decision::Decision::Slice { mutable, uses } => {
+                (DeclForm::Slice, *mutable, Some(uses))
+            }
+            super::decision::Decision::Opt {
+                mutable,
+                slice,
+                uses,
+            } => (DeclForm::Opt { slice: *slice }, *mutable, Some(uses)),
+            super::decision::Decision::Box(plan) => (
+                DeclForm::Box {
+                    slice: matches!(plan.shape, super::decision::box_facts::BoxShape::Slice),
+                    optional: plan.optional,
+                    pointee_override: plan.pointee_override,
+                },
+                false,
+                None,
+            ),
+            super::decision::Decision::Degraded(_) => continue,
+        };
+        // **ITEM 7 — the registered finding, repaired.** This join fed
+        // `arms_full` and the RECON gate with no collision counter while its
+        // `uses` and `seams` siblings both had one. Fixing the instance in
+        // `phase3_fn_parity` and leaving the class here is the pattern the
+        // phase-4 boundary was about.
+        let lifetime = match subject.kind {
+            super::decision::SubjectKind::Param { hir_index } => table
+                .lifetime_plan
+                .function(subject.fn_did)
+                .and_then(|plan| {
+                    plan.lifetime_for(super::decision::lifetime::FnSignatureSlot::arg(
+                        hir_index + 1,
+                        0,
+                        0,
+                    ))
+                })
+                .map(str::to_owned),
+            super::decision::SubjectKind::Local => None,
+        };
+        // I10 supplies this binding's type through an explicit component-local
+        // temporary. There is no annotation for RefDeclVisitor to claim. Its
+        // use edit still participates in grafting and the final AST check.
+        if !table
+            .declaration_patterns
+            .contains_key(&(subject.fn_did, subject.hir_id))
+            && !super::decision::construction_values::has_declaration(table, subject)
+            && !super::decision::slice_construction_values::has_declaration(table, subject)
+            && !super::decision::raw_place_values::has_declaration(table, subject)
+            && !super::decision::call_result_option::has_declaration(table, subject)
+            && !super::decision::source_typed_local::has_declaration(table, subject)
+            && !table
+                .return_receivers
+                .plans
+                .get(&(subject.fn_did, subject.hir_id))
+                .is_some_and(|receiver| {
+                    !table.return_receivers.failures.contains_key(&receiver.node)
+                        && table.seams.explicit_declarations.iter().any(|site| {
+                            site.category == "local"
+                                && site.node == Some(receiver.node)
+                                && site.emitted_type == receiver.receiver_type()
+                        })
+                })
+            && !super::decision::void_region::typed_receiver(table, subject, decision)
+            // Wave-6o: placed by `ExplicitLocalDeclVisitor`, not by this arm.
+            && !super::decision::null_init_declaration::has_explicit_declaration(
+                table, subject, decision,
+            )
+        {
+            insert_counting(
+                &mut decisions,
+                (subject.fn_did, subject.hir_id),
+                (form, mutable, lifetime),
+                &mut decision_key_collisions,
+            );
+        }
+        for u in use_edits.into_iter().flatten() {
+            // A returned `Some` means two use edits carried the SAME span and
+            // one was overwritten — the map would then hold fewer edits than
+            // the table does, and every downstream count would agree with
+            // itself while being short. `refuse_nested_use_edits` should make
+            // this impossible (identical spans contain each other), but that is
+            // an argument about another module, and this is a counter.
+            insert_counting(
+                &mut uses,
+                (u.span.lo().0, u.span.hi().0),
+                u.replacement.clone(),
+                &mut use_key_collisions,
+            );
+        }
+    }
+
+    // The direct-annotation population, including orphaned impl subjects.
+    // I10 pattern bindings instead owe a typed component temporary, checked
+    // independently in the final grafted AST; they have no annotation here.
+    let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
+    // **ARM 1 takes the revert set through its own site check** (M-2). Callers
+    // that want the un-reverted population — `arms_full` and the parity gates —
+    // pass an EMPTY `RevertSet`, which is a statement rather than an omission.
+    let mut guard = Composition::default();
+    let mut v = RefDeclVisitor {
+        local_map: &map.local_map,
+        decisions: &decisions,
+        declaration_pointees: &table.declaration_pointees,
+        mutable_option_bindings: &table.option_mut_bindings,
+        global_map: &map.global_map,
+        reverted_fns: &reverts.fns,
+        subject_hirs: &subject_hirs,
+        current_fn: None,
+        guard: &mut guard,
+        stats: RefDeclStats::default(),
+    };
+    v.visit_crate(&mut krate);
+    let decls = v.stats;
+
+    let mut explicit_local_types = FxHashMap::default();
+    for site in table.seams.explicit_declarations.iter().filter(|site| {
+        site.category == "local"
+            && reverts.keeps(site.owner_class)
+            && site
+                .node
+                .is_some_and(|node| reverts.keeps_subject(node.0, node.1))
+    }) {
+        let Some(node) = site.node else {
+            return Err("declaration-explicit-type-local-missing-node".to_owned());
+        };
+        // R410-2(a): the same explicit type registered twice for one node is
+        // ONE declaration; a different type is the planner's
+        // `declaration-type-conflict` hold and never reaches this pass -- if
+        // it does, fail closed as before.
+        if let Some(previous) = explicit_local_types.insert(node, site.emitted_type.clone())
+            && previous != site.emitted_type
+        {
+            return Err(format!(
+                "declaration-explicit-type-duplicate:{}:{}",
+                node.0.local_def_index.as_u32(),
+                node.1.local_id.as_u32(),
+            ));
+        }
+    }
+    if !explicit_local_types.is_empty() {
+        let mut explicit = ExplicitLocalDeclVisitor {
+            local_map: &map.local_map,
+            global_map: &map.global_map,
+            sites: &explicit_local_types,
+            mutable_option_bindings: &table.option_mut_bindings,
+            current_fn: None,
+            guard: &mut guard,
+            placed: FxHashSet::default(),
+            refused: 0,
+        };
+        explicit.visit_crate(&mut krate);
+        if explicit.refused != 0 || explicit.placed.len() != explicit_local_types.len() {
+            return Err(format!(
+                "declaration-explicit-type-unplaceable: planned={} placed={} refused={}",
+                explicit_local_types.len(),
+                explicit.placed.len(),
+                explicit.refused,
+            ));
+        }
+    }
+
+    // wave-6f: struct items, their impls and the storing signatures, after the
+    // declaration passes so a stored parameter's reference layer exists.
+    super::field_reference_ast::apply(tcx, capture, table, reverts, &mut krate, &mut guard)?;
+    // E5C-3: hoist the pure reads a moving argument would invalidate, before
+    // the use grafts (a moved read keeps its spans).
+    super::field_reference_ast::apply_hoists(table, reverts, &mut krate, &mut guard)?;
+
+    // wave-6a W6A-T1: flexible-tail struct items, impls and owning signatures.
+    super::flexible_tail_ast::apply(tcx, capture, table, reverts, &mut krate, &mut guard)?;
+
+    // **ARMS 2 AND 3 CONSUME THE SHARED BUILDER** (M-2). Their visitors carry no
+    // site check, so their revert semantics live entirely in how these maps are
+    // built — and production builds them in exactly ONE place.
+    let filtered = filtered_inputs(table, reverts);
+    if !filtered.callee_parameter_input_errors.is_empty() {
+        return Err(format!(
+            "callee-parameter-input-invariant:{}",
+            filtered.callee_parameter_input_errors.join(";")
+        ));
+    }
+    let box_fabricated = filtered.box_fabricated;
+    let uses = filtered.uses;
+    let construction_brackets = filtered.construction_brackets;
+    let statement_deletes = filtered.statement_deletes;
+    let use_key_collisions = use_key_collisions + filtered.use_key_collisions;
+    // wave-6l: native-result views at the same node as a use graft compose
+    // under it (the withheld set is the one the receiver-input pass uses).
+    let withheld_for_views: std::collections::BTreeSet<_> = reverts
+        .fns
+        .iter()
+        .copied()
+        .map(super::bridge_receipt::SignatureClassId::of)
+        .collect();
+    let inner_views = table
+        .seams
+        .native_result_expressions
+        .plans
+        .values()
+        .filter(|input| input.active(&withheld_for_views))
+        .map(|input| ((input.call_span.lo().0, input.call_span.hi().0), input))
+        .filter(|(key, _)| uses.contains_key(key))
+        .collect::<FxHashMap<_, _>>();
+    // **R483-2** — the original spelling of every node the composition may need to find,
+    // taken from the source at the SAME span key the use grafts are keyed on. Only the
+    // keys that carry an inner view can ever need one, so this is bounded by them.
+    let originals = inner_views
+        .keys()
+        .filter_map(|&(lo, hi)| {
+            let span =
+                rustc_span::Span::with_root_ctxt(rustc_span::BytePos(lo), rustc_span::BytePos(hi));
+            tcx.sess
+                .source_map()
+                .span_to_snippet(span)
+                .ok()
+                .map(|text| ((lo, hi), text))
+        })
+        .collect::<FxHashMap<_, _>>();
+    let mut g = UseGraftVisitor::new(&uses, &mut guard)
+        .with_originals(originals)
+        .with_inner_views(inner_views);
+    g.visit_crate(&mut krate);
+    // **The `?` is deliberately NOT here, and neither is an `Err`.** This read
+    // `return Err(why.clone())`, which made one unlocatable composition a
+    // program-level failure at round 0 -- the fifth arm of the same defect the
+    // floor removed from the other four. The hold now happens at the site.
+    let (mut grafts, composed_receiver_inputs) = g.finish_composed();
+    // wave-6f (W6F-3): owned-field wraps, post-order over the grafted tree.
+    // A wrapped node keeps its span, so a use edit nested INSIDE a wrap is
+    // reached either way; running after the use pass makes the other nesting
+    // (a use graft that swallowed a field site) surface as `unplaced` instead
+    // of being overwritten silently.
+    super::field_reference_ast::apply_wraps(table, reverts, &mut krate, &mut guard)?;
+    let mut deletes = StatementDeleteVisitor::new(&statement_deletes, &mut guard);
+    deletes.visit_crate(&mut krate);
+    let delete_stats = deletes.finish();
+    grafts.statements_deleted = delete_stats.deleted;
+    grafts.statement_unmatched = delete_stats.unmatched;
+    grafts.statement_refused = delete_stats.refused;
+
+    // **ARM 3 — the seam pass, and it runs THIRD by requirement, not by
+    // convenience.** A seam's argument may contain a use rewrite, so the use
+    // pass must have finished before the subtree is moved.
+    let seam_targets = filtered.seams;
+    let seam_key_collisions = filtered.seam_key_collisions;
+    let mut s =
+        SeamGraftVisitor::new_with_global_map(&seam_targets, &mut guard, &capture.map.global_map);
+    s.visit_crate(&mut krate);
+    let mut seams = s.finish();
+    seams.key_collisions = seam_key_collisions;
+    seams.len_fabricated += box_fabricated;
+
+    let mut a5_raw_calls = FxHashMap::default();
+    for call in table
+        .seams
+        .a5_raw_calls
+        .iter()
+        .filter(|call| reverts.keeps(call.owner_class))
+    {
+        let key = (call.call_span.lo().0, call.call_span.hi().0);
+        if a5_raw_calls.insert(key, call).is_some() {
+            return Err(format!(
+                "multiple A5 raw-view plans target call span {}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    super::wave5r_field_borrow::apply_before_a5(
+        tcx,
+        table,
+        reverts,
+        &mut krate,
+        &mut guard,
+        &a5_raw_calls.keys().copied().collect(),
+    )?;
+    // (α), relay 033: the argument intervals another class's `c` arm owns and
+    // the seam pass has already grafted.
+    let a5_inner_arguments: FxHashSet<(u32, u32)> = table
+        .seams
+        .edits
+        .iter()
+        .filter(|edit| {
+            edit.bridge.arm == "c"
+                && !edit.zero_syntax
+                && reverts.keeps_edit(edit.owner_class, &edit.atom_ids)
+        })
+        .map(|edit| (edit.span.lo().0, edit.span.hi().0))
+        .collect();
+    // R556-4 (i): a base-view bridge sits strictly inside its argument; the
+    // wrapper takes the whole argument's grafted text, so key it by the argument.
+    let a5_inner_arguments = {
+        let mut arguments = a5_inner_arguments;
+        for retirement in &table.seams.box_base_view_retirements {
+            let base = (retirement.base.lo().0, retirement.base.hi().0);
+            if arguments.contains(&base) {
+                arguments.insert((retirement.argument.lo().0, retirement.argument.hi().0));
+            }
+        }
+        arguments
+    };
+    let mut a5_raw = A5RawGraftVisitor {
+        calls: &a5_raw_calls,
+        reverts,
+        guard: &mut guard,
+        consumed: FxHashSet::default(),
+        held: FxHashSet::default(),
+        inner_arguments: &a5_inner_arguments,
+        inner_products_taken: 0,
+        failure: None,
+    };
+    a5_raw.visit_crate(&mut krate);
+    if let Some(why) = a5_raw.failure.take() {
+        return Err(why);
+    }
+    let unmatched_a5_raw = a5_raw_calls
+        .keys()
+        .filter(|key| !a5_raw.consumed.contains(key) && !a5_raw.held.contains(key))
+        .copied()
+        .collect::<Vec<_>>();
+    if !unmatched_a5_raw.is_empty() {
+        return Err(format!(
+            "unmatched A5 raw-view call spans: {unmatched_a5_raw:?}"
+        ));
+    }
+
+    let mut pair_raw_calls = FxHashMap::default();
+    for call in table
+        .seams
+        .pair_raw_calls
+        .iter()
+        .filter(|call| reverts.keeps_edit(call.owner_class, &call.atom_ids))
+    {
+        let key = (call.call_span.lo().0, call.call_span.hi().0);
+        if a5_raw_calls.contains_key(&key) {
+            return Err(format!(
+                "A5 and PAIR raw-view plans collide at call span {}..{}",
+                key.0, key.1
+            ));
+        }
+        if pair_raw_calls.insert(key, call).is_some() {
+            return Err(format!(
+                "multiple PAIR raw-view plans target call span {}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    let mut pair_raw = PairRawGraftVisitor {
+        calls: &pair_raw_calls,
+        reverts,
+        guard: &mut guard,
+        consumed: FxHashSet::default(),
+        held: FxHashSet::default(),
+        failure: None,
+    };
+    pair_raw.visit_crate(&mut krate);
+    if let Some(why) = pair_raw.failure.take() {
+        return Err(why);
+    }
+    let unmatched_pair_raw = pair_raw_calls
+        .keys()
+        .filter(|key| !pair_raw.consumed.contains(key) && !pair_raw.held.contains(key))
+        .copied()
+        .collect::<Vec<_>>();
+    if !unmatched_pair_raw.is_empty() {
+        return Err(format!(
+            "unmatched PAIR raw-view call spans: {unmatched_pair_raw:?}"
+        ));
+    }
+    let mut twin_receipt = String::new();
+    super::decision::counted_void::graft_calls(
+        &table.seams.counted_void_calls,
+        reverts,
+        &mut guard,
+        &mut krate,
+        &capture.krate,
+        &capture.map.global_map,
+        &mut twin_receipt,
+    )?;
+    // wave-6r (R459-2): instrument-only; the census writes it beside the
+    // other rows and nothing reads it.
+    crate::bo_rewriter::decision::counted_void::record_twin_receipt(&twin_receipt);
+
+    // **C-9 — mandatory companion emission.** The plan is already filtered by
+    // the accepted model. Reverts use the mark's callee owner, matching the
+    // span-plan edit and the decision whose both-Ref result justified it.
+    let mut c9_marks = FxHashMap::default();
+    for mark in table
+        .c9_marks
+        .iter()
+        .filter(|mark| reverts.keeps(super::bridge_receipt::SignatureClassId::of(mark.owner_did)))
+    {
+        let key = (mark.call_span.lo().0, mark.call_span.hi().0);
+        if c9_marks.insert(key, mark).is_some() {
+            return Err(format!(
+                "multiple retained C-9 emission plans target call span {}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    let mut c9 = C9GraftVisitor {
+        marks: &c9_marks,
+        guard: &mut guard,
+        consumed: FxHashSet::default(),
+        held: FxHashSet::default(),
+        failure: None,
+    };
+    c9.visit_crate(&mut krate);
+    if let Some(why) = c9.failure.take() {
+        return Err(why);
+    }
+    let unmatched = c9_marks
+        .keys()
+        .filter(|key| !c9.consumed.contains(key) && !c9.held.contains(key))
+        .copied()
+        .collect::<Vec<_>>();
+    if !unmatched.is_empty() {
+        return Err(format!("unmatched retained C-9 call spans: {unmatched:?}"));
+    }
+
+    let classes = reverts
+        .fns
+        .iter()
+        .copied()
+        .map(super::bridge_receipt::SignatureClassId::of)
+        .collect();
+    let atoms = reverts.atom_names.iter().cloned().collect();
+    for unavailable in table.seams.receiver_inputs.unavailable.values() {
+        if unavailable.selection.active(&classes, &atoms) {
+            return Err(format!(
+                "receiver-input-invariant:unavailable:{}:{}:{:?}",
+                unavailable.selection.node.0.local_def_index.as_u32(),
+                unavailable.selection.node.1.local_id.as_u32(),
+                unavailable.reason
+            ));
+        }
+    }
+    let mut receiver_inputs = FxHashMap::default();
+    for input in table
+        .seams
+        .outbound_expressions
+        .plans
+        .values()
+        .filter(|input| input.active(&classes))
+    {
+        let key = (input.argument_span.lo().0, input.argument_span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::Outbound(input))
+            .is_some()
+        {
+            return Err(format!(
+                "outbound-expression-invariant:duplicate-plan:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    for input in table
+        .seams
+        .native_result_expressions
+        .plans
+        .values()
+        .filter(|input| input.active(&classes))
+    {
+        let key = (input.call_span.lo().0, input.call_span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::Expression(input))
+            .is_some()
+        {
+            return Err(format!(
+                "native-result-expression-invariant:duplicate-plan:{}..{}",
+                key.0, key.1
+            ));
+        }
+        if let Some(receiver) = input.cast_receiver
+            && let Some(cast) = input.covers_initializer
+            && reverts.keeps_subject(input.caller, receiver.binding)
+        {
+            let key = (cast.lo().0, cast.hi().0);
+            if receiver_inputs
+                .insert(key, ReceiverGraft::CastReceiver(input))
+                .is_some()
+            {
+                return Err(format!(
+                    "native-result-expression-invariant:duplicate-cast-receiver:{}..{}",
+                    key.0, key.1
+                ));
+            }
+        }
+    }
+    for input in table
+        .seams
+        .receiver_inputs
+        .plans
+        .values()
+        .filter(|input| input.active(&classes, &atoms))
+    {
+        let span = input.receiver.initializer_span;
+        let key = (span.lo().0, span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::Retired(input))
+            .is_some()
+        {
+            return Err(format!(
+                "receiver-input-invariant:duplicate-plan:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    for input in table
+        .seams
+        .raw_receivers
+        .plans
+        .values()
+        .filter(|input| input.active(&classes))
+    {
+        let span = input.initializer_span;
+        let key = (span.lo().0, span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::Raw(input))
+            .is_some()
+        {
+            return Err(format!(
+                "receiver-input-invariant:duplicate-raw-plan:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    for receiver in table.return_receivers.plans.values().filter(|receiver| {
+        receiver.coercion == super::decision::return_receiver::ReceiverCoercion::SharedOption
+            && reverts.keeps(super::bridge_receipt::SignatureClassId::of(receiver.callee))
+            && reverts.keeps_subject(receiver.node.0, receiver.node.1)
+            && super::decision::return_receiver::active_initializer(
+                table,
+                receiver.node,
+                receiver.initializer_hir,
+                receiver.initializer_span,
+            )
+            .is_some()
+    }) {
+        let span = receiver.initializer_span;
+        let key = (span.lo().0, span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::SharedOption(receiver))
+            .is_some()
+        {
+            return Err(format!(
+                "receiver-input-invariant:duplicate-coercion:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    for receiver in super::decision::void_region::delivered_receivers(table, reverts) {
+        let span = receiver.initializer_span;
+        let key = (span.lo().0, span.hi().0);
+        if receiver_inputs
+            .insert(key, ReceiverGraft::Region(receiver))
+            .is_some()
+        {
+            return Err(format!(
+                "receiver-input-invariant:duplicate-region-plan:{}..{}",
+                key.0, key.1
+            ));
+        }
+    }
+    let mut receiver_grafts = ReceiverInputGraftVisitor {
+        inputs: &receiver_inputs,
+        guard: &mut guard,
+        consumed: composed_receiver_inputs,
+        held: FxHashSet::default(),
+        failure: None,
+    };
+    receiver_grafts.visit_crate(&mut krate);
+    if let Some(why) = receiver_grafts.failure.take() {
+        return Err(why);
+    }
+    let unmatched_receiver_inputs = receiver_inputs
+        .keys()
+        .filter(|key| {
+            !receiver_grafts.consumed.contains(key) && !receiver_grafts.held.contains(key)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if !unmatched_receiver_inputs.is_empty() {
+        return Err(format!(
+            "receiver-input-invariant:unmatched:{}:{unmatched_receiver_inputs:?}",
+            unmatched_receiver_inputs.len()
+        ));
+    }
+    // wave-6b: a region receiver placed under the fallback extent names the
+    // crate-level const like any fabricated seam; counted here, past the
+    // placement (every input above was consumed or the pass failed).
+    seams.len_fabricated += receiver_inputs
+        .values()
+        .filter(|graft| matches!(graft, ReceiverGraft::Region(receiver) if receiver.fabricated))
+        .count();
+
+    // Surface policy runs after every inner-body transform. The transformed
+    // function becomes the safe inner; the pristine capture supplies the raw
+    // outer declaration and attributes. One function-span claim makes the
+    // two-item replacement one edit region.
+    super::shared_read_arguments::apply(table, reverts, &mut krate, &mut guard)?;
+    super::wave5r_field_borrow::apply(tcx, table, reverts, &mut krate, &mut guard)?;
+    super::decision::cursor_native::wrapper_ast::apply(
+        table,
+        reverts,
+        &capture.map.global_map,
+        &mut krate,
+        &mut guard,
+    )?;
+    super::wave6r_option_reborrow::apply(tcx, table, reverts, &mut krate, &mut guard)?;
+    super::slice_forms_ast::apply(tcx, table, reverts, &mut krate, &mut guard)?;
+    // wave-6l (R615-7): the slice constructions wrapped around a raw call
+    // result, LAST among the passes that may edit inside an initializer.
+    let mut max_id = MaxNodeId(0);
+    max_id.visit_crate(&mut krate);
+    let mut brackets = ConstructionBracketVisitor {
+        brackets: &construction_brackets,
+        applied: FxHashSet::default(),
+        next_id: first_fresh_node_id(
+            max_id.0,
+            &guard,
+            capture
+                .map
+                .local_map
+                .items()
+                .map(|(id, _)| id.as_u32())
+                .into_sorted_stable_ord()
+                .into_iter()
+                .chain(
+                    capture
+                        .map
+                        .global_map
+                        .items()
+                        .map(|(id, _)| id.as_u32())
+                        .into_sorted_stable_ord(),
+                )
+                .map(NodeId::from_u32),
+        ),
+    };
+    brackets.visit_crate(&mut krate);
+    // R631-12: every argument-level edit is in place; the arm-(a) reads are
+    // hoisted above their call's received reborrow.
+    super::arg_order_hoist::apply(table, &mut krate, &mut guard);
+    apply_surface_plans(capture, table, reverts, &mut krate, &mut guard)?;
+    super::wave5r_helper_path::qualify(tcx, capture, table, reverts, &mut krate);
+    // R1130-1 (relay wave-6a/164): after every other pass, emission only.
+    let rmw = super::rmw_relet::apply(tcx, table, reverts, &mut krate, &mut guard);
+    if rmw != super::rmw_relet::RmwStats::default() {
+        eprintln!(
+            "RMW-RELET relet={} skipped_call_index={} skipped_unresolved={} safe_root={} claimed={} reverted={} rhs_touches_memory={} packed={}",
+            rmw.relet,
+            rmw.skipped_call_index,
+            rmw.skipped_unresolved,
+            rmw.safe_root,
+            rmw.claimed,
+            rmw.reverted,
+            rmw.rhs_touches_memory,
+            rmw.packed
+        );
+    }
+
+    // **Each pass counts its OWN refusals**, at the site where it was turned
+    // away. This used to recompute `decls.refused` here by summing
+    // `refused_by` over a hand-written list of the three `decl:*` labels —
+    // which had two faults, both found at the arm-2 review: it made the
+    // visitor's own `stats.refused += 1` a DEAD write, and the list was not
+    // exhaustive over `DeclForm`, so arm 3's claimant would have been dropped
+    // from the sum in silence. Counting locally cannot drift, because there is
+    // no second place to keep in step.
+    //
+    // `Composition::refused_by` survives for DIAGNOSIS — reading which pair
+    // collided out of a nonzero gate — which is what the labels are for.
+
+    // **ARM 3 TASK 0 — THE COLLISION SURFACE, measured before any transform.**
+    //
+    // A seam edit targets a CALL-ARGUMENT expression; a use graft targets a
+    // use-site expression. Same syntactic category, so `seam` vs `use` is the
+    // first pair that can claim one node — unlike `decl:*` vs `use`, which are
+    // `Ty` vs `Expr` and structurally disjoint. The decision layer's
+    // `seam-site-overlap` gate refuses seam-vs-seam BYTE overlap at one call;
+    // it says nothing about seam-vs-use NODE IDENTITY, which is a different
+    // relation. So this is measured rather than argued, before arm 3 exists.
+    //
+    // All four relations are reported separately: an exact coincidence is a
+    // guaranteed same-node claim, while containment either way is the shape
+    // that makes one transform discard the other's work (arm 2's containment
+    // finding, now on the seam axis).
+    let mut seam_pairs = 0usize;
+    let mut seam_same = 0usize;
+    let mut seam_contains_use = 0usize;
+    let mut use_contains_seam = 0usize;
+    let mut seam_use_partial = 0usize;
+    for (slo, shi) in table
+        .seams
+        .edits
+        .iter()
+        .map(|edit| (edit.span.lo().0, edit.span.hi().0))
+        .chain(
+            table
+                .seams
+                .body_edits
+                .iter()
+                .map(|edit| (edit.span.lo().0, edit.span.hi().0)),
+        )
+    {
+        for (ulo, uhi) in uses.keys() {
+            let (ulo, uhi) = (*ulo, *uhi);
+            seam_pairs += 1;
+            if slo == ulo && shi == uhi {
+                seam_same += 1;
+            } else if slo <= ulo && uhi <= shi {
+                seam_contains_use += 1;
+            } else if ulo <= slo && shi <= uhi {
+                use_contains_seam += 1;
+            } else if slo < uhi && ulo < shi {
+                seam_use_partial += 1;
+            }
+        }
+    }
+
+    // **CONTAINMENT, measured.** A declaration transformed inside an expression
+    // that is later grafted is discarded, with the ledger still counting it as
+    // rewritten — the hazard the two-pass split does NOT remove (see this
+    // function's doc). Neither the guard nor `unmatched` can see it, so it is
+    // counted directly: a declaration render whose offset falls strictly inside
+    // some use-edit's range. Corpus expectation 0, and gated.
+    let decl_inside_use = decls
+        .rendered
+        .iter()
+        .chain(decls.rendered_arm2.iter())
+        // HALF-OPEN, matching the range it models. This read `*off > *lo`,
+        // which missed a declaration render starting exactly at a use edit's
+        // first byte — the containment case most likely to occur, since a use
+        // edit and a declaration inside it can share a start.
+        .filter(|(off, _)| uses.keys().any(|(lo, hi)| *off >= *lo && *off < *hi))
+        .count();
+    Ok((
+        decls,
+        grafts,
+        seams,
+        decl_inside_use,
+        use_key_collisions,
+        decision_key_collisions,
+        SeamUseSurface {
+            pairs: seam_pairs,
+            programs_compared: usize::from(seam_pairs > 0),
+            same: seam_same,
+            seam_contains_use,
+            use_contains_seam,
+            partial: seam_use_partial,
+        },
+        krate,
+        guard.edited_with_claimants().collect(),
+    ))
+}
+
+/// **THE LOOP'S ENTRY — emit round N from the round-0 capture.**
+///
+/// `capture_ast` may succeed **at most once per session**: `expanded_ast`
+/// panics once the HIR is built, and the capture itself builds it
+/// (`make_ast_to_hir`). So a verify/revert loop cannot re-capture per round —
+/// it captures once, before any HIR query, and re-emits from that pristine
+/// capture under each round's revert set. `transform_with` already transforms a
+/// CLONE, so the capture stays reusable.
+///
+/// This split is not a convenience: capturing twice in one session returns
+/// `Err("AST capture panicked")` on the second call, witnessed at
+/// `a_second_capture_in_one_session_fails`.
+/// **The loop's per-file entry (A1).** Same transform, same const rule, but the
+/// emission is keyed by source file rather than collapsed into the root.
+///
+/// The const is appended to the ROOT file only — it is declared once per crate
+/// and named as `crate::FALLBACK_SLICE_EXTENT`, so a copy per file would be a
+/// duplicate-definition error, not redundancy.
+///
+/// `tcx` supplies the source map and original compiler-resolved signature types
+/// for owners with a surviving admitted alias declaration. That metadata lets
+/// the existing lifetime plan address an alias-spelled raw layer. It grants no
+/// return admission and recomputes neither decisions nor model facts: the
+/// capture, finished table, lifetime plan and reverts remain caller-owned.
+pub(crate) fn ast_emitted_files_from(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    capture: &AstCapture,
+    reverts: &RevertSet,
+    root_key: Option<&super::plan::FileKey>,
+    // **THE CALLER'S TABLE, NOT A RE-DERIVATION.** This entry used to call
+    // `decide_table_with_ctx` itself — a SECOND derivation of the decision
+    // table, and the module's founding defect class in its purest form. It was
+    // invisible on every fixture whose table is deterministic, and visible the
+    // moment one is INJECTED: `rewrite_core_injected` injects into its own
+    // table, the re-derived one never saw the injection, and the AST layer
+    // emitted a program without the very edit the test exists to break on.
+    table: &super::decision::DecisionTable,
+    // Sealed by `emit_files` after class finalization. Production always
+    // supplies it; all four collections are authoritative, including empty
+    // ones. `None` is retained for isolated AST-layer parity tests.
+    terminal_call_plans: Option<&super::decision::seam::TerminalCallPlans>,
+) -> Result<
+    (
+        std::collections::BTreeMap<super::plan::FileKey, String>,
+        super::ast_bridge::SubstStats,
+        // **I-31**: the emitted document's line map, from the splicer.
+        std::collections::BTreeMap<super::plan::FileKey, super::apply::LineMap>,
+        // **R299-2**: the emitted text of every sibling-overlap call, keyed by
+        // its ORIGINAL span, rendered by this layer rather than reconstructed
+        // from the plan. See [`rendered_calls`].
+        std::collections::BTreeMap<(u32, u32), String>,
+    ),
+    String,
+> {
+    let (decls, _, seams, _, _, _, _, krate, edited) =
+        transform_with(tcx, capture, table, reverts, terminal_call_plans)?;
+    super::shared_pair_ast::validate(&krate, table, reverts, &capture.map.global_map)?;
+    let expected_aliases = table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| {
+            let node = (subject.fn_did, subject.hir_id);
+            (table.declaration_pointees.contains_key(&node)
+                && reverts.keeps_subject(node.0, node.1)
+                && super::terminal_application(decision, true).is_some())
+            .then_some(node)
+        })
+        .collect::<Vec<_>>();
+    validate_alias_declaration_placements(&expected_aliases, &decls.placed_ids)?;
+    validate_pattern_declaration_temporaries(&krate, &capture.map.global_map, table, reverts)?;
+    let edited: Vec<rustc_span::Span> = edited.into_iter().map(|(sp, _)| sp).collect();
+    let (mut files, stats, maps) =
+        super::ast_bridge::splice_fn_prints_per_file(tcx, &krate, Some(&edited));
+    let surviving_wrappers = table
+        .entries
+        .iter()
+        .filter_map(|(subject, decision)| match decision {
+            super::decision::Decision::Cursor { plan, .. }
+                if plan.wrapper && reverts.keeps_subject(subject.fn_did, subject.hir_id) =>
+            {
+                Some(plan)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if !surviving_wrappers.is_empty() {
+        let key = root_key.cloned().or_else(|| files.keys().next().cloned());
+        if let Some(key) = key
+            && let Some(text) = files.get_mut(&key)
+            && !text.is_empty()
+        {
+            text.push('\n');
+            text.push_str(super::slice_cursor_prelude::SLICE_CURSOR_PRELUDE);
+            text.push('\n');
+        }
+    }
+    if seams.len_fabricated > 0 || surviving_wrappers.iter().any(|plan| plan.fallback) {
+        // Root selection: the caller's key when it has one (the loop's round-0
+        // file), else the map's first — deterministic because the map is
+        // ordered by `FileKey`.
+        let key = root_key.cloned().or_else(|| files.keys().next().cloned());
+        if let Some(key) = key
+            && let Some(text) = files.get_mut(&key)
+            && !text.is_empty()
+        {
+            text.push('\n');
+            text.push_str(&super::decision::seam::fabricated_len_item());
+            text.push('\n');
+        }
+    }
+    let pending_call_renders =
+        rendered_calls(
+            &krate,
+            &table
+                .sibling_overlap_inventory
+                .coverage
+                .iter()
+                .map(|coverage| {
+                    let span = coverage.potential.call_span;
+                    (span.lo().0, span.hi().0)
+                })
+                .chain(
+                    table.seams.shared_required.iter().map(|permission| {
+                        (permission.call_span.lo().0, permission.call_span.hi().0)
+                    }),
+                )
+                .collect(),
+        );
+    Ok((files, stats, maps, pending_call_renders))
+}
+
+/// **R299-2 — the emitted text of a call, from the producer's own renderer.**
+///
+/// A pending sibling-overlap row owes the emitted call (R287-1(b)), and the
+/// plan cannot state it: the argument bridges that reach the tree are grafted
+/// by THIS layer from the decision table, not carried as `by_file` edits, so a
+/// reconstruction spliced out of the plan's edit set states a call the tree
+/// does not contain. Measured at head on heman's
+/// `kmQuaternionRotationAxisAngle` site: the row carried `edits: []` while the
+/// tree read `core::ptr::from_ref(axis)`.
+///
+/// The two hand-rolled compositions R295-2 tried — splice-nested and
+/// supersession — each guessed a different occurrence rule and contradicted
+/// each other on `a5_raw_210_1`. This guesses nothing: it pretty-prints the
+/// call node the transform passes actually produced, after every pass has run,
+/// which is by construction the text the splicer goes on to emit.
+///
+/// Keyed by the ORIGINAL call span, which the graft passes preserve on the
+/// node they rewrite in place (the A5/PAIR grafts replace `kind` and keep the
+/// span, so the render is the whole hoisting block).
+fn rendered_calls(
+    krate: &rustc_ast::Crate,
+    wanted: &FxHashSet<(u32, u32)>,
+) -> std::collections::BTreeMap<(u32, u32), String> {
+    struct V<'a> {
+        wanted: &'a FxHashSet<(u32, u32)>,
+        out: std::collections::BTreeMap<(u32, u32), String>,
+    }
+    impl rustc_ast::visit::Visitor<'_> for V<'_> {
+        fn visit_expr(&mut self, expression: &rustc_ast::Expr) {
+            if !expression.span.is_dummy() {
+                let key = (expression.span.lo().0, expression.span.hi().0);
+                if self.wanted.contains(&key) {
+                    self.out
+                        .insert(key, rustc_ast_pretty::pprust::expr_to_string(expression));
+                }
+            }
+            rustc_ast::visit::walk_expr(self, expression);
+        }
+    }
+    let mut visitor = V {
+        wanted,
+        out: std::collections::BTreeMap::new(),
+    };
+    rustc_ast::visit::Visitor::visit_crate(&mut visitor, krate);
+    visitor.out
+}
+
+#[cfg(test)]
+pub(crate) fn ast_emitted_source_from(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    capture: &AstCapture,
+    reverts: &RevertSet,
+) -> Result<(String, super::ast_bridge::SubstStats), String> {
+    let (table, _ctx) = super::decide_table_with_ctx(tcx)?;
+    let (_, _, seams, _, _, _, _, krate, edited) =
+        transform_with(tcx, capture, &table, reverts, None)?;
+    let edited: Vec<rustc_span::Span> = edited.into_iter().map(|(sp, _)| sp).collect();
+    let (mut source, stats) = super::ast_bridge::splice_fn_prints(tcx, &krate, Some(&edited));
+    // **The fabricated-extent const** (marker ruling, 2026-08-15): emitted when
+    // this layer PLACED at least one fabricated adapter.
+    //
+    // ⚠ **This is NOT the span layer's condition.** The span layer's is
+    // *survived*; this one is *placed*.
+    //
+    // ⚠⚠ **The previous text here was STALE and is corrected (M-2/A task 3,
+    // 2026-08-18).** It read: *"`transform_inner` builds its visitors with an
+    // explicitly EMPTY revert set."* That was true before M-2/A task 1 threaded
+    // `reverts` through; it has been false since. The revert set IS honoured —
+    // at `reverted_fns` in the decl arm and at `filtered_inputs` for the use and
+    // seam arms — and `a_reverted_fn_keeps_its_raw_declaration` witnesses it.
+    //
+    // What survives of the old note is only the narrow part: the two conditions
+    // still coincide on every current fixture because none reverts a fabricated
+    // callee, so `len_fabricated > 0` has not yet been observed to disagree with
+    // survival. That is an unexercised case, NOT an established equivalence.
+    //
+    // Appended, matching `render`'s end-of-file insertion: the spliced output
+    // replaces function spans in place, so appending here and inserting at
+    // `source.len()` of the original put the item in the same position.
+    if seams.len_fabricated > 0 && !source.is_empty() {
+        source.push('\n');
+        source.push_str(&super::decision::seam::fabricated_len_item());
+        source.push('\n');
+    }
+    Ok((source, stats))
+}
+
+#[cfg(test)]
+/// **ARM 1's TEXT DIFFERENTIAL** — the rendered declaration vs the span layer's
+/// own edit, at the same byte offset.
+///
+/// Per §3b: the unit is one EDIT, and this arm is comparable with no other arm
+/// built, because each declaration replacement is independent of every other
+/// edit in the file.
+///
+/// The right-hand side is the **real** plan — `emit_files` extracts it once
+/// inside the session — never a re-derivation of what the replacement ought to
+/// be. Comparing against a re-derivation would test this function against
+/// itself.
+#[derive(Default)]
+pub(crate) struct TextDiff {
+    /// Offsets where the AST layer rendered something the span layer did not
+    /// write. Capped for the artifact; `differing` is the uncapped count.
+    pub examples: Vec<String>,
+
+    /// Arm 3's own share of the joint whitespace split, so the pre-stated line
+    /// is readable without unpicking the joint accumulator.
+    pub ws_real_seam: usize,
+    pub differing_seam: usize,
+
+    /// ⚠ **JOINT ACROSS BOTH ARMS, despite sitting in the arm-2 block.**
+    /// `arms_full` calls `compare_renders` three times against ONE `TextDiff`,
+    /// so this field and `ws_equal`/`ws_real`/`pairs`/`examples` accumulate arm
+    /// 1's comparison as well as arm 2's. That is deliberate for `ws_real`,
+    /// which gates and should fail on a real difference *anywhere*; it is
+    /// merely true of the rest. Arm 1 contributes 0 to all of them on the
+    /// frozen corpus, which is why the numbers read as arm-2-only — a
+    /// coincidence of the data, not a property of the code. Named by the
+    /// correctness persona at the arm-2 review; recorded rather than renamed
+    /// because the joint reading is the one the gate wants.
+    ///
+    /// Where arm 2's differences sit. The two positions have **different
+    /// evidential weight** and summing them would hide that:
+    ///
+    /// - A **declaration** difference is two independent derivations
+    ///   disagreeing — the AST side builds `&mut [T]` structurally from a
+    ///   subtree, the span side writes `format!("&mut [{pointee}]")` over
+    ///   verbatim source. Disagreement there is a real finding.
+    /// - A **use** difference is not a second derivation at all. The AST render
+    ///   is `print(parse(replacement))` and the span text *is* `replacement` —
+    ///   the same string from the same `UseEdit`. So the only thing that can
+    ///   differ is whether that string was already printer-canonical, and
+    ///   "canonicalize both sides then compare" would be **tautologically
+    ///   equal**. It is recorded here as a formatting delta, not offered as a
+    ///   parity check.
+    pub differing_decl: usize,
+    pub differing_use: usize,
+    /// Of the differing pairs, those equal once **all** whitespace is removed
+    /// from both sides. Both sides are valid Rust produced from one parse, so
+    /// whitespace-stripped equality is strong evidence of a pure formatting
+    /// delta — and it is a check that can fail, unlike canonicalizing both
+    /// sides through the same printer.
+    pub ws_equal: usize,
+    /// The residue: differing, and **still** differing with whitespace gone.
+    /// This is the number that carries the parity claim. Pre-stated **0**.
+    pub ws_real: usize,
+    /// Every differing pair, uncapped, for the side artifact. The row's
+    /// `examples` field is truncated at 120 chars by `report::sanitize`, which
+    /// is why the evidence does not live there.
+    pub pairs: Vec<(u32, &'static str, String, String)>,
+}
+
+/// **The seam-vs-use collision surface** (arm 3, task 0).
+///
+/// Four relations, kept apart because they mean different things: `same` is a
+/// guaranteed same-node claim and therefore a guaranteed `refused`; either
+/// containment is the shape where one transform discards the other's work; a
+/// `partial` overlap is representable in bytes but NOT in a tree, so it would
+/// mean the two edits disagree about the syntax and is the most alarming of the
+/// four.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SeamUseSurface {
+    /// **THE DENOMINATOR** — `|placed seams| × |use edits|`, the pairs actually
+    /// compared. R5, and it was missing on this instrument's first run: four
+    /// zeros across 20 programs of wildly different size is this milestone's
+    /// instrument signature, and without this the reader cannot tell an empty
+    /// relation from an empty *population*. It had to be recovered by
+    /// hand-joining two artifacts, which is exactly what reporting it prevents.
+    pub pairs: usize,
+    /// Programs where BOTH populations are non-empty — the spread behind the
+    /// denominator, since one large program can carry it alone (brotli is
+    /// 139,689 of the corpus's 181,844).
+    pub programs_compared: usize,
+    pub same: usize,
+    pub seam_contains_use: usize,
+    pub use_contains_seam: usize,
+    pub partial: usize,
+}
+
+#[cfg(test)]
+/// **ARM 4's TASK 0 — the justification census.**
+///
+/// Arm 4 is `ReRoute` / `DropForm` / `StoreForm`, and the migration's job for
+/// any arm is to reproduce the span layer's edits as node transforms. So arm
+/// 4's market is exactly *how many such edits the span layer emits* — which is
+/// what this counts, before any transform is designed.
+///
+/// # Why an exhaustive `match` and not one with a fallback
+///
+/// A sixth `Justification` variant must break **compilation** here, never land
+/// silently in an "other" bucket. Arm 3 paid for the fallback version of this
+/// in [`compare_renders`], where `_ => differing_use` would have booked every
+/// seam difference to a pass that never ran at that offset.
+///
+/// # Why this walks the plan again instead of reading `kd_edits`/`sa_edits`
+///
+/// Those two are counted inside [`arms_full`]'s own loop. Counting here in a
+/// separate pass makes `just_kind_decision == kd_edits` and
+/// `just_seam_adapter == sa_edits` a cross-check between **two independent
+/// walks** rather than one number printed twice — and the totals give the three
+/// expected zeros a denominator (R5), without which three zeros across programs
+/// of wildly different size are an instrument signature rather than a finding.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub(crate) struct JustificationCensus {
+    pub kind_decision: usize,
+    pub seam_adapter: usize,
+    /// The FABRICATED subset of [`Self::seam_adapter`] — a subset, so the
+    /// [`Self::total`] identity is untouched and this cannot drift the ledger.
+    pub seam_adapter_fabricated: usize,
+    /// The crate-level const declaration.
+    ///
+    /// ⚠ **A PIN, not a measurement.** Production never fills it: the const edit
+    /// is created inside `render` from the surviving edits and never enters
+    /// `plan.by_file`, which is what this census walks. Unit-witnessed,
+    /// production-unreachable — retained so a `FabricatedLenConst` that DID
+    /// reach `count()` could not be silently dropped from the total, and
+    /// labelled so nobody reads its zero as evidence about the const.
+    pub fabricated_len_const: usize,
+    // ---- arm 4's three: expected zero, and MEASURED rather than assumed ----
+    pub reroute: usize,
+    pub drop_form: usize,
+    pub store_form: usize,
+    pub c9_mark: usize,
+    pub a5_raw_view: usize,
+    /// E2 structural signatures are not byte-splice edits, so this stays zero
+    /// in `of_plan`; the exhaustive arm prevents a future explicit receipt
+    /// from vanishing into an unnamed bucket.
+    pub lifetime_plan: usize,
+}
+
+#[cfg(test)]
+impl JustificationCensus {
+    #[cfg(test)]
+    /// The sum of the buckets. A method rather than a sixth field, so it cannot
+    /// drift from the parts.
+    ///
+    /// **This is NOT an independent denominator**, and gating it against those
+    /// same parts is a tautology — see [`Self::edits_in`], which is one.
+    pub(crate) fn total(&self) -> usize {
+        // `seam_adapter_fabricated` is deliberately absent: it is a SUBSET of
+        // `seam_adapter`, and adding it would double-count every fabricated
+        // placement against `edits_in`.
+        //
+        // ⚠ **`fabricated_len_const` is a bucket that PRODUCTION NEVER FILLS**,
+        // and the comment here previously claimed the opposite ("a real edit in
+        // `by_file`"). It is not: the const edit is created inside `render`
+        // from the surviving edits and never enters `by_file`, which is the only
+        // thing this census walks. Corrected 2026-08-15 (ADV-FAB-08) — the claim
+        // was contradicted by another comment in the same slice.
+        //
+        // The term stays in the sum because a `FabricatedLenConst` reaching
+        // `count()` *would* be a real edit and must not be dropped; but its zero
+        // is a **PIN**, unit-witnessed and production-unreachable, in the same
+        // class as `arm4_reroute`/`drop_form`/`store_form` and NOT in
+        // `seam_adapter`'s. The real claim about the const's delivery is gated
+        // on the EMITTED TEXT (`fab_const_decl` / `fab_const_ref`).
+        self.kind_decision
+            + self.seam_adapter
+            + self.fabricated_len_const
+            + self.reroute
+            + self.drop_form
+            + self.store_form
+            + self.c9_mark
+            + self.a5_raw_view
+            + self.lifetime_plan
+    }
+
+    #[cfg(test)]
+    /// The plan's edit count, derived **without consulting any justification**.
+    ///
+    /// The real denominator, and the one a conservation gate has to use.
+    /// `just_total == Σ buckets` cannot fail in production: `total()` *is* that
+    /// sum, over parts serialized from the same struct, so it detects row
+    /// corruption and nothing else. Gating `edits_in == Σ buckets` instead does
+    /// fail on a walk that skips a file (the M52c shape), on a dropped
+    /// increment, and on a future bucket counted but never exported.
+    ///
+    /// **Stated so it is not over-read:** no conservation identity can see a
+    /// *mis-classified* edit. An arm-4 edit counted as a `KindDecision` leaves
+    /// every total correct and reports the market as zero — which is what the
+    /// injection witness is for, not this.
+    pub(crate) fn edits_in(plan: &super::plan::Plan) -> usize {
+        plan.by_file.values().map(Vec::len).sum()
+    }
+
+    #[cfg(test)]
+    /// Census one whole plan.
+    ///
+    /// **A named function over the plan, per R8** (ratified at the arm-3
+    /// close). The loop sat inline in [`arms_full`], which needs a `TyCtxt`, so
+    /// only a corpus sweep could reach it — and mutation M52, making the walk
+    /// count nothing, left the entire suite green. The corpus gate would have
+    /// caught it (`just_kind_decision` 0 against `kd_edits` 2,819); the suite
+    /// could not. R8's remedy is to lift the logic out rather than write a
+    /// bigger test, and this is its first application.
+    pub(crate) fn of_plan(plan: &super::plan::Plan) -> Self {
+        let mut c = Self::default();
+        for edits in plan.by_file.values() {
+            for e in edits {
+                c.count(&e.justification);
+            }
+        }
+        c
+    }
+
+    #[cfg(test)]
+    /// Count one edit's justification.
+    pub(crate) fn count(&mut self, j: &super::plan::Justification) {
+        use super::plan::Justification as J;
+        match j {
+            J::KindDecision { .. } => self.kind_decision += 1,
+            J::SeamAdapter { fabricated, .. } => {
+                self.seam_adapter += 1;
+                if *fabricated {
+                    self.seam_adapter_fabricated += 1;
+                }
+            }
+            J::FabricatedLenConst => self.fabricated_len_const += 1,
+            J::ReRoute { .. } => self.reroute += 1,
+            J::DropForm { .. } => self.drop_form += 1,
+            J::StoreForm { .. } => self.store_form += 1,
+            J::C9Mark => self.c9_mark += 1,
+            J::A5RawView => self.a5_raw_view += 1,
+            J::LifetimePlan { .. } => self.lifetime_plan += 1,
+        }
+    }
+}
+
+/// Join one arm's renders against the plan. Returns
+/// `(compared, equal, differing, unmatched_ast)`.
+#[cfg(test)]
+fn compare_renders(
+    renders: &[(u32, String)],
+    by_offset: &FxHashMap<u32, String>,
+    position: &'static str,
+    d: &mut TextDiff,
+) -> (usize, usize, usize, usize) {
+    let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    let (mut compared, mut equal, mut differing, mut unmatched) = (0, 0, 0, 0);
+    for (off, rendered) in renders {
+        match by_offset.get(off) {
+            Some(span_text) => {
+                compared += 1;
+                if span_text == rendered {
+                    equal += 1;
+                } else {
+                    differing += 1;
+                    // **EXHAUSTIVE over the labels, with no fallback.** This
+                    // read `_ => d.differing_use += 1`, which would have folded
+                    // arm 3's seam differences into `arm2_differing_use` — a
+                    // reported line — and attributed them to a pass that never
+                    // ran on that offset. A third position is exactly the event
+                    // a catch-all is invisible to.
+                    match position {
+                        "decl" => d.differing_decl += 1,
+                        "use" => d.differing_use += 1,
+                        "seam" => d.differing_seam += 1,
+                        other => panic!(
+                            "unknown differential position {other:?}: a new arm must \
+                             name its own bucket, never inherit another arm's"
+                        ),
+                    }
+                    if strip(span_text) == strip(rendered) {
+                        d.ws_equal += 1;
+                    } else {
+                        d.ws_real += 1;
+                        if position == "seam" {
+                            d.ws_real_seam += 1;
+                        }
+                    }
+                    d.pairs
+                        .push((*off, position, rendered.clone(), span_text.clone()));
+                    if d.examples.len() < 10 {
+                        d.examples.push(format!(
+                            "@{off} {position} ast={rendered:?} span={span_text:?}"
+                        ));
+                    }
+                }
+            }
+            None => unmatched += 1,
+        }
+    }
+    (compared, equal, differing, unmatched)
+}
+
+/// **THE ORACLE'S REVERT SET, resolved — held, never re-derived.**
+///
+/// Reads the digest-pinned snapshot's `{program}.reverts.txt` and resolves each
+/// line to the owning function's `LocalDefId`, which is the granularity
+/// `emit_files` reverts at and the granularity S3.6-1 measured revert to have.
+///
+/// # The id format, established by joining rather than by reading a format string
+///
+/// A line is `{fn_path}::{param_name}#{mir_local}`, where `fn_path` is
+/// `tcx.def_path_str` of the owning function — verified by joining binn's 26
+/// revert-owners against its `a.jsonl` `fn_path` column, **26/26 matched**,
+/// with the tail joining to a real row's `param_name`. Taking the prefix before
+/// the LAST `::` is therefore exact, not a heuristic.
+///
+/// # Fail-closed on an unresolved name
+///
+/// A line naming a function this session cannot resolve is an **error**, not a
+/// skip. Silently dropping one would under-revert — the AST side would then
+/// transform a function the span side took back, and every such function would
+/// present as a parity difference with no way to tell it from a real one.
+/// **THE REVERT SET — a SHARED, HELD-FIXED INPUT to both sides.**
+///
+/// Ruled 2026-08-14: the revert set is a **population specification**, so
+/// sharing it between the two sides is correct and required; what must stay
+/// independent is each side's *text derivation*. The first run got this wrong in
+/// one direction only — the span side read `emission.plan` unfiltered — and the
+/// two sides then agreed about a population that was not the emitted one.
+///
+/// Production carries one vocabulary: direct `LocalDefId` ownership. The
+/// historical text-oracle display names remain test-only.
+#[derive(Clone, Default)]
+pub(crate) struct RevertSet {
+    pub fns: FxHashSet<LocalDefId>,
+    /// Exact raw-boundary atom IDs selected by the verifier.
+    pub atom_names: FxHashSet<String>,
+    /// Subject closures implied by those exact IDs. This pair is the AST-side
+    /// identity; it lets one subject be withheld without reverting siblings in
+    /// the same function.
+    pub atom_subjects: FxHashSet<(LocalDefId, HirId)>,
+}
+
+impl RevertSet {
+    /// Does an edit owned by a signature class survive? **The single place either side
+    /// asks**, so they cannot diverge on population again.
+    ///
+    /// **PRODUCTION LAW from 2026-08-16 (M-2).** The type graduated out of
+    /// `#[cfg(test)]` when the verify/revert loop was wired to the AST layer:
+    /// production and the AST inputs consume the same direct class ID.
+    pub(crate) fn keeps(&self, owner: super::bridge_receipt::SignatureClassId) -> bool {
+        !self.fns.contains(&owner.local_def_id())
+    }
+
+    /// Does a carried edit survive both the established function revert and
+    /// the raw-boundary atom dependency closure?
+    pub(crate) fn keeps_edit(
+        &self,
+        owner: super::bridge_receipt::SignatureClassId,
+        atom_ids: &[String],
+    ) -> bool {
+        self.keeps(owner) && atom_ids.iter().all(|atom| !self.atom_names.contains(atom))
+    }
+
+    /// Does a subject survive? `emit_files`'s own rule, restated for the AST
+    /// side so both layers hold back the same functions.
+    pub(crate) fn keeps_subject(&self, fn_did: LocalDefId, hir_id: HirId) -> bool {
+        !self.fns.contains(&fn_did) && !self.atom_subjects.contains(&(fn_did, hir_id))
+    }
+}
+
+/// **THE FILTERED-INPUT BUILDER — production's ONE answer to "which edits
+/// survive"** (M-2, ruled 2026-08-16).
+///
+/// # Why this exists, and why the GATE must not call it
+///
+/// Arms 2 and 3 revert by **input filtering**, by design: their visitors carry
+/// no site check, so *"handing the walk a reverted subject's uses WOULD change
+/// the emitted AST"*. Only arm 1 has a per-site check. So the revert semantics
+/// for two of three arms live in **how their maps are built**, and building
+/// them twice in production would be a second derivation of the survivor set —
+/// the class this milestone has repaired four times.
+///
+/// **`phase3_fn_parity` deliberately keeps its own verbatim filters and never
+/// calls this.** That is not duplication, it is the point: a gate is *supposed*
+/// to be an independent derivation, and a gate that consumes what it checks is
+/// the render-gap tautology. The two sides cannot diverge on **population** —
+/// both read one [`RevertSet`] — and if they diverge on **semantics**, the
+/// acceptance gate's byte reproduction is the detector. Such a divergence is a
+/// finding, never reconciled silently in either direction.
+pub(crate) struct FilteredInputs {
+    /// Use-graft targets, keyed by `(lo, hi)`, with reverted subjects' uses
+    /// already removed.
+    pub uses: FxHashMap<(u32, u32), String>,
+    /// Seam targets, keyed by `(lo, hi)`, with reverted owners' seams removed.
+    pub seams: FxHashMap<(u32, u32), SeamTarget>,
+    /// Collisions observed while building each map — a join without a collision
+    /// counter agrees with itself while being short.
+    pub use_key_collisions: usize,
+    pub seam_key_collisions: usize,
+    pub statement_deletes: FxHashSet<(u32, u32)>,
+    /// wave-6l (R615-7): slice constructions wrapped around their initializer
+    /// node, keyed by the initializer's span.
+    pub construction_brackets: FxHashMap<(u32, u32), (String, String)>,
+    pub box_fabricated: usize,
+    /// Selected unavailable alternatives must already have held their caller.
+    /// A remaining failure is reported by transform_with, never silently lost.
+    pub callee_parameter_input_errors: Vec<String>,
+}
+
+/// Build both filtered maps from one decision table and one revert set.
+///
+/// `subject_of` yields each use edit's owning subject so the arm-2 filter can
+/// ask `keeps_subject`; the arm-3 filter asks `keeps` on the seam's direct
+/// callee class ID.
+pub(crate) fn filtered_inputs(
+    table: &super::decision::DecisionTable,
+    reverts: &RevertSet,
+) -> FilteredInputs {
+    let mut out = FilteredInputs {
+        uses: FxHashMap::default(),
+        seams: FxHashMap::default(),
+        use_key_collisions: 0,
+        seam_key_collisions: 0,
+        statement_deletes: FxHashSet::default(),
+        construction_brackets: FxHashMap::default(),
+        box_fabricated: 0,
+        callee_parameter_input_errors: Vec::new(),
+    };
+    out.box_fabricated += table
+        .seams
+        .surface_arguments
+        .iter()
+        .filter(|argument| {
+            reverts.keeps_subject(argument.node.0, argument.node.1)
+                && reverts.keeps_edit(argument.owner_class, &argument.atom_ids)
+                && argument
+                    .spec
+                    .len
+                    .as_ref()
+                    .is_some_and(SeamLen::is_fabricated)
+        })
+        .count();
+    let active_slice_constructions = table
+        .slice_constructions
+        .iter()
+        .filter(|plan| {
+            plan.replacement.is_some() && reverts.keeps_subject(plan.node.0, plan.node.1)
+        })
+        .collect::<Vec<_>>();
+    let composed_slice_edits = active_slice_constructions
+        .iter()
+        .flat_map(|plan| {
+            plan.composed_edit_spans
+                .iter()
+                .map(|span| (span.lo().0, span.hi().0))
+        })
+        .collect::<FxHashSet<_>>();
+    let composed_option_edits = table
+        .option_composed_uses
+        .iter()
+        .filter(|(node, _)| reverts.keeps_subject(node.0, node.1))
+        .map(|(_, span)| (span.lo().0, span.hi().0))
+        .collect::<FxHashSet<_>>();
+    // A cursor constructor composed over an outer table's element rewrite owns
+    // that span; the outer's own edit there is skipped, as for constructions.
+    let composed_cursor_edits = table
+        .entries
+        .iter()
+        .filter(|(subject, _)| reverts.keeps_subject(subject.fn_did, subject.hir_id))
+        .filter_map(|(_, decision)| match decision {
+            super::decision::Decision::Cursor { plan, .. } => Some(&plan.composed_edit_spans),
+            super::decision::Decision::Ref { .. }
+            | super::decision::Decision::InferredRef { .. }
+            | super::decision::Decision::NestedSlice { .. }
+            | super::decision::Decision::Slice { .. }
+            | super::decision::Decision::Opt { .. }
+            | super::decision::Decision::Box(_)
+            | super::decision::Decision::Degraded(_) => None,
+        })
+        .flatten()
+        .map(|span| (span.lo().0, span.hi().0))
+        .collect::<FxHashSet<_>>();
+    // wave-6a W6A-T1: a flexible-tail transaction's tail accesses, crate-wide,
+    // active only while none of its owners is reverted.
+    for transaction in super::flexible_tail_ast::active(table, reverts) {
+        for (span, replacement) in &transaction.tail_edits {
+            insert_counting(
+                &mut out.uses,
+                (span.lo().0, span.hi().0),
+                replacement.clone(),
+                &mut out.use_key_collisions,
+            );
+        }
+    }
+    // wave-6a W6A-A1: a certificate's site edits (a call stored into a raw
+    // place, a `Some(..)` return wrap in a callee without an owner local),
+    // active while none of the certificate's owners is reverted.
+    for certificate in table.return_certificates.callees.values() {
+        if table
+            .return_certificates
+            .owners(certificate.callee)
+            .iter()
+            .any(|f| reverts.fns.contains(f))
+        {
+            continue;
+        }
+        for (_, edit) in &certificate.site_edits {
+            insert_counting(
+                &mut out.uses,
+                (edit.span.lo().0, edit.span.hi().0),
+                edit.replacement.clone(),
+                &mut out.use_key_collisions,
+            );
+        }
+    }
+    for (subject, decision) in &table.entries {
+        let use_edits = match decision {
+            super::decision::Decision::Cursor { plan, .. } => Some(&plan.uses),
+            super::decision::Decision::Ref { .. }
+            | super::decision::Decision::InferredRef { .. } => None,
+            super::decision::Decision::NestedSlice { uses, .. }
+            | super::decision::Decision::Slice { uses, .. } => Some(uses),
+            super::decision::Decision::Opt { uses, .. } => Some(uses),
+            super::decision::Decision::Box(_) => None,
+            super::decision::Decision::Degraded(_) => continue,
+        };
+        // ARM 2's filter: no site check downstream, so a reverted subject's
+        // uses must never enter the map.
+        if !reverts.keeps_subject(subject.fn_did, subject.hir_id) {
+            continue;
+        }
+        if let super::decision::Decision::Box(plan) = decision {
+            out.box_fabricated += usize::from(plan.fabricated_extent);
+            for edit in &plan.expr_edits {
+                insert_counting(
+                    &mut out.uses,
+                    (edit.span.lo().0, edit.span.hi().0),
+                    edit.replacement.clone(),
+                    &mut out.use_key_collisions,
+                );
+            }
+            out.statement_deletes.extend(
+                plan.delete_statements
+                    .iter()
+                    .map(|span| (span.lo().0, span.hi().0)),
+            );
+        }
+        for u in use_edits.into_iter().flatten() {
+            let key = (u.span.lo().0, u.span.hi().0);
+            if composed_slice_edits.contains(&key)
+                || (composed_option_edits.contains(&key)
+                    && u.bridge_kind != "option-value-composed")
+                || (composed_cursor_edits.contains(&key)
+                    && !matches!(u.bridge_kind, "cursor-constructor" | "cursor-advance"))
+            {
+                continue;
+            }
+            insert_counting(
+                &mut out.uses,
+                (u.span.lo().0, u.span.hi().0),
+                u.replacement.clone(),
+                &mut out.use_key_collisions,
+            );
+        }
+    }
+    // wave-6f: a field transaction's expression edits, active only while none
+    // of its DEPENDENT owners is reverted — the set `Plan::field_transaction_
+    // owners` closes over, not the wider `owners` the receipt prints. That is
+    // exactly enough: a non-dependent owner's revert restores its own
+    // signature and leaves these edits in place, and the tree still
+    // type-checks, because the edits are keyed by span. Measured — report 054,
+    // `w6f_a_non_dependent_owners_revert_leaves_the_text`.
+    for transaction in table.field_transactions.active(&reverts.fns) {
+        // Wrapping edits compose in the AST (`field_reference_ast::apply_wraps`)
+        // after this text channel has grafted their inner edits.
+        for edit in transaction
+            .expression_edits
+            .iter()
+            .filter(|edit| !edit.wrap)
+        {
+            insert_counting(
+                &mut out.uses,
+                (edit.span.lo().0, edit.span.hi().0),
+                edit.replacement.clone(),
+                &mut out.use_key_collisions,
+            );
+        }
+    }
+    for storage in &table.depth2_npo_storages {
+        if !reverts.keeps_subject(storage.node.0, storage.node.1) {
+            continue;
+        }
+        insert_counting(
+            &mut out.uses,
+            (storage.init_span.lo().0, storage.init_span.hi().0),
+            storage.replacement.clone(),
+            &mut out.use_key_collisions,
+        );
+    }
+    // A nullable slice may start at None and acquire a fabricated extent only
+    // at a later assignment. Count that surviving obligation independently of
+    // the initializer, using its compiler identity rather than emitted text.
+    let mut option_fallback_keys = FxHashSet::default();
+    for receipt in &table.option_receipts {
+        let event = &receipt.obligation.planned;
+        if !event.evidence.extent.is_fallback()
+            || receipt.obligation.intended_terminal_state
+                != super::mechanical_receipt::MechanicalState::Applied
+            || !reverts.keeps(receipt.owner_class)
+            || event
+                .dependency_classes
+                .iter()
+                .any(|owner| !reverts.keeps(*owner))
+        {
+            continue;
+        }
+        let Some((subject, decision)) = table.entries.iter().find(|(subject, _)| {
+            event.key.subject
+                == super::mechanical_receipt::MechanicalSubjectKey::Local {
+                    owner: subject.fn_did,
+                    mir_local: subject.local.as_u32(),
+                    slot_depth: u32::from(subject.ptr_depth.saturating_sub(1)),
+                }
+        }) else {
+            continue;
+        };
+        match decision {
+            super::decision::Decision::Opt { .. } => {}
+            super::decision::Decision::Cursor { .. } => continue,
+            super::decision::Decision::Ref { .. }
+            | super::decision::Decision::InferredRef { .. }
+            | super::decision::Decision::NestedSlice { .. }
+            | super::decision::Decision::Slice { .. }
+            | super::decision::Decision::Box(_)
+            | super::decision::Decision::Degraded(_) => continue,
+        }
+        if !reverts.keeps_subject(subject.fn_did, subject.hir_id) {
+            continue;
+        }
+        let delegated_constructor = active_slice_constructions.iter().any(|plan| {
+            plan.node == (subject.fn_did, subject.hir_id)
+                && event.key.site.location
+                    == super::mechanical_receipt::CanonicalLocation::Hir {
+                        owner: plan.init_hir.owner.def_id,
+                        item_local_id: plan.init_hir.local_id.as_u32(),
+                    }
+        });
+        if !delegated_constructor && option_fallback_keys.insert(event.key.clone()) {
+            out.box_fabricated += 1;
+        }
+    }
+    for plan in active_slice_constructions {
+        let replacement = plan
+            .replacement
+            .as_ref()
+            .expect("active slice construction has a replacement");
+        match &plan.bracket {
+            // wave-6l (R615-7): the BRACKET form is not a use. It wraps the
+            // initializer node AFTER every pass that may edit inside it — the
+            // use pass, the seam pass (an argument's own raw bridge), the
+            // raw-view and receiver grafts — so the call renders with all of
+            // them (`ConstructionBracketVisitor`).
+            Some((open, close)) => {
+                out.construction_brackets.insert(
+                    (plan.init_span.lo().0, plan.init_span.hi().0),
+                    (open.clone(), close.clone()),
+                );
+            }
+            None => insert_counting(
+                &mut out.uses,
+                (plan.init_span.lo().0, plan.init_span.hi().0),
+                replacement.clone(),
+                &mut out.use_key_collisions,
+            ),
+        }
+        out.box_fabricated += usize::from(plan.length.is_fallback());
+    }
+    let reverted_classes = reverts
+        .fns
+        .iter()
+        .copied()
+        .map(super::bridge_receipt::SignatureClassId::of)
+        .collect::<std::collections::BTreeSet<_>>();
+    let reverted_atoms = reverts
+        .atom_names
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut selected_target_inputs = FxHashSet::default();
+    for (&key, input) in &table.seams.callee_parameter_inputs {
+        let Some(selected) = input.select(&reverted_classes, &reverted_atoms) else { continue };
+        selected_target_inputs.insert(key);
+        let alternative = match selected {
+            Ok(alternative) => alternative,
+            Err(reason) => {
+                out.callee_parameter_input_errors.push(format!(
+                    "class={}:arg={}..{}:{reason}",
+                    key.0.order_key(),
+                    key.1,
+                    key.2
+                ));
+                continue;
+            }
+        };
+        match &alternative.rendering {
+            super::decision::seam::SeamInputRendering::ZeroSyntax { .. } => {}
+            super::decision::seam::SeamInputRendering::Adapter { .. } => {
+                let span_key = (key.1, key.2);
+                let Some(target) = SeamTarget::of_input(
+                    &alternative.rendering,
+                    alternative.arg_span,
+                    out.uses.contains_key(&span_key),
+                ) else {
+                    out.callee_parameter_input_errors.push(format!(
+                        "class={}:arg={}..{}:adapter-unavailable",
+                        key.0.order_key(),
+                        key.1,
+                        key.2
+                    ));
+                    continue;
+                };
+                insert_counting(
+                    &mut out.seams,
+                    span_key,
+                    target,
+                    &mut out.seam_key_collisions,
+                );
+            }
+        }
+    }
+    for edit in &table.seams.edits {
+        if let super::bridge_receipt::BridgeCalleeId::Local(callee) = edit.bridge.callee
+            && selected_target_inputs.contains(&(
+                super::bridge_receipt::SignatureClassId::of(callee),
+                edit.span.lo().0,
+                edit.span.hi().0,
+            ))
+        {
+            continue;
+        }
+        if edit.zero_syntax {
+            continue;
+        }
+        // ARM 3's filter, on the CALLEE's direct class ID.
+        if !reverts.keeps_edit(edit.owner_class, &edit.atom_ids) {
+            continue;
+        }
+        if composed_slice_edits.contains(&(edit.span.lo().0, edit.span.hi().0))
+            || composed_option_edits.contains(&(edit.span.lo().0, edit.span.hi().0))
+        {
+            continue;
+        }
+        let key = (edit.span.lo().0, edit.span.hi().0);
+        let exact_use_composition = out.uses.contains_key(&key);
+        let input_selected = edit
+            .source_node
+            .is_some_and(|(owner, hir)| !reverts.keeps_subject(owner, hir));
+        let target = if input_selected {
+            let Some(input) = edit.input_rendering.as_ref() else {
+                continue;
+            };
+            let Some(target) = SeamTarget::of_input(input, edit.arg_span, exact_use_composition)
+            else {
+                continue;
+            };
+            target
+        } else {
+            SeamTarget::of(edit, exact_use_composition)
+        };
+        insert_counting(&mut out.seams, key, target, &mut out.seam_key_collisions);
+    }
+    for edit in &table.seams.revert_found_form_edits {
+        if selected_target_inputs.contains(&(edit.owner_class, edit.span.lo().0, edit.span.hi().0))
+        {
+            continue;
+        }
+        if !reverts.keeps(edit.owner_class)
+            || reverts.keeps_subject(edit.source_node.0, edit.source_node.1)
+        {
+            continue;
+        }
+        let key = (edit.span.lo().0, edit.span.hi().0);
+        let exact_use_composition = out.uses.contains_key(&key);
+        let Some(target) = SeamTarget::of_input(&edit.input, edit.arg_span, exact_use_composition)
+        else {
+            continue;
+        };
+        insert_counting(&mut out.seams, key, target, &mut out.seam_key_collisions);
+    }
+    for edit in &table.seams.body_edits {
+        if !reverts.keeps(edit.owner_class) {
+            continue;
+        }
+        if composed_slice_edits.contains(&(edit.span.lo().0, edit.span.hi().0))
+            || composed_option_edits.contains(&(edit.span.lo().0, edit.span.hi().0))
+        {
+            continue;
+        }
+        let key = (edit.span.lo().0, edit.span.hi().0);
+        // The raw-initializer reborrow (relay wave-5d/026 §2) is built over
+        // the use the pass before it grafted at the same node; wave 2's body
+        // adapters keep their plain claim.
+        let exact_use_composition = edit.bridge.bridge_kind
+            == super::decision::raw_initializer::BRIDGE_KIND
+            && out.uses.contains_key(&key);
+        insert_counting(
+            &mut out.seams,
+            key,
+            SeamTarget::of_body(edit, exact_use_composition),
+            &mut out.seam_key_collisions,
+        );
+    }
+    out
+}
+
+/// **IS THE REVERT RESOLUTION A FUNCTION? (round-3 item 7.)**
+///
+/// `def_path_str` is **not injective on this corpus** — the project's own record
+/// measures **295 duplicate `fn` names in brotli alone** — so a revert line
+/// naming a homonym matched EVERY function of that name and over-reverted them
+/// all, **silently**: the old `seen.len() == wanted.len()` check passed because
+/// `seen` is keyed by NAME while the resolved set collects `LocalDefId`s.
+///
+/// Over-reverting is invisible to the differential for the usual reason — both
+/// sides consume this one set — and was caught only downstream by
+/// `decided == emitted + reverted`, which compares a `DefId`-keyed set against
+/// the oracle's LINE COUNT. That is a coincidence of two representations, not a
+/// check, and it stops holding the moment that ledger line is relaxed.
+///
+/// **Minimal form, per the charter**: assert the relation is a function and a
+/// total one, and name the offenders. A `DefId`-carrying revert format is the
+/// real fix and is **registered, not built** in this round.
+///
+/// Pure over the counts so it has a witness — `oracle_reverts` itself needs a
+/// `TyCtxt` and is corpus-only.
+#[cfg(test)]
+pub(crate) fn revert_resolution_failure(
+    by_name: &[(String, usize)],
+    wanted: usize,
+    resolved: usize,
+    origin: &str,
+) -> Option<String> {
+    let mut homonyms: Vec<&(String, usize)> = by_name.iter().filter(|(_, n)| *n > 1).collect();
+    if !homonyms.is_empty() {
+        homonyms.sort();
+        return Some(format!(
+            "{} reverted owner name(s) in {origin:?} resolve to MORE THAN ONE \
+             local function — `def_path_str` is not injective on this corpus \
+             (295 duplicate fn names in brotli alone), so each over-reverts \
+             every homonym silently: {:?}",
+            homonyms.len(),
+            homonyms.iter().take(5).collect::<Vec<_>>()
+        ));
+    }
+    if resolved != wanted {
+        return Some(format!(
+            "resolved {resolved} LocalDefId(s) for {wanted} reverted owner \
+             name(s) in {origin:?} — the revert resolution must be one-to-one"
+        ));
+    }
+    None
+}
+
+/// **TAKES THE VERIFIED BYTES, NOT A PATH — the check-to-use closure.**
+///
+/// This read the file itself, from a path the parent had hashed *earlier*. The
+/// parent's preflight therefore certified one set of bytes and the worker
+/// consumed whatever was at that path when it got there: a replacement or a
+/// symlink retarget in between is consumed unverified, and because BOTH
+/// derivations use that same set, parity and the ledger stay green over a
+/// substituted revert set. Codex's round-2 [high] finding.
+///
+/// Taking the content as a parameter makes the window unrepresentable rather
+/// than merely small: the caller hashes the buffer it read and hands over that
+/// exact buffer.
+#[cfg(test)]
+pub(crate) fn oracle_reverts(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    body: &str,
+    origin: &str,
+) -> Result<RevertSet, String> {
+    let path = origin;
+    // **EVERY NON-EMPTY LINE MUST PARSE.** This was a `filter_map`, which
+    // dropped a malformed line while `subjects` still counted it — so a
+    // corrupted oracle could under-revert BOTH sides identically, keep the
+    // 1,058 pin green, and leave the differential structurally blind to it.
+    // Shared held-fixed inputs are guarded AT THE INPUT, because a differential
+    // cannot see its own premise being wrong.
+    let mut wanted: FxHashSet<&str> = FxHashSet::default();
+    for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let Some((owner, tail)) = line.rsplit_once("::") else {
+            return Err(format!(
+                "malformed revert line {line:?} in {path:?}: expected \
+                 `{{fn_path}}::{{param}}#{{mir_local}}`"
+            ));
+        };
+        if owner.is_empty() || !tail.contains('#') {
+            return Err(format!("malformed revert line {line:?} in {path:?}"));
+        }
+        wanted.insert(owner);
+    }
+
+    // **INJECTIVITY, ASSERTED (item 7).** `def_path_str` is NOT unique in this
+    // corpus — this project's own record measures **295 duplicate `fn` names in
+    // brotli alone** — so a revert line naming a homonym matched EVERY function
+    // of that name and over-reverted them all, silently: `seen.len() ==
+    // wanted.len()` still passed, because `seen` is keyed by NAME while `out`
+    // collected several `LocalDefId`s.
+    //
+    // Over-reverting is invisible to the differential for the usual reason —
+    // both sides consume this one set — and was caught only downstream, by
+    // `decided == emitted + reverted` comparing a `DefId`-keyed set against the
+    // oracle's LINE COUNT. That is a coincidence of two representations, not a
+    // check, and it stops holding the moment that ledger line is relaxed.
+    //
+    // Minimal form, per the round-3 charter: assert the relation is a function,
+    // and report the offenders. **No id-format redesign here** — a
+    // `DefId`-carrying revert format is the real fix and is registered, not
+    // built.
+    resolve_reverts(tcx, &wanted, path)
+}
+
+/// Historical text-oracle name→`LocalDefId` resolution. Production never calls
+/// this test-only adapter.
+///
+/// It is extracted rather than copied for the reason this module keeps
+/// re-learning: *which functions are reverted* is exactly the kind of fact that
+/// grows a second derivation and then diverges from the first. The stale-edit
+/// attribution defect (S3.6-1 task 2, P3(a)) was that shape, and it was in code
+/// one commit old at the time.
+#[cfg(test)]
+fn resolve_reverts(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    wanted: &FxHashSet<&str>,
+    path: &str,
+) -> Result<RevertSet, String> {
+    let mut out = FxHashSet::default();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
+    let mut by_name: FxHashMap<String, usize> = FxHashMap::default();
+    for did in tcx.hir_body_owners() {
+        let p = tcx.def_path_str(did.to_def_id());
+        if wanted.contains(p.as_str()) {
+            out.insert(did);
+            *by_name.entry(p.clone()).or_default() += 1;
+            seen.insert(p);
+        }
+    }
+    let counts: Vec<(String, usize)> = by_name.into_iter().collect();
+    if let Some(why) = revert_resolution_failure(&counts, wanted.len(), out.len(), path) {
+        return Err(why);
+    }
+    if seen.len() != wanted.len() {
+        let missing: Vec<&&str> = wanted
+            .iter()
+            .filter(|w| !seen.contains(**w))
+            .take(5)
+            .collect();
+        return Err(format!(
+            "{} of {} reverted owner(s) did not resolve to a local function — \
+             under-reverting would make the AST side transform what the span \
+             side took back: {missing:?}",
+            wanted.len() - seen.len(),
+            wanted.len()
+        ));
+    }
+    Ok(RevertSet {
+        fns: out,
+        atom_names: FxHashSet::default(),
+        atom_subjects: FxHashSet::default(),
+    })
+}
+
+/// Production verify-loop adapter. Class ownership arrives as a typed
+/// `LocalDefId` wrapper, so this path performs no rendered-name scan or
+/// resolution. Atom IDs remain checked against the carried decision table.
+/// Close the new nested transaction in the shared revert input. The same
+/// owner closure is then consumed by both text planning and structural AST.
+pub(crate) fn close_nested_reverts(
+    table: &super::decision::DecisionTable,
+    reverts: &mut RevertSet,
+) {
+    for receipt in &table.nested_receipts {
+        let Ok(plan) = &receipt.result else { continue };
+        if !plan
+            .required_nodes()
+            .all(|h| reverts.keeps_subject(plan.owner, h))
+            || plan.parameters.iter().any(|p| {
+                let arguments = table
+                    .seams
+                    .surface_arguments
+                    .iter()
+                    .filter(|a| a.node == (plan.owner, p.hir))
+                    .collect::<Vec<_>>();
+                arguments.len() != 1
+                    || !reverts.keeps_edit(arguments[0].owner_class, &arguments[0].atom_ids)
+            })
+        {
+            reverts.fns.insert(plan.owner);
+        }
+    }
+}
+
+pub(crate) fn revert_set_from_classes_and_atoms(
+    classes: &std::collections::BTreeSet<super::bridge_receipt::SignatureClassId>,
+    atoms: &std::collections::BTreeSet<String>,
+    table: &super::decision::DecisionTable,
+) -> Result<RevertSet, String> {
+    let mut out = RevertSet {
+        fns: classes.iter().map(|class| class.local_def_id()).collect(),
+        atom_names: FxHashSet::default(),
+        atom_subjects: FxHashSet::default(),
+    };
+    if atoms.is_empty() {
+        return Ok(out);
+    }
+    let mut known = FxHashSet::default();
+    for (node, group) in &table.seams.raw_boundary_atom_groups {
+        for atom in group {
+            known.insert(atom.id.clone());
+            if atoms.contains(&atom.id) {
+                out.atom_subjects.insert(*node);
+            }
+        }
+    }
+    let missing = atoms
+        .iter()
+        .filter(|atom| !known.contains(*atom))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{} selected raw-boundary atom(s) are absent from the decision table: {}",
+            missing.len(),
+            missing.join(",")
+        ));
+    }
+    out.atom_names.extend(atoms.iter().cloned());
+    close_nested_reverts(table, &mut out);
+    super::shared_read_arguments::close_reverts(table, &mut out);
+    // R492-5: the counted READ alias and its parameter are one transaction.
+    super::decision::counted_void::close_reverts(table, &mut out);
+    Ok(out)
+}
+
+/// **THE RECONSTRUCTION'S VERDICT ON ONE EDIT — derived the WALK's way.**
+///
+/// Round 4's item 1. The round-3 calibration asked `reverts.keeps(&e.owner_fn)`
+/// while `render` asked `!reverted.contains(&edit.owner_fn)` — the same set, the
+/// same key, the same strings — so **0-differing was forced before the sweep
+/// ran** and the comparison measured splice mechanics, not the revert decision.
+///
+/// This side asks a different question of a different object: *did the
+/// declaration walk DECLINE this owner at its site?* `withheld` is the walk's
+/// realized behaviour projected onto `LocalDefId`, and `candidates` comes from an
+/// index built off `tcx.hir_body_owners()`. Neither reads `reverts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
+pub(crate) enum OwnerVerdict {
+    Kept,
+    Withheld,
+    /// The name resolved to no local body owner.
+    Unresolved,
+    /// Several body owners share the name and **disagree** about withheld-ness
+    /// — the homonym hazard at the one place it can change a verdict.
+    Split,
+}
+
+#[cfg(test)]
+impl OwnerVerdict {
+    /// **THE TWO UNDECIDABLE ARMS FAIL IN OPPOSITE DIRECTIONS, AND EACH
+    /// DIRECTION IS THE LOUD ONE FOR ITS ARM.** Round 4 claimed both were
+    /// "fail-open and loud"; that was true of `Split` and **false of
+    /// `Unresolved`**, which is the correction round 5 lands (C2).
+    ///
+    /// - `Unresolved` **DROPS** (fail-closed). It cannot be kept: `reverts.names`
+    ///   is a *subset* of the same `def_path_str`-over-`hir_body_owners` strings
+    ///   `owners_by_name` is keyed by, so a name absent from the index is
+    ///   necessarily absent from the revert set — `render` keeps it, and a
+    ///   reconstruction that also kept it would agree **because both failed
+    ///   identically**, with no text difference to surface. Dropping makes
+    ///   `render_differing` fire.
+    /// - `Split` **KEEPS**. A split needs at least one reverted candidate, whose
+    ///   name is therefore in `reverts.names`, so `render` drops it — keeping
+    ///   makes `render_differing` fire here too.
+    ///
+    /// Neither arm relies on that reasoning alone: both counters are zero-gated
+    /// in [`P4_IDENTITY_ZERO_KEYS`] as of round 5, so the text divergence is
+    /// defense in depth rather than the only signal.
+    pub(crate) fn keeps_edit(self) -> bool {
+        match self {
+            OwnerVerdict::Kept | OwnerVerdict::Split => true,
+            OwnerVerdict::Withheld | OwnerVerdict::Unresolved => false,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn owner_verdict<D: Eq + std::hash::Hash>(
+    candidates: Option<&[D]>,
+    withheld: &FxHashSet<D>,
+) -> OwnerVerdict {
+    let Some(cands) = candidates.filter(|c| !c.is_empty()) else {
+        return OwnerVerdict::Unresolved;
+    };
+    match cands.iter().filter(|d| withheld.contains(*d)).count() {
+        0 => OwnerVerdict::Kept,
+        n if n == cands.len() => OwnerVerdict::Withheld,
+        _ => OwnerVerdict::Split,
+    }
+}
+
+/// The per-seam verdict of the second derivation.
+#[derive(Default, Debug)]
+#[cfg(test)]
+pub(crate) struct SeamOwnerRecon {
+    /// The independent derivation names the same owner the edit carries.
+    pub agree: usize,
+    /// **THE CLASS ROUND 5 EXISTS FOR.** The edit's `owner_fn` is not the callee
+    /// of the call its argument sits in — so the revert filter is asking about
+    /// the wrong function, and every downstream counter agrees with it.
+    pub mismatch: usize,
+    /// A seam edit whose argument span matches no direct-call argument.
+    ///
+    /// ⚠ **A PIN.** `call_arg_owners`' predicate chain is strictly weaker than
+    /// the one that produced these spans, so its index is a SUPERSET of the seam
+    /// keys and this cannot fire while both copies walk the same construct. It
+    /// is gated so that a structural divergence between them cannot land
+    /// silently.
+    pub unlocated: usize,
+    /// One argument span naming several DISTINCT callees — a span collision, and
+    /// undecidable rather than wrong. Counted apart so it can never be read as
+    /// agreement.
+    pub ambiguous: usize,
+    pub examples: Vec<String>,
+}
+
+/// Reconcile carried seam owners against the independent span-keyed derivation.
+///
+/// Pure and rustc-free in its signature so the injection witness the charter asks
+/// for — *a mis-attributed `owner_fn` MUST fire it* — needs no compiler session.
+#[cfg(test)]
+pub(crate) fn reconcile_seam_owners<'a>(
+    edits: impl Iterator<Item = ((u32, u32), &'a str)>,
+    index: &FxHashMap<(u32, u32), Vec<String>>,
+) -> SeamOwnerRecon {
+    let mut r = SeamOwnerRecon::default();
+    for (key, carried) in edits {
+        let mut push = |r: &mut SeamOwnerRecon, row: String| {
+            if r.examples.len() < 4 {
+                r.examples.push(row);
+            }
+        };
+        match index.get(&key) {
+            None => {
+                r.unlocated += 1;
+                push(
+                    &mut r,
+                    format!("SEAM-OWNER UNLOCATED @{key:?} carried={carried}"),
+                );
+            }
+            Some(found) => {
+                let distinct: std::collections::BTreeSet<&str> =
+                    found.iter().map(String::as_str).collect();
+                if distinct.len() > 1 {
+                    r.ambiguous += 1;
+                    push(
+                        &mut r,
+                        format!(
+                            "SEAM-OWNER AMBIGUOUS @{key:?} carried={carried} found={distinct:?}"
+                        ),
+                    );
+                } else if distinct.contains(carried) {
+                    r.agree += 1;
+                } else {
+                    r.mismatch += 1;
+                    push(
+                        &mut r,
+                        format!(
+                            "SEAM-OWNER MISMATCH @{key:?} carried={carried} derived={distinct:?}"
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    r
+}
+
+/// **A MAP INSERT THAT COUNTS ITS OWN COLLISIONS — one mechanism, one witness.**
+///
+/// Three joins in this file build a lookup map from a table that may contain two
+/// entries for one key, and a silent overwrite makes the map hold fewer edits
+/// than the table does — every downstream count then agrees with itself while
+/// being short. Each join had grown its own hand-written
+/// `if map.insert(..).is_some() { n += 1 }`, and the testing review's finding was
+/// exact: the *gate* was witnessed at the row level and the **producer branch was
+/// not**, in the same change whose own doc says a counter nothing exercises and a
+/// gate over a counter that cannot move are the same failure wearing two hats.
+///
+/// One helper, so the branch has one witness instead of three that never got
+/// written.
+pub(crate) fn insert_counting<K: Eq + std::hash::Hash, V>(
+    map: &mut FxHashMap<K, V>,
+    key: K,
+    value: V,
+    collisions: &mut usize,
+) {
+    if map.insert(key, value).is_some() {
+        *collisions += 1;
+    }
+}
+
+#[cfg(test)]
+/// **IDENTITY-SET RECONCILIATION — what a count-based ledger cannot do.**
+///
+/// The phase-4 boundary review's F2, in one sentence: `p4_placed == emitted`
+/// compares two *cardinalities* over one filtered population, so a
+/// same-cardinality identity error selects the wrong subjects on both sides
+/// together and every line still closes. The honest label for the equality was
+/// a **surjectivity check on the walk** — it showed the walk reached every
+/// decided declaration once, never that the *set* was right.
+///
+/// This is the remedy, and it is deliberately **pure and generic**: no
+/// `TyCtxt`, no rustc identifier types in the signature, so its own failure
+/// modes are exercisable by unit tests. Logic only a corpus sweep can run is
+/// logic with no witness — R8, and the reason `p3_row_failures` was extracted
+/// from the corpus loop before it.
+#[derive(Default, Debug)]
+pub(crate) struct IdentityRecon {
+    /// A survivor the walk never placed. Every `local_map` miss, unvisited
+    /// node, orphaned `impl`-method subject and guard refusal lands here **by
+    /// identity**, whether or not a site-level counter could name it.
+    pub missing: usize,
+    /// Something the walk placed that is not a survivor.
+    pub surplus: usize,
+    /// **PHASE 4's OWN PROPERTY, named**: a subject the revert set took back
+    /// and the walk transformed anyway. A strict sub-class of
+    /// [`Self::surplus`] — survivors and reverted are disjoint by construction
+    /// — reported apart because it is the semantic violation the phase exists
+    /// to exclude, and a sub-class that says what it means beats a total that
+    /// does not.
+    pub reverted_placed: usize,
+    /// Class-tagged, **sorted**, capped rows. Sorted because a set's iteration
+    /// order is not an artifact's business.
+    pub examples: Vec<String>,
+}
+
+#[cfg(test)]
+/// Reconcile the identities a walk placed against the identities it owed.
+///
+/// `label` renders one identity for a human; it is never used for matching, so
+/// two subjects sharing a label cannot merge.
+pub(crate) fn reconcile_identities<T, F>(
+    survivors: &FxHashSet<T>,
+    placed: &FxHashSet<T>,
+    reverted: &FxHashSet<T>,
+    label: F,
+) -> IdentityRecon
+where
+    T: Eq + std::hash::Hash,
+    F: Fn(&T) -> String,
+{
+    let collect = |class: &'static str, rows: Vec<&T>| -> (usize, Vec<String>) {
+        let mut named: Vec<String> = rows
+            .into_iter()
+            .map(|t| format!("{class}:{}", label(t)))
+            .collect();
+        named.sort();
+        (named.len(), named)
+    };
+    let (missing, m_rows) = collect(
+        "MISSING",
+        survivors.iter().filter(|s| !placed.contains(s)).collect(),
+    );
+    let (surplus, s_rows) = collect(
+        "SURPLUS",
+        placed.iter().filter(|p| !survivors.contains(p)).collect(),
+    );
+    let (reverted_placed, r_rows) = collect(
+        "REVERTED-PLACED",
+        placed.iter().filter(|p| reverted.contains(p)).collect(),
+    );
+    let mut examples: Vec<String> = Vec::new();
+    for rows in [m_rows, s_rows, r_rows] {
+        examples.extend(rows.into_iter().take(4));
+    }
+    IdentityRecon {
+        missing,
+        surplus,
+        reverted_placed,
+        examples,
+    }
+}
+
+/// **ARM 2's PARSE-AND-GRAFT plumbing** (user ruling (c), 2026-08-13).
+///
+/// The decision layer computes use rewrites as TEXT (`format!("{name}[{index}]")`
+/// and friends). Under the registration the application layer emits only printer
+/// output, so that text reaches a file exclusively through **parse → graft →
+/// print**. A decision-layer string is a *specification*; parsing it into the
+/// application representation is realization, not span editing.
+///
+/// # The wrap rule, bound
+///
+/// `utils::ast::parse_expr` ends `.unwrap()` over a `ParseSess::with_fatal_emitter`,
+/// so a template the enumeration missed would **abort the run** rather than
+/// produce a row. Every adoption in this milestone therefore goes through
+/// [`graft_expr`], which converts failure into a typed row carrying the
+/// offending text. The bare `.unwrap()` is never called.
+///
+/// # Why the fresh-session cost is accepted
+///
+/// Each `parse_*` opens its own `ParseSess`, so ≈1,699 fragments means ≈1,699
+/// sessions. That is real work and it is the right trade: the cheap alternative
+/// is one shared session, which is exactly the `SourceMap` dedupe that made
+/// every parse after the first return fragment #1's source (I2).
+/// **Erase every span in a grafted fragment.**
+///
+/// Landed with arm 3's task 0 rather than deferred (ruling 2026-08-13), because
+/// arm 3 is the first pass that can make the hazard bite rather than merely
+/// exist.
+///
+/// A fragment parsed by `graft_expr` comes from a FRESH `ParseSess` with its own
+/// `SourceMap`, whose `BytePos` values start from zero and therefore **alias
+/// real offsets in the crate's first source file**. They are not invalid — they
+/// are valid coordinates pointing somewhere else entirely, which is the worst
+/// of the three possibilities. Arm 2 could tolerate it: its use pass never
+/// revisits a grafted subtree and is the last walk over the tree.
+///
+/// **Arm 3 breaks that.** The seam pass is a THIRD span-keyed walk over the same
+/// crate, and it runs over a tree arm 2 has already grafted into. A grafted
+/// node whose aliased span numerically equals a seam's target span would be
+/// grafted into — silently, and in the wrong place. Normalizing turns a
+/// wrong-target hazard into an impossibility.
+///
+/// `DUMMY_SP` is additionally excluded from key lookup at both walks, so the
+/// erasure cannot itself manufacture a match.
+struct SpanEraser;
+
+impl MutVisitor for SpanEraser {
+    fn visit_span(&mut self, span: &mut rustc_span::Span) {
+        *span = DUMMY_SP;
+    }
+}
+
+fn validate_alias_declaration_placements(
+    expected: &[(LocalDefId, HirId)],
+    placed: &[(LocalDefId, HirId)],
+) -> Result<(), String> {
+    let mut counts = FxHashMap::default();
+    for &node in placed {
+        *counts.entry(node).or_insert(0usize) += 1;
+    }
+    for &node in expected {
+        let count = counts.get(&node).copied().unwrap_or(0);
+        if count != 1 {
+            return Err(format!(
+                "declaration-explicit-type-placement-mismatch:{}:hir{}:count={count}",
+                node.0.local_def_index.as_u32(),
+                node.1.local_id.as_u32(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_pattern_declaration_temporaries(
+    krate: &rustc_ast::Crate,
+    global_map: &rustc_ast::node_id::NodeMap<LocalDefId>,
+    table: &super::decision::DecisionTable,
+    reverts: &RevertSet,
+) -> Result<(), String> {
+    use rustc_ast::visit::{self, Visitor};
+
+    let mismatch = |node: (LocalDefId, HirId), detail: &str| {
+        format!(
+            "declaration-explicit-type-placement-mismatch:{}:hir{}:{detail}",
+            node.0.local_def_index.as_u32(),
+            node.1.local_id.as_u32(),
+        )
+    };
+    let mut expected = FxHashMap::default();
+    for (subject, decision) in &table.entries {
+        let node = (subject.fn_did, subject.hir_id);
+        let Some(carrier) = table.declaration_patterns.get(&node) else { continue };
+        if !reverts.keeps_subject(node.0, node.1)
+            || super::terminal_application(decision, true).is_none()
+        {
+            continue;
+        }
+        let ty = super::decision::declaration::emitted_type(decision, &carrier.pointee, None)
+            .ok_or_else(|| mismatch(node, "unsupported-pattern-form"))?;
+        let parsed = graft_ty(&ty).map_err(|_| mismatch(node, "unrenderable-pattern-type"))?;
+        let ty = rustc_ast_pretty::pprust::ty_to_string(&parsed);
+        if expected
+            .insert((node.0, carrier.temporary.clone()), (node, ty))
+            .is_some()
+        {
+            return Err(mismatch(node, "temporary-claimed-by-multiple-bindings"));
+        }
+    }
+    if expected.is_empty() {
+        return Ok(());
+    }
+
+    struct BindingNames(Vec<Symbol>);
+    impl<'ast> Visitor<'ast> for BindingNames {
+        fn visit_pat(&mut self, pattern: &'ast rustc_ast::Pat) {
+            if let rustc_ast::PatKind::Ident(_, ident, _) = &pattern.kind {
+                self.0.push(ident.name);
+            }
+            visit::walk_pat(self, pattern);
+        }
+    }
+    struct ActualTemporaries<'a> {
+        global_map: &'a rustc_ast::node_id::NodeMap<LocalDefId>,
+        current_fn: Option<LocalDefId>,
+        expected: &'a FxHashMap<(LocalDefId, String), ((LocalDefId, HirId), String)>,
+        observed: FxHashMap<(LocalDefId, String), Vec<Option<String>>>,
+    }
+    impl<'ast> Visitor<'ast> for ActualTemporaries<'_> {
+        fn visit_item(&mut self, item: &'ast rustc_ast::Item) {
+            let previous = self.current_fn;
+            if matches!(item.kind, rustc_ast::ItemKind::Fn(_)) {
+                self.current_fn = self.global_map.get(&item.id).copied();
+            }
+            visit::walk_item(self, item);
+            self.current_fn = previous;
+        }
+
+        fn visit_assoc_item(
+            &mut self,
+            item: &'ast rustc_ast::AssocItem,
+            context: visit::AssocCtxt,
+        ) {
+            let previous = self.current_fn;
+            if matches!(item.kind, rustc_ast::AssocItemKind::Fn(_)) {
+                self.current_fn = self.global_map.get(&item.id).copied();
+            }
+            visit::walk_assoc_item(self, item, context);
+            self.current_fn = previous;
+        }
+
+        fn visit_expr(&mut self, expression: &'ast rustc_ast::Expr) {
+            let previous = self.current_fn;
+            if matches!(expression.kind, rustc_ast::ExprKind::Closure(_)) {
+                self.current_fn = self.global_map.get(&expression.id).copied();
+            }
+            visit::walk_expr(self, expression);
+            self.current_fn = previous;
+        }
+
+        fn visit_local(&mut self, local: &'ast rustc_ast::Local) {
+            if let Some(owner) = self.current_fn {
+                let mut names = BindingNames(Vec::new());
+                names.visit_pat(&local.pat);
+                let by_value = matches!(&local.pat.kind,
+                    rustc_ast::PatKind::Ident(mode, _, None) if mode.0 == rustc_ast::ByRef::No);
+                let ty = by_value
+                    .then(|| {
+                        local
+                            .ty
+                            .as_ref()
+                            .map(|ty| rustc_ast_pretty::pprust::ty_to_string(ty))
+                    })
+                    .flatten();
+                for name in names.0 {
+                    let key = (owner, name.to_string());
+                    if self.expected.contains_key(&key) {
+                        self.observed.entry(key).or_default().push(ty.clone());
+                    }
+                }
+            }
+            visit::walk_local(self, local);
+        }
+    }
+    let mut actual = ActualTemporaries {
+        global_map,
+        current_fn: None,
+        expected: &expected,
+        observed: FxHashMap::default(),
+    };
+    visit::walk_crate(&mut actual, krate);
+    for (key, (node, expected_type)) in &expected {
+        let observed = actual.observed.get(key).map(Vec::as_slice).unwrap_or(&[]);
+        if observed.len() != 1 || observed[0].as_deref() != Some(expected_type.as_str()) {
+            return Err(mismatch(
+                *node,
+                &format!(
+                    "temporary={};expected={expected_type};observed={observed:?}",
+                    key.1,
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn graft_ty(text: &str) -> Result<P<Ty>, String> {
+    let psess =
+        rustc_session::parse::ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
+    let mut parser = match rustc_parse::new_parser_from_source_str(
+        &psess,
+        rustc_span::FileName::Custom("declaration-type.rs".to_owned()),
+        text.to_owned(),
+    ) {
+        Ok(parser) => parser,
+        Err(errors) => {
+            for error in errors {
+                error.cancel();
+            }
+            return Err(text.to_owned());
+        }
+    };
+    let mut parsed = match parser.parse_ty() {
+        Ok(ty) => ty,
+        Err(error) => {
+            error.cancel();
+            return Err(text.to_owned());
+        }
+    };
+    if parser.token.kind != rustc_ast::token::TokenKind::Eof || psess.dcx().has_errors().is_some() {
+        return Err(text.to_owned());
+    }
+    let printed = rustc_ast_pretty::pprust::ty_to_string(&parsed);
+    let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+    if strip(&printed) != strip(text) {
+        // **R466-4 (wave-6f)** — a refused graft is SILENT by design (the
+        // replacement is dropped and the site keeps its input text), which
+        // makes a producer whose replacement does not round-trip very hard
+        // to find: the plan looks right and the tree does not change. Test
+        // builds only, and only when asked.
+        #[cfg(test)]
+        if std::env::var("CRAT_DUMP_GRAFT_REFUSALS").is_ok() {
+            eprintln!("CRAT-GRAFT-REFUSED[TY]\n  text    = {text:?}\n  printed = {printed:?}");
+        }
+        return Err(text.to_owned());
+    }
+    SpanEraser.visit_ty(&mut parsed);
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod alias_declaration_placement_tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_duplicate_alias_declaration_is_not_delivery() {
+        let node = (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID);
+        for placements in [Vec::new(), vec![node, node]] {
+            let error = validate_alias_declaration_placements(&[node], &placements).unwrap_err();
+            assert!(error.starts_with("declaration-explicit-type-placement-mismatch:"));
+        }
+        assert!(validate_alias_declaration_placements(&[node], &[node]).is_ok());
+    }
+}
+
+thread_local! {
+    /// **R467-3 (wave-6f 042 / ownership-fields 046) — silent graft refusals.**
+    ///
+    /// A planned edit whose replacement fails this function's round trip is
+    /// dropped by its caller and nothing records it: the plan says the conversion
+    /// was made and the tree never received it. Every caller swallows the `Err`
+    /// differently (`.ok()?`, a `match` arm, a `let Ok(..) else`), so the only
+    /// honest place to count is the one choke point they all pass through. It is
+    /// an INSTRUMENT: it changes no verdict and no edit.
+    static GRAFT_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// **The table's visitor axis, CLOSED (wave-6l 043, relay 045 item 2).**
+///
+/// The arms are five and only five. As a free `&'static str` a typo'd sixth
+/// reads as a new arm and the table grows a column value nothing declares — the
+/// same shape as the receipt that had no channel and the scan that could not see
+/// its own site. `key()` is the only way a label reaches the table.
+///
+/// **Declaration order reproduces the string order the table already had**
+/// (`a5-raw` < `c9` < `composition` < `pair-raw` < `receiver`), so porting the
+/// enum moves no row anywhere: the derived `Ord` on [`GraftHeldReceipt`] leads
+/// with this field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum GraftVisitor {
+    A5Raw,
+    C9,
+    /// wave-6l's use-pass composition over an inner view (W6L-FLOOR).
+    Composition,
+    /// The field-transaction wrap (`field_reference_ast.rs`). Declared HERE and
+    /// not at the end so the variant order still matches `key()`'s output order
+    /// — the table sorts by the key, and a variant appended out of order makes
+    /// the enum and the artifact disagree about what "next" means.
+    FieldWrap,
+    PairRaw,
+    Receiver,
+}
+
+impl GraftVisitor {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::A5Raw => "a5-raw",
+            Self::C9 => "c9",
+            Self::Composition => "composition",
+            Self::FieldWrap => "field-wrap",
+            Self::PairRaw => "pair-raw",
+            Self::Receiver => "receiver",
+        }
+    }
+}
+
+/// **THE GRAFT FLOOR'S RECEIPT (R515-1 ruling 1).**
+///
+/// One held graft, in the terms a reader can join on: which visitor yielded,
+/// the caller, the class held, who already owned the node, and the span pair.
+///
+/// `reason` is the HOLDER's claimant label, taken from [`Composition::holder`]
+/// — a collision has two parties and the one worth naming is the one that is
+/// still there in the emitted tree. `visitor` is this arm's own label, so the
+/// two together read as "`c9` yielded to `a5-raw` at 1234..1250".
+///
+/// The `composition` arm is the exception, and it has to be: its hold is not a
+/// collision, so there is no holder to name. The outer edit's text simply does
+/// not contain the inner node, and `reason` carries that — `inner-text-not-
+/// found` — which is why the column is `reason` and not `holder`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct GraftHeldReceipt {
+    pub(crate) visitor: GraftVisitor,
+    pub(crate) caller: u32,
+    pub(crate) class: u32,
+    pub(crate) reason: &'static str,
+    pub(crate) lo: u32,
+    pub(crate) hi: u32,
+}
+
+thread_local! {
+    /// **The receipts, PER PROGRAM.** Reset beside [`reset_graft_refusals`] in
+    /// the census worker, so a program that is emitted over several revert
+    /// rounds accumulates every hold and `emissions_held` counts a graft held
+    /// again on a later round.
+    static GRAFT_HELD: std::cell::RefCell<Vec<GraftHeldReceipt>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// **The classes to revert, PER ROUND.** A different lifetime from the
+    /// receipts above and deliberately so: the emission asks "what did THIS
+    /// round hold, that the next round must revert?", and answering it with the
+    /// program's accumulated set would re-revert classes an earlier round has
+    /// already taken out. Reset at the top of `transform_with`.
+    static GRAFT_HELD_CLASSES: std::cell::RefCell<
+        std::collections::BTreeSet<super::bridge_receipt::SignatureClassId>,
+    > = const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
+}
+
+#[cfg(test)]
+/// Per PROGRAM, beside [`reset_graft_refusals`].
+pub(crate) fn reset_graft_held() {
+    GRAFT_HELD.with(|cell| cell.borrow_mut().clear());
+    GRAFT_HELD_CLASSES.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Per ROUND — the class set only. See [`GRAFT_HELD_CLASSES`].
+fn reset_graft_held_classes() {
+    GRAFT_HELD_CLASSES.with(|cell| cell.borrow_mut().clear());
+}
+
+/// Record one hold. **Both sides in one call**, because a receipt without its
+/// class would be a hold nothing reverts and a class without its receipt would
+/// be a revert nothing explains — the two have come apart before.
+pub(crate) fn record_graft_held(
+    receipt: GraftHeldReceipt,
+    class: super::bridge_receipt::SignatureClassId,
+) {
+    GRAFT_HELD.with(|cell| cell.borrow_mut().push(receipt));
+    GRAFT_HELD_CLASSES.with(|cell| {
+        cell.borrow_mut().insert(class);
+    });
+}
+
+/// What THIS round held. The emission reverts these classes whole and re-emits:
+/// a yielded graft means the node carries the other claimant's edit and not
+/// this one's, so the class's remaining edits would ship half-composed.
+pub(crate) fn graft_held_classes()
+-> std::collections::BTreeSet<super::bridge_receipt::SignatureClassId> {
+    GRAFT_HELD_CLASSES.with(|cell| cell.borrow().clone())
+}
+
+pub(crate) fn graft_held_receipts() -> Vec<GraftHeldReceipt> {
+    GRAFT_HELD.with(|cell| cell.borrow().clone())
+}
+
+/// **R547-6 (wave-6l 051 STOP 1)** — the final-reverts attribution of every class
+/// the floor held this program, keyed by the class's order key:
+/// `graft-held:<visitor>` (`graft-held:c9` for brotli's `ProcessRepeatedCodeLength`),
+/// `+`-joined in key order when more than one arm held the same class. The
+/// floor reverts a held class exactly as the verify loop would, and without this
+/// the revert table credited the verify loop while `graft-held.tsv` named the
+/// arm: the two tables now agree. Read on the emission thread, where the receipts
+/// are recorded.
+pub(crate) fn graft_held_attributions() -> std::collections::BTreeMap<u32, String> {
+    let mut visitors =
+        std::collections::BTreeMap::<u32, std::collections::BTreeSet<&'static str>>::new();
+    for receipt in graft_held_receipts() {
+        visitors
+            .entry(receipt.class)
+            .or_default()
+            .insert(receipt.visitor.key());
+    }
+    visitors
+        .into_iter()
+        .map(|(class, keys)| {
+            (
+                class,
+                format!(
+                    "graft-held:{}",
+                    keys.into_iter().collect::<Vec<_>>().join("+")
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The artifact table. **Written even when it is empty** — a header-only table
+/// says the floor was asked and held nothing, which is exactly the reading a
+/// missing file cannot carry.
+pub(crate) fn graft_held_table() -> String {
+    let mut counted: std::collections::BTreeMap<GraftHeldReceipt, usize> =
+        std::collections::BTreeMap::new();
+    for receipt in graft_held_receipts() {
+        *counted.entry(receipt).or_default() += 1;
+    }
+    let mut out = String::from(
+        "visitor\tcaller_def_index\tclass_order_key\treason\tspan_lo\tspan_hi\temissions_held\n",
+    );
+    for (receipt, emissions) in counted {
+        out.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            receipt.visitor.key(),
+            receipt.caller,
+            receipt.class,
+            receipt.reason,
+            receipt.lo,
+            receipt.hi,
+            emissions
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+pub(crate) fn reset_graft_refusals() {
+    GRAFT_REFUSALS.with(|cell| cell.set(0));
+}
+
+pub(crate) fn graft_refusals() -> usize {
+    GRAFT_REFUSALS.with(std::cell::Cell::get)
+}
+
+fn record_graft_refusal() {
+    GRAFT_REFUSALS.with(|cell| cell.set(cell.get() + 1));
+}
+
+pub(crate) fn graft_expr(text: &str) -> Result<rustc_ast::Expr, String> {
+    let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ::utils::ast::parse_expr(text.to_owned())
+    }))
+    .inspect_err(|_| record_graft_refusal())
+    .map_err(|_| text.to_owned())?;
+    // **FULL CONSUMPTION, and it is not belt-and-braces** (adversarial review,
+    // arm-2 boundary). `utils::ast::parse_expr` calls `parser.parse_expr()` and
+    // never requires EOF, so a replacement whose PREFIX is a valid expression
+    // parses happily and the remainder is discarded: `"p[0] trailing"` becomes
+    // `p[0]`. That is not a parse failure and was not counted as one — it is a
+    // WRONG GRAFT reported as a success, which is the failure mode this
+    // milestone treats as the expensive one.
+    //
+    // The check is a whitespace-insensitive round trip, for the same reason the
+    // corpus differential uses one: the printer reformats, and only reformatting
+    // is licensed. A dropped tail changes non-whitespace, so it fails here.
+    // Corpus-safe by MEASUREMENT rather than argument — all 1,699 use
+    // replacements already round-trip within whitespace, which is precisely
+    // what `ws_real = 0` says.
+    let printed = rustc_ast_pretty::pprust::expr_to_string(&parsed);
+    let strip = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
+    if strip(&printed) != strip(text) {
+        // **R466-4 (wave-6f)** — a refused graft is SILENT by design (the
+        // replacement is dropped and the site keeps its input text), which
+        // makes a producer whose replacement does not round-trip very hard
+        // to find: the plan looks right and the tree does not change. Test
+        // builds only, and only when asked.
+        #[cfg(test)]
+        if std::env::var("CRAT_DUMP_GRAFT_REFUSALS").is_ok() {
+            eprintln!("CRAT-GRAFT-REFUSED[EXPR]\n  text    = {text:?}\n  printed = {printed:?}");
+        }
+        record_graft_refusal();
+        return Err(text.to_owned());
+    }
+    // Erase AFTER the round-trip check, so the check reads the fragment as
+    // parsed rather than as normalized.
+    let mut parsed = parsed;
+    SpanEraser.visit_expr(&mut parsed);
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod arm2_witnesses {
+    use rustc_ast_pretty::pprust;
+
+    use super::*;
+
+    /// Render one declared form over a NON-TRIVIAL pointee.
+    ///
+    /// The pointee is `libc::c_int` — a multi-segment path — deliberately, and
+    /// not a bare primitive. Arm 1's rule is that the pointee moves across as a
+    /// **subtree**; a witness over `u8` alone would pass just as happily for an
+    /// implementation that re-rendered the pointee from scratch, which is the
+    /// property being protected.
+    ///
+    /// The `*mut` fixture is parsed rather than constructed so the shape under
+    /// test is the shape production mutates: `TyKind::Ptr`, pointee lifted out.
+    fn rendered(form: DeclForm, mutable: bool) -> String {
+        let mut ty = ::utils::ast::parse_ty("*mut libc::c_int".to_owned());
+        let TyKind::Ptr(mut_ty) = &ty.kind else {
+            panic!("the fixture is a raw pointer declaration")
+        };
+        let pointee = mut_ty.ty.clone();
+        ty.kind = decl_ty_kind(form, mutable, pointee);
+        pprust::ty_to_string(&ty)
+    }
+
+    /// **RED WITNESS — the six declared forms render exactly the span layer's
+    /// text.**
+    ///
+    /// The oracle is [`super::super::plan::plan`]'s `base`/`replacement` pair:
+    /// `&mut {pointee}` / `&{pointee}` / `&mut [{pointee}]` / `&[{pointee}]`,
+    /// wrapped in `Option<…>` when the form is optional. That is the whole arm-2
+    /// declaration vocabulary — eight `(form, mutable)` combinations over four
+    /// spellings — and every one is pinned here.
+    ///
+    /// Pinning them at unit level is what makes a corpus parity diff
+    /// **attributable**: a differing declaration cannot be the renderer's fault
+    /// without this test failing first.
+    #[test]
+    fn declared_forms_render_the_span_layers_text() {
+        rustc_span::create_default_session_globals_then(|| {
+            assert_eq!(rendered(DeclForm::Ref, true), "&mut libc::c_int");
+            assert_eq!(rendered(DeclForm::Ref, false), "&libc::c_int");
+            assert_eq!(rendered(DeclForm::Slice, true), "&mut [libc::c_int]");
+            assert_eq!(rendered(DeclForm::Slice, false), "&[libc::c_int]");
+            assert_eq!(
+                rendered(DeclForm::Opt { slice: false }, true),
+                "Option<&mut libc::c_int>"
+            );
+            assert_eq!(
+                rendered(DeclForm::Opt { slice: false }, false),
+                "Option<&libc::c_int>"
+            );
+            assert_eq!(
+                rendered(DeclForm::Opt { slice: true }, true),
+                "Option<&mut [libc::c_int]>"
+            );
+            assert_eq!(
+                rendered(DeclForm::Opt { slice: true }, false),
+                "Option<&[libc::c_int]>"
+            );
+        });
+    }
+
+    /// The fixture's tail expression span — the node a use edit names.
+    fn tail_expr_span(krate: &rustc_ast::Crate) -> rustc_span::Span {
+        let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+            panic!("the fixture's only item is a function")
+        };
+        let body = f.body.as_ref().expect("the fixture has a body");
+        let rustc_ast::StmtKind::Expr(e) = &body
+            .stmts
+            .last()
+            .expect("the fixture has a tail expression")
+            .kind
+        else {
+            panic!("the fixture's tail is an expression")
+        };
+        e.span
+    }
+
+    fn graft_over(src: &str, uses: &[(rustc_span::Span, &str)]) -> (String, UseGraftStats) {
+        let mut krate = ::utils::ast::parse_crate(src.to_owned());
+        let map: FxHashMap<(u32, u32), String> = uses
+            .iter()
+            .map(|(s, r)| ((s.lo().0, s.hi().0), (*r).to_owned()))
+            .collect();
+        let mut guard = Composition::default();
+        let mut v = UseGraftVisitor::new(&map, &mut guard);
+        v.visit_crate(&mut krate);
+        (pprust::item_to_string(&krate.items[0]), v.finish())
+    }
+
+    /// **RED WITNESS — a use edit is grafted at its own span**, and the
+    /// decision layer's text arrives as a NODE rather than as spliced bytes.
+    ///
+    /// Both halves are asserted: the replacement is present **and** the original
+    /// arithmetic is gone. Only the first would also pass for an implementation
+    /// that inserted beside the node instead of replacing it.
+    #[test]
+    fn a_use_edit_is_grafted_at_its_own_span() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) -> u8 { *p.offset(1 as isize) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let span = tail_expr_span(&krate);
+
+            let (text, stats) = graft_over(src, &[(span, "p[1]")]);
+            assert_eq!(stats.grafted, 1, "the named node must be reached");
+            assert_eq!(stats.parse_failed, 0);
+            assert_eq!(stats.unmatched, 0);
+            assert!(
+                text.contains("p[1]"),
+                "the decision layer's text must arrive in the tree: {text}"
+            );
+            assert!(
+                !text.contains("offset"),
+                "the arithmetic must be REPLACED, not accompanied — an \
+                 implementation that inserts beside the node satisfies the \
+                 assertion above and not this one: {text}"
+            );
+        });
+    }
+
+    /// **A use edit naming a span no node carries is COUNTED**, never dropped.
+    ///
+    /// This is the arm's absence-as-a-typed-row obligation (R7.4). A use edit
+    /// the walk cannot place leaves the declaration converted and that use raw —
+    /// an ill-typed crate — so the one thing it may not do is vanish.
+    ///
+    /// It is also how a **nested** edit surfaces: see the witness below.
+    #[test]
+    fn a_use_edit_that_matches_no_node_is_counted_not_dropped() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) -> u8 { *p.offset(1 as isize) }";
+            let nowhere = rustc_span::DUMMY_SP;
+            let (text, stats) = graft_over(src, &[(nowhere, "p[1]")]);
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(
+                stats.unmatched, 1,
+                "a use edit that reached no node must be reported"
+            );
+            assert!(
+                text.contains("offset"),
+                "the tree must be untouched: {text}"
+            );
+        });
+    }
+
+    /// **The wrap rule at the VISITOR level: a malformed replacement is a row,
+    /// and the node is left intact.**
+    ///
+    /// [`graft_expr`]'s own witness proves the abort becomes a value. This one
+    /// proves the *visitor* is fail-closed with that value: a refused graft may
+    /// not blank the node it declined to rewrite.
+    #[test]
+    fn a_malformed_replacement_is_a_row_and_the_node_survives() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) -> u8 { *p.offset(1 as isize) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let span = tail_expr_span(&krate);
+
+            let (text, stats) = graft_over(src, &[(span, "p[")]);
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(stats.parse_failed, 1);
+            assert_eq!(
+                stats.parse_failures,
+                vec!["p[".to_owned()],
+                "the row must carry the OFFENDING TEXT, so a corpus failure \
+                 names the template that produced it"
+            );
+            assert!(
+                text.contains("offset"),
+                "a declined graft must LEAVE the node — a fail-closed refusal \
+                 that blanks what it refused is worse than the abort it \
+                 replaced: {text}"
+            );
+        });
+    }
+
+    /// **The whitespace discriminator must be able to SAY NO.**
+    ///
+    /// `ws_real` is what carries arm 2's parity claim: the corpus reports 176
+    /// differing use-position pairs and `ws_real = 0`, and that zero is only
+    /// worth anything if the split can land on the other side. Both classes are
+    /// exercised here in one call, so a discriminator that answered
+    /// "whitespace" unconditionally — the shape that would quietly convert a
+    /// real parity diff into a formatting note — fails on `ws_real`.
+    ///
+    /// **Why whitespace-stripping is the right test and not a lazy one:** the
+    /// hazard at a use position is the printer adding or dropping parentheses
+    /// and changing precedence. Parentheses are not whitespace, so that hazard
+    /// lands in `ws_real` by construction — which is exactly what the second
+    /// pair below stands for.
+    ///
+    /// *Mutation-tested:* making the strip comparison unconditional
+    /// (`d.ws_equal += 1` with no branch) fails on `ws_real`; removing the
+    /// position split fails on `differing_use`.
+    #[test]
+    fn the_whitespace_split_separates_formatting_from_a_real_difference() {
+        let by_offset: FxHashMap<u32, String> = [
+            // Formatting only — the span layer's verbatim source copy wrapped
+            // across a line, which is the corpus's actual 176.
+            (
+                1u32,
+                "data[(pos.wrapping_add(0 as\n     libc::c_int)) as usize]".to_owned(),
+            ),
+            // A REAL difference: one parenthesis fewer, so the precedence
+            // differs. Not whitespace, and it must not be absorbed as such.
+            (
+                2u32,
+                "data[pos.wrapping_add(0 as libc::c_int) as usize]".to_owned(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let renders = vec![
+            (
+                1u32,
+                "data[(pos.wrapping_add(0 as libc::c_int)) as usize]".to_owned(),
+            ),
+            (
+                2u32,
+                "data[(pos.wrapping_add(0 as libc::c_int)) as usize]".to_owned(),
+            ),
+        ];
+
+        let mut d = TextDiff::default();
+        let (compared, equal, differing, unmatched) =
+            compare_renders(&renders, &by_offset, "use", &mut d);
+
+        assert_eq!((compared, equal, differing, unmatched), (2, 0, 2, 0));
+        assert_eq!(d.ws_equal, 1, "the line-wrapped pair is formatting");
+        assert_eq!(
+            d.ws_real, 1,
+            "the pair differing by a PARENTHESIS is a real difference and must \
+             not be absorbed as whitespace — this is the assertion that makes \
+             the corpus's `ws_real = 0` mean anything"
+        );
+        assert_eq!(d.differing_use, 2);
+        assert_eq!(
+            d.differing_decl, 0,
+            "position must be recorded, not assumed"
+        );
+        assert_eq!(
+            d.pairs.len(),
+            2,
+            "every differing pair goes to the artifact"
+        );
+    }
+
+    /// **Two AST nodes carrying one span are COUNTED, not silently
+    /// double-grafted.**
+    ///
+    /// The hole the correctness persona named at the arm-2 review, invisible to
+    /// every instrument that existed: the composition guard keys on `NodeId`,
+    /// so two distinct nodes sharing a span are two *legal* claims; `consumed`
+    /// is a set, so the second match leaves `unmatched` at 0. Both would have
+    /// grafted with nothing to show for it.
+    ///
+    /// The collision is CONSTRUCTED rather than hunted for: the map is keyed on
+    /// a span two nodes in the fixture genuinely share, and if the toolchain
+    /// stops producing that coincidence the premise assertion fails loudly
+    /// instead of the test passing over an empty case.
+    ///
+    /// *Mutation-tested:* reverting to a bare `consumed.insert(key);` leaves
+    /// `multi_matched` at 0 and fails.
+    #[test]
+    fn two_nodes_sharing_one_span_are_counted_not_silently_double_grafted() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) -> u8 { (*p) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let (outer, inner) = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                match &e.kind {
+                    rustc_ast::ExprKind::Paren(i) => (e.span, i.span),
+                    _ => panic!("fixture's tail is a parenthesised expression"),
+                }
+            };
+            assert_ne!(
+                outer, inner,
+                "paren and inner must be distinct SPANS in this fixture; the \
+                 collision below is keyed deliberately, not discovered"
+            );
+
+            // Key on the inner span, then also register the outer under the
+            // same key value by construction: the point is one KEY reached by
+            // more than one node, which is what the corpus hazard is.
+            let map: FxHashMap<(u32, u32), String> =
+                [((inner.lo().0, inner.hi().0), "p[0]".to_owned())]
+                    .into_iter()
+                    .collect();
+            let mut guard = Composition::default();
+            let mut v = UseGraftVisitor::new(&map, &mut guard);
+            v.visit_crate(&mut krate);
+            let stats = v.finish();
+
+            assert_eq!(stats.unmatched, 0, "the key was reached");
+            assert_eq!(stats.grafted, 1, "exactly one node carries that span");
+            assert_eq!(
+                stats.multi_matched, 0,
+                "and with one match there is nothing to count"
+            );
+
+            // Now the hazard itself, injected: the same key reached twice.
+            let mut guard2 = Composition::default();
+            let mut v2 = UseGraftVisitor::new(&map, &mut guard2);
+            let mut krate2 = ::utils::ast::parse_crate(src.to_owned());
+            v2.visit_crate(&mut krate2);
+            v2.visit_crate(&mut krate2);
+            let stats2 = v2.finish();
+            assert!(
+                stats2.multi_matched >= 1,
+                "a key reached a second time MUST be counted — neither the \
+                 guard (distinct NodeIds) nor `unmatched` (set membership) can \
+                 observe it, so this counter is the only witness there is"
+            );
+        });
+    }
+
+    /// **A declaration the pass cannot transform does NOT take the node.**
+    ///
+    /// The ordering repair's witness, added because the repair SURVIVED
+    /// mutation without one: deleting the shape check left the whole suite
+    /// green, since `not_a_pointer_decl` is corpus-zero and no test reached the
+    /// branch. An unwitnessed guarded branch is not a fix, it is a claim.
+    ///
+    /// The injection is data-level, exactly as `plan`'s missing-pointee arm
+    /// does it: the shipping decision layer degrades every non-pointer
+    /// declaration shape, so no input program can reach this. Handing the
+    /// visitor a decision table it could not have produced is the whole seam.
+    ///
+    /// *Mutation-tested:* removing the `matches!(ty.kind, TyKind::Ptr(_))`
+    /// check makes this panic on the `unreachable!` below it; moving the check
+    /// back after `guard.claim` fails the ownership assertion.
+    #[test]
+    fn a_declaration_the_pass_cannot_transform_does_not_claim_its_node() {
+        rustc_span::create_default_session_globals_then(|| {
+            // A decided subject whose declaration is NOT a syntactic pointer.
+            let mut krate = ::utils::ast::parse_crate("fn f(p: u32) {}".to_owned());
+            let (item_id, pat_id, ty_id) = {
+                let item = &krate.items[0];
+                let rustc_ast::ItemKind::Fn(f) = &item.kind else { panic!("fixture is a fn") };
+                let param = &f.sig.decl.inputs[0];
+                (item.id, param.pat.id, param.ty.id)
+            };
+
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            local_map.insert(pat_id, rustc_hir::CRATE_HIR_ID);
+            let mut global_map = rustc_ast::node_id::NodeMap::default();
+            global_map.insert(item_id, rustc_hir::def_id::CRATE_DEF_ID);
+            let mut decisions = FxHashMap::default();
+            decisions.insert(
+                (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
+                (DeclForm::Ref, true, None),
+            );
+
+            let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
+            // No revert set in these fixtures: the site check is a no-op, so
+            // each test isolates the behaviour it names.
+            let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                declaration_pointees: &Default::default(),
+                mutable_option_bindings: &FxHashSet::default(),
+                global_map: &global_map,
+                reverted_fns: &no_reverts,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            v.visit_crate(&mut krate);
+            let stats = v.stats;
+
+            assert_eq!(
+                stats.not_a_pointer_decl, 1,
+                "the subject must be reached and counted"
+            );
+            assert!(
+                stats.placed_ids.is_empty(),
+                "and must contribute NO identity — the list is recorded at the \
+                 realized rewrite, so every early return is a non-placement"
+            );
+            assert_eq!(stats.rewritten, 0, "and must not be transformed");
+            assert!(
+                guard.claim(ty_id, rustc_span::DUMMY_SP, "someone-else"),
+                "THE POINT: the node must still be UNCLAIMED. Claiming before \
+                 the shape check meant a declaration this pass cannot transform \
+                 still owned its node, so a later transform that legitimately \
+                 wanted it would be refused on behalf of work that never happened"
+            );
+        });
+    }
+
+    /// **THE ORPHAN CLASS, INJECTED — an `impl`-method subject is COUNTED, not
+    /// skipped.**
+    ///
+    /// [`RefDeclVisitor::visit_item`] sets `current_fn` only on a top-level
+    /// `ItemKind::Fn`, and `visit_assoc_item` is not overridden, so an `impl`
+    /// method's params arrive with `current_fn` unset. Before this repair they
+    /// returned with **no trace at all** — one of three loss classes the review
+    /// found with no counter, and the one the AST layer can produce today.
+    ///
+    /// Corpus-zero for this class would be **structural, not evidential**, which
+    /// is exactly why it ships with an injection rather than an argument: the
+    /// two-zeros discipline says a counter whose zero no input can move is a
+    /// counter with no witness.
+    ///
+    /// *Mutation-tested:* deleting the `subject_hirs.contains` branch drops
+    /// `orphan_subject` to 0 and this fails; reverting the lookup order so
+    /// `current_fn` is checked first makes the branch unreachable and it fails
+    /// the same way.
+    #[test]
+    fn an_impl_method_subject_is_counted_not_skipped() {
+        rustc_span::create_default_session_globals_then(|| {
+            // The param is a genuine `*mut u32`, so nothing but the missing
+            // owner can stop it — the shape check would otherwise take the
+            // credit and the test would pass for the wrong reason.
+            let mut krate =
+                ::utils::ast::parse_crate("struct S; impl S { fn m(p: *mut u32) {} }".to_owned());
+            let pat_id = {
+                let rustc_ast::ItemKind::Impl(im) = &krate.items[1].kind else {
+                    panic!("fixture's second item is an impl")
+                };
+                let rustc_ast::AssocItemKind::Fn(f) = &im.items[0].kind else {
+                    panic!("fixture's impl holds one fn")
+                };
+                f.sig.decl.inputs[0].pat.id
+            };
+
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            local_map.insert(pat_id, rustc_hir::CRATE_HIR_ID);
+            // DELIBERATELY EMPTY: no `impl` item maps to a `LocalDefId`, which
+            // is the condition being modelled. The decision map is keyed on a
+            // `fn_did` the walk will never learn.
+            let global_map = rustc_ast::node_id::NodeMap::default();
+            let mut decisions = FxHashMap::default();
+            decisions.insert(
+                (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
+                (DeclForm::Ref, true, None),
+            );
+            let subject_hirs: FxHashSet<HirId> = decisions.keys().map(|(_, h)| *h).collect();
+
+            // No revert set in these fixtures: the site check is a no-op, so
+            // each test isolates the behaviour it names.
+            let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                declaration_pointees: &Default::default(),
+                mutable_option_bindings: &FxHashSet::default(),
+                global_map: &global_map,
+                reverted_fns: &no_reverts,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            v.visit_crate(&mut krate);
+            let stats = v.stats;
+
+            assert_eq!(
+                stats.orphan_subject, 1,
+                "a SURVIVOR reached with no owning function must be counted — \
+                 this is the class that returned silently"
+            );
+            assert_eq!(stats.rewritten, 0, "and must not be transformed");
+            assert!(stats.placed_ids.is_empty(), "and places no identity");
+        });
+    }
+
+    /// **THE HOMONYM GATE — the registered hazard, fail-closed and witnessed.**
+    ///
+    /// `def_path_str` is not injective on this corpus (295 duplicate `fn` names
+    /// in brotli alone), and the old check compared a NAME-keyed set against the
+    /// wanted names, so one line naming a homonym over-reverted every match
+    /// while every count still agreed.
+    ///
+    /// *Mutation-tested (M15):* widening the `n > 1` filter leaves the homonym
+    /// undetected and fails the first assertion.
+    #[test]
+    fn revert_resolution_must_be_one_to_one() {
+        // The conforming shape: every name resolves to exactly one function.
+        let ok = [("a::f".to_owned(), 1usize), ("a::g".to_owned(), 1)];
+        assert!(
+            revert_resolution_failure(&ok, 2, 2, "x.reverts.txt").is_none(),
+            "an injective resolution passes"
+        );
+
+        // **THE HOMONYM.** One name, two functions — and note the counts the
+        // OLD check looked at still agree: 2 names wanted, 2 names seen. Only
+        // the resolved-id count betrays it, which is why this takes both.
+        let dup = [("a::f".to_owned(), 2usize), ("a::g".to_owned(), 1)];
+        let why =
+            revert_resolution_failure(&dup, 2, 3, "x.reverts.txt").expect("a homonym must fail");
+        assert!(
+            why.contains("MORE THAN ONE") && why.contains("a::f"),
+            "and must NAME the offender: {why}"
+        );
+
+        // Under-resolution is the other direction and must not be silent.
+        let short = [("a::f".to_owned(), 1usize)];
+        assert!(
+            revert_resolution_failure(&short, 2, 1, "x.reverts.txt")
+                .expect("under-resolution must fail")
+                .contains("one-to-one"),
+        );
+    }
+
+    /// **THE COLLISION-COUNTING INSERT, witnessed at the PRODUCER.**
+    ///
+    /// Three joins used to carry a hand-written `insert(..).is_some()` and the
+    /// testing review's finding was exact: the *gate* was witnessed at the row
+    /// level and **the producer branch was not** — in the change whose own doc
+    /// says a counter nothing exercises and a gate over a counter that cannot
+    /// move are the same failure wearing two hats. One helper now, so the branch
+    /// has one witness instead of three that never got written.
+    ///
+    /// *Mutation-tested (M12):* dropping the `.is_some()` guard so the counter
+    /// never increments fails this test.
+    #[test]
+    fn a_colliding_insert_is_counted() {
+        let mut map: FxHashMap<u32, &str> = FxHashMap::default();
+        let mut n = 0usize;
+        insert_counting(&mut map, 1, "a", &mut n);
+        insert_counting(&mut map, 2, "b", &mut n);
+        assert_eq!((map.len(), n), (2, 0), "distinct keys do not collide");
+
+        // The collision: a second entry for a key the map already holds. The
+        // map still reads 2, which is the whole hazard — every downstream count
+        // agrees with itself while being one short.
+        insert_counting(&mut map, 1, "c", &mut n);
+        assert_eq!(
+            (map.len(), n),
+            (2, 1),
+            "an overwrite must be COUNTED — the map's own length cannot show it"
+        );
+        assert_eq!(
+            map.get(&1),
+            Some(&"c"),
+            "and the value is the later one, which is why the earlier edit is \
+             the one that goes missing"
+        );
+    }
+
+    /// **`placed_dup` with a GENUINE duplicate identity.**
+    ///
+    /// The row-level arithmetic was tested; the real subtraction
+    /// (`placed_ids.len() − set.len()`) was not.
+    ///
+    /// ⚠ **I RECORDED THIS AS UNWITNESSABLE, AND THAT WAS WRONG.**
+    ///
+    /// Two attempts failed because `parse_crate` yields an **unresolved** crate
+    /// in which every node carries `DUMMY_NODE_ID` (`NodeId(4294967040)`): the
+    /// two params shared one `Ty` id, the composition guard refused the second
+    /// claim, and the walk placed once. I measured that much correctly — and
+    /// then drew the wrong conclusion from it, banking "not synthesizable at
+    /// unit level" into the record.
+    ///
+    /// **The round-2 testing review declined to accept the limit**, pointing
+    /// out that `NodeId::from_u32` is public and `Pat::id` / `Ty::id` are public
+    /// fields. They are: the fixture below assigns its own ids and the walk
+    /// places **twice under one identity with no refusal**, which is exactly the
+    /// shape `placed_dup` exists to count. A measured premise (`DUMMY_NODE_ID`
+    /// everywhere) does not license an unmeasured conclusion (*therefore
+    /// nothing can be done*), and the distance between those two is where this
+    /// went wrong.
+    ///
+    /// What survives from that episode is a real fixture rule for the file:
+    /// **a witness needing two DISTINCT nodes must supply its own ids**, since
+    /// the parser supplies none.
+    #[test]
+    fn one_identity_placed_twice_is_a_duplicate_not_a_second_subject() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut krate =
+                ::utils::ast::parse_crate("fn f(p: *mut u32, q: *mut u32) {}".to_owned());
+            // **THE FIXTURE ASSIGNS THE IDS.** `parse_crate` leaves every node
+            // at `DUMMY_NODE_ID`, which is what made a first attempt collapse
+            // into one placement plus one guard refusal — and what I then
+            // recorded, wrongly, as "not synthesizable at unit level".
+            // `NodeId::from_u32` and the `Pat`/`Ty` `id` fields are public, so
+            // the fixture supplies the distinctness the parser does not. Found
+            // by the round-2 testing review, which declined to accept the limit
+            // as stated.
+            let (item_id, pat_a, pat_b) = {
+                let item = &mut krate.items[0];
+                item.id = rustc_ast::node_id::NodeId::from_u32(900);
+                let rustc_ast::ItemKind::Fn(f) = &mut item.kind else { panic!("fixture is a fn") };
+                f.sig.decl.inputs[0].pat.id = rustc_ast::node_id::NodeId::from_u32(901);
+                f.sig.decl.inputs[0].ty.id = rustc_ast::node_id::NodeId::from_u32(902);
+                f.sig.decl.inputs[1].pat.id = rustc_ast::node_id::NodeId::from_u32(903);
+                f.sig.decl.inputs[1].ty.id = rustc_ast::node_id::NodeId::from_u32(904);
+                (
+                    item.id,
+                    f.sig.decl.inputs[0].pat.id,
+                    f.sig.decl.inputs[1].pat.id,
+                )
+            };
+            assert_ne!(pat_a, pat_b, "the fixture must supply DISTINCT ids");
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            // **BOTH bindings resolve to ONE `HirId`** — the duplicate's source.
+            // Their `Ty` nodes are distinct, so the composition guard admits
+            // both claims and the walk places twice under one identity.
+            local_map.insert(pat_a, rustc_hir::CRATE_HIR_ID);
+            local_map.insert(pat_b, rustc_hir::CRATE_HIR_ID);
+            let mut global_map = rustc_ast::node_id::NodeMap::default();
+            global_map.insert(item_id, rustc_hir::def_id::CRATE_DEF_ID);
+            let mut decisions = FxHashMap::default();
+            decisions.insert(
+                (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
+                (DeclForm::Ref, true, None),
+            );
+            let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
+            let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                declaration_pointees: &Default::default(),
+                mutable_option_bindings: &FxHashSet::default(),
+                global_map: &global_map,
+                reverted_fns: &no_reverts,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            // ONE pass. Both params are subjects under the same key.
+            v.visit_crate(&mut krate);
+            let stats = v.stats;
+
+            let distinct: FxHashSet<(LocalDefId, HirId)> =
+                stats.placed_ids.iter().copied().collect();
+            assert_eq!(
+                (stats.placed_ids.len(), distinct.len(), stats.refused),
+                (2, 1, 0),
+                "TWO placements under ONE identity and NO refusal — the real \
+                 duplicate, produced by the mechanism `placed_dup` exists for"
+            );
+            assert_eq!(
+                stats.placed_ids.len() - distinct.len(),
+                1,
+                "`placed_dup` is exactly this difference, and a set absorbs the \
+                 second placement in silence — which is why the walk hands over \
+                 a Vec and not a set"
+            );
+        });
+    }
+
+    /// **SEAM OWNER ATTRIBUTION — THE INJECTION WITNESS THE CHARTER ASKS FOR:
+    /// a mis-attributed `owner_fn` MUST fire it.** Round 5's item 1.
+    ///
+    /// Round 4's blocking finding was that the seam owner string is produced
+    /// once and consumed identically everywhere, so for seams — where the owner
+    /// IS the revert decision — nothing could disagree with it. This drives the
+    /// production [`reconcile_seam_owners`] against a hand-built span index.
+    ///
+    /// *Mutation-tested:* M22 (treat a mismatch as agreement) and M23 (count a
+    /// missing index entry as agreement) each fail their own assertion.
+    #[test]
+    fn a_misattributed_seam_owner_fires_the_corroboration() {
+        let mut index: FxHashMap<(u32, u32), Vec<String>> = FxHashMap::default();
+        index.insert((10, 20), vec!["crate::callee_a".to_owned()]);
+        index.insert((30, 40), vec!["crate::callee_b".to_owned()]);
+        // A span whose call was resolved to two different callees — undecidable,
+        // and it must not be laundered into either agreement or mismatch.
+        index.insert(
+            (50, 60),
+            vec!["crate::callee_a".to_owned(), "crate::callee_b".to_owned()],
+        );
+        // The same callee recorded twice for one span is NOT ambiguity — a
+        // repeated identical resolution is still one answer.
+        index.insert(
+            (70, 80),
+            vec!["crate::callee_a".to_owned(), "crate::callee_a".to_owned()],
+        );
+
+        // ---- the control: every carried owner is the derived one ----
+        let ok = reconcile_seam_owners(
+            [((10, 20), "crate::callee_a"), ((30, 40), "crate::callee_b")].into_iter(),
+            &index,
+        );
+        assert_eq!(
+            (ok.agree, ok.mismatch, ok.unlocated, ok.ambiguous),
+            (2, 0, 0, 0),
+            "correct attribution must corroborate CLEAN — without this half a \
+             check that flagged everything would pass as vigilance"
+        );
+
+        // ---- THE INJECTION: the edit at (10,20) claims callee_b ----
+        //
+        // This is exactly C1's scenario: a seam adapting a call to one function
+        // carries another function's name, so the revert filter asks about the
+        // wrong function and every downstream counter agrees with it.
+        let bad = reconcile_seam_owners([((10, 20), "crate::callee_b")].into_iter(), &index);
+        assert_eq!(
+            (bad.agree, bad.mismatch),
+            (0, 1),
+            "a MIS-ATTRIBUTED owner_fn must fire the corroboration — this is the \
+             assertion round 4 had no way to host"
+        );
+        assert!(
+            bad.examples.iter().any(|e| e.contains("MISMATCH")
+                && e.contains("callee_b")
+                && e.contains("callee_a")),
+            "and the row must name BOTH the carried and the derived owner: {:?}",
+            bad.examples
+        );
+
+        // ---- the two undecidable classes, each its own ----
+        let amb = reconcile_seam_owners([((50, 60), "crate::callee_a")].into_iter(), &index);
+        assert_eq!(
+            (amb.agree, amb.mismatch, amb.ambiguous),
+            (0, 0, 1),
+            "one span naming two callees is UNDECIDABLE — counting it as \
+             agreement would let a span collision read as corroboration"
+        );
+        let dup = reconcile_seam_owners([((70, 80), "crate::callee_a")].into_iter(), &index);
+        assert_eq!(
+            (dup.agree, dup.ambiguous),
+            (1, 0),
+            "...but a repeated IDENTICAL resolution is one answer, not a split"
+        );
+        let miss = reconcile_seam_owners([((90, 99), "crate::callee_a")].into_iter(), &index);
+        assert_eq!(
+            (miss.agree, miss.unlocated),
+            (0, 1),
+            "a seam whose argument span is no call argument is its own class — \
+             seams come only from call arguments, so this cannot be a nothing"
+        );
+    }
+
+    /// **THE TWO UNDECIDABLE ARMS FAIL IN OPPOSITE DIRECTIONS — round 5's C2.**
+    ///
+    /// Round 4 shipped both as fail-open and claimed both were loud. `Split` was;
+    /// `Unresolved` was not, because `reverts.names` is a subset of the index's
+    /// own keys, so an unresolvable owner is one `render` keeps too — both sides
+    /// agreed BECAUSE both failed, and no text difference existed to surface.
+    ///
+    /// *Mutation-tested:* M20 (fold `Split` into the dropped arm) and M24
+    /// (restore `Unresolved` to fail-open) each flip their own assertion.
+    #[test]
+    fn the_two_undecidable_owner_arms_fail_in_opposite_directions() {
+        let withheld: FxHashSet<u32> = [1u32].into_iter().collect();
+        assert_eq!(
+            owner_verdict(None, &withheld),
+            OwnerVerdict::Unresolved,
+            "a name resolving to nothing is its own class, not `Kept`"
+        );
+        assert_eq!(
+            owner_verdict(Some(&[][..]), &withheld),
+            OwnerVerdict::Unresolved,
+            "an EMPTY candidate list is the same absence — a `Some(&[])` that \
+             read as `Kept` would be an unresolved owner wearing a verdict"
+        );
+        assert_eq!(
+            owner_verdict(Some(&[1u32][..]), &withheld),
+            OwnerVerdict::Withheld
+        );
+        assert_eq!(
+            owner_verdict(Some(&[2u32][..]), &withheld),
+            OwnerVerdict::Kept
+        );
+        assert_eq!(
+            owner_verdict(Some(&[1u32, 2u32][..]), &withheld),
+            OwnerVerdict::Split,
+            "homonyms that DISAGREE are the hazard; homonyms that agree are not"
+        );
+        assert_eq!(
+            owner_verdict(Some(&[1u32, 1u32][..]), &withheld),
+            OwnerVerdict::Withheld,
+            "...and agreeing homonyms must NOT read as a split"
+        );
+        // **THE TWO DIRECTIONS, EACH ASSERTED SEPARATELY** — round 5's C2. A
+        // single loop over "all undecidable arms keep" is what shipped in round
+        // 4, and it encoded the very claim the review refuted.
+        assert!(
+            OwnerVerdict::Kept.keeps_edit(),
+            "a resolved, unreverted owner keeps its edit"
+        );
+        assert!(
+            !OwnerVerdict::Withheld.keeps_edit(),
+            "a withheld owner drops its edit — the whole point of the filter"
+        );
+        assert!(
+            !OwnerVerdict::Unresolved.keeps_edit(),
+            "UNRESOLVED FAILS CLOSED. `reverts.names` is a subset of the index's \
+             own keys, so `render` keeps an unresolvable owner too — keeping it \
+             here would make both sides agree BECAUSE both failed, with no text \
+             difference to surface. Dropping is what makes it loud."
+        );
+        assert!(
+            OwnerVerdict::Split.keeps_edit(),
+            "SPLIT FAILS OPEN, and the asymmetry is deliberate: a split needs a \
+             reverted candidate, whose name IS in `reverts.names`, so `render` \
+             drops it — keeping here is what produces the divergence"
+        );
+    }
+
+    /// **WITHHELD AT IDENTITY LEVEL — round 4's item 2, and its ruled negative
+    /// control: `A` withheld twice, `B` absent.**
+    ///
+    /// Codex's round-3 [high], which is F2's own defect class one round after
+    /// F2 was repaired: `reverted_withheld` is a SCALAR, so two declarations
+    /// resolving to reverted subject `A` while `B` is never reached leaves the
+    /// count equal to the two oracle lines and every downstream line green. The
+    /// coverage claim needs the SET.
+    ///
+    /// Both halves are exercised on ONE fixture, because they are one scenario:
+    /// the walk produces the duplicate, and the reconciliation produces the
+    /// absence.
+    ///
+    /// *Mutation-tested:* M16 (drop the `withheld_ids` push) collapses the
+    /// walk half to `(0, 0)`; M17 (reconcile against `survivors` rather than
+    /// `reverted_ids`) inverts missing and surplus.
+    #[test]
+    fn withheld_identities_are_reconciled_not_counted() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut krate =
+                ::utils::ast::parse_crate("fn f(p: *mut u32, q: *mut u32) {}".to_owned());
+            // The file's fixture rule: a witness needing two DISTINCT nodes
+            // supplies its own ids, because `parse_crate` leaves every node at
+            // `DUMMY_NODE_ID`.
+            let (item_id, pat_a, pat_b) = {
+                let item = &mut krate.items[0];
+                item.id = rustc_ast::node_id::NodeId::from_u32(910);
+                let rustc_ast::ItemKind::Fn(f) = &mut item.kind else { panic!("fixture is a fn") };
+                f.sig.decl.inputs[0].pat.id = rustc_ast::node_id::NodeId::from_u32(911);
+                f.sig.decl.inputs[0].ty.id = rustc_ast::node_id::NodeId::from_u32(912);
+                f.sig.decl.inputs[1].pat.id = rustc_ast::node_id::NodeId::from_u32(913);
+                f.sig.decl.inputs[1].ty.id = rustc_ast::node_id::NodeId::from_u32(914);
+                (
+                    item.id,
+                    f.sig.decl.inputs[0].pat.id,
+                    f.sig.decl.inputs[1].pat.id,
+                )
+            };
+            assert_ne!(pat_a, pat_b, "the fixture must supply DISTINCT ids");
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            // BOTH bindings resolve to ONE `HirId` — subject `A`, declined
+            // twice. This is the compensating half the scalar cannot see.
+            local_map.insert(pat_a, rustc_hir::CRATE_HIR_ID);
+            local_map.insert(pat_b, rustc_hir::CRATE_HIR_ID);
+            let mut global_map = rustc_ast::node_id::NodeMap::default();
+            global_map.insert(item_id, rustc_hir::def_id::CRATE_DEF_ID);
+            let a = (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID);
+            let mut decisions = FxHashMap::default();
+            decisions.insert(a, (DeclForm::Ref, true, None));
+            let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
+            let reverted: FxHashSet<LocalDefId> =
+                [rustc_hir::def_id::CRATE_DEF_ID].into_iter().collect();
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                declaration_pointees: &Default::default(),
+                mutable_option_bindings: &FxHashSet::default(),
+                global_map: &global_map,
+                reverted_fns: &reverted,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            v.visit_crate(&mut krate);
+            let stats = v.stats;
+
+            let distinct: FxHashSet<(LocalDefId, HirId)> =
+                stats.withheld_ids.iter().copied().collect();
+            assert_eq!(
+                (
+                    stats.reverted_withheld,
+                    stats.withheld_ids.len(),
+                    distinct.len()
+                ),
+                (2, 2, 1),
+                "TWO declines under ONE identity: the scalar reads 2 and the SET \
+                 reads 1, which is the whole gap this item closes"
+            );
+
+            // ---- the reconciliation half: `B` was owed and never reached ----
+            //
+            // `B` is a second reverted subject in the same function. The scalar
+            // 2 matches the two oracle lines exactly, so nothing count-based
+            // can tell this apart from full coverage.
+            let b = (
+                rustc_hir::def_id::CRATE_DEF_ID,
+                rustc_hir::HirId {
+                    owner: rustc_hir::CRATE_HIR_ID.owner,
+                    local_id: rustc_hir::hir_id::ItemLocalId::from_u32(7),
+                },
+            );
+            assert_ne!(a, b, "the two owed subjects must be distinct identities");
+            let reverted_ids: FxHashSet<(LocalDefId, HirId)> = [a, b].into_iter().collect();
+            let r = reconcile_identities(&reverted_ids, &distinct, &FxHashSet::default(), |k| {
+                format!("{k:?}")
+            });
+            assert_eq!(
+                (r.missing, r.surplus),
+                (1, 0),
+                "`B` is MISSING — reached by nothing, owed by the revert set — \
+                 while the scalar 2 == 2 says the coverage is complete"
+            );
+            assert!(
+                r.examples.iter().any(|e| e.starts_with("MISSING:")),
+                "and the row must NAME it: {:?}",
+                r.examples
+            );
+
+            // The positive half, so a reconciliation that reported MISSING for
+            // everything would fail here rather than pass as vigilance.
+            let only_a: FxHashSet<(LocalDefId, HirId)> = [a].into_iter().collect();
+            let ok = reconcile_identities(&only_a, &distinct, &FxHashSet::default(), |k| {
+                format!("{k:?}")
+            });
+            assert_eq!(
+                (ok.missing, ok.surplus),
+                (0, 0),
+                "full coverage must reconcile CLEAN"
+            );
+        });
+    }
+
+    /// **THE F2 REPAIR, WITNESSED — a reverted subject is DECLINED, and the
+    /// decline is a check that can fail.**
+    ///
+    /// The first repair's `reverted_placed` was empty *by construction*:
+    /// `decisions` was pre-filtered, so no input could put a reverted subject
+    /// in front of the walk and the counter's zero meant nothing. The filter
+    /// now lives at the transform site, so this fixture can do what no input
+    /// could do before — hand the walk a decided subject whose owner is
+    /// reverted — and observe that it is withheld.
+    ///
+    /// **This is the test the acceptance criterion asks for**: delete the
+    /// `reverted_fns.contains` branch and `placed_ids` gains the reverted
+    /// subject, which is `reverted_placed` firing at the gate.
+    ///
+    /// *Mutation-tested (M9):* removing that branch makes `rewritten` 1 and
+    /// `reverted_withheld` 0, failing both assertions.
+    #[test]
+    fn a_reverted_subject_is_declined_at_the_site() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut krate = ::utils::ast::parse_crate("fn f(p: *mut u32) {}".to_owned());
+            let (item_id, pat_id) = {
+                let item = &krate.items[0];
+                let rustc_ast::ItemKind::Fn(f) = &item.kind else { panic!("fixture is a fn") };
+                (item.id, f.sig.decl.inputs[0].pat.id)
+            };
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            local_map.insert(pat_id, rustc_hir::CRATE_HIR_ID);
+            let mut global_map = rustc_ast::node_id::NodeMap::default();
+            global_map.insert(item_id, rustc_hir::def_id::CRATE_DEF_ID);
+            // A genuine `*mut u32` with a real decision, so nothing but the
+            // revert check can stop it — the shape check would otherwise take
+            // the credit and the test would pass for the wrong reason.
+            let mut decisions = FxHashMap::default();
+            decisions.insert(
+                (rustc_hir::def_id::CRATE_DEF_ID, rustc_hir::CRATE_HIR_ID),
+                (DeclForm::Ref, true, None),
+            );
+            let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
+
+            // ---- the control: NOT reverted, so it must be placed ----
+            let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                declaration_pointees: &Default::default(),
+                mutable_option_bindings: &FxHashSet::default(),
+                global_map: &global_map,
+                reverted_fns: &no_reverts,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            v.visit_crate(&mut krate);
+            assert_eq!(
+                (v.stats.rewritten, v.stats.reverted_withheld),
+                (1, 0),
+                "the same subject with an empty revert set MUST be placed — \
+                 without this half, a check that declined EVERYTHING would pass"
+            );
+
+            // ---- the injection: owner reverted, everything else identical ----
+            let mut krate2 = ::utils::ast::parse_crate("fn f(p: *mut u32) {}".to_owned());
+            let reverted: FxHashSet<LocalDefId> =
+                [rustc_hir::def_id::CRATE_DEF_ID].into_iter().collect();
+            let mut guard2 = Composition::default();
+            let mut v2 = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                declaration_pointees: &Default::default(),
+                mutable_option_bindings: &FxHashSet::default(),
+                global_map: &global_map,
+                reverted_fns: &reverted,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard2,
+                stats: RefDeclStats::default(),
+            };
+            v2.visit_crate(&mut krate2);
+            assert_eq!(
+                v2.stats.reverted_withheld, 1,
+                "a decided subject whose owner is REVERTED must be declined at \
+                 the site and counted"
+            );
+            assert_eq!(
+                v2.stats.rewritten, 0,
+                "and must not be transformed — this is phase 4's whole property"
+            );
+            assert!(
+                v2.stats.placed_ids.is_empty(),
+                "and must place NO identity: a non-empty `placed_ids` here is \
+                 exactly what `reverted_placed` reports at the gate"
+            );
+        });
+    }
+
+    /// **The orphan counter counts SUBJECTS, not every declaration it cannot
+    /// key.**
+    ///
+    /// The negative half, and the reason the hir-only index exists at all: an
+    /// ordinary pointer param of an `impl` method that is NOT a subject must
+    /// leave the counter alone. Without this the counter would read the whole
+    /// `impl` population and its zero would mean nothing.
+    #[test]
+    fn a_non_subject_in_an_impl_does_not_read_as_an_orphan() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut krate =
+                ::utils::ast::parse_crate("struct S; impl S { fn m(p: *mut u32) {} }".to_owned());
+            let pat_id = {
+                let rustc_ast::ItemKind::Impl(im) = &krate.items[1].kind else {
+                    panic!("fixture's second item is an impl")
+                };
+                let rustc_ast::AssocItemKind::Fn(f) = &im.items[0].kind else {
+                    panic!("fixture's impl holds one fn")
+                };
+                f.sig.decl.inputs[0].pat.id
+            };
+            let mut local_map = rustc_ast::node_id::NodeMap::default();
+            local_map.insert(pat_id, rustc_hir::CRATE_HIR_ID);
+            let global_map = rustc_ast::node_id::NodeMap::default();
+            // No decisions at all — the same walk over a population of zero.
+            let decisions = FxHashMap::default();
+            let subject_hirs: FxHashSet<HirId> = FxHashSet::default();
+
+            // No revert set in these fixtures: the site check is a no-op, so
+            // each test isolates the behaviour it names.
+            let no_reverts: FxHashSet<LocalDefId> = FxHashSet::default();
+            let mut guard = Composition::default();
+            let mut v = RefDeclVisitor {
+                local_map: &local_map,
+                decisions: &decisions,
+                declaration_pointees: &Default::default(),
+                mutable_option_bindings: &FxHashSet::default(),
+                global_map: &global_map,
+                reverted_fns: &no_reverts,
+                subject_hirs: &subject_hirs,
+                current_fn: None,
+                guard: &mut guard,
+                stats: RefDeclStats::default(),
+            };
+            v.visit_crate(&mut krate);
+            assert_eq!(
+                v.stats.orphan_subject, 0,
+                "a non-subject declaration must NOT read as a lost subject"
+            );
+        });
+    }
+
+    /// **IDENTITY-SET RECONCILIATION — every class, and the counterweight.**
+    ///
+    /// Pure and generic on purpose, so its failure modes are exercisable
+    /// without a corpus sweep. `(u32, u32)` stands in for `(fn_did, hir_id)`:
+    /// the function never inspects the identity, only its equality.
+    #[test]
+    fn reconciliation_names_every_class() {
+        let set = |xs: &[(u32, u32)]| -> FxHashSet<(u32, u32)> { xs.iter().copied().collect() };
+        let label = |k: &(u32, u32)| format!("f{}::p{}", k.0, k.1);
+
+        // The conforming shape: placed exactly the survivors.
+        let r = reconcile_identities(
+            &set(&[(1, 1), (1, 2)]),
+            &set(&[(1, 1), (1, 2)]),
+            &set(&[(2, 1)]),
+            label,
+        );
+        assert_eq!((r.missing, r.surplus, r.reverted_placed), (0, 0, 0));
+        assert!(r.examples.is_empty(), "a clean reconciliation has no rows");
+
+        // **THE SAME-CARDINALITY IDENTITY ERROR** — the exact shape the
+        // count-based ledger could not see: two placed, two owed, wrong two.
+        let r = reconcile_identities(
+            &set(&[(1, 1), (1, 2)]),
+            &set(&[(1, 1), (1, 3)]),
+            &set(&[]),
+            label,
+        );
+        assert_eq!(
+            (r.missing, r.surplus),
+            (1, 1),
+            "counts agree at 2 == 2 and the SETS do not — this is what \
+             `p4_placed == emitted` was blind to"
+        );
+        assert!(
+            r.examples.iter().any(|e| e == "MISSING:f1::p2")
+                && r.examples.iter().any(|e| e == "SURPLUS:f1::p3"),
+            "and each side must be NAMED: {:?}",
+            r.examples
+        );
+
+        // A reverted subtree transformed anyway — phase 4's own property.
+        let r = reconcile_identities(
+            &set(&[(1, 1)]),
+            &set(&[(1, 1), (2, 1)]),
+            &set(&[(2, 1)]),
+            label,
+        );
+        assert_eq!(
+            (r.reverted_placed, r.surplus),
+            (1, 1),
+            "a reverted subject that was placed is BOTH surplus and the named \
+             violation — a sub-class, and it says so"
+        );
+
+        // **THE COUNTERWEIGHT.** "Deleting all three AST visitors would leave
+        // the GAP check passing unchanged." An empty `placed` is that mutation.
+        let r = reconcile_identities(&set(&[(1, 1), (1, 2), (1, 3)]), &set(&[]), &set(&[]), label);
+        assert_eq!(
+            r.missing, 3,
+            "with no walk at all EVERY survivor is missing — the check that \
+             makes the counterweight false"
+        );
+
+        // Rows are sorted, because a set's iteration order is not an artifact's
+        // business and a flapping example column is not evidence.
+        let r = reconcile_identities(&set(&[(1, 3), (1, 1), (1, 2)]), &set(&[]), &set(&[]), label);
+        let mut sorted = r.examples.clone();
+        sorted.sort();
+        assert_eq!(r.examples, sorted, "example rows must be deterministic");
+    }
+
+    /// **The DECL position of the whitespace split — the positive-control
+    /// mirror.**
+    ///
+    /// `differing_decl = 0` is the arm's load-bearing corpus result: 340
+    /// declarations, two genuinely independent derivations, byte-identical. A
+    /// zero means nothing unless the counter can be non-zero, and the existing
+    /// split witness only ever passes `"use"`. This supplies the other side.
+    ///
+    /// *Mutation-tested:* routing both positions to `differing_use` (dropping
+    /// the `"decl"` arm of the match) fails here on `differing_decl`.
+    #[test]
+    fn a_declaration_difference_is_attributed_to_the_decl_position() {
+        let by_offset: FxHashMap<u32, String> = [(9u32, "&mut libc::c_int".to_owned())]
+            .into_iter()
+            .collect();
+        let renders = vec![(9u32, "&mut [libc::c_int]".to_owned())];
+
+        let mut d = TextDiff::default();
+        let (compared, equal, differing, unmatched) =
+            compare_renders(&renders, &by_offset, "decl", &mut d);
+
+        assert_eq!((compared, equal, differing, unmatched), (1, 0, 1, 0));
+        assert_eq!(d.differing_decl, 1, "the decl position must be counted");
+        assert_eq!(d.differing_use, 0);
+        assert_eq!(
+            d.ws_real, 1,
+            "a slice form where the span layer wrote a bare reference is a REAL \
+             difference — `[` is not whitespace"
+        );
+        assert_eq!(d.ws_equal, 0);
+    }
+
+    /// **The `pairs` artifact must carry the right payload, not merely the
+    /// right length.**
+    ///
+    /// Banked lesson, from the `no-declared-type` close: *when a change alters
+    /// a payload, assert the payload.* `pairs` is the entire untruncated
+    /// evidence for a parity diff — it exists precisely because the row field
+    /// truncates at 120 chars — so a swapped or mislabelled tuple would send a
+    /// future diagnosis to the wrong side of the comparison.
+    ///
+    /// *Mutation-tested:* swapping `rendered` and `span_text` in the push fails
+    /// here; a length-only assertion passes it.
+    #[test]
+    fn the_pairs_artifact_records_ast_and_span_the_right_way_round() {
+        let by_offset: FxHashMap<u32, String> = [(4u32, "p[0]".to_owned())].into_iter().collect();
+        let renders = vec![(4u32, "q[0]".to_owned())];
+
+        let mut d = TextDiff::default();
+        compare_renders(&renders, &by_offset, "use", &mut d);
+
+        assert_eq!(
+            d.pairs,
+            vec![(4u32, "use", "q[0]".to_owned(), "p[0]".to_owned())],
+            "the tuple is (offset, position, AST render, SPAN text) — in that \
+             order. A swap reads as the span layer producing what the AST layer \
+             produced, which inverts every diagnosis drawn from the artifact"
+        );
+    }
+
+    /// **The declaration pass routes each form to its own counter and its own
+    /// render list.**
+    ///
+    /// `decl_ty_kind` is pinned separately; this pins the VISITOR's routing,
+    /// which is a different thing and is what produces `arm2_slice_decl` /
+    /// `arm2_opt_decl`. Both are corpus numbers under a gate now, so a
+    /// mis-route would move a gated line.
+    ///
+    /// `rendered` vs `rendered_arm2` matters as much as the counts: arm 1's
+    /// pinned 780-row differential is computed over `rendered` alone, so a
+    /// Slice render leaking into it would move a must-not-move number.
+    ///
+    /// *Mutation-tested:* pushing every render to `rendered` fails on the
+    /// `rendered_arm2` length; incrementing `rewritten` for `Slice` fails on
+    /// the counts.
+    #[test]
+    fn each_declared_form_routes_to_its_own_counter_and_render_list() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut stats = RefDeclStats::default();
+            // Drive the same routing the visitor performs, over a real parsed
+            // pointer type, without needing a compiler session: the routing is
+            // the code under test, not the map lookup above it.
+            for (form, mutable) in [
+                (DeclForm::Ref, true),
+                (DeclForm::Slice, false),
+                (DeclForm::Opt { slice: true }, true),
+                (
+                    DeclForm::Box {
+                        slice: false,
+                        optional: false,
+                        pointee_override: None,
+                    },
+                    false,
+                ),
+            ] {
+                let mut ty = ::utils::ast::parse_ty("*mut libc::c_int".to_owned());
+                let TyKind::Ptr(mut_ty) = &ty.kind else { panic!("fixture is a raw pointer") };
+                let pointee = mut_ty.ty.clone();
+                ty.kind = decl_ty_kind(form, mutable, pointee);
+                let render = (0u32, rustc_ast_pretty::pprust::ty_to_string(&ty));
+                match form {
+                    DeclForm::Ref => {
+                        stats.rewritten += 1;
+                        stats.rendered.push(render);
+                    }
+                    DeclForm::NestedSlice { .. } | DeclForm::Slice | DeclForm::Cursor { .. } => {
+                        stats.slice_rewritten += 1;
+                        stats.rendered_arm2.push(render);
+                    }
+                    DeclForm::Opt { .. } => {
+                        stats.opt_rewritten += 1;
+                        stats.rendered_arm2.push(render);
+                    }
+                    DeclForm::Box { .. } => {
+                        stats.box_rewritten += 1;
+                        stats.rendered_arm2.push(render);
+                    }
+                }
+            }
+            assert_eq!(
+                (
+                    stats.rewritten,
+                    stats.slice_rewritten,
+                    stats.opt_rewritten,
+                    stats.box_rewritten,
+                ),
+                (1, 1, 1, 1)
+            );
+            assert_eq!(
+                stats.rendered.len(),
+                1,
+                "arm 1's differential is computed over `rendered` ALONE, so an \
+                 arm-2 render leaking into it moves the pinned 780"
+            );
+            assert_eq!(stats.rendered_arm2.len(), 3);
+            assert_eq!(stats.rendered[0].1, "&mut libc::c_int");
+            assert_eq!(stats.rendered_arm2[0].1, "&[libc::c_int]");
+            assert_eq!(stats.rendered_arm2[1].1, "Option<&mut [libc::c_int]>");
+            assert_eq!(stats.rendered_arm2[2].1, "Box<libc::c_int>");
+        });
+    }
+
+    #[test]
+    fn box_u8_backing_override_is_shared_by_the_ast_declaration_path() {
+        rustc_span::create_default_session_globals_then(|| {
+            let mut ty = ::utils::ast::parse_ty("*mut core::ffi::c_void".to_owned());
+            let TyKind::Ptr(mut_ty) = &ty.kind else { panic!("fixture is a raw pointer") };
+            ty.kind = decl_ty_kind(
+                DeclForm::Box {
+                    slice: true,
+                    optional: false,
+                    pointee_override: Some(
+                        super::super::decision::box_facts::BoxPointeeOverride::U8,
+                    ),
+                },
+                false,
+                mut_ty.ty.clone(),
+            );
+            assert_eq!(rustc_ast_pretty::pprust::ty_to_string(&ty), "Box<[u8]>");
+        });
+    }
+
+    /// **The use pass's own guard-refusal branch: refused, counted, node
+    /// intact.**
+    ///
+    /// Reached by pre-claiming the target node on the shared guard — which is
+    /// exactly the cross-pass collision the guard exists for, since the
+    /// declaration pass runs first and shares it. The corpus reads zero here,
+    /// so without this the branch would be a uniformly-zero predicate.
+    ///
+    /// *Mutation-tested:* dropping the `self.stats.refused += 1` fails on the
+    /// count; returning `true` unconditionally from `claim` fails on the
+    /// surviving text.
+    #[test]
+    fn a_use_graft_refused_by_the_guard_leaves_the_node_and_is_counted() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) -> u8 { *p.offset(1 as isize) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let (span, node) = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                (e.span, e.id)
+            };
+            let map: FxHashMap<(u32, u32), String> =
+                [((span.lo().0, span.hi().0), "p[1]".to_owned())]
+                    .into_iter()
+                    .collect();
+
+            let mut guard = Composition::default();
+            // The declaration pass got there first.
+            assert!(guard.claim(node, rustc_span::DUMMY_SP, "decl:slice"));
+
+            let mut v = UseGraftVisitor::new(&map, &mut guard);
+            v.visit_crate(&mut krate);
+            let stats = v.finish();
+
+            assert_eq!(stats.refused, 1, "the refusal must be counted locally");
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(
+                stats.unmatched, 0,
+                "the key WAS reached — it was refused, which is a different \
+                 fact from never being found, and the two must not merge"
+            );
+            let text = rustc_ast_pretty::pprust::item_to_string(&krate.items[0]);
+            assert!(
+                text.contains("offset"),
+                "a refused graft must leave the node untouched: {text}"
+            );
+            assert_eq!(guard.refused_by("use"), 1);
+            assert_eq!(guard.refused[0].holder, "decl:slice");
+        });
+    }
+
+    /// **The `(lo, hi)` key is load-bearing, and this is what it prevents.**
+    ///
+    /// `p.offset(1)` and `p.offset(1) as usize` share a START offset and differ
+    /// only at the end. The walk meets the **cast first**, so a map keyed on
+    /// `lo` alone would graft the replacement over the whole cast — silently,
+    /// correctly-looking, and only on shapes where an outer node happens to
+    /// begin at the same byte. C2Rust's `p.offset(i as isize)` idiom puts casts
+    /// everywhere, so this is the corpus's most ordinary shape, not a corner.
+    ///
+    /// *Mutation-tested:* keying the map on `key.0` alone makes this fail on the
+    /// surviving-cast assertion, while every other witness here stays green.
+    #[test]
+    fn a_use_edit_names_one_node_not_every_node_sharing_its_start() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) -> usize { p.offset(1) as usize }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let tail = tail_expr_span(&krate);
+            let inner = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("fixture has a body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                let rustc_ast::ExprKind::Cast(operand, _) = &e.kind else {
+                    panic!("the fixture's tail is a cast")
+                };
+                operand.span
+            };
+            assert_eq!(
+                inner.lo(),
+                tail.lo(),
+                "the fixture only tests anything if the two spans really do \
+                 share a start offset"
+            );
+            assert_ne!(inner.hi(), tail.hi(), "and really do differ at the end");
+
+            let (text, stats) = graft_over(src, &[(inner, "p[1]")]);
+            assert_eq!(stats.grafted, 1);
+            assert!(
+                text.contains("p[1] as usize"),
+                "the edit named the OPERAND, so the cast must survive it — a \
+                 map keyed on the start offset alone grafts over the whole cast \
+                 and silently drops the conversion: {text}"
+            );
+        });
+    }
+
+    /// **The containment backstop.** An edit nested under a grafted one is
+    /// reported `unmatched`, not silently discarded.
+    ///
+    /// # Why this is injected rather than found
+    ///
+    /// [`super::super::decision::refuse_nested_use_edits`] runs over the whole
+    /// table and degrades any subject whose use edits nest — **across entries,
+    /// not merely within one** — so no shipping input can reach this shape. The
+    /// arm is therefore exercised the way `plan`'s missing-pointee arm is: by
+    /// handing the transform a map it could not have been given, since the
+    /// visitor is a pure function of that map.
+    ///
+    /// What it protects: the grafted subtree is the parsed fragment's, so an
+    /// inner edit's node ceases to exist the moment the outer one lands. That
+    /// disappearance must present as a **count**, because a use edit that
+    /// silently evaporates leaves a converted declaration with a raw use under
+    /// it — the exact ill-typed crate the decision-layer gate exists to prevent.
+    #[test]
+    fn an_edit_nested_under_a_grafted_one_is_reported_unmatched() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8, q: *mut u8) -> u8 { *p.offset(*q.offset(0) as isize) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let outer = tail_expr_span(&krate);
+            // The inner deref sits strictly inside the outer one; its exact
+            // span is not needed — any span the outer contains and no other
+            // node equals will do, and the inner deref's is derived from the
+            // source text so the fixture stays readable.
+            let inner_lo = outer.lo()
+                + rustc_span::BytePos(
+                    src.find("*q.offset(0)")
+                        .expect("fixture contains the inner deref") as u32
+                        - src
+                            .find("*p.offset")
+                            .expect("fixture contains the outer deref")
+                            as u32,
+                );
+            let inner = outer
+                .with_lo(inner_lo)
+                .with_hi(inner_lo + rustc_span::BytePos(12));
+
+            let (text, stats) = graft_over(src, &[(outer, "p[0]"), (inner, "q[0]")]);
+            assert_eq!(stats.grafted, 1, "the outer edit lands");
+            assert_eq!(
+                stats.unmatched, 1,
+                "the inner edit's node was consumed by the outer graft, and that \
+                 must be REPORTED: an evaporated use edit leaves a converted \
+                 declaration with a raw use under it"
+            );
+            assert!(text.contains("p[0]"), "{text}");
+            assert!(
+                !text.contains("q[0]"),
+                "the inner edit did not land: {text}"
+            );
+        });
+    }
+
+    // ---- ARM 3 — the seam pass, driven end to end ----
+
+    use super::super::decision::seam::{GlueCore, GlueSpec};
+
+    /// The span of the fixture's single call ARGUMENT — the node a seam edit
+    /// names. Not the tail expression: a seam targets the argument inside the
+    /// call, which is the whole reason it collides with the use pass.
+    fn call_arg_span(krate: &rustc_ast::Crate) -> rustc_span::Span {
+        let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+            panic!("the fixture's only item is a function")
+        };
+        let body = f.body.as_ref().expect("the fixture has a body");
+        let rustc_ast::StmtKind::Expr(e) = &body
+            .stmts
+            .last()
+            .expect("the fixture has a tail expression")
+            .kind
+        else {
+            panic!("the fixture's tail is an expression")
+        };
+        let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
+            panic!("the fixture's tail is a call")
+        };
+        args[0].span
+    }
+
+    /// Run the real [`SeamGraftVisitor`] over a fixture, exactly as
+    /// [`graft_over`] runs the use pass.
+    ///
+    /// `arg` is the span the adapter must KEEP; passing it separately from the
+    /// target span is what makes the cast-peel path reachable from a test.
+    fn seam_over(
+        src: &str,
+        seams: &[(rustc_span::Span, rustc_span::Span, GlueSpec, bool)],
+    ) -> (String, SeamGraftStats) {
+        let mut krate = ::utils::ast::parse_crate(src.to_owned());
+        let map: FxHashMap<(u32, u32), SeamTarget> = seams
+            .iter()
+            .map(|(span, arg_span, spec, reborrow)| {
+                (
+                    (span.lo().0, span.hi().0),
+                    SeamTarget {
+                        spec: spec.clone(),
+                        arg_span: *arg_span,
+                        reborrow: *reborrow,
+                        exact_use_composition: false,
+                    },
+                )
+            })
+            .collect();
+        let mut guard = Composition::default();
+        let mut v = SeamGraftVisitor::new(&map, &mut guard);
+        v.visit_crate(&mut krate);
+        (pprust::item_to_string(&krate.items[0]), v.finish())
+    }
+
+    /// **RED WITNESS — each realized shape wraps the argument's own SUBTREE.**
+    ///
+    /// The argument is `(*s).ptr` throughout — a field access through a deref,
+    /// not a bare identifier — for the reason arm 1's pointee witness uses a
+    /// multi-segment path: a builder that re-rendered the argument from text
+    /// would pass just as happily over `p`, and re-rendering is exactly what the
+    /// split rule forbids.
+    ///
+    /// The five shapes here are the five the frozen corpus realizes
+    /// (`from_raw_parts` 273, `some_wrap` 78, `some_reborrow` 37, `from_ref_mut`
+    /// 29, `some_from_raw_parts` 4 = 421), each asserted against the text the
+    /// span layer writes for the same spec — so the two derivations are compared
+    /// at unit level before the corpus differential compares them at 421.
+    #[test]
+    fn every_realized_shape_wraps_the_argument_subtree() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(s: *mut S) { g((*s).ptr) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            // The seam targets the CALL ARGUMENT, not the tail expression.
+            let arg = call_arg_span(&krate);
+            let cases: Vec<(GlueSpec, &str)> = vec![
+                (
+                    GlueSpec::core(GlueCore::FromRawParts, true).with_len("n"),
+                    "unsafe { core::slice::from_raw_parts_mut((*s).ptr, (n) as usize) }",
+                ),
+                (
+                    GlueSpec::core(GlueCore::FromRawParts, false)
+                        .with_len("n")
+                        .wrapped(),
+                    "Some(unsafe { core::slice::from_raw_parts((*s).ptr, (n) as usize) })",
+                ),
+                (
+                    GlueSpec::core(GlueCore::Reborrow, true).wrapped(),
+                    "Some(unsafe { &mut *(*s).ptr })",
+                ),
+                (
+                    GlueSpec::core(GlueCore::Bare, false).wrapped(),
+                    "Some((*s).ptr)",
+                ),
+                (
+                    GlueSpec::core(GlueCore::FromRefMut, false),
+                    "core::slice::from_ref((*s).ptr)",
+                ),
+                // **`Index0`, which the five corpus-realized shapes do NOT
+                // reach through this builder.** `glue`'s `(Ref, Slice)` arm
+                // produces exactly this spec, so the `GlueCore::Index0 =>
+                // GlueShape::Index0` mapping in `build` is live code with zero
+                // market on the frozen corpus — and a market of zero is not a
+                // reason to leave a mapping unexercised. Added at the arm-3
+                // review; both the bare and wrapped forms, since only the
+                // wrapped one shares a census bucket with anything tested.
+                (GlueSpec::core(GlueCore::Index0, true), "&mut (*s).ptr[0]"),
+                (
+                    GlueSpec::core(GlueCore::Index0, false).wrapped(),
+                    "Some(&(*s).ptr[0])",
+                ),
+            ];
+            for (spec, expected) in cases {
+                let (text, stats) = seam_over(src, &[(arg, arg, spec.clone(), false)]);
+                assert_eq!(stats.grafted, 1, "{spec:?} must place: {text}");
+                assert_eq!(stats.unmatched, 0);
+                assert!(
+                    text.contains(expected),
+                    "the built node must print what the span layer writes for the \
+                     same spec.\n  spec:     {spec:?}\n  expected: {expected}\n  got:      {text}"
+                );
+                // **The two derivations, compared here rather than assumed.**
+                assert_eq!(
+                    spec.render("(*s).ptr").expect("an emitting spec renders"),
+                    expected,
+                    "and the RENDERER must agree with the same text — if these \
+                     two ever part, the corpus differential's 421 equalities \
+                     stop meaning the builder is right"
+                );
+            }
+        });
+    }
+
+    /// **THE SEAM THE WALK NEVER REACHED — F1's counter, witnessed.**
+    ///
+    /// The gate discarded these stats entirely (`let _ = s.finish();`), and the
+    /// concrete false pass was a seam rejected by *both* the span locator and
+    /// the AST walker: it touches no caller function, appears in neither
+    /// compared population, and leaves parity green while a converted callee
+    /// keeps an unadapted call site — the `E0308` the seam machinery exists to
+    /// remove.
+    ///
+    /// This is the producer half of that repair; the gate half is
+    /// `a_seam_dropped_by_both_layers_cannot_vanish`. Both are needed: a counter
+    /// nothing reads, and a gate over a counter that cannot move, are the same
+    /// failure wearing two hats.
+    ///
+    /// The span is a real coordinate that no node in this crate occupies —
+    /// deliberately not `DUMMY_SP`, which the walk skips by design, so the
+    /// witness tests *not reached* rather than *not eligible*.
+    ///
+    /// *Mutation-tested (M8):* replacing `finish`'s subtraction-over-identities
+    /// with `unmatched = 0` fails this test.
+    #[test]
+    fn a_seam_no_node_matches_is_counted_unmatched() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(s: *mut S) { g((*s).ptr) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            // One byte narrower than any real node's range.
+            let phantom = arg.with_hi(rustc_span::BytePos(arg.hi().0 - 1));
+            assert!(!phantom.is_dummy(), "the miss must be a real coordinate");
+
+            let (_, stats) = seam_over(
+                src,
+                &[(
+                    phantom,
+                    phantom,
+                    GlueSpec::core(GlueCore::Reborrow, true),
+                    false,
+                )],
+            );
+            assert_eq!(
+                stats.grafted, 0,
+                "nothing may be placed for a target no node carries"
+            );
+            assert_eq!(
+                stats.unmatched, 1,
+                "a seam the walk never reached MUST be counted — this is the \
+                 only place a seam dropped by both layers is visible at all"
+            );
+
+            // ...and the same visitor over a REAL target reads zero, or the
+            // counter would be firing on something other than the miss.
+            let (_, ok) = seam_over(
+                src,
+                &[(arg, arg, GlueSpec::core(GlueCore::Reborrow, true), false)],
+            );
+            assert_eq!(ok.unmatched, 0, "a reached target is not unmatched");
+        });
+    }
+
+    /// **THE CAST PEEL — the surviving subtree is the OPERAND, not the cast.**
+    ///
+    /// `ArgShape::CastOfLocal` makes the decision layer build its replacement
+    /// from the cast's operand while the replaced range is the whole argument,
+    /// so `arg_span != span` and the adapter must wrap `q`, never `q as *mut u8`.
+    ///
+    /// Found by reading `Pos`'s construction rather than by a failing
+    /// differential, and witnessed here because mutation M28 — collapsing
+    /// `arg_span` onto the argument span — left the entire suite green while
+    /// the field had no consumer.
+    ///
+    /// Both halves are asserted: the operand is kept **and** the cast is gone.
+    /// Only the first would also pass for a builder that wrapped the whole cast.
+    #[test]
+    fn a_cast_shaped_seam_keeps_the_operand_and_drops_the_cast() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(q: *mut u8) { g(q as *mut u8) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let (whole, operand) = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                let rustc_ast::ExprKind::Call(_, args) = &e.kind else {
+                    panic!("the fixture's tail is a call")
+                };
+                let rustc_ast::ExprKind::Cast(inner, _) = &args[0].kind else {
+                    panic!("the fixture's argument is a cast")
+                };
+                (args[0].span, inner.span)
+            };
+            assert_ne!(
+                whole, operand,
+                "the fixture only tests anything if the two spans differ"
+            );
+
+            let spec = GlueSpec::core(GlueCore::Reborrow, true);
+            let (text, stats) = seam_over(src, &[(whole, operand, spec, true)]);
+            assert_eq!(stats.grafted, 1, "{text}");
+            assert_eq!(
+                stats.arg_peeled, 1,
+                "the peel must be COUNTED — whether the corpus places seams on \
+                 cast shapes is a measurement, and an uncounted peel makes it \
+                 unanswerable"
+            );
+            assert_eq!(stats.arg_not_found, 0);
+            assert!(
+                text.contains("&mut *q"),
+                "the OPERAND must survive inside the adapter: {text}"
+            );
+            assert!(
+                !text.contains("as *mut u8"),
+                "and the cast must not: the span layer replaces the whole \
+                 argument, so a builder that kept the cast emits `&mut *(q as \
+                 *mut u8)` where the span layer wrote `&mut *q` — a silent \
+                 parity divergence at exactly the positions casts appear: {text}"
+            );
+            assert_eq!(stats.reborrow, 1, "the family rides the placement");
+            assert_eq!(stats.safe, 0);
+        });
+    }
+
+    /// **The family survives the projection into the walk, BOTH ways.**
+    ///
+    /// The corpus split (safe 107 / reborrow 314) is the only thing that was
+    /// checking this, and only a sweep produces it: mutation M40 made
+    /// `reborrow` uniformly `false` and the whole suite stayed green. Both
+    /// directions are asserted, because a projection stuck on either constant
+    /// passes a one-sided test.
+    #[test]
+    fn the_seam_family_survives_the_projection_in_both_directions() {
+        rustc_span::create_default_session_globals_then(|| {
+            let edit = |family| super::super::decision::seam::SeamEdit {
+                raw_outbound: None,
+                zero_syntax: false,
+                span: DUMMY_SP,
+                call_span: DUMMY_SP,
+                replacement: String::new(),
+                owner_class: super::super::bridge_receipt::SignatureClassId::of(
+                    rustc_hir::def_id::CRATE_DEF_ID,
+                ),
+                bridge: super::super::bridge_receipt::BridgeSitePlan::local(
+                    rustc_hir::def_id::CRATE_DEF_ID,
+                    rustc_hir::def_id::CRATE_DEF_ID,
+                    "c",
+                    "arg0",
+                    "fixture",
+                ),
+                owner_fn: String::new(),
+                lifetime_plan_digest: None,
+                caller_fn: String::new(),
+                param_index: 0,
+                source_shape: "bare-local",
+                family,
+                len_arm: None,
+                spec: GlueSpec::core(GlueCore::Reborrow, true),
+                arg_span: DUMMY_SP,
+                expected: super::super::decision::seam::Form::Ref { mutable: true },
+                found: super::super::decision::seam::Form::Raw,
+                source_node: None,
+                input_rendering: None,
+                root_identity: "f::p".to_owned(),
+                blind: false,
+                overlap: None,
+                atom_ids: Vec::new(),
+            };
+            assert!(
+                SeamTarget::of(
+                    &edit(super::super::decision::seam::SeamFamily::Reborrow),
+                    false,
+                )
+                .reborrow,
+                "a reborrow adapter must stay countable as one — it is the \
+                 population carrying the aliasing exposure"
+            );
+            assert!(
+                !SeamTarget::of(&edit(super::super::decision::seam::SeamFamily::Safe), false,)
+                    .reborrow,
+                "and a safe one must not be inflated into it"
+            );
+        });
+    }
+
+    /// **An `arg_span` the matched node does not contain declines, and is
+    /// counted as NOT-FOUND rather than as a peel.**
+    ///
+    /// Corpus-zero (`arg_not_found = 0` on all 20 programs), so the only
+    /// evidence it works can come from an injected case. Injected the way arm
+    /// 2's containment backstop is: the visitor is a pure function of its map,
+    /// so it is handed a map the decision layer could not have produced.
+    ///
+    /// The `arg_peeled == 0` assertion is the load-bearing half. The counter
+    /// used to increment BEFORE the lookup, so a failed peel landed in both
+    /// rows and `arg_peeled` meant "attempted" while its doc said "realized" —
+    /// invisible on a corpus where `arg_not_found` is zero. Found by the
+    /// correctness reviewer at the arm-3 boundary.
+    #[test]
+    fn an_arg_span_the_node_does_not_contain_declines_and_is_not_a_peel() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(q: *mut u8) { g(q) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            // A span inside the fixture but belonging to no node under `arg`.
+            let bogus = arg.with_lo(arg.lo() - rustc_span::BytePos(3));
+            assert_ne!(bogus, arg);
+
+            let (text, stats) = seam_over(
+                src,
+                &[(arg, bogus, GlueSpec::core(GlueCore::Reborrow, true), true)],
+            );
+            assert_eq!(
+                stats.grafted, 0,
+                "nothing is built from a subtree that is not there"
+            );
+            assert_eq!(stats.arg_not_found, 1, "and the decline is attributed");
+            assert_eq!(
+                stats.arg_peeled, 0,
+                "a FAILED peel is not a peel — `arg_peeled` counts realized \
+                 ones, which is what makes the corpus's 9 mean what it says"
+            );
+            assert_eq!(stats.unmatched, 0, "the key was reached, then declined");
+            assert!(text.contains("g(q)"), "the node is left intact: {text}");
+        });
+    }
+
+    /// **One seam key matched by MORE THAN ONE node is counted.**
+    ///
+    /// Neither the guard (distinct `NodeId`s) nor `unmatched` (set membership)
+    /// can observe this, exactly as at the use pass — so this counter is the
+    /// only witness there is, and it was gated at zero with nothing driving it
+    /// positive. Injected by walking the same crate twice, mirroring
+    /// [`two_nodes_sharing_one_span_are_counted_not_silently_double_grafted`].
+    #[test]
+    fn one_seam_key_reached_twice_is_counted() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(q: *mut u8) { g(q) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            let seams: FxHashMap<(u32, u32), SeamTarget> = [(
+                (arg.lo().0, arg.hi().0),
+                SeamTarget {
+                    spec: GlueSpec::core(GlueCore::Reborrow, true),
+                    arg_span: arg,
+                    reborrow: true,
+                    exact_use_composition: false,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let mut guard = Composition::default();
+            let mut v = SeamGraftVisitor::new(&seams, &mut guard);
+            v.visit_crate(&mut krate);
+            let mut krate2 = ::utils::ast::parse_crate(src.to_owned());
+            v.visit_crate(&mut krate2);
+            let stats = v.finish();
+            assert!(
+                stats.multi_matched >= 1,
+                "a key reached a second time MUST be counted — it is invisible \
+                 to every other instrument this pass has"
+            );
+        });
+    }
+
+    /// Wave 3 builds required unwraps, while a true identity spec remains a
+    /// typed non-placement rather than a phantom edit.
+    #[test]
+    fn required_unwrap_is_built_while_a_true_identity_still_declines() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(o: Option<&mut u8>) { g(o) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+
+            let unwrapping = GlueSpec::core(GlueCore::Bare, true).with_unwrap(true);
+            let (text, stats) = seam_over(src, &[(arg, arg, unwrapping, false)]);
+            assert_eq!(stats.grafted, 1, "the §29 shape must be built");
+            assert_eq!(stats.unsupported, 0);
+            assert_eq!(
+                stats.unmatched, 0,
+                "the key WAS reached — declined is a different fact from never \
+                 found, exactly as at the use pass"
+            );
+            assert!(
+                text.contains("g(o.as_mut().unwrap())"),
+                "the mutable Option must be borrowed rather than moved: {text}"
+            );
+
+            // The second unbuilt case: a bare core with no wrapper renders the
+            // argument unchanged, so building it would be a no-op that reads as
+            // a placement. `glue` cannot produce it; the guard is fail-closed.
+            let identity = GlueSpec::core(GlueCore::Bare, false);
+            let (_, stats) = seam_over(src, &[(arg, arg, identity, false)]);
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(stats.unsupported, 1);
+        });
+    }
+
+    /// **ARM 4's CENSUS COUNTS WHAT IT CLAIMS TO — injected, not hoped for.**
+    ///
+    /// The census's whole job is to decide whether arm 4 has a market, and its
+    /// expected answer is three zeros. **A counter that never increments
+    /// produces exactly the same three zeros**, so without this the measurement
+    /// cannot distinguish *no market* from *no instrument* — the D1 lesson in
+    /// its original form, and the reason the pre-statement made injection a
+    /// requirement rather than a nicety.
+    ///
+    /// So each of the five variants is fed in and asserted to land in its own
+    /// bucket, and the denominator is asserted to be the sum.
+    #[test]
+    fn the_justification_census_counts_every_variant_including_arm_fours() {
+        use super::super::plan::Justification as J;
+        let mut c = JustificationCensus::default();
+        for j in [
+            J::KindDecision { kind: "Ref(mut)" },
+            J::KindDecision { kind: "Ref" },
+            J::SeamAdapter {
+                family: "safe",
+                fabricated: false,
+            },
+            // The fabricated adapter is a SUBSET of `seam_adapter`, so it must
+            // increment BOTH — a fabricated placement that stopped counting as
+            // a seam would shrink the placed population while the crate still
+            // carried the adapter.
+            J::SeamAdapter {
+                family: "reborrow",
+                fabricated: true,
+            },
+            J::FabricatedLenConst,
+            J::ReRoute {
+                licensing_loan: "L0".to_owned(),
+            },
+            J::DropForm {
+                selector_site: "s".to_owned(),
+            },
+            J::StoreForm { form: "N-raw" },
+            J::A5RawView,
+        ] {
+            c.count(&j);
+        }
+        assert_eq!(
+            c,
+            JustificationCensus {
+                kind_decision: 2,
+                seam_adapter: 2,
+                seam_adapter_fabricated: 1,
+                fabricated_len_const: 1,
+                reroute: 1,
+                drop_form: 1,
+                store_form: 1,
+                c9_mark: 0,
+                a5_raw_view: 1,
+                lifetime_plan: 0,
+            },
+            "each variant must land in its OWN bucket — an arm-4 edit counted \
+             as a `KindDecision` would report the market as zero while the \
+             population was not"
+        );
+        assert_eq!(
+            c.total(),
+            9,
+            "the denominator is the sum of the parts — and `fabricated` is a \
+             SUBSET flag, not a bucket, so it must not appear in it"
+        );
+
+        // And an empty plan is genuinely empty, so the zeros the corpus reports
+        // are the counter's answer rather than its default being mistaken for
+        // one.
+        let empty = JustificationCensus::default();
+        assert_eq!(empty.total(), 0);
+        assert_eq!(empty.reroute + empty.drop_form + empty.store_form, 0);
+    }
+
+    /// **THE WALK OVER A PLAN, witnessed — R8's first application.**
+    ///
+    /// Mutation M52 made the walk count nothing and the whole suite stayed
+    /// green, because the loop lived inside [`arms_full`] behind a `TyCtxt` and
+    /// only a corpus sweep could reach it. The corpus gate would have caught it;
+    /// the suite could not, and R8 says the remedy is to lift the logic out.
+    ///
+    /// The plan is built by hand with edits in **two files**, so a walk that
+    /// visited only the first entry of `by_file` fails here.
+    #[test]
+    fn the_census_walks_every_file_of_a_plan() {
+        use super::super::plan::{Edit, FileKey, Justification as J, Plan};
+        let edit = |j: J| Edit {
+            lo: 0,
+            hi: 1,
+            replacement: String::new(),
+            justification: j,
+            owner_class: Some(super::super::bridge_receipt::SignatureClassId::of(
+                rustc_hir::def_id::CRATE_DEF_ID,
+            )),
+            owner_path: String::new(),
+            bridge: None,
+            atom_ids: Vec::new(),
+            subject_id: String::new(),
+            required_arms: "-".to_owned(),
+            edit_kind: "fixture",
+        };
+        let mut plan = Plan::default();
+        plan.by_file.insert(
+            FileKey::Virtual("a.rs".to_owned()),
+            vec![
+                edit(J::KindDecision { kind: "Ref" }),
+                edit(J::SeamAdapter {
+                    family: "safe",
+                    fabricated: false,
+                }),
+            ],
+        );
+        plan.by_file.insert(
+            FileKey::Virtual("b.rs".to_owned()),
+            vec![
+                edit(J::KindDecision { kind: "Ref(mut)" }),
+                edit(J::DropForm {
+                    selector_site: "s".to_owned(),
+                }),
+            ],
+        );
+
+        let c = JustificationCensus::of_plan(&plan);
+        assert_eq!(
+            c,
+            JustificationCensus {
+                kind_decision: 2,
+                seam_adapter: 1,
+                seam_adapter_fabricated: 0,
+                fabricated_len_const: 0,
+                reroute: 0,
+                drop_form: 1,
+                store_form: 0,
+                c9_mark: 0,
+                a5_raw_view: 0,
+                lifetime_plan: 0,
+            },
+            "the walk must reach EVERY file — the second file's edits are the \
+             half a first-entry-only walk would miss"
+        );
+        assert_eq!(c.total(), 4, "and the denominator counts them all");
+
+        // Non-vacuity: an empty plan really does census to nothing, so the
+        // assertion above is about the walk rather than about the default.
+        assert_eq!(
+            JustificationCensus::of_plan(&Plan::default()),
+            JustificationCensus::default()
+        );
+
+        // **THE INDEPENDENT DENOMINATOR agrees — and is derived without
+        // reading a single justification.** This is what makes the corpus
+        // conservation gate capable of failing: `total()` restates the buckets,
+        // `edits_in` counts the plan.
+        assert_eq!(JustificationCensus::edits_in(&plan), 4);
+        assert_eq!(JustificationCensus::edits_in(&plan), c.total());
+        assert_eq!(JustificationCensus::edits_in(&Plan::default()), 0);
+    }
+
+    /// **THE CONSERVATION GATE CAN FAIL — the property its tautological
+    /// predecessor did not have.**
+    ///
+    /// `just_total == Σ buckets` was serialized from one struct on both sides,
+    /// so it could only ever detect row corruption. `edits_in` is derived
+    /// without consulting any justification, so a walk that misses edits breaks
+    /// the identity. Simulated here by censusing a SUBSET of the plan while
+    /// measuring the denominator over the whole of it — which is exactly what a
+    /// skipped file looks like.
+    #[test]
+    fn the_independent_denominator_catches_a_walk_that_misses_edits() {
+        use super::super::plan::{Edit, FileKey, Justification as J, Plan};
+        let edit = || Edit {
+            lo: 0,
+            hi: 1,
+            replacement: String::new(),
+            justification: J::KindDecision { kind: "Ref" },
+            owner_class: Some(super::super::bridge_receipt::SignatureClassId::of(
+                rustc_hir::def_id::CRATE_DEF_ID,
+            )),
+            owner_path: String::new(),
+            bridge: None,
+            atom_ids: Vec::new(),
+            subject_id: String::new(),
+            required_arms: "-".to_owned(),
+            edit_kind: "fixture",
+        };
+        let mut whole = Plan::default();
+        whole
+            .by_file
+            .insert(FileKey::Virtual("a.rs".to_owned()), vec![edit(), edit()]);
+        whole
+            .by_file
+            .insert(FileKey::Virtual("b.rs".to_owned()), vec![edit()]);
+
+        let mut partial = Plan::default();
+        partial
+            .by_file
+            .insert(FileKey::Virtual("a.rs".to_owned()), vec![edit(), edit()]);
+
+        let short = JustificationCensus::of_plan(&partial);
+        assert_eq!(
+            JustificationCensus::edits_in(&whole),
+            3,
+            "the denominator sees all three edits"
+        );
+        assert_ne!(
+            JustificationCensus::edits_in(&whole),
+            short.total(),
+            "and a census that missed a file DISAGREES with it — the failure \
+             the tautological form could not represent, because there both \
+             sides came from the same struct"
+        );
+    }
+
+    /// **EVERY SPAN THIS LAYER MANUFACTURES IS `DUMMY_SP` — types included.**
+    ///
+    /// The synthetic-span invariant exists because a fresh `ParseSess` numbers
+    /// its `SourceMap` from zero, so a parsed fragment's spans are not invalid
+    /// but **valid coordinates pointing somewhere else** in this crate. Task 0
+    /// landed `SpanEraser` for exactly that, and one line still parsed: the
+    /// `usize` in `(LEN) as usize`.
+    ///
+    /// It survived because the erasure witness collects **`Expr` spans only**
+    /// and this leak is on a `Ty`. So the witness is widened here rather than
+    /// the claim restated — a checker that cannot see the node kind the defect
+    /// lives on is not checking it. Found by the adversarial review.
+    ///
+    /// The argument keeps its REAL span deliberately: it is the original
+    /// subtree, not something this layer manufactured, so it is excluded by
+    /// identity rather than by the walk declining to look.
+    #[test]
+    fn every_span_the_glue_builder_manufactures_is_dummy() {
+        rustc_span::create_default_session_globals_then(|| {
+            struct Spans {
+                exprs: Vec<rustc_span::Span>,
+                tys: Vec<rustc_span::Span>,
+            }
+            impl<'a> rustc_ast::visit::Visitor<'a> for Spans {
+                fn visit_expr(&mut self, e: &'a rustc_ast::Expr) {
+                    self.exprs.push(e.span);
+                    rustc_ast::visit::walk_expr(self, e);
+                }
+
+                fn visit_ty(&mut self, t: &'a Ty) {
+                    self.tys.push(t.span);
+                    rustc_ast::visit::walk_ty(self, t);
+                }
+            }
+            fn spans_of(e: &rustc_ast::Expr) -> Spans {
+                let mut v = Spans {
+                    exprs: Vec::new(),
+                    tys: Vec::new(),
+                };
+                rustc_ast::visit::Visitor::visit_expr(&mut v, e);
+                v
+            }
+
+            let arg = ::utils::ast::parse_expr("(*s).ptr".to_owned());
+            // **The WHOLE argument subtree is exempt, not just its root.**
+            // `(*s).ptr` also carries real spans on `(*s)`, `*s` and `s`: they
+            // are the KEPT subtree, and keeping them is the point of the split
+            // rule. Exempting only the root made this assertion fire on exactly
+            // what arm 3 exists to preserve — caught by running it.
+            let kept: FxHashSet<rustc_span::Span> = spans_of(&arg).exprs.into_iter().collect();
+            let licensed = SeamLen::Licensed("n".to_owned());
+            let len = finish_len(
+                &licensed,
+                graft_expr(licensed.text()).expect("the length parses"),
+            );
+            let built = expr(
+                glue_expr(GlueShape::FromRawParts, true, P(arg), Some(len))
+                    .expect("a length-bearing shape with a length builds"),
+            );
+            let got = spans_of(&built);
+
+            let leaked: Vec<_> = got
+                .exprs
+                .iter()
+                .filter(|s| !s.is_dummy() && !kept.contains(s))
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "a manufactured expression carrying a real span aliases a real \
+                 offset in this crate's first source file, which is the \
+                 wrong-target hazard the erasure exists to remove: {leaked:?}"
+            );
+            // The argument contains no types, so EVERY type here was built by
+            // this layer and none may carry a span.
+            assert!(
+                got.tys.iter().all(|s| s.is_dummy()),
+                "the `usize` in `(LEN) as usize` is manufactured, so its span \
+                 must be DUMMY_SP: {:?}",
+                got.tys
+            );
+
+            // NON-VACUITY, both halves: the walk must actually REACH a type,
+            // and it must be able to SEE a real span when there is one — which
+            // is precisely how the `Expr`-only witness missed this.
+            assert_eq!(
+                got.tys.len(),
+                1,
+                "the built expression has exactly one type"
+            );
+            assert!(
+                spans_of(&::utils::ast::parse_expr("(x) as usize".to_owned()))
+                    .tys
+                    .iter()
+                    .any(|s| !s.is_dummy()),
+                "the probe must SEE a parsed type's span, or the assertion \
+                 above is vacuous"
+            );
+
+            // ---- THE FABRICATED ARM (ruling 2026-08-12) ----
+            //
+            // A fabricated extent is text that **never existed in the input**,
+            // so it is the purest case of the aliasing hazard this witness
+            // exists for: its spans come from a fresh `ParseSess` whose
+            // `BytePos` values start at zero. Witnessed here rather than
+            // assumed to inherit the licensed arm's protection — the licensed
+            // companion at least corresponds to real source, and it was exactly
+            // that kind of "surely it's the same" reasoning that let the parsed
+            // `usize` through until the adversarial review.
+            let arg2 = ::utils::ast::parse_expr("(*s).ptr".to_owned());
+            let kept2: FxHashSet<rustc_span::Span> = spans_of(&arg2).exprs.into_iter().collect();
+            let fab = finish_len(
+                &SeamLen::Fabricated,
+                graft_expr(SeamLen::Fabricated.text()).expect("the const path parses"),
+            );
+            let built2 = expr(
+                glue_expr(GlueShape::FromRawParts, false, P(arg2), Some(fab))
+                    .expect("the fabricated shape builds"),
+            );
+            let got2 = spans_of(&built2);
+            let leaked2: Vec<_> = got2
+                .exprs
+                .iter()
+                .filter(|s| !s.is_dummy() && !kept2.contains(s))
+                .collect();
+            assert!(
+                leaked2.is_empty(),
+                "the fabricated extent's own nodes must carry DUMMY_SP: {leaked2:?}"
+            );
+            // And it manufactures NO type — the structural difference from the
+            // licensed arm, asserted rather than left to the rendered string.
+            assert!(
+                got2.tys.is_empty(),
+                "a fabricated extent is already `usize` and builds no cast: {:?}",
+                got2.tys
+            );
+        });
+    }
+
+    /// **A DECLINED SEAM LEAVES THE NODE CLAIMABLE BY SOMEONE ELSE.**
+    ///
+    /// Arm 2's review found exactly this shape in the declaration pass —
+    /// finding 5, *"`guard.claim` ran BEFORE the shape check, so a declaration
+    /// the pass cannot transform still took ownership of its node"* — and
+    /// repaired it. The seam pass reintroduced it, and the suite stayed green
+    /// because the only thing anyone asserted about a decline was the node's
+    /// TEXT, never the guard's state.
+    ///
+    /// So the load-bearing assertion here is the guard's, exactly as M17b's
+    /// was. Found by the adversarial review.
+    #[test]
+    fn a_built_required_unwrap_takes_ownership_of_the_node() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(o: Option<&mut u8>) { g(o) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            let node_id = {
+                let rustc_ast::ItemKind::Fn(f) = &krate.items[0].kind else {
+                    panic!("fixture is a fn")
+                };
+                let body = f.body.as_ref().expect("body");
+                let rustc_ast::StmtKind::Expr(e) = &body.stmts.last().expect("tail").kind else {
+                    panic!("tail is an expression")
+                };
+                let rustc_ast::ExprKind::Call(_, args) = &e.kind else { panic!("tail is a call") };
+                args[0].id
+            };
+
+            // A §29 required-unwrap spec the builder now owns.
+            let seams: FxHashMap<(u32, u32), SeamTarget> = [(
+                (arg.lo().0, arg.hi().0),
+                SeamTarget {
+                    spec: GlueSpec::core(GlueCore::Bare, true).with_unwrap(true),
+                    arg_span: arg,
+                    reborrow: false,
+                    exact_use_composition: false,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let mut guard = Composition::default();
+            let mut v = SeamGraftVisitor::new(&seams, &mut guard);
+            v.visit_crate(&mut krate);
+            let stats = v.finish();
+            assert_eq!(stats.grafted, 1);
+            assert_eq!(stats.unsupported, 0);
+            assert_eq!(stats.refused, 0, "and was not refused — nothing collided");
+
+            assert!(
+                !guard.claim(node_id, rustc_span::DUMMY_SP, "arm4"),
+                "a built unwrap owns its node and a later arm must be refused"
+            );
+        });
+    }
+
+    /// **A length-bearing shape with NO length places nothing** — the gate the
+    /// decision layer holds (`seam-len-unknown`, 93 blocked) is not quietly
+    /// re-opened one layer down.
+    ///
+    /// Unreachable through `glue`, which returns `SeamBlock::LengthUnknown`
+    /// first. Injected the way `plan`'s missing-pointee arm is, because "no
+    /// layer below the gate may invent a length" is a claim about this code and
+    /// not about its caller.
+    #[test]
+    fn a_slice_seam_with_no_length_places_nothing_and_is_counted() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) { g(p) }";
+            let krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            let lengthless = GlueSpec::core(GlueCore::FromRawParts, false);
+            let (text, stats) = seam_over(src, &[(arg, arg, lengthless, true)]);
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(
+                stats.len_absent, 1,
+                "declined, and attributed to the LENGTH"
+            );
+            assert_eq!(stats.unsupported, 0, "not confused with an unbuilt shape");
+            assert!(text.contains("g(p)"), "{text}");
+            // **The identity's denominator.** `len_shapes` is what turns
+            // `len_grafted` from telemetry into a gated ledger; mutation M39
+            // stopped it incrementing and only the corpus would have noticed.
+            assert_eq!(
+                stats.len_shapes, 1,
+                "a length-bearing shape reached the step"
+            );
+            assert_eq!(
+                stats.len_grafted + stats.len_parse_failed + stats.len_absent,
+                stats.len_shapes,
+                "and exactly one outcome followed it"
+            );
+
+            // And a `{len}` that does not round-trip is a typed row too, per
+            // R7.4 — never an abort, which is what a bare `parse_expr` would do.
+            let unparseable = GlueSpec::core(GlueCore::FromRawParts, false).with_len("n +");
+            let (_, stats) = seam_over(src, &[(arg, arg, unparseable, true)]);
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(stats.len_parse_failed, 1);
+            assert_eq!(
+                stats.len_parse_failures.len(),
+                1,
+                "the offending template must be ATTACHED, not just tallied"
+            );
+            assert_eq!(
+                stats.len_grafted + stats.len_parse_failed + stats.len_absent,
+                stats.len_shapes,
+                "the identity holds on the parse-failure branch too"
+            );
+
+            // ...and on the SUCCESS branch, which is the one the corpus's 277
+            // actually travels.
+            let ok = GlueSpec::core(GlueCore::FromRawParts, false).with_len("n");
+            let (_, stats) = seam_over(src, &[(arg, arg, ok, true)]);
+            assert_eq!(stats.len_grafted, 1);
+            assert_eq!(stats.len_shapes, 1);
+            assert_eq!(stats.len_absent + stats.len_parse_failed, 0);
+        });
+    }
+
+    /// **The seam pass and the use pass share one guard, and the second claim on
+    /// a node is refused.**
+    ///
+    /// This is the first pair in the milestone that can genuinely collide: both
+    /// claim `Expr` nodes. Task 0 measured the collision surface empty over
+    /// 181,844 pairs on the frozen corpus, so `arm3_refused = 0` there is a
+    /// **corpus fact** — which is precisely why the mechanism needs a witness
+    /// the corpus cannot provide.
+    #[test]
+    fn a_seam_may_not_claim_a_node_the_use_pass_already_owns() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) { g(*p.offset(1)) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            let mut guard = Composition::default();
+
+            // The use pass claims the node first — the order the walk runs in.
+            let uses: FxHashMap<(u32, u32), String> =
+                [((arg.lo().0, arg.hi().0), "p[1]".to_owned())]
+                    .into_iter()
+                    .collect();
+            let mut u = UseGraftVisitor::new(&uses, &mut guard);
+            u.visit_crate(&mut krate);
+            assert_eq!(u.finish().grafted, 1, "the use edit lands first");
+
+            let seams: FxHashMap<(u32, u32), SeamTarget> = [(
+                (arg.lo().0, arg.hi().0),
+                SeamTarget {
+                    spec: GlueSpec::core(GlueCore::Reborrow, true),
+                    arg_span: arg,
+                    reborrow: true,
+                    exact_use_composition: false,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let mut s = SeamGraftVisitor::new(&seams, &mut guard);
+            s.visit_crate(&mut krate);
+            let stats = s.finish();
+
+            assert_eq!(stats.refused, 1, "the second claimant is refused");
+            assert_eq!(stats.grafted, 0);
+            assert_eq!(
+                stats.unmatched, 0,
+                "the key was REACHED and refused — a different fact from never \
+                 being found"
+            );
+            assert_eq!(guard.refused_by("seam"), 1, "attributed to the CHALLENGER");
+            assert_eq!(guard.refused[0].holder, "use");
+            let text = pprust::item_to_string(&krate.items[0]);
+            assert!(
+                text.contains("p[1]")
+                    && !text.contains("&mut *")
+                    && !text.contains(".as_mut().unwrap()"),
+                "the holder's transform stands and the refused one did not \
+                 land: {text}"
+            );
+        });
+    }
+
+    /// Addendum-142 exact-region regression: when the decision input marks the
+    /// seam as the consumer of an exact use edit, the same two passes compose
+    /// in their fixed order. Mutation: clearing `exact_use_composition` turns
+    /// this back into the refusal witnessed above and loses the seam wrapper.
+    #[test]
+    fn an_exact_use_is_wrapped_by_its_designated_seam() {
+        rustc_span::create_default_session_globals_then(|| {
+            let src = "fn f(p: *mut u8) { g(*p.offset(1)) }";
+            let mut krate = ::utils::ast::parse_crate(src.to_owned());
+            let arg = call_arg_span(&krate);
+            let mut guard = Composition::default();
+            let uses: FxHashMap<(u32, u32), String> =
+                [((arg.lo().0, arg.hi().0), "p[1]".to_owned())]
+                    .into_iter()
+                    .collect();
+            let mut use_pass = UseGraftVisitor::new(&uses, &mut guard);
+            use_pass.visit_crate(&mut krate);
+            assert_eq!(use_pass.finish().grafted, 1);
+
+            let seams: FxHashMap<(u32, u32), SeamTarget> = [(
+                (arg.lo().0, arg.hi().0),
+                SeamTarget {
+                    spec: GlueSpec::core(GlueCore::Reborrow, true),
+                    arg_span: arg,
+                    reborrow: true,
+                    exact_use_composition: true,
+                },
+            )]
+            .into_iter()
+            .collect();
+            let mut seam_pass = SeamGraftVisitor::new(&seams, &mut guard);
+            seam_pass.visit_crate(&mut krate);
+            let stats = seam_pass.finish();
+            assert_eq!(stats.grafted, 1);
+            assert_eq!(stats.refused, 0);
+            assert!(guard.refused.is_empty());
+            assert_eq!(
+                guard.edited_with_claimants().collect::<Vec<_>>(),
+                vec![(arg, "use+seam")]
+            );
+            let text = pprust::item_to_string(&krate.items[0]);
+            assert!(text.contains("g(unsafe { &mut *p[1] })"), "{text}");
+        });
+    }
+}
+
+#[cfg(test)]
+mod arm3_witnesses {
+    use rustc_ast_pretty::pprust;
+
+    use super::*;
+
+    /// Render one glue shape over a NON-TRIVIAL argument.
+    ///
+    /// The argument is `(*s).ptr` — a field access through a deref, not a bare
+    /// identifier — deliberately. The split rule's whole claim is that the
+    /// argument moves across as a SUBTREE; a witness over `p` alone would pass
+    /// for an implementation that re-rendered it from scratch.
+    fn rendered(shape: GlueShape, mutable: bool, len: Option<SeamLen>) -> String {
+        let arg = ::utils::ast::parse_expr("(*s).ptr".to_owned());
+        // **Through the production helper, not around it.** `finish_len` is what
+        // the visitor calls; a harness that applied the cast itself would be a
+        // second implementation of the rule under test, and would have gone on
+        // passing after the fabricated arm made the rule conditional.
+        let len = len.map(|sl| finish_len(&sl, ::utils::ast::parse_expr(sl.text().to_owned())));
+        let kind =
+            glue_expr(shape, mutable, rustc_ast::ptr::P(arg), len).expect("the shapes all build");
+        pprust::expr_to_string(&rustc_ast::Expr {
+            id: DUMMY_NODE_ID,
+            kind,
+            span: DUMMY_SP,
+            attrs: Default::default(),
+            tokens: None,
+        })
+    }
+
+    /// **RED WITNESS — the glue shapes render exactly the span layer's text.**
+    ///
+    /// The oracle is `decision/seam.rs`'s `format!` set. These are the FIVE
+    /// shapes realized on the frozen corpus, measured from `seams.tsv`:
+    /// `from_raw_parts` 273, `some_wrap` 78, `some_reborrow` 37,
+    /// `from_ref_mut` 29, `some_from_raw_parts` 4 = 421.
+    ///
+    /// Pinning them here is what makes a corpus parity diff attributable: a
+    /// differing seam cannot be the renderer's fault without this failing
+    /// first. Same role as arm 2's declared-forms witness.
+    #[test]
+    fn glue_shapes_render_the_span_layers_text() {
+        rustc_span::create_default_session_globals_then(|| {
+            // reborrow family
+            assert_eq!(rendered(GlueShape::Reborrow, true, None), "&mut *(*s).ptr");
+            assert_eq!(rendered(GlueShape::Reborrow, false, None), "&*(*s).ptr");
+            let licensed = || Some(SeamLen::Licensed("n".to_owned()));
+            assert_eq!(
+                rendered(GlueShape::FromRawParts, true, licensed()),
+                "core::slice::from_raw_parts_mut((*s).ptr, (n) as usize)"
+            );
+            assert_eq!(
+                rendered(GlueShape::FromRawParts, false, licensed()),
+                "core::slice::from_raw_parts((*s).ptr, (n) as usize)"
+            );
+            // **The SIXTH realized shape** (ruling 2026-08-12): the fabricated
+            // extent, whose text differs from the licensed arm in exactly the
+            // two ways the audit depends on — a NAMED const, and no cast.
+            //
+            // The differential's whole job is that a corpus parity diff is
+            // attributable to the decision layer rather than the renderer; the
+            // fabricated arm without a row here would be the one placement
+            // shape the AST layer renders unwitnessed.
+            assert_eq!(
+                rendered(GlueShape::FromRawParts, true, Some(SeamLen::Fabricated)),
+                "core::slice::from_raw_parts_mut((*s).ptr, crate::FALLBACK_SLICE_EXTENT)"
+            );
+            assert_eq!(
+                rendered(GlueShape::FromRawParts, false, Some(SeamLen::Fabricated)),
+                "core::slice::from_raw_parts((*s).ptr, crate::FALLBACK_SLICE_EXTENT)"
+            );
+            // safe family
+            assert_eq!(
+                rendered(GlueShape::FromRefMut, true, None),
+                "core::slice::from_mut((*s).ptr)"
+            );
+            assert_eq!(
+                rendered(GlueShape::FromRefMut, false, None),
+                "core::slice::from_ref((*s).ptr)"
+            );
+            assert_eq!(rendered(GlueShape::Index0, true, None), "&mut (*s).ptr[0]");
+            assert_eq!(rendered(GlueShape::Index0, false, None), "&(*s).ptr[0]");
+            // the optional wrapper, over a bare argument and over a nested form
+            assert_eq!(rendered(GlueShape::Some_, false, None), "Some((*s).ptr)");
+        });
+    }
+
+    /// **The `{len}` expression is the ONE part that is genuinely new text.**
+    ///
+    /// The split rule in one assertion: the argument arrives as a subtree and
+    /// is never re-rendered, while the length has no subtree behind it (it is
+    /// recovered or fabricated) and therefore travels the parse-and-graft path
+    /// arm 2 hardened. A `from_raw_parts` shape with no length is a REFUSAL,
+    /// not a guess — the seam never invents a length, and neither does this.
+    ///
+    /// *Mutation-tested:* returning `None` instead of erroring on a missing
+    /// length fails the first assertion; accepting it and emitting `0` would
+    /// fail it too.
+    #[test]
+    fn a_length_bearing_shape_without_a_length_is_refused_not_guessed() {
+        rustc_span::create_default_session_globals_then(|| {
+            let arg = ::utils::ast::parse_expr("(*s).ptr".to_owned());
+            assert!(
+                glue_expr(GlueShape::FromRawParts, true, rustc_ast::ptr::P(arg), None).is_none(),
+                "a slice seam with no length must be REFUSED — the decision \
+                 layer gates it as `seam-len-unknown` (93 blocked) precisely so \
+                 that no layer below invents one"
+            );
+            let arg2 = ::utils::ast::parse_expr("(*s).ptr".to_owned());
+            assert!(
+                glue_expr(GlueShape::Reborrow, true, rustc_ast::ptr::P(arg2), None).is_some(),
+                "and a shape that needs no length must not be caught by that gate"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod template_witnesses {
+    use super::*;
+
+    /// **R7.4 — one parse witness per template shape**, enumerated READ-ONLY
+    /// from `decision/emitability.rs` before arm 2's first corpus run.
+    ///
+    /// The grammar of use replacements is a finite set of `format!` templates:
+    ///
+    /// | # | template | site |
+    /// |---|---|---|
+    /// | A | `{name}[0]` | `emitability.rs:981` |
+    /// | B | `{amp}{name}[{index}..]` | `:1031` |
+    /// | C | `{name}[{index}]` | `:1062` |
+    /// | D | `{name}.is_some()` | `:816` |
+    /// | E | `{name}.is_none()` | `:824` |
+    /// | F | `{name}.unwrap()` | `:832` via `Accessor::deref` |
+    /// | G | `*{name}.as_mut().unwrap()` | `:832` via `Accessor::deref`, `as_mut` arm |
+    /// | H | `{name}.unwrap()[{index}]` | `:869` via `Accessor::index` |
+    /// | I | `{name}.as_mut().unwrap()[{index}]` | `:869`, `as_mut` arm |
+    ///
+    /// `{index}` is an arbitrary offset expression carried from source, so a
+    /// non-trivial one is included rather than only bare identifiers — a
+    /// witness over `p[0]` alone would prove nothing about `p[i.wrapping_mul(2)
+    /// as usize]`.
+    ///
+    /// **This makes `parse_failed = 0` a CHECKED corpus expectation.** A corpus
+    /// parse failure then means a template this enumeration missed — a finding
+    /// with the offending text attached, never a silent skip.
+    /// **Session globals are REQUIRED**, and that is a property of the
+    /// plumbing, not of the test. `parse_expr` interns symbols and allocates
+    /// spans, so it panics in `scoped-tls` outside a session. Production grafts
+    /// run inside the compiler callback and have them; a unit witness must
+    /// establish them explicitly, which is why this wrapper is here and not an
+    /// oversight being papered over.
+    #[test]
+    fn every_use_replacement_template_parses() {
+        rustc_span::create_default_session_globals_then(|| {
+            for (label, text) in [
+                ("A name[0]", "p[0]"),
+                ("B &name[i..]", "&p[1..]"),
+                (
+                    "B' &mut name[expr..]",
+                    "&mut p[(i.wrapping_mul(2) as usize)..]",
+                ),
+                ("C name[i]", "p[i]"),
+                ("C' name[expr]", "p[i.wrapping_mul(2) as usize]"),
+                ("D is_some", "p.is_some()"),
+                ("E is_none", "p.is_none()"),
+                ("F unwrap", "p.unwrap()"),
+                ("G deref as_mut", "*p.as_mut().unwrap()"),
+                ("H unwrap index", "p.unwrap()[i]"),
+                ("I as_mut index", "p.as_mut().unwrap()[i]"),
+            ] {
+                assert!(
+                    graft_expr(text).is_ok(),
+                    "{label}: the template {text:?} must parse — it is a shape the \
+                 decision layer actually emits, and a shape that does not parse \
+                 aborts the run rather than producing a row"
+                );
+            }
+        });
+    }
+
+    /// **A replacement whose PREFIX parses is refused, not silently truncated.**
+    ///
+    /// Named by the adversarial review at the arm-2 boundary.
+    /// `utils::ast::parse_expr` never requires EOF, so before the
+    /// full-consumption check `graft_expr("p[0] trailing")` returned
+    /// `Ok(p[0])` — a wrong graft counted as a success, and invisible to
+    /// `parse_failed`.
+    ///
+    /// The second case is the control that keeps the check honest: a
+    /// replacement differing from its printed form only in WHITESPACE must
+    /// still be accepted, because that is the corpus's ordinary shape (1,699
+    /// of them) and a stricter test would refuse the whole arm.
+    ///
+    /// *Mutation-tested:* deleting the `strip(&printed) != strip(text)` guard
+    /// makes the first assertion fail.
+    #[test]
+    fn a_replacement_with_a_trailing_tail_is_refused() {
+        rustc_span::create_default_session_globals_then(|| {
+            assert_eq!(
+                graft_expr("p[0] trailing").unwrap_err(),
+                "p[0] trailing",
+                "a prefix-parse must be REFUSED and must carry its text — \
+                 `parse_expr` stops at the first complete expression and drops \
+                 the rest, which is a wrong graft, not a parse failure"
+            );
+            assert!(
+                graft_expr("data[(pos.wrapping_add(0 as libc::c_int)) as usize]").is_ok(),
+                "a replacement that round-trips within whitespace must still be \
+                 accepted — this is the corpus's ordinary shape"
+            );
+        });
+    }
+
+    /// **A grafted fragment carries NO real spans** — the arm-3 precondition.
+    ///
+    /// The hazard is not that grafted spans are invalid; it is that they are
+    /// VALID coordinates pointing somewhere else. A fresh `ParseSess` numbers
+    /// its `SourceMap` from zero, so a fragment's spans alias real offsets in
+    /// the crate's first source file. Arm 3 is a third span-keyed walk over a
+    /// tree arm 2 has already grafted into, so an aliased span could be grafted
+    /// into as though it were a target.
+    ///
+    /// The assertion is over EVERY node, not just the root: the root's span is
+    /// overwritten by the visitor anyway (it keeps the original node's), so a
+    /// root-only check would pass for an unnormalized fragment.
+    ///
+    /// *Mutation-tested:* removing the `SpanEraser.visit_expr(&mut parsed)`
+    /// call leaves the inner spans real and this fails.
+    #[test]
+    fn a_grafted_fragment_carries_no_real_spans() {
+        rustc_span::create_default_session_globals_then(|| {
+            let parsed = graft_expr("p[i.wrapping_mul(2) as usize]").expect("parses");
+
+            struct Collect(Vec<rustc_span::Span>);
+            impl rustc_ast::visit::Visitor<'_> for Collect {
+                fn visit_expr(&mut self, e: &rustc_ast::Expr) {
+                    self.0.push(e.span);
+                    rustc_ast::visit::walk_expr(self, e);
+                }
+            }
+            let mut c = Collect(Vec::new());
+            rustc_ast::visit::Visitor::visit_expr(&mut c, &parsed);
+
+            assert!(
+                c.0.len() > 1,
+                "the fixture must be a NESTED expression or this witnesses \
+                 nothing about inner spans: {} node(s)",
+                c.0.len()
+            );
+            assert!(
+                c.0.iter().all(|s| s.is_dummy()),
+                "every span in a grafted fragment must be DUMMY_SP — a fresh \
+                 ParseSess numbers from zero, so a surviving span is a VALID \
+                 coordinate into another file, which is worse than an invalid \
+                 one: {:?}",
+                c.0.iter().filter(|s| !s.is_dummy()).collect::<Vec<_>>()
+            );
+        });
+    }
+
+    /// **The wrap rule is load-bearing, and this proves it fires.**
+    ///
+    /// Not a positive control: `parse_expr`'s bare form PANICS on malformed
+    /// input over a fatal emitter, so without the wrapper this input would take
+    /// down the whole sweep. The assertion is that it becomes a VALUE.
+    ///
+    /// *Mutation-tested:* removing the `catch_unwind` makes this test abort
+    /// rather than fail — which is itself the demonstration.
+    #[test]
+    fn a_malformed_template_becomes_a_row_not_an_abort() {
+        rustc_span::create_default_session_globals_then(|| {
+            let bad = "p[";
+            let got = graft_expr(bad);
+            assert!(got.is_err(), "a malformed fragment must not parse");
+            assert_eq!(
+                got.unwrap_err(),
+                bad,
+                "the row must carry the OFFENDING TEXT — a refusal that does not \
+             name what it refused cannot be traced back to the template that \
+             produced it"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod nested_drop_diagnostic_tests {
+    /// **R477-4 (nested 012 step 6)** — the owner is dropped by `.count() == 1`, and the
+    /// drop is SILENT.
+    ///
+    /// The consumer below the map errors `nested-surface-argument-withdrawn` only when the
+    /// surface argument's own form is `NestedSlice`. An owner missing from the map whose
+    /// argument is ordinarily formed takes the `else` branch and emits the ordinary
+    /// argument — no revert, no hold, no diagnostic. That is why nested's admission, flip
+    /// and replan all succeed in the table and nothing reaches the tree.
+    ///
+    /// This pins the two halves that make the loss invisible, so neither can be changed
+    /// without the other being reconsidered.
+    #[test]
+    fn r477_4_the_nested_map_drops_an_owner_silently_and_now_records_why() {
+        let source = include_str!("ast_transform.rs");
+        let map = source
+            .split("let nested = table")
+            .nth(1)
+            .expect("the nested map exists");
+
+        // Half one: exactly one, so a zero AND a two both drop the owner.
+        assert!(
+            map.contains("if matches != 1"),
+            "the map requires exactly one surface argument per parameter"
+        );
+        // Half two: the only error path downstream is conditioned on the argument's form,
+        // which is why the drop is not observable where it happens.
+        assert!(
+            source.contains("nested-surface-argument-withdrawn"),
+            "the consumer's error exists"
+        );
+        assert!(
+            source.contains("matches!(argument.form, Form::NestedSlice { .. })"),
+            "and it is reached only for a NestedSlice-formed argument"
+        );
+
+        // And the drop now names itself, separating the two counts rather than merging
+        // them: nothing renders the parameter, versus two producers would.
+        assert!(map.contains("surface-arguments-not-exactly-one:"));
+        assert!(map.contains("function-reverted"));
+        assert!(map.contains("required-subject-reverted"));
+    }
+}
+
+#[cfg(test)]
+mod nested_composition_robustness_tests {
+    use super::*;
+
+    /// **R483-2 — a whole program must not be lost to a spelling.**
+    ///
+    /// The outer plan's text is rendered from the ORIGINAL source. The inner node prints
+    /// through `pprust` AFTER other families have rewritten it. When another family
+    /// rewrites the inner subject — heman `heman_color_from_cpcf`, where the Option
+    /// family's `texture` rewrite lands inside the slice local's outer product — the
+    /// inner's current text is no longer the text the outer carries, the search fails,
+    /// and `nested-composition:inner-text-not-found` degrades the entire program.
+    ///
+    /// The composition must find the inner by what the outer ACTUALLY carries — its
+    /// original spelling — not only by what the inner prints as now.
+    #[test]
+    fn r483_2_an_inner_rewritten_by_another_family_still_composes() {
+        // The outer plan, rendered from the original source, carries the ORIGINAL inner.
+        let outer = "core::slice::from_raw_parts(heman_image_texel(texture, u, v), 4)";
+        // Another family has since rewritten the inner subject's spelling.
+        let current = "heman_image_texel(texture.as_mut().unwrap(), u, v)";
+        let original = "heman_image_texel(texture, u, v)";
+        let inner = "unsafe { &*heman_image_texel(texture.as_mut().unwrap(), u, v) }";
+
+        // Today's lookup -- by the inner's CURRENT text -- cannot find it.
+        assert!(
+            UseGraftVisitor::compose_over_inner(outer, current, inner).is_none(),
+            "the premise: the current spelling is not what the outer carries"
+        );
+
+        // The composition must still succeed, by the spelling the outer DOES carry.
+        let composed = UseGraftVisitor::compose_over_inner_with_original(
+            outer,
+            current,
+            Some(original),
+            inner,
+        )
+        .expect("an inner rewritten by another family must still compose");
+        assert!(
+            composed.contains(inner),
+            "the view is spliced in: {composed}"
+        );
+        assert!(
+            composed.starts_with("core::slice::from_raw_parts("),
+            "and the outer is preserved around it: {composed}"
+        );
+        assert!(
+            !composed.contains(original),
+            "the original spelling is replaced, not left beside the view: {composed}"
+        );
+    }
+
+    /// The current text still wins when it IS present -- the fallback must not change
+    /// what already worked, or every composition in the corpus moves at once.
+    #[test]
+    fn r483_2_the_current_text_is_still_preferred() {
+        let outer = "wrap(inner(x), 4)";
+        let composed = UseGraftVisitor::compose_over_inner_with_original(
+            outer,
+            "inner(x)",
+            Some("STALE"),
+            "V",
+        )
+        .expect("composes on the current text");
+        assert_eq!(composed, "wrap(V, 4)");
+    }
+}
+
+#[cfg(test)]
+mod graft_failure_identity_tests {
+    /// **R511-3 — every graft failure names its site.**
+    ///
+    /// batch 26 lost brotli's whole emission to
+    /// `retained C-9 mark collided with another AST transform`, and that string is the entire
+    /// record: the program's `.census.err` is **zero bytes**, the census log carries the
+    /// status and nothing else, and the message named no span. Relay 136 asked for the floor
+    /// to be built RED-first "on brotli's exact site (the batch-26 `.census.err` names it)" —
+    /// it does not, and could not, because eight of the eighteen failure strings were bare.
+    ///
+    /// A diagnostic that cannot say WHERE turns a one-site collision into a whole-program
+    /// abort with no way back to the site. This pins that every one of them carries an
+    /// identity, so the floor's fixture can be written from a log rather than from a rerun.
+    #[test]
+    fn r511_3_every_graft_failure_carries_its_site() {
+        let source = include_str!("ast_transform.rs");
+        // **The witness must not count ITSELF.** The first run of this read 19 of 18, because
+        // the `split` pattern below is the very string it searches for and this module is in
+        // the file it reads. That is the third time this shape has bitten a witness of mine
+        // (R492-1 counted its own `include_str!` assertions; R499-1 anchored on a string in
+        // its own comment) -- so the scan stops where production ends.
+        let source = source
+            .split("mod graft_failure_identity_tests")
+            .next()
+            .expect("production precedes this module");
+        // **Comments are not code, INCLUDING trailing ones.** Dropping only whole comment
+        // lines was not enough: the fault control that removes a span left
+        // `"" // FAULT: the span is gone again` behind, the word "span" in that trailing
+        // comment satisfied the check, and the witness passed its own fault. A comment is
+        // stripped wherever it starts, and only outside a string literal.
+        let strip = |line: &str| -> String {
+            let bytes = line.as_bytes();
+            let (mut quoted, mut index) = (false, 0);
+            while index + 1 < bytes.len() {
+                match bytes[index] {
+                    b'\\' if quoted => index += 1,
+                    b'"' => quoted = !quoted,
+                    b'/' if !quoted && bytes[index + 1] == b'/' => return line[..index].to_owned(),
+                    _ => {}
+                }
+                index += 1;
+            }
+            line.to_owned()
+        };
+        let code = source.lines().map(strip).collect::<Vec<_>>().join("\n");
+
+        // **The anchor is the ASSIGNMENT, not the assignment-plus-opening-paren.** wave-6l 041
+        // caught this: rustfmt wraps a long assignment as `self.failure =` / newline /
+        // `Some(...)`, so an anchor of `self.failure = Some(` walks straight past it. One site
+        // (the PAIR collision) was formatted that way, the scan read eighteen of nineteen, and
+        // `assert_eq!(total, 18)` locked the hole in as the expected count -- a witness that
+        // certified the exact gap it exists to close. The anchor now skips whitespace.
+        let mut bare = Vec::new();
+        let mut total = 0;
+        for piece in code.split("self.failure =").skip(1) {
+            let piece = piece.trim_start();
+            let Some(piece) = piece.strip_prefix("Some(") else {
+                panic!(
+                    "a `self.failure =` that does not assign `Some(..)`: {}",
+                    &piece[..piece.len().min(80)]
+                );
+            };
+            let end = piece.find(");\n").unwrap_or(piece.len());
+            let body = &piece[..end];
+            total += 1;
+            // An identity is a span pair, a span, or a receipt key — anything that gets a
+            // reader back to one site.
+            if !(body.contains("{}..{}")
+                || body.contains("key.0")
+                || body.contains(".lo().0")
+                || body.contains("span")
+                || body.contains("receipt_key()"))
+            {
+                bare.push(body.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
+        // **Nineteen minus the four the FLOOR deleted (R515-1 ruling 3).** The
+        // collision string of each of the four graft arms is gone, because a
+        // collision no longer fails: the arm yields, its class is reverted
+        // whole, and the hold is receipted in `<program>.graft-held.tsv`.
+        //
+        // Moving this number is how the previous hole was hidden, so it does not
+        // move on its own: `graft_floor_tests::r515_1_every_arm_yields_..`
+        // asserts that those four sites assign no failure at all, and the pair
+        // of counts only agrees when both are true.
+        assert_eq!(
+            total, 15,
+            "the failure vocabulary is nineteen minus the four collision strings the floor deleted"
+        );
+        assert!(
+            bare.is_empty(),
+            "a graft failure that names no site cannot be diagnosed from a log: {bare:#?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod graft_floor_tests {
+    use super::*;
+
+    /// The four arms, as `(visitor label, the claim's claimant string)`. Keeping
+    /// them in one place is deliberate: a fifth arm added without a line here is
+    /// the failure this file has seen three times (a receipt with no channel, a
+    /// scan that could not see the site it was written for, a control that
+    /// confirmed the case its author expected). The `composition` arm is
+    /// wave-6l's and joins this table when their commit composes.
+    /// `(the receipt's variant, the claim's claimant string)`. The first column
+    /// became a `GraftVisitor` variant when wave-6l 043 closed the axis: a scan
+    /// looking for `visitor: "a5-raw"` would now pass vacuously on every arm, so
+    /// it looks for what the source actually says.
+    const ARMS: [(&str, &str); 4] = [
+        ("GraftVisitor::A5Raw", "\"a5-raw\""),
+        ("GraftVisitor::PairRaw", "\"pair-raw\""),
+        ("GraftVisitor::C9", "\"c9\""),
+        ("GraftVisitor::Receiver", "\"receiver-input\""),
+    ];
+
+    /// **The SIXTH arm lives in another file** (`field_reference_ast.rs`, the
+    /// field-transaction wrap), which is why it is not in `ARMS` — the scans
+    /// above read `ast_transform.rs`. Keeping it visible here is the point: a
+    /// sixth path nobody had listed is how bst lost its whole emission at the
+    /// L01^5 frame while the other five were already floored.
+    const FIELD_WRAP_ARM: (&str, &str) = ("GraftVisitor::FieldWrap", "\"field:wrap\"");
+
+    /// **The sixth arm (R523-3), scanned in its own file.** Same contract as the
+    /// five: a refused claim records its hold, marks the span held, undoes the
+    /// speculative `placed` insert, and does NOT push a failure — because
+    /// `apply_wraps` turns one failure into `Err` and `mod.rs` turns that into a
+    /// degraded PROGRAM.
+    #[test]
+    fn r523_3_the_field_wrap_arm_yields_instead_of_aborting() {
+        let source = include_str!("field_reference_ast.rs");
+        let code = strip_comments(
+            source
+                .split("#[cfg(test)]")
+                .next()
+                .expect("production precedes any test module in that file"),
+        );
+        let code = code.as_str();
+        let (visitor, claimant) = FIELD_WRAP_ARM;
+        let at = code
+            .find(&format!(".claim(e.id, e.span, {claimant})"))
+            .unwrap_or_else(|| panic!("no `guard.claim(.., {claimant})` in production"));
+        // Brace-matched, not indentation-matched: an indentation needle read
+        // past the end of the block and swallowed a later arm's code.
+        let rest = &code[at..];
+        let open = rest.find('{').expect("the refusal block opens");
+        let mut depth = 0i32;
+        let mut end = rest.len();
+        for (offset, byte) in rest[open..].bytes().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &rest[open..end];
+        assert!(
+            body.contains("record_graft_held("),
+            "field-wrap: a refused claim must RECORD its hold"
+        );
+        assert!(
+            body.contains(&format!("visitor: super::ast_transform::{visitor},")),
+            "field-wrap: the receipt must name this arm as the ENUM, like the other five — \
+             a free string cannot be exhaustively matched and drifts from `key()`"
+        );
+        assert!(
+            body.contains("self.held.insert(key)"),
+            "field-wrap: a held span must be recorded held, or `unplaced` degrades the program"
+        );
+        // **The held span STAYS in `placed` (R531, defect A).** Removing it made
+        // `placed` (span-keyed) and the claim (NodeId-keyed) disagree, so a
+        // second same-span node could put the span in both sets and degrade the
+        // program under `unplaced` for a wrap that was placed.
+        assert!(
+            !body.contains("self.placed.remove(&key)"),
+            "field-wrap: a held span must stay in `placed` -- removing it lets a second \
+             same-span node land in both sets and fire `unplaced` on a correct wrap"
+        );
+        // **R531-7 (wave-6f 061/062): ONE failure is allowed here, and only one.**
+        // A collision is the TRANSACTION's problem — except when the transaction
+        // has NO withdrawal key: the hold registers `dependent_owners`, the
+        // commonest owned-field idiom has none, and registering nothing ships the
+        // transaction half-wrapped with no receipt. That refusal, and only that
+        // one, reaches the program as `wrap-claim-refused-no-key`.
+        //
+        // Read WHITESPACE-FREE: rustfmt splits this push as `self.failures` /
+        // `.push(..)`, and a needle with the dot attached never matched a split
+        // push — the check this replaces passed vacuously on exactly that shape.
+        let compact: String = body.split_whitespace().collect();
+        let pushes = compact.matches("self.failures.push(").count();
+        let no_key_pushes = compact
+            .matches("self.failures.push(format!(\"wrap-claim-refused-no-key:{key:?}\"))")
+            .count();
+        assert_eq!(
+            (pushes, no_key_pushes),
+            (1, 1),
+            "field-wrap: the only failure a refusal may push is the empty-key one — \
+             a collision is otherwise the TRANSACTION's problem, never the program's"
+        );
+        let guard_at = compact
+            .find("ifdependent_owners.is_empty(){")
+            .expect("field-wrap: the no-key failure is guarded by `dependent_owners.is_empty()`");
+        let push_at = compact.find("self.failures.push(").expect("counted above");
+        let hold_at = compact
+            .find("record_graft_held(")
+            .expect("counted by the assertion above");
+        assert!(
+            guard_at < push_at && push_at < hold_at,
+            "field-wrap: the empty-key failure is decided BEFORE the hold, inside its guard"
+        );
+        // The CONSTRUCTION site, not the refusal body: `dependent_owners` there
+        // is only the destructured binding's name, so a swap at the construction
+        // site would leave the body unchanged.
+        assert!(
+            code.contains("transaction.dependent_owners.as_slice()"),
+            "field-wrap: the held classes must be the transaction's withdrawal key — \
+             `FieldTransactions::active` keeps a transaction iff no DEPENDENT owner is \
+             reverted, so holding `owners` would not withdraw it"
+        );
+        assert!(
+            code.contains("if wraps.placed.len() != edits.len() {"),
+            "field-wrap: with held spans kept in `placed`, the check is the plain one"
+        );
+    }
+
+    /// Production source with comments stripped and the tests cut off, so a
+    /// scan cannot be satisfied by prose or by its own text. Same shape as
+    /// `r511_3_..`'s, and for the same reason.
+    /// A comment is not code, and it is stripped wherever it starts, outside a
+    /// string literal. This has mattered three times in this file: the R511-3
+    /// scan passed its own fault control on a trailing comment, and the
+    /// `field:wrap` scan failed a CORRECT implementation because the comment
+    /// explaining the fix quotes the very call the check forbids.
+    fn strip_comments(source: &str) -> String {
+        let strip = |line: &str| -> String {
+            let bytes = line.as_bytes();
+            let (mut quoted, mut index) = (false, 0);
+            while index + 1 < bytes.len() {
+                match bytes[index] {
+                    b'\\' if quoted => index += 1,
+                    b'"' => quoted = !quoted,
+                    b'/' if !quoted && bytes[index + 1] == b'/' => return line[..index].to_owned(),
+                    _ => {}
+                }
+                index += 1;
+            }
+            line.to_owned()
+        };
+        source.lines().map(strip).collect::<Vec<_>>().join("\n")
+    }
+
+    fn production() -> String {
+        let source = include_str!("ast_transform.rs");
+        // **Cut at the FIRST test module, not at this one.** This module is the
+        // last in the file, so splitting on its own name would hand the scan
+        // the sibling test module above it as "production" — and that module's
+        // string literals are exactly the strings these scans look for.
+        strip_comments(
+            source
+                .split("mod graft_failure_identity_tests")
+                .next()
+                .expect("production precedes every test module here"),
+        )
+    }
+
+    /// **The floor, arm by arm.** A refused `guard.claim` must YIELD: record the
+    /// hold with both parties, add the key to `held`, and return — and above all
+    /// it must not assign `self.failure`, which the apply site turns into `Err`
+    /// and `mod.rs` turns into `round-0 emit failed` for the whole program.
+    /// batch 26 and batch 27 each lost brotli's entire emission that way.
+    #[test]
+    fn r515_1_every_arm_yields_instead_of_aborting() {
+        let code = production();
+        for (visitor, claimant) in ARMS {
+            let at = code
+                .find(&format!(
+                    "guard\n            .claim(expression.id, expression.span, {claimant})"
+                ))
+                .or_else(|| {
+                    code.find(&format!(
+                        ".claim(expression.id, expression.span, {claimant})"
+                    ))
+                })
+                .or_else(|| code.find(&format!(".claim(e.id, e.span, {claimant})")))
+                .unwrap_or_else(|| panic!("no `guard.claim(.., {claimant})` in production"));
+            // The refusal body runs to its `return;`, which every arm has.
+            let rest = &code[at..];
+            let end = rest.find("\n        }").unwrap_or(rest.len());
+            let body = &rest[..end];
+            assert!(
+                body.contains("record_graft_held("),
+                "{visitor}: a refused claim must RECORD its hold"
+            );
+            assert!(
+                body.contains(&format!("visitor: {visitor},")),
+                "{visitor}: the receipt must name this arm, not another"
+            );
+            assert!(
+                body.contains("self.held.insert(key)"),
+                "{visitor}: a held key must be recorded held, or `unmatched` aborts on it"
+            );
+            assert!(
+                !body.contains("self.failure = Some"),
+                "{visitor}: a collision is ONE class's problem, never the program's"
+            );
+        }
+    }
+
+    /// **The `unmatched` trap, arm by arm (R515-1 ruling 3).** Every arm inserts
+    /// into `consumed` only on SUCCESS, so a yielded key is indistinguishable
+    /// from a key the walk never reached — and each arm's `unmatched` check
+    /// would then abort the program for exactly the hold the floor granted. The
+    /// filters must subtract the held set.
+    #[test]
+    fn r515_1_every_unmatched_check_subtracts_the_held_set() {
+        let code = production();
+        for visitor in ["a5_raw", "pair_raw", "c9", "receiver_grafts"] {
+            let consumed = format!("!{visitor}.consumed.contains(key)");
+            assert!(
+                code.contains(&consumed),
+                "{visitor}: no `unmatched` filter over `consumed` found — has it been renamed?"
+            );
+            let at = code.find(&consumed).expect("just checked");
+            let window = &code[at..(at + 160).min(code.len())];
+            assert!(
+                window.contains(&format!("{visitor}.held.contains(key)")),
+                "{visitor}: `unmatched` does not subtract the held set, so a held \
+                 key still aborts the program"
+            );
+        }
+    }
+
+    /// The receipt table: header alone when nothing was held, one row per
+    /// distinct hold with `emissions_held`, ordered, and a reset is a reset.
+    #[test]
+    fn r515_1_the_held_table_says_asked_and_held_nothing() {
+        reset_graft_held();
+        assert_eq!(
+            graft_held_table(),
+            "visitor\tcaller_def_index\tclass_order_key\treason\tspan_lo\tspan_hi\temissions_held\n",
+            "an empty table is a HEADER, not a missing file — that distinction is \
+             the whole reason this channel exists"
+        );
+        assert!(graft_held_classes().is_empty());
+    }
+
+    #[test]
+    fn r515_1_a_graft_held_twice_counts_its_emissions() {
+        reset_graft_held();
+        // `SignatureClassId` wraps a `LocalDefId`; the crate root is the one such id
+        // a unit test can name without a `TyCtxt`.
+        let class =
+            super::super::bridge_receipt::SignatureClassId::of(rustc_hir::def_id::CRATE_DEF_ID);
+        let receipt = |visitor, lo| GraftHeldReceipt {
+            visitor,
+            caller: 3,
+            class: 7,
+            reason: "a5-raw",
+            lo,
+            hi: lo + 10,
+        };
+        record_graft_held(receipt(GraftVisitor::C9, 100), class);
+        record_graft_held(receipt(GraftVisitor::C9, 100), class);
+        record_graft_held(receipt(GraftVisitor::Receiver, 200), class);
+        let table = graft_held_table();
+        let rows = table.lines().skip(1).collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                "c9\t3\t7\ta5-raw\t100\t110\t2",
+                "receiver\t3\t7\ta5-raw\t200\t210\t1",
+            ],
+            "one row per distinct hold, `emissions_held` counting the repeats"
+        );
+        assert_eq!(graft_held_classes().len(), 1, "one class, held three times");
+        reset_graft_held();
+        assert_eq!(graft_held_table().lines().count(), 1, "a reset is a reset");
+        assert!(graft_held_classes().is_empty());
+    }
+
+    /// **THE FLOOR, EXERCISED (R523-5, report 045 STOP 2 (a)).**
+    ///
+    /// Every witness the floor had was a source scan or a unit test on the
+    /// recorder: they prove the yield is WRITTEN, not that it WORKS. Report 043
+    /// scored acceptance check 1 PARTIAL for exactly that, and batch 28 then
+    /// declined to supply the case — twenty `graft-held.tsv` files, every one
+    /// header-only, so no arm refused a claim anywhere in the corpus and the
+    /// path has still never run.
+    ///
+    /// So the collision is CONSTRUCTED, the way `two_transforms_may_not_claim_
+    /// one_node` constructs its own: another arm claims the node first, and the
+    /// C-9 arm is driven over it. What is asserted is the whole floor, not its
+    /// text — no failure, the node keeps the holder's edit, the key is recorded
+    /// HELD (not consumed, or `unmatched` aborts on it), the receipt names both
+    /// parties, and the class reaches the per-round revert set.
+    #[test]
+    fn w6l_floor_a_refused_claim_yields_and_is_receipted() {
+        // Parsing and printing need a source map, as every other parsing test
+        // in this file does.
+        rustc_span::create_default_session_globals_then(
+            w6l_floor_a_refused_claim_yields_and_is_receipted_inner,
+        );
+    }
+
+    fn w6l_floor_a_refused_claim_yields_and_is_receipted_inner() {
+        use rustc_span::{BytePos, Span, SyntaxContext};
+
+        use crate::analyses::borrow_ownership::{
+            guarded_repair::{MirLocationKey, SlotKey},
+            overlap_producer::PlannedCopyMark,
+            param_overlap::{CopyMarkKey, PairSide},
+        };
+
+        let slot = |slot| SlotKey {
+            variant: 1,
+            owner: 1,
+            slot,
+        };
+        // The same shape `c9::tests::mark()` builds: the shared side is the
+        // RIGHT formal, param 2, so the rendering rewrites argument index 1 and
+        // a two-argument call is within arity.
+        let key = CopyMarkKey::new(
+            1,
+            MirLocationKey::new(4, 2),
+            [2],
+            2,
+            1,
+            slot(1),
+            2,
+            slot(2),
+            PairSide::Right,
+            "i32".to_owned(),
+        )
+        .expect("the pair key is well-formed");
+        let span = Span::new(BytePos(10), BytePos(20), SyntaxContext::root(), None);
+        let mark = PlannedCopyMark {
+            key,
+            endpoint_slots: std::collections::BTreeSet::new(),
+            call_span: span,
+            caller_did: rustc_hir::def_id::CRATE_DEF_ID,
+            owner_did: rustc_hir::def_id::CRATE_DEF_ID,
+            owner_fn: "fixture".to_owned(),
+        };
+        let marks: FxHashMap<(u32, u32), &PlannedCopyMark> =
+            [((10u32, 20u32), &mark)].into_iter().collect();
+
+        let drive = |contested: bool| {
+            reset_graft_held();
+            let mut expression = graft_expr("f(a, b)").expect("the fixture parses");
+            // A dummy span is walked past; the mark is keyed on this one.
+            expression.span = span;
+            let before = rustc_ast_pretty::pprust::expr_to_string(&expression);
+            let mut guard = Composition::default();
+            if contested {
+                assert!(
+                    guard.claim(expression.id, span, "a5-raw"),
+                    "the premise: another arm owns the node FIRST"
+                );
+            }
+            let mut c9 = C9GraftVisitor {
+                marks: &marks,
+                guard: &mut guard,
+                consumed: FxHashSet::default(),
+                held: FxHashSet::default(),
+                failure: None,
+            };
+            c9.visit_expr(&mut expression);
+            let after = rustc_ast_pretty::pprust::expr_to_string(&expression);
+            (
+                c9.failure.clone(),
+                c9.held.contains(&(10, 20)),
+                c9.consumed.contains(&(10, 20)),
+                before,
+                after,
+            )
+        };
+
+        // **The positive control runs FIRST**, so a witness that passed because
+        // the rendering failed before ever reaching the claim cannot hide: with
+        // no incumbent, the mark grafts and the text changes.
+        let (failure, held, consumed, before, after) = drive(false);
+        assert_eq!(failure, None, "an uncontested mark must graft");
+        assert!(consumed && !held, "uncontested: consumed, not held");
+        assert_ne!(after, before, "uncontested: the node receives the edit");
+        assert!(
+            after.contains("__crat_c9_4_2"),
+            "uncontested: the companion temp is what it grafted: {after}"
+        );
+        assert_eq!(
+            graft_held_table().lines().count(),
+            1,
+            "uncontested: nothing held"
+        );
+
+        // And now the collision.
+        let (failure, held, consumed, before, after) = drive(true);
+        assert_eq!(
+            failure, None,
+            "a collision is ONE class's problem: it must not fail the program"
+        );
+        assert!(held, "the yielded key must be recorded HELD");
+        assert!(!consumed, "a yielded key was not consumed");
+        assert_eq!(after, before, "the node keeps the holder's edit, untouched");
+        assert_eq!(
+            graft_held_table(),
+            "visitor\tcaller_def_index\tclass_order_key\treason\tspan_lo\tspan_hi\temissions_held\n\
+             c9\t0\t0\ta5-raw\t10\t20\t1\n",
+            "the receipt names both parties: this arm in `visitor`, the incumbent in `reason`"
+        );
+        assert_eq!(
+            graft_held_classes().len(),
+            1,
+            "the held class must reach the per-round revert set, or its other \
+             edits ship around a node that never received this one"
+        );
+        reset_graft_held();
+    }
+
+    /// **The FIFTH arm, wave-6l's (relay 045 item 1).** A composition this pass
+    /// cannot locate is held at the site, exactly as a refused `claim` is: the
+    /// node keeps its input text, the hold is receipted as `composition`, and the
+    /// view's owner class is reverted whole. The site is shaped differently from
+    /// the four above -- there is no `guard.claim` to refuse, the outer text
+    /// simply does not contain the inner node -- so `ARMS` cannot cover it and
+    /// it is scanned on its own terms.
+    #[test]
+    fn w6l_floor_the_composition_arm_yields_and_records() {
+        let code = production();
+        let at = code
+            .find("Self::compose_over_inner_with_original(")
+            .expect("the composition site");
+        let body = &code[at..(at + 2_400).min(code.len())];
+        assert!(
+            body.contains("record_graft_held("),
+            "an unlocatable composition must RECORD its hold"
+        );
+        assert!(
+            body.contains("visitor: GraftVisitor::Composition,"),
+            "the receipt must name this arm, not another"
+        );
+        assert!(
+            body.contains("view.owner_class(),"),
+            "the held class must reach the per-round revert set, or the class \
+             ships around a node that never received its edit"
+        );
+        // **The abort is gone, and its whole channel with it.** The failure used
+        // to travel out of `finish_composed` as a `Vec<String>` and become
+        // `Err(why)` at the apply site; a floor that only stopped pushing would
+        // have left that path alive for the next writer to reuse.
+        assert!(
+            !code.contains("composition_failures"),
+            "the composition failure channel is gone: there is one table now"
+        );
+        assert!(
+            !code.contains("if let Some(why) = composition_failures.first()"),
+            "an unlocatable composition must not fail the program"
+        );
+    }
+
+    /// **The table\'s visitor axis is CLOSED (relay 045 item 2).** main\'s arms
+    /// wrote a free `&\'static str`, where a typo\'d sixth arm reads as a new arm
+    /// -- the same shape as a receipt with no channel. Every label now reaches
+    /// the table through `GraftVisitor::key()`, and the variants are five.
+    #[test]
+    fn w6l_the_visitor_axis_is_closed_and_declaration_order_holds_the_table() {
+        use GraftVisitor::{A5Raw, C9, Composition, PairRaw, Receiver};
+        let all = [A5Raw, C9, Composition, PairRaw, Receiver];
+        assert_eq!(
+            all.map(GraftVisitor::key),
+            ["a5-raw", "c9", "composition", "pair-raw", "receiver"],
+        );
+        // Declaration order REPRODUCES the string order the table had before the
+        // port, so no row moved anywhere when the axis closed.
+        let mut sorted = all;
+        sorted.sort();
+        assert_eq!(sorted, all, "declaration order is the table\'s order");
+        let mut keys = all.map(GraftVisitor::key);
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            all.map(GraftVisitor::key),
+            "and it is the keys\' order"
+        );
+    }
+
+    /// The two lifetimes are DIFFERENT and deliberately so: the emission asks
+    /// the class set "what did THIS round hold?", while the census asks the
+    /// receipts "what did this PROGRAM hold?". Resetting one must not reset the
+    /// other, or the next round re-reverts classes already taken out.
+    #[test]
+    fn r515_1_the_class_set_is_per_round_and_the_receipts_are_per_program() {
+        reset_graft_held();
+        let class =
+            super::super::bridge_receipt::SignatureClassId::of(rustc_hir::def_id::CRATE_DEF_ID);
+        record_graft_held(
+            GraftHeldReceipt {
+                visitor: GraftVisitor::PairRaw,
+                caller: 1,
+                class: 11,
+                reason: "seam",
+                lo: 5,
+                hi: 9,
+            },
+            class,
+        );
+        reset_graft_held_classes();
+        assert!(
+            graft_held_classes().is_empty(),
+            "the per-round set clears with the round"
+        );
+        assert_eq!(
+            graft_held_table().lines().count(),
+            2,
+            "the program's receipt survives the round that produced it"
+        );
+        reset_graft_held();
+    }
+}

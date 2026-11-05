@@ -1,0 +1,360 @@
+{
+ "bridges": [
+  {
+   "argument_kind": "return-seam",
+   "extent_none": true,
+   "key": {
+    "arm": "glue",
+    "callee": 729,
+    "caller": 729,
+    "endpoint": "def-id:0:729",
+    "endpoint_def_id": [
+     0,
+     729
+    ],
+    "file": "heman/lib.rs",
+    "hi": 409070,
+    "key": "729:729:local:729:glue:return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view:heman/lib.rs:408926:409070:return-raw-to-ref",
+    "kind": "return-raw-to-ref",
+    "lo": 408926,
+    "owner": 729,
+    "position": "return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view"
+   },
+   "reason": null,
+   "source_form": "raw",
+   "stage": "plan",
+   "state": "planned",
+   "target_form": "ref-mut",
+   "tier": "T2",
+   "waiver": "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01"
+  },
+  {
+   "argument_kind": "return-seam",
+   "extent_none": true,
+   "key": {
+    "arm": "glue",
+    "callee": 729,
+    "caller": 729,
+    "endpoint": "def-id:0:729",
+    "endpoint_def_id": [
+     0,
+     729
+    ],
+    "file": "heman/lib.rs",
+    "hi": 409070,
+    "key": "729:729:local:729:glue:return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view:heman/lib.rs:408926:409070:return-raw-to-ref",
+    "kind": "return-raw-to-ref",
+    "lo": 408926,
+    "owner": 729,
+    "position": "return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view"
+   },
+   "reason": null,
+   "source_form": "raw",
+   "stage": "terminal",
+   "state": "applied",
+   "target_form": "ref-mut",
+   "tier": "T2",
+   "waiver": "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01"
+  }
+ ],
+ "capture_errors": [],
+ "common": [
+  {
+   "argument_kind": "return-seam",
+   "extent_none": true,
+   "key": {
+    "argument_index": null,
+    "caller": 729,
+    "endpoint": "def-id:0:729",
+    "endpoint_def_id": [
+     0,
+     729
+    ],
+    "family": "return-not-adapted",
+    "hir_item_local_id": 9,
+    "hir_owner": 729,
+    "key": "class=729:subject=local:729:1:depth=0:site=owner=729:location=hir:729:9:callee=def-id:0:729:arg=-:depth=0:family=return-not-adapted",
+    "owner": 729,
+    "slot_depth": 0,
+    "subject": {
+     "generated": null,
+     "key": "local:729:1:depth=0",
+     "local": [
+      729,
+      1,
+      0
+     ]
+    }
+   },
+   "negative_write": "not-applicable",
+   "reason": null,
+   "return_adapter": true,
+   "source_form": "raw",
+   "stage": "plan",
+   "state": "planned",
+   "target_form": "ref-mut",
+   "terminal_interface": "ref-mut",
+   "tier": "T2",
+   "waiver": "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01"
+  },
+  {
+   "argument_kind": "return-seam",
+   "extent_none": true,
+   "key": {
+    "argument_index": null,
+    "caller": 729,
+    "endpoint": "def-id:0:729",
+    "endpoint_def_id": [
+     0,
+     729
+    ],
+    "family": "return-not-adapted",
+    "hir_item_local_id": 9,
+    "hir_owner": 729,
+    "key": "class=729:subject=local:729:1:depth=0:site=owner=729:location=hir:729:9:callee=def-id:0:729:arg=-:depth=0:family=return-not-adapted",
+    "owner": 729,
+    "slot_depth": 0,
+    "subject": {
+     "generated": null,
+     "key": "local:729:1:depth=0",
+     "local": [
+      729,
+      1,
+      0
+     ]
+    }
+   },
+   "negative_write": "not-applicable",
+   "reason": null,
+   "return_adapter": true,
+   "source_form": "raw",
+   "stage": "terminal",
+   "state": "applied",
+   "target_form": "ref-mut",
+   "terminal_interface": "ref-mut",
+   "tier": "T2",
+   "waiver": "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01"
+  }
+ ],
+ "rendered_tsv": "",
+ "required": [
+  {
+   "adapter": "c-raw-reborrow-mut",
+   "bridge": {
+    "arm": "glue",
+    "callee": 729,
+    "caller": 729,
+    "endpoint": "def-id:0:729",
+    "endpoint_def_id": [
+     0,
+     729
+    ],
+    "file": "heman/lib.rs",
+    "hi": 409070,
+    "key": "729:729:local:729:glue:return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view:heman/lib.rs:408926:409070:return-raw-to-ref",
+    "kind": "return-raw-to-ref",
+    "lo": 408926,
+    "owner": 729,
+    "position": "return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view"
+   },
+   "key": {
+    "argument_index": null,
+    "caller": 729,
+    "endpoint": "def-id:0:729",
+    "endpoint_def_id": [
+     0,
+     729
+    ],
+    "family": "return-not-adapted",
+    "hir_item_local_id": 9,
+    "hir_owner": 729,
+    "key": "class=729:subject=local:729:1:depth=0:site=owner=729:location=hir:729:9:callee=def-id:0:729:arg=-:depth=0:family=return-not-adapted",
+    "owner": 729,
+    "slot_depth": 0,
+    "subject": {
+     "generated": null,
+     "key": "local:729:1:depth=0",
+     "local": [
+      729,
+      1,
+      0
+     ]
+    }
+   },
+   "native_lifetime": {
+    "lifetime": "static",
+    "owner": 729,
+    "plan_digest": "360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209"
+   },
+   "origins": [
+    {
+     "generated": null,
+     "key": "local:729:1:depth=0",
+     "local": [
+      729,
+      1,
+      0
+     ]
+    }
+   ],
+   "retention": null,
+   "terminal_interface": "ref-mut"
+  }
+ ],
+ "rows": [
+  {
+   "boundary_kind": "return-raw-to-ref",
+   "effect_carrier": null,
+   "endpoint": "def-id:0:729",
+   "negative_write": "not-applicable",
+   "pair_role": "not-applicable",
+   "position": "return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view",
+   "reason": null,
+   "required": {
+    "adapter": "c-raw-reborrow-mut",
+    "bridge": {
+     "arm": "glue",
+     "callee": 729,
+     "caller": 729,
+     "endpoint": "def-id:0:729",
+     "endpoint_def_id": [
+      0,
+      729
+     ],
+     "file": "heman/lib.rs",
+     "hi": 409070,
+     "key": "729:729:local:729:glue:return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view:heman/lib.rs:408926:409070:return-raw-to-ref",
+     "kind": "return-raw-to-ref",
+     "lo": 408926,
+     "owner": 729,
+     "position": "return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view"
+    },
+    "key": {
+     "argument_index": null,
+     "caller": 729,
+     "endpoint": "def-id:0:729",
+     "endpoint_def_id": [
+      0,
+      729
+     ],
+     "family": "return-not-adapted",
+     "hir_item_local_id": 9,
+     "hir_owner": 729,
+     "key": "class=729:subject=local:729:1:depth=0:site=owner=729:location=hir:729:9:callee=def-id:0:729:arg=-:depth=0:family=return-not-adapted",
+     "owner": 729,
+     "slot_depth": 0,
+     "subject": {
+      "generated": null,
+      "key": "local:729:1:depth=0",
+      "local": [
+       729,
+       1,
+       0
+      ]
+     }
+    },
+    "native_lifetime": {
+     "lifetime": "static",
+     "owner": 729,
+     "plan_digest": "360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209"
+    },
+    "origins": [
+     {
+      "generated": null,
+      "key": "local:729:1:depth=0",
+      "local": [
+       729,
+       1,
+       0
+      ]
+     }
+    ],
+    "retention": null,
+    "terminal_interface": "ref-mut"
+   },
+   "source_form": "raw",
+   "stage": "plan",
+   "state": "planned",
+   "target_form": "ref-mut",
+   "tier": "T2",
+   "waiver": "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01"
+  },
+  {
+   "boundary_kind": "return-raw-to-ref",
+   "effect_carrier": null,
+   "endpoint": "def-id:0:729",
+   "negative_write": "not-applicable",
+   "pair_role": "not-applicable",
+   "position": "return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view",
+   "reason": null,
+   "required": {
+    "adapter": "c-raw-reborrow-mut",
+    "bridge": {
+     "arm": "glue",
+     "callee": 729,
+     "caller": 729,
+     "endpoint": "def-id:0:729",
+     "endpoint_def_id": [
+      0,
+      729
+     ],
+     "file": "heman/lib.rs",
+     "hi": 409070,
+     "key": "729:729:local:729:glue:return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view:heman/lib.rs:408926:409070:return-raw-to-ref",
+     "kind": "return-raw-to-ref",
+     "lo": 408926,
+     "owner": 729,
+     "position": "return@408926..409070:target=*mut f32:lifetime_plan=360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209:through_raw_field=arg1/deref1/field:untied-return-view"
+    },
+    "key": {
+     "argument_index": null,
+     "caller": 729,
+     "endpoint": "def-id:0:729",
+     "endpoint_def_id": [
+      0,
+      729
+     ],
+     "family": "return-not-adapted",
+     "hir_item_local_id": 9,
+     "hir_owner": 729,
+     "key": "class=729:subject=local:729:1:depth=0:site=owner=729:location=hir:729:9:callee=def-id:0:729:arg=-:depth=0:family=return-not-adapted",
+     "owner": 729,
+     "slot_depth": 0,
+     "subject": {
+      "generated": null,
+      "key": "local:729:1:depth=0",
+      "local": [
+       729,
+       1,
+       0
+      ]
+     }
+    },
+    "native_lifetime": {
+     "lifetime": "static",
+     "owner": 729,
+     "plan_digest": "360f5d86b9d6cbb0e83af13175f2c062f9369381567bfb74ab127ad56ac1a209"
+    },
+    "origins": [
+     {
+      "generated": null,
+      "key": "local:729:1:depth=0",
+      "local": [
+       729,
+       1,
+       0
+      ]
+     }
+    ],
+    "retention": null,
+    "terminal_interface": "ref-mut"
+   },
+   "source_form": "raw",
+   "stage": "terminal",
+   "state": "applied",
+   "target_form": "ref-mut",
+   "tier": "T2",
+   "waiver": "c-aliasing-semantics-at-unsafe-bridges/v1@2026-09-01"
+  }
+ ]
+}
