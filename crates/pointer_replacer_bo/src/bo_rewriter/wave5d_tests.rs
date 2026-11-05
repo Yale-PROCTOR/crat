@@ -5,7 +5,15 @@ use std::sync::OnceLock;
 
 use super::{OverlapMode, SlotKind, SlotRef, WholeProgramAttestation, decision::Decision};
 
-#[allow(dead_code, unused_assignments, unused_mut)]
+// Keep the translated source shape used by the transformation tests.
+#[allow(
+    dead_code,
+    unused_assignments,
+    unused_mut,
+    unused_variables,
+    unsafe_op_in_unsafe_fn,
+    clippy::needless_return
+)]
 #[path = "wave5d_ti_abs.rs"]
 mod original;
 

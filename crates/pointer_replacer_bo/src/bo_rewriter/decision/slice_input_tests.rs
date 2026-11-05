@@ -638,7 +638,7 @@ fn w6l_r068_an_index_naming_the_companion_unmasked_refuses() {
                 &format!("*in_0.offset({wide} as isize)"),
                 &format!("*in_0.offset({other} as isize)"),
             );
-        let got = extent_of(&input_extents(&input), "pixel_rgba8::in_0").clone();
+        let got = *extent_of(&input_extents(&input), "pixel_rgba8::in_0");
         if got != want {
             mismatches.push(format!("{label}: {got:?} (want {want:?})"));
         }
@@ -683,7 +683,7 @@ fn w6l_r068_a_forwarding_that_drops_the_companion_refuses() {
             Ok(Extent::Companion(Following)),
         ),
     ] {
-        let got = extent_of(&input_extents(&input), "pixel_rgba8::in_0").clone();
+        let got = *extent_of(&input_extents(&input), "pixel_rgba8::in_0");
         if got != want {
             mismatches.push(format!("{label}: {got:?} (want {want:?})"));
         }
@@ -767,7 +767,7 @@ fn w6l_r068_the_masked_forms_keep_the_companion() {
             Ok(Extent::CompanionMask(Following)),
         ),
     ] {
-        let got = extent_of(&input_extents(&input), "ht_set::entries").clone();
+        let got = *extent_of(&input_extents(&input), "ht_set::entries");
         if got != want {
             mismatches.push(format!("{label}: {got:?} (want {want:?})"));
         }
@@ -941,7 +941,7 @@ fn w6l_r068_review_the_companion_bounds_nothing_it_does_not_reach() {
         // control
         ("plain::p", Ok(Extent::Companion(Following))),
     ] {
-        let got = extent_of(&extents, label).clone();
+        let got = *extent_of(&extents, label);
         if got != want {
             mismatches.push(format!("{label}: {got:?} (want {want:?})"));
         }
@@ -971,7 +971,7 @@ fn w6l_r068_review_f1_an_end_pointer_read_through_a_cast_refuses() {
         ("through the let", through_let),
         ("cast in place", in_place),
     ] {
-        let got = extent_of(&input_extents(&input), "BitsEntropy::population").clone();
+        let got = *extent_of(&input_extents(&input), "BitsEntropy::population");
         if got != Err(Hold::CompanionNotIndexBound) {
             mismatches.push(format!("{label}: {got:?}"));
         }

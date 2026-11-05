@@ -9,7 +9,7 @@ use std::{
 thread_local! {
     static CALL_GRAPH_BUILDS: Cell<usize> = const { Cell::new(0) };
     static READER_PLAN_BUILDS: Cell<usize> = const { Cell::new(0) };
-    static VALIDATE_RETURNS: RefCell<BTreeMap<(u32, String), usize>> = RefCell::new(BTreeMap::new());
+    static VALIDATE_RETURNS: RefCell<BTreeMap<(u32, String), usize>> = const { RefCell::new(BTreeMap::new()) };
     static REFERENCE_SCANS: Cell<bool> = const { Cell::new(false) };
     static WASTED_CONSUMES: Cell<usize> = const { Cell::new(0) };
     static WASTED_EDGES: Cell<usize> = const { Cell::new(0) };

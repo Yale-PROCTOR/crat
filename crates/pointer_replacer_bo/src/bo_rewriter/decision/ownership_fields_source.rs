@@ -2260,7 +2260,8 @@ pub unsafe extern "C" fn deleteNode(mut root: *mut node, mut key: libc::c_int) -
                     "{owner}::{name} must own no allocation"
                 );
             }
-            for name in ["temp"] {
+            {
+                let name = "temp";
                 let (subject, _) = table
                     .entries
                     .iter()

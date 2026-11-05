@@ -707,7 +707,7 @@ mod tests {
                 // emptiness (not merely "no y") pins the union as the *sole* cause.
                 let bb0 = borrow_conflicts(&program, is_ref, is_mutable);
                 assert!(
-                    bb0.get(&f).map_or(true, |edges| edges.is_empty()),
+                    bb0.get(&f).is_none_or(|edges| edges.is_empty()),
                     "BB0 (no union) must find NO conflict for `f`; got {bb0:?}"
                 );
 

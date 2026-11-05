@@ -10,7 +10,15 @@ use super::{
     decision::{Decision, nested_slice::Hold},
 };
 
-#[allow(dead_code, unused_assignments, unused_mut)]
+// Keep the translated source shape used by the transformation tests.
+#[allow(
+    dead_code,
+    unused_assignments,
+    unused_mut,
+    unsafe_op_in_unsafe_fn,
+    clippy::needless_return,
+    clippy::assign_op_pattern
+)]
 #[path = "nested_one_sided_fixture.rs"]
 mod original;
 

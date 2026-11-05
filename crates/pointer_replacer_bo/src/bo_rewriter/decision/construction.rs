@@ -2811,11 +2811,6 @@ fn product<'tcx>(
         }
         _ => None,
     }
-    .map(|(left, right)| {
-        // The COUNT is the factor that is not the element size; the caller
-        // checks the other one, so hand them back in that order.
-        (left, right)
-    })
 }
 
 #[cfg(test)]

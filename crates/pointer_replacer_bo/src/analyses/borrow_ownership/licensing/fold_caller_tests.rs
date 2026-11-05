@@ -857,7 +857,7 @@ fn payload_atoms(
         })
         .map(|row| {
             (
-                row.licensing_role.clone(),
+                row.licensing_role,
                 matches!(row.actual_occurrence, Present(_)),
                 row.matched
                     .iter()

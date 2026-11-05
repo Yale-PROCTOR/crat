@@ -126,12 +126,3 @@ pub fn inspect<'tcx>(
 ) -> Admission {
     compiler::inspect(tcx, owner, body, candidate, model_kinds)
 }
-
-#[cfg(test)]
-pub fn counts(rows: &[Admission]) -> BTreeMap<(Shape, Status), usize> {
-    let mut counts = BTreeMap::new();
-    for row in rows {
-        *counts.entry((row.shape, row.status)).or_default() += 1;
-    }
-    counts
-}

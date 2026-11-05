@@ -5,7 +5,7 @@
 //! stage on, not first at the Option stage's call receipts.
 use rustc_span::def_id::LocalDefId;
 
-use super::{bridge_receipt::SignatureClassId, emit_tests::ast_emitted_source_of, verify};
+use super::{bridge_receipt::SignatureClassId, verify};
 
 /// wave-5d's `accessors-null-tested-fixture.rs` (relay 020): `GetValue` is
 /// held by the retention hold on `p`; `get_value` passes its optional `value`

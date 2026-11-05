@@ -1159,7 +1159,7 @@ pub unsafe fn f() -> i32 {
             true,
         );
         assert!(
-            complete.get(&f).map_or(true, |e| e.is_empty()),
+            complete.get(&f).is_none_or(|e| e.is_empty()),
             "[{fn_name}] accepted model must have no hidden aliasing under the complete replay; \
              got {complete:?}"
         );
@@ -3131,9 +3131,7 @@ unsafe fn f(mut p: *mut i32) -> i32 {
     /// a release-active convergence failure in the replay engine.
     #[test]
     fn escw1_escape_shape_demotes_x_raw() {
-        use crate::analyses::borrow_ownership::{
-            retirement::local_outcome::Reason, source_events::SourceRole,
-        };
+        use crate::analyses::borrow_ownership::source_events::SourceRole;
         const CODE: &str = r#"
 unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
 unsafe fn caller() -> i32 {
@@ -3392,9 +3390,7 @@ unsafe fn caller() -> i32 {
     /// only the subsequent candidate construction may do so.
     #[test]
     fn a5_baseline_reference_does_not_consume_esc_selection() {
-        use crate::analyses::borrow_ownership::{
-            retirement::local_outcome::Reason, source_events::SourceRole,
-        };
+        use crate::analyses::borrow_ownership::source_events::SourceRole;
         const CODE: &str = r#"
 unsafe fn save(out: *mut *mut i32, x: *mut i32) { *out = x; *x = 1; }
 unsafe fn caller() -> i32 {
@@ -3518,7 +3514,7 @@ unsafe fn caller() -> i32 {
         let (_s, sel) = emit_crate_ownership_constraints(
             &crate_ctxt,
             &slots,
-            &compute_origins(&program),
+            &compute_origins(program),
             &solver,
         )
         .expect("emission");
@@ -3947,7 +3943,7 @@ unsafe fn caller() -> i32 {
                 let field0 = [PlaceElem::Field(FieldIdx::from_usize(0), i32_ty)]; // Pair.a : i32
 
                 // MISMATCH: edge `(*p):i32`, access derefs to `Pair` with a Pair-field rest ⇒ fallback.
-                match route_compose(tcx, &*body, bp, &field0, pair_ty) {
+                match route_compose(tcx, &body, bp, &field0, pair_ty) {
                     RoutedCompose::WholeCell(pl) => {
                         assert_eq!(pl, bp, "fallback must be the whole borrowed cell `(*p)`")
                     }
@@ -3959,7 +3955,7 @@ unsafe fn caller() -> i32 {
                     }
                 }
                 // WELL-TYPED control: edge `(*q):Pair`, `deref_ty=Pair`, Pair-field rest ⇒ compose.
-                match route_compose(tcx, &*body, bq, &field0, pair_ty) {
+                match route_compose(tcx, &body, bq, &field0, pair_ty) {
                     RoutedCompose::Composed(pl) => {
                         assert_eq!(
                             pl,
@@ -5018,8 +5014,7 @@ pub unsafe fn stash(owner: *mut Holder) {
     fn outparam_escape_aliasing_outer_ptr_never_owning() {
         use crate::analyses::borrow_ownership::{
             borrow_engine::borrow_conflicts_with_flows, borrow_verify::verify_to_fixpoint_counting,
-            origin_flow::analyze_program_origin_flow, retirement::local_outcome::Reason,
-            source_events::SourceRole,
+            origin_flow::analyze_program_origin_flow, source_events::SourceRole,
         };
         run_compiler(
             r#"
@@ -5230,7 +5225,7 @@ pub unsafe fn f() {
                 // conflict at all for `f`. Emptiness pins the union as the sole cause.
                 let bb0 = revalidate(&program, &slots, is_ref, true);
                 assert!(
-                    bb0.get(&f).map_or(true, |edges| edges.is_empty()),
+                    bb0.get(&f).is_none_or(|edges| edges.is_empty()),
                     "round-0 revalidate must find NO conflict for f; got {bb0:?}"
                 );
 
@@ -5341,7 +5336,7 @@ pub unsafe fn f() {
                     true,
                 );
                 assert!(
-                    clean.get(&f).map_or(true, |e| e.is_empty()),
+                    clean.get(&f).is_none_or(|e| e.is_empty()),
                     "fixpoint model must be conflict-free under replay; got {clean:?}"
                 );
             },
@@ -5407,7 +5402,7 @@ pub unsafe fn g() {
                     true,
                 );
                 assert!(
-                    clean.get(&f).map_or(true, |e| e.is_empty()),
+                    clean.get(&f).is_none_or(|e| e.is_empty()),
                     "fixpoint must be conflict-free under replay; got {clean:?}"
                 );
             },
@@ -5460,7 +5455,7 @@ pub unsafe fn dcu() {
                     true,
                 );
                 assert!(
-                    clean.get(&f).map_or(true, |e| e.is_empty()),
+                    clean.get(&f).is_none_or(|e| e.is_empty()),
                     "dead-copy fixpoint must be conflict-free under replay; got {clean:?}"
                 );
             },

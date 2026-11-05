@@ -1,7 +1,7 @@
 //! Witnesses for the inner-loan representation.
 
 use super::{
-    inner_loan::{self, ValueEscapes},
+    inner_loan::{self},
     tests_call_reach::named_local,
     tests_return_origin::{named_function, with_program},
 };
@@ -109,7 +109,7 @@ fn c_w00_a_field_owned_inner_holder_gets_no_obligation() {
     with_program(HOLDERS, |program| {
         let slots = CrateSlots::build(program);
         assert!(
-            slots.field_slots.len() > 0,
+            !slots.field_slots.is_empty(),
             "the fixture must actually register a field slot"
         );
         assert!(
@@ -423,7 +423,7 @@ fn c_w04_a_dead_holder_drags_no_closure_member_raw() {
             .members(wanted, local, 1)
             .expect("the inner holder has an obligation");
         assert!(
-            members.len() >= 1,
+            !members.is_empty(),
             "the closure is what the old chain would have demoted"
         );
     });

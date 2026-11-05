@@ -1298,11 +1298,8 @@ fn compute_body_a2<'tcx>(
     }
 
     let mut refined = flow.unknown_targets.clone();
-    match exit {
-        Some(exit) => {
-            refined.intersect(&exit.may_originless);
-        }
-        None => {}
+    if let Some(exit) = exit {
+        refined.intersect(&exit.may_originless);
     }
     restored.sort_by_key(|slot| {
         (

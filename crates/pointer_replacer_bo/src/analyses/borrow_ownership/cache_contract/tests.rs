@@ -948,8 +948,7 @@ fn e5_i_cache_publish_is_atomic_idempotent_and_never_overwrites() {
     rehashed.hashes.as_mut().unwrap().entry = file_sha256(&rehashed.path).unwrap();
     let readback_root = directory.0.join("semantic-readback-refused");
     let publish_error = publish_streamed(&readback_root, &rehashed)
-        .err()
-        .expect("W06 publication must validate despite a matching body hash");
+        .expect_err("W06 publication must validate despite a matching body hash");
     assert!(
         publish_error.contains("incomplete portable family"),
         "{publish_error}"

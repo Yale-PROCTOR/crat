@@ -916,7 +916,8 @@ fn w6v2_descendant_discharge_needs_the_callee_body() {
     // retention spends the tier-2 retention waiver at `probe`'s site, whose exclusion is a
     // use while the reference is live; filter 2 reads no retention there, so the
     // retained-access check of record holds `probe::s` (a delivery lost).
-    for (name, escape) in [("derived-global-store", "KEPT = p.cast::<i8>() as *mut u8;")] {
+    {
+        let (name, escape) = ("derived-global-store", "KEPT = p.cast::<i8>() as *mut u8;");
         let input = KEEP.replace("//ESCAPE//", escape);
         let rows = by_function(&input);
         assert!(
@@ -2020,10 +2021,6 @@ fn w6v2_header_path_refuses_a_write_and_a_wide_cursor() {
         .replace("let mut p = 0 as *mut u8;", "let mut p = 0 as *mut u32;")
         .replace("p = pbuf as *mut u8;", "p = pbuf as *mut u32;")
         .replace("byte = *p;", "byte = *p as u8;")
-        .replace(
-            "if !psize.is_null() { *psize = *p as i32; }",
-            "if !psize.is_null() { *psize = *p as i32; }",
-        )
         .replace(
             "return p.offset_from(pbuf as *mut u8) as i32;",
             "return p.offset_from(pbuf as *mut u32) as i32;",

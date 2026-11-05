@@ -239,13 +239,10 @@ fn raw_binding(
     match input_lets.iter().find(|(other, ..)| other == name) {
         Some((_, declared, _)) => match binding_of(&declared.pat).and_then(|(_, ty)| ty) {
             Some(ty) => Some(is_raw_pointer(ty)),
-            None => match &declared.init {
-                Some(init) => Some(
-                    !matches!(peel(&init.expr), Expr::Reference(_))
-                        && reference_from_raw(&init.expr).is_none(),
-                ),
-                None => None,
-            },
+            None => declared.init.as_ref().map(|init| {
+                !matches!(peel(&init.expr), Expr::Reference(_))
+                    && reference_from_raw(&init.expr).is_none()
+            }),
         },
         None => raw_formal(function, name).then_some(true),
     }

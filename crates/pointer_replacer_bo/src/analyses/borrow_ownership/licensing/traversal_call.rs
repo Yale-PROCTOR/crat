@@ -553,7 +553,7 @@ pub(crate) fn validate_valuation(
                 .reference_peel
                 .as_ref()
                 .map(|p| &p.original_formal)
-                .or_else(|| match &argument.formal {
+                .or(match &argument.formal {
                     Present(w) => Some(w),
                     _ => None,
                 })

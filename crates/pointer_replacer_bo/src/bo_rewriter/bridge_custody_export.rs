@@ -295,8 +295,8 @@ fn source_location(tcx: TyCtxt<'_>, span: Span) -> Result<(String, ByteSpan), St
     Ok((
         file_label(&file),
         ByteSpan {
-            lo: low.pos.0 as u32,
-            hi: high.pos.0 as u32,
+            lo: low.pos.0,
+            hi: high.pos.0,
         },
     ))
 }

@@ -7331,7 +7331,8 @@ mod wave3_class_tests {
         // Relay 045: the Option glue's unwrap carries the same geometry on two
         // of the three rows that survived batch 10 (brotli 2714x2764 is
         // 26834330..26834418 over 26834335..26834418).
-        for (arm, kind) in [(Arm::Glue, "nullable-required-unwrap")] {
+        {
+            let (arm, kind) = (Arm::Glue, "nullable-required-unwrap");
             with_classes(1, |ids| {
                 let class = ClassInput::new(ids[0], arms(&[arm, Arm::Surface]))
                     .with_site(ClassSite::edit(

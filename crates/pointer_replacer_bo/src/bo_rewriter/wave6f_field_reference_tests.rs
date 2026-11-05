@@ -1011,7 +1011,7 @@ fn w6f_contract_deallocator_transfers_and_a_value_instance_holds() {
     assert!(flat.contains(transfer), "{source}");
     if flat.contains("fn HolderFree(mut m: &mut Mem, mut h: &mut Holder)") {
         assert!(
-            flat.contains(&format!("let __crat_a5_raw")) && flat.contains(&format!("{transfer};")),
+            flat.contains("let __crat_a5_raw") && flat.contains(&format!("{transfer};")),
             "a delivered container hoists the transfer into the A5 view's binding\n{source}"
         );
     } else {
@@ -1787,7 +1787,7 @@ fn w6f_an_inline_array_field_taken_as_a_pointer_delivers_a_slice() {
         "let mut v = ((*self_0).last_entropy_).as_ptr();",
     )];
 
-    let mut check = |group: &[(&str, &str, &str)], name: &str| {
+    let check = |group: &[(&str, &str, &str)], name: &str| {
         let delivered: Vec<&str> = group
             .iter()
             .filter(|(label, _, _)| decision_of(&observed, label).starts_with("Slice"))

@@ -174,7 +174,8 @@ fn e5_r245_inner_holder_and_copy_chain_demote_raw_without_decline() {
                         SlotKind::Ref,
                         "witness requires real safe inner holder"
                     );
-                    let result = if l2 {
+
+                    if l2 {
                         verify_bo_construction_l2_for_test(
                             program, &slots, &origins, &solver, &c, &facts, backend,
                         )
@@ -182,8 +183,7 @@ fn e5_r245_inner_holder_and_copy_chain_demote_raw_without_decline() {
                         verify_bo_construction_counting_for_test(
                             program, &slots, &origins, &solver, &c, &facts, backend,
                         )
-                    };
-                    result
+                    }
                 });
                 let model = model.expect("missing represented inner loan must demote locally");
                 assert_eq!(model[&target], SlotKind::Raw);

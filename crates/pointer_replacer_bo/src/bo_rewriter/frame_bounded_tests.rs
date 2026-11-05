@@ -11,7 +11,6 @@
 //! `BZ2_bzBuffToBuffCompress` has the same (1) and (2) but fails (3), because
 //! `BZ2_bzCompressInit` retains `&strm` — measured, and the control below is
 //! that case.
-use super::decision::raw_boundary::RetentionVerdict;
 
 const READER: &str = r#"
 #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]

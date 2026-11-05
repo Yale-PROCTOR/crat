@@ -90,7 +90,7 @@ fn named_local(
     body.var_debug_info
         .iter()
         .find_map(|info| {
-            (info.name.as_str() == name).then(|| match info.value {
+            (info.name.as_str() == name).then_some(match info.value {
                 rustc_middle::mir::VarDebugInfoContents::Place(place) => Some(place.local),
                 _ => None,
             })?
@@ -695,7 +695,7 @@ fn declining_run_records_no_certificate() {
             let victim = slots
                 .fn_local_slots
                 .iter()
-                .find(|(_, universe)| universe.len() > 0)
+                .find(|(_, universe)| !universe.is_empty())
                 .map(|(did, _)| SlotRef::Local(*did, super::super::slots::SlotId::from_usize(0)))
                 .expect("fixture has at least one local slot");
             solver.assume(victim, super::SlotKindAlias::Ref);

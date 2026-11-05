@@ -88,8 +88,12 @@ fn w06_w08_optional_indices_copy_without_a_base_capability() {
     let original = Some(position(3));
     let mut copy = original;
     copy.as_mut().unwrap().index = 5;
-    assert_eq!(original.unwrap().index, 3);
-    assert_eq!(copy.unwrap().difference(&original.unwrap()), Ok(2));
+    assert_eq!(original, Some(position(3)));
+    assert_eq!(
+        copy.zip(original)
+            .map(|(copy, original)| copy.difference(&original)),
+        Some(Ok(2))
+    );
     let absent: Option<Position<u32>> = None;
     assert!(absent.is_none(), "null is absence, not position zero");
 }

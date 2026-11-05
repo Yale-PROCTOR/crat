@@ -125,17 +125,10 @@ pub unsafe fn entry() -> u32 {
 /// The control: a one-element reader keeps `from_ref`.
 #[test]
 fn w5c_reader_chain_one_element_reader_keeps_from_ref() {
-    let input = fixture(
-        &ADLER
-            .replace(
-                "    while i < len {\n        s1 = (s1 + *data.offset(i as isize) as u32) % 65521;",
-                "    while i < len {\n        s1 = (s1 + *data as u32) % 65521;",
-            )
-            .replace(
-                "update_adler32(1, data, len)",
-                "update_adler32(1, data, len)",
-            ),
-    );
+    let input = fixture(&ADLER.replace(
+        "    while i < len {\n        s1 = (s1 + *data.offset(i as isize) as u32) % 65521;",
+        "    while i < len {\n        s1 = (s1 + *data as u32) % 65521;",
+    ));
     let table = super::slice_input_tests::decisions(&input);
     assert!(
         matches!(

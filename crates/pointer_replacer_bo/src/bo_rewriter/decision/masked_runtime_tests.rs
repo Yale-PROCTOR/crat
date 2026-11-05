@@ -71,7 +71,8 @@ pub unsafe fn Compress(r: *mut Ring, n: usize) -> usize {
 #[test]
 fn w6l_mask_m1_a_read_past_a_masked_index_by_a_runtime_length_is_held() {
     let rows = crate::bo_rewriter::emit_tests::decisions_of(&ring_field_root());
-    for name in ["data"] {
+    {
+        let name = "data";
         let held: Vec<_> = rows
             .iter()
             .filter(|(n, p, _)| n == name && *p)

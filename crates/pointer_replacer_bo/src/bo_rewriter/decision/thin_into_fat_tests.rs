@@ -287,28 +287,24 @@ fn r808_6_the_restore_hold_releases_a_subject_whose_formal_is_not_fat() {
                 .unwrap_or_else(|| panic!("{label}"))
         };
         let (mid, reads) = (at("mid::x"), at("reads::p"));
-        let held =
-            |entries: &[(super::Subject, super::Decision)], subject: usize, formal: usize| {
-                super::degrade(
-                    &entries[subject].0,
-                    "test".into(),
-                    super::DegradeReason::LocalCalleeAccessExtent {
-                        access: Box::new(LocalCalleeAccess {
-                            callee_id: entries[formal].0.fn_did,
-                            parameter_index: 0,
-                            callee: "reads".into(),
-                            parameter: "p".into(),
-                            access: "read",
-                            reason: AccessReason::PointerArithmetic {
-                                op: super::RESTORE_HOLD_OP.into(),
-                            },
-                            footprint_bytes: None,
-                        }),
-                        count: None,
+        entries[mid].1 = super::degrade(
+            &entries[mid].0,
+            "test".into(),
+            super::DegradeReason::LocalCalleeAccessExtent {
+                access: Box::new(LocalCalleeAccess {
+                    callee_id: entries[reads].0.fn_did,
+                    parameter_index: 0,
+                    callee: "reads".into(),
+                    parameter: "p".into(),
+                    access: "read",
+                    reason: AccessReason::PointerArithmetic {
+                        op: super::RESTORE_HOLD_OP.into(),
                     },
-                )
-            };
-        entries[mid].1 = held(&entries, mid, reads);
+                    footprint_bytes: None,
+                }),
+                count: None,
+            },
+        );
         let key = (entries[mid].0.fn_did, entries[mid].0.hir_id);
         assert!(
             is_slice(&entries[reads].1),

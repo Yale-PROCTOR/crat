@@ -294,6 +294,27 @@ pub(super) fn owns_initializer(
         })
 }
 
+/// **The counted READ alias needs no declaration (relay 035; wave-6v 028 route
+/// (a)).** `let mut csrc = src as *const libc::c_uchar;` over a `*const c_void`
+/// parameter whose counted contract is active is not a copy this family has to
+/// type: the contract already rewrote the initializer and every use, so the
+/// emitted local IS the byte view (`let mut csrc = src.unwrap_or(&[]); … csrc =
+/// &csrc[1..];`). Its type comes from that initializer, so the receiver-form
+/// refusal must not degrade it for lacking a declaration it does not need.
+///
+/// Declaration-FREE, not veto-exempt: this only removes the refusal's claim on
+/// the subject; every arm below it still decides the form. wave-6v 028 measured
+/// what the exempting form costs — six of their witnesses turn red when the
+/// subject short-circuits those arms.
+pub(super) fn counted_alias_needs_no_declaration(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
+    // The relation is the CONTRACT's to state, not the initializer's to imply:
+    // report 035 measured three keys derived from this side and all three miss,
+    // because the contract that rewrites the local is not the one keyed on the
+    // parameter it casts. `counted_void_read::prove` records which local it
+    // rewrote (wave-6v's `Contract::alias`), and `alias_contract` resolves it.
+    super::counted_void::alias_contract(ctx, subject).is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,25 +462,4 @@ mod tests {
             assert!(!has_declaration(&table, &destination));
         });
     }
-}
-
-/// **The counted READ alias needs no declaration (relay 035; wave-6v 028 route
-/// (a)).** `let mut csrc = src as *const libc::c_uchar;` over a `*const c_void`
-/// parameter whose counted contract is active is not a copy this family has to
-/// type: the contract already rewrote the initializer and every use, so the
-/// emitted local IS the byte view (`let mut csrc = src.unwrap_or(&[]); … csrc =
-/// &csrc[1..];`). Its type comes from that initializer, so the receiver-form
-/// refusal must not degrade it for lacking a declaration it does not need.
-///
-/// Declaration-FREE, not veto-exempt: this only removes the refusal's claim on
-/// the subject; every arm below it still decides the form. wave-6v 028 measured
-/// what the exempting form costs — six of their witnesses turn red when the
-/// subject short-circuits those arms.
-pub(super) fn counted_alias_needs_no_declaration(ctx: &Ctx<'_, '_>, subject: &Subject) -> bool {
-    // The relation is the CONTRACT's to state, not the initializer's to imply:
-    // report 035 measured three keys derived from this side and all three miss,
-    // because the contract that rewrites the local is not the one keyed on the
-    // parameter it casts. `counted_void_read::prove` records which local it
-    // rewrote (wave-6v's `Contract::alias`), and `alias_contract` resolves it.
-    super::counted_void::alias_contract(ctx, subject).is_some()
 }

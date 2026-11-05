@@ -1647,7 +1647,8 @@ fn w6v_field_load_exemption_is_receipted_per_site() {
                     && key == "alias-exempt:field-load(tree_t.root->node_t)"),
             "the site's receipt: {keys:?}"
         );
-    });
+    })
+    .expect("input fixture must compile");
 }
 
 /// wave-5d 150 (the round-3 review's M4): quadtree's own recursion,

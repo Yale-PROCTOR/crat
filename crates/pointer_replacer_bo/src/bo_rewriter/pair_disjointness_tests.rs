@@ -807,13 +807,6 @@ fn w6p_two_sources_keep_the_root_unknown() {
         let index = bo_rewriter::decision::pair_disjointness::PairDisjointnessIndex::derive(
             &program, &mut_facts, None,
         );
-        let function = |name: &str| {
-            *program
-                .functions
-                .iter()
-                .find(|did| tcx.item_name(did.to_def_id()).as_str() == name)
-                .unwrap_or_else(|| panic!("no fn {name}"))
-        };
         // The control is about the ROOT, so it reads the root directly: a
         // later certificate (R466-5's temporal one rescues this very call)
         // must not be able to make the assertion vacuous.

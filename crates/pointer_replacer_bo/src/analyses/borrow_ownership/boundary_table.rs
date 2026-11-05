@@ -369,7 +369,6 @@ mod tests {
                 e.matcher
             );
         }
-        assert!(!TABLE.is_empty(), "the table must not be a stub");
     }
 
     /// Legacy list 1 — `sources.rs::ALLOCATOR_NAMES` (the const before this table, formerly

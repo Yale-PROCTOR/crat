@@ -41,7 +41,6 @@ struct ShapeOutcome {
     unavailable: Vec<String>,
     source_form: Form,
     withdrawals: Vec<String>,
-    tiers: Vec<String>,
 }
 
 /// Runs one arm through the ordinary pipeline and reports what the outbound
@@ -92,13 +91,6 @@ fn shape_outcome(input: &str, label: &str) -> ShapeOutcome {
         .expect("one emitted round");
         assert!(rollbacks.is_empty(), "{label}: the arm owns its rendering");
         ShapeOutcome {
-            tiers: table
-                .seams
-                .outbound_expressions
-                .plans
-                .values()
-                .map(|plan| format!("{:?}/{:?}", plan.tier, plan.retention))
-                .collect(),
             withdrawals: format!("{:#?}", ctx.raw_boundary_artifacts.additive_family_receipts)
                 .lines()
                 .map(str::trim)

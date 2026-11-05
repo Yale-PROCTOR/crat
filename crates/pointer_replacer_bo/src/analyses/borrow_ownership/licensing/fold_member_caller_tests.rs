@@ -44,7 +44,7 @@ fn oc06_member_caller_certificate_binds_membership_forwarding_zero_and_laws() {
         );
         assert!(proof.requirements.kind_keys.contains(&member.field));
         for (key, value) in &member.requirements.guards {
-            assert_eq!(proof.requirements.guards.contains(&(*key, *value)), true);
+            assert!(proof.requirements.guards.contains(&(*key, *value)));
         }
     });
 }

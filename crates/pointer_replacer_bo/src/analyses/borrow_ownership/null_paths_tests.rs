@@ -1150,7 +1150,8 @@ fn funnel_rows(code: &str) -> Vec<String> {
                 row.shape,
             ));
         }
-    });
+    })
+    .expect("input fixture must compile");
     rows
 }
 
@@ -1335,7 +1336,8 @@ fn e5c_a4_wall_probe_named_source() {
             &holds,
             std::time::Duration::from_secs(600),
         );
-    });
+    })
+    .expect("input fixture must compile");
     let out = std::env::var("CRAT_E5C_A4_ROWS").expect("CRAT_E5C_A4_ROWS");
     let mut names = names;
     names.sort_by_key(|(debug, _)| std::cmp::Reverse(debug.len()));
@@ -4105,7 +4107,8 @@ fn e5c_inner_w84_coverage_of_file() {
         for body in held {
             eprintln!("E5C_W84 held {body}");
         }
-    });
+    })
+    .expect("input fixture must compile");
 }
 
 /// A tree insert one level down, as a newer translator writes it -- `NULL` becomes
