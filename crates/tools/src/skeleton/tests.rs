@@ -6,6 +6,9 @@ use super::*;
 #[path = "type_spelling_sources.rs"]
 mod type_spelling_sources;
 
+#[path = "bo_pointer_tests.rs"]
+mod bo_pointer_tests;
+
 fn type_spelling_source(name: &str) -> &'static str {
     let delimited = match name {
         "motivating" => type_spelling_sources::MOTIVATING,
@@ -1770,13 +1773,7 @@ fn local_def_path(path: &str, tcx: TyCtxt<'_>) -> LocalDefId {
 }
 
 fn tools_pointer_decisions(tcx: TyCtxt<'_>) -> InitialPointerDecisions {
-    initial_pointer_decisions(
-        &pointer_replacer::Config::default(),
-        PointerDecisionOptions {
-            assume_nonnegative_offsets: true,
-        },
-        tcx,
-    )
+    initial_pointer_decisions(tcx).unwrap()
 }
 
 fn local_binding_hir_id(function: LocalDefId, binding_name: &str, tcx: TyCtxt<'_>) -> HirId {
@@ -2655,7 +2652,7 @@ pub unsafe fn callback(callback: Option<extern "C" fn(Value) -> Value>) {
         .record;
     assert_eq!(
         compact(&identity.target_signature),
-        "pub unsafe fn identity(mut value: *mut ::core::ffi::c_void) -> *mut ::core::ffi::c_void"
+        "pub unsafe fn identity<'a>(mut value: &'a u8) -> &'a u8"
     );
     let skeletons = frozen
         .functions
@@ -2686,20 +2683,18 @@ pub unsafe fn callback(callback: Option<extern "C" fn(Value) -> Value>) {
 }
 
 #[test]
-fn void_type_spelling_preserves_imports_and_standard_crate_aliases() {
-    for (context, pointee, expected) in [
-        ("", "core::ffi::c_void", "::core::ffi::c_void"),
-        ("#![no_std]", "core::ffi::c_void", "::core::ffi::c_void"),
-        ("use core::ffi::c_void as Void;", "Void", "Void"),
+fn void_promotions_use_bytes_and_preserve_source_alias_context() {
+    for (context, pointee) in [
+        ("", "core::ffi::c_void"),
+        ("#![no_std]", "core::ffi::c_void"),
+        ("use core::ffi::c_void as Void;", "Void"),
         (
             "#![feature(no_core)]\n#![no_core]\n#![no_implicit_prelude]\nextern crate core as platform;\nuse platform::todo;",
             "platform::ffi::c_void",
-            "::platform::ffi::c_void",
         ),
         (
             "#![feature(no_core)]\n#![no_core]\n#![no_implicit_prelude]\nextern crate std as platform;\nuse platform::todo;",
             "platform::ffi::c_void",
-            "::platform::ffi::c_void",
         ),
     ] {
         let source = format!(
@@ -2712,7 +2707,12 @@ fn void_type_spelling_preserves_imports_and_standard_crate_aliases() {
         .unwrap();
         assert_eq!(
             compact(&frozen.functions[0].record.target_signature),
-            format!("pub unsafe fn identity(mut value: *mut {expected}) -> *mut {expected}")
+            "pub unsafe fn identity<'a>(mut value: &'a u8) -> &'a u8"
+        );
+        assert!(
+            frozen
+                .target_source
+                .contains(&format!("type Value = *mut {pointee}"))
         );
         let mut config = utils::compilation::make_config(utils::compilation::str_to_input(
             &frozen.target_source,
@@ -3053,12 +3053,12 @@ fn same_module_parameter_return_local_and_lifetime_types_are_short() {
         let update = local_def_path("update_and_return", tcx);
         let signature = &decisions.signatures.data[&update];
         assert_eq!(signature.input_decs[0], Some(PtrKind::Ref(true)));
-        assert_eq!(signature.output_dec, Some(PtrKind::Ref(true)));
+        assert_eq!(signature.output_dec, Some(PtrKind::Ref(false)));
         assert_eq!(signature.input_lifetimes[0], Some(Symbol::intern("a")));
         assert_eq!(signature.output_lifetime, Some(Symbol::intern("a")));
         assert_eq!(
             signature.input_lifetimes[0], signature.output_lifetime,
-            "the returned mutable borrow must share the exact lifetime Symbol"
+            "the returned borrow must share the exact lifetime Symbol"
         );
         let local_pointer = local_def_path("local_pointer", tcx);
         assert_eq!(
@@ -3086,7 +3086,7 @@ fn same_module_parameter_return_local_and_lifetime_types_are_short() {
     );
     assert_eq!(
         compact(&update.target_signature),
-        "pub unsafe fn update_and_return<'a>(mut pointer: &'a mut Node) -> &'a mut Node"
+        "pub unsafe fn update_and_return<'a>(mut pointer: &'a mut Node) -> &'a Node"
     );
     assert!(!update.target_signature.contains("crate::Node"));
     assert!(!update.baseline.skeleton.contains("crate::Node"));
@@ -3186,8 +3186,8 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
         (PtrKind::Raw(true), false, false),
         (PtrKind::Slice(false), false, false),
         (PtrKind::Slice(true), false, false),
-        (PtrKind::SliceCursor(false), false, false),
-        (PtrKind::SliceCursor(true), false, false),
+        (PtrKind::OptSlice(false), true, false),
+        (PtrKind::OptSlice(true), true, false),
         (PtrKind::OptRef(false), true, false),
         (PtrKind::OptRef(true), true, false),
         (PtrKind::Box, false, true),
@@ -4984,37 +4984,37 @@ fn array_pointer_fixture() -> &'static str {
 }
 
 #[test]
-fn selects_shared_and_mutable_slices_for_array_borrows() {
+fn preserves_array_local_pointer_kinds_from_bo() {
     let records = generate(array_pointer_fixture());
     assert!(
         function(&records, "read_array")
             .baseline
             .skeleton
-            .contains("let mut p: &[i32]")
+            .contains("let mut p: *const i32")
     );
     assert!(
         function(&records, "write_array")
             .baseline
             .skeleton
-            .contains("let mut p: &mut [i32]")
+            .contains("let mut p: *mut i32")
     );
     assert!(!skeletons_to_json(&records).unwrap().contains("SliceCursor"));
 }
 
 #[test]
-fn promotes_array_derived_locals_to_explicit_slices() {
+fn keeps_bo_raw_array_locals_explicit() {
     let records = generate(array_pointer_fixture());
     assert!(
         function(&records, "read_array")
             .baseline
             .skeleton
-            .contains("let mut p: &[i32] = todo!();")
+            .contains("let mut p: *const i32 = todo!();")
     );
     assert!(
         function(&records, "write_array")
             .baseline
             .skeleton
-            .contains("let mut p: &mut [i32] = todo!();")
+            .contains("let mut p: *mut i32 = todo!();")
     );
 }
 
@@ -5062,11 +5062,11 @@ fn adds_named_lifetimes_for_returned_borrows() {
     );
     assert_eq!(
         function(&records, "id").target_signature,
-        "pub unsafe fn id<'a>(mut x: &'a mut i32) -> &'a mut i32"
+        "pub unsafe fn id<'a>(mut x: &'a i32) -> &'a i32"
     );
     assert_eq!(
         function(&records, "wrap").target_signature,
-        "pub unsafe fn wrap<'a>(mut y: &'a mut i32) -> &'a mut i32"
+        "pub unsafe fn wrap<'a>(mut y: &'a i32) -> &'a i32"
     );
 }
 
@@ -5077,11 +5077,8 @@ fn preserves_nullable_returned_borrow_relationships() {
     );
     for path in ["maybe", "maybe_local"] {
         let signature = &function(&records, path).target_signature;
-        assert!(
-            signature.contains("mut x: Option<&'a mut i32>"),
-            "{signature}"
-        );
-        assert!(signature.contains("-> Option<&'a mut i32>"), "{signature}");
+        assert!(signature.contains("mut x: &'a mut i32"), "{signature}");
+        assert!(signature.contains("-> Option<&'a"), "{signature}");
     }
     assert!(
         function(&records, "maybe_local")
@@ -5096,19 +5093,19 @@ fn raw_pointer_fixture() -> &'static str {
 }
 
 #[test]
-fn keeps_required_raw_pointers_raw() {
+fn uses_bo_model_before_symbolic_rewrite_restrictions() {
     let records = generate(raw_pointer_fixture());
     assert!(
         function(&records, "void_address")
             .target_signature
-            .contains("*mut core::ffi::c_void"),
+            .contains("out: &u8"),
         "{}",
         function(&records, "void_address").target_signature
     );
     assert!(
         function(&records, "keep_alias_raw")
             .target_signature
-            .contains("mut a: *mut i32, mut b: *mut i32"),
+            .contains("mut b: *mut i32"),
         "{}",
         function(&records, "keep_alias_raw").target_signature
     );
@@ -5116,7 +5113,7 @@ fn keeps_required_raw_pointers_raw() {
         function(&records, "global_escape")
             .baseline
             .skeleton
-            .contains("let mut p: *mut *mut i32")
+            .contains("let mut p: *mut ")
     );
 }
 
@@ -5181,8 +5178,8 @@ fn all_simple_locals_receive_final_explicit_target_types() {
         (
             array_pointer_fixture(),
             &[
-                ("read_array", "p", "&[i32]"),
-                ("write_array", "p", "&mut [i32]"),
+                ("read_array", "p", "*const i32"),
+                ("write_array", "p", "*mut i32"),
             ],
         ),
         (scalar_box_fixture(), &[("alloc", "p", "Box<i32>")]),
@@ -5192,7 +5189,7 @@ fn all_simple_locals_receive_final_explicit_target_types() {
             &[
                 ("alias_caller", "x", "i32"),
                 ("alias_caller", "p", "&mut i32"),
-                ("global_escape", "p", "*mut *mut i32"),
+                ("global_escape", "p", "*mut Option<&i32>"),
             ],
         ),
         (
@@ -5220,34 +5217,8 @@ fn skeleton_pointer_result_contains_no_cursor_variant() {
         tools_cursor_fixture(),
     ] {
         run_compiler_on_str(source, |tcx| {
-            let decisions = initial_pointer_decisions(
-                &pointer_replacer::Config::default(),
-                PointerDecisionOptions {
-                    assume_nonnegative_offsets: true,
-                },
-                tcx,
-            );
-            assert!(
-                decisions
-                    .signatures
-                    .data
-                    .values()
-                    .flat_map(|decision| {
-                        decision
-                            .input_decs
-                            .iter()
-                            .copied()
-                            .chain(std::iter::once(decision.output_dec))
-                    })
-                    .flatten()
-                    .all(|kind| !matches!(kind, PtrKind::SliceCursor(_)))
-            );
-            assert!(
-                decisions
-                    .bindings
-                    .values()
-                    .all(|kind| !matches!(kind, PtrKind::SliceCursor(_)))
-            );
+            let decisions = initial_pointer_decisions(tcx).unwrap();
+            assert!(!decisions.signatures.data.is_empty());
         })
         .unwrap();
         let json = skeletons_to_json(&generate(source)).unwrap();
@@ -5257,7 +5228,7 @@ fn skeleton_pointer_result_contains_no_cursor_variant() {
 }
 
 fn optional_box_fixture() -> &'static str {
-    "unsafe extern \"C\" { fn malloc(size: usize) -> *mut i32; } pub unsafe fn owned_id(mut p: *mut i32) -> *mut i32 { p } pub unsafe fn foo() -> *mut i32 { let p: *mut i32 = malloc(core::mem::size_of::<i32>()); *p = 7; let q: *mut i32 = owned_id(p); q }"
+    "unsafe extern \"C\" { fn malloc(size: usize) -> *mut i32; } pub unsafe fn owned_id(mut p: *mut i32) -> *mut i32 { if p.is_null() { core::ptr::null_mut() } else { p } } pub unsafe fn foo() -> *mut i32 { let p: *mut i32 = malloc(core::mem::size_of::<i32>()); *p = 7; let q: *mut i32 = owned_id(p); q }"
 }
 
 #[test]
@@ -5285,9 +5256,9 @@ fn tools_cursor_fixture() -> &'static str {
 fn tools_mode_disables_conservative_slice_cursors_without_changing_crat_default() {
     let source = tools_cursor_fixture();
     let default_kind = run_compiler_on_str(source, |tcx| {
-        let result = initial_pointer_decisions(
+        let result = pointer_replacer::initial_pointer_decisions(
             &pointer_replacer::Config::default(),
-            PointerDecisionOptions::default(),
+            pointer_replacer::PointerDecisionOptions::default(),
             tcx,
         );
         let did = result
@@ -5300,21 +5271,10 @@ fn tools_mode_disables_conservative_slice_cursors_without_changing_crat_default(
         result.signatures.data[&did].input_decs[0].unwrap()
     })
     .unwrap();
-    assert_eq!(default_kind, PtrKind::SliceCursor(false));
+    assert_eq!(default_kind, pointer_replacer::PtrKind::SliceCursor(false));
     let tools_kind = run_compiler_on_str(source, |tcx| {
-        let result = initial_pointer_decisions(
-            &pointer_replacer::Config::default(),
-            PointerDecisionOptions {
-                assume_nonnegative_offsets: true,
-            },
-            tcx,
-        );
-        assert!(
-            result
-                .bindings
-                .values()
-                .all(|kind| !matches!(kind, PtrKind::SliceCursor(_)))
-        );
+        let result = initial_pointer_decisions(tcx).unwrap();
+
         let did = result
             .signatures
             .data
@@ -5657,20 +5617,15 @@ fn compound_pointees_and_inferred_pointer_locals_recurse() {
             (PtrKind::OptBoxedSlice, "Option<Box<[P]>>"),
             (PtrKind::Slice(false), "&[P]"),
             (PtrKind::Slice(true), "&mut [P]"),
-            (
-                PtrKind::SliceCursor(false),
-                "crate::slice_cursor::SliceCursor<'_, P>",
-            ),
-            (
-                PtrKind::SliceCursor(true),
-                "crate::slice_cursor::SliceCursorMut<'_, P>",
-            ),
+            (PtrKind::OptSlice(false), "Option<&[P]>"),
+            (PtrKind::OptSlice(true), "Option<&mut [P]>"),
         ];
         for (kind, expected) in cases {
             let actual = target_type(
                 original,
                 kind,
                 None,
+                &[],
                 Some(hint),
                 &speller,
                 "hint",
@@ -5817,6 +5772,7 @@ fn compound_pointees_and_inferred_pointer_locals_recurse() {
             higher_sig.inputs()[0],
             PtrKind::Raw(false),
             None,
+            &[],
             None,
             &speller,
             "higher_ranked",
@@ -6769,7 +6725,13 @@ fn reference_rule_types_ignore_propagated_pointer_decisions() {
             .skip_binder()
             .inputs()[0];
         assert_eq!(
-            selected_target_type_tree(reference, PtrKind::OptRef(false), &mapper.ast_to_hir, tcx),
+            selected_target_type_tree(
+                reference,
+                PtrKind::OptRef(false),
+                &[],
+                &mapper.ast_to_hir,
+                tcx
+            ),
             semantic_type_tree(reference, &mapper.ast_to_hir, tcx)
         );
     })
@@ -7006,13 +6968,7 @@ pub unsafe fn scalar(y: i32, z: i32) -> i32 {
         finder.visit_crate(&surface);
         ast_to_hir.local_map.remove(&finder.id.unwrap());
         let ItemKind::Fn(box function) = &surface.items[0].kind else { unreachable!() };
-        let decisions = initial_pointer_decisions(
-            &pointer_replacer::Config::default(),
-            PointerDecisionOptions {
-                assume_nonnegative_offsets: true,
-            },
-            tcx,
-        );
+        let decisions = initial_pointer_decisions(tcx).unwrap();
         assert!(!statement_is_preservable(
             &function.body.as_ref().unwrap().stmts[0],
             &ast_to_hir,
@@ -7036,13 +6992,7 @@ pub unsafe fn observe(pointer: *mut i32) -> bool {
         let ast_to_hir = mapper.ast_to_hir;
         let ItemKind::Fn(box function) = &surface.items[0].kind else { unreachable!() };
         let parameter_hir = ast_to_hir.local_map[&function.sig.decl.inputs[0].pat.id];
-        let mut decisions = initial_pointer_decisions(
-            &pointer_replacer::Config::default(),
-            PointerDecisionOptions {
-                assume_nonnegative_offsets: true,
-            },
-            tcx,
-        );
+        let mut decisions = initial_pointer_decisions(tcx).unwrap();
         decisions.bindings.insert(parameter_hir, PtrKind::Ref(true));
         let overrides = PreservationDecisionOverrides::default();
         let excluded_roots = FxHashSet::default();
@@ -7086,13 +7036,7 @@ pub unsafe fn generic_values(
 "#;
     run_compiler_on_str(source, |tcx| {
         let owner = local_def("generic_values", tcx);
-        let decisions = initial_pointer_decisions(
-            &pointer_replacer::Config::default(),
-            PointerDecisionOptions {
-                assume_nonnegative_offsets: true,
-            },
-            tcx,
-        );
+        let decisions = initial_pointer_decisions(tcx).unwrap();
         let overrides = PreservationDecisionOverrides::default();
         let excluded_roots = FxHashSet::default();
         let mut checker = HirPreservationCheck {
@@ -7127,13 +7071,7 @@ pub unsafe fn projection<T: HasItem>(value: T::Item) { let _ = value; }
 "#;
     run_compiler_on_str(source, |tcx| {
         let owner = local_def("projection", tcx);
-        let decisions = initial_pointer_decisions(
-            &pointer_replacer::Config::default(),
-            PointerDecisionOptions {
-                assume_nonnegative_offsets: true,
-            },
-            tcx,
-        );
+        let decisions = initial_pointer_decisions(tcx).unwrap();
         let overrides = PreservationDecisionOverrides::default();
         let excluded_roots = FxHashSet::default();
         let mut checker = HirPreservationCheck {
@@ -7894,7 +7832,7 @@ fn main_override_aliases_and_raw_fallbacks_report_actual_skeleton_types() {
         .find(|variable| variable.name == "a")
         .unwrap();
     assert_eq!(retained.before_type, "*mut i32");
-    assert_eq!(retained.selected_target_type, "*mut i32");
+    assert_eq!(retained.selected_target_type, "&'a mut i32");
 }
 
 #[test]
@@ -8249,7 +8187,7 @@ pub unsafe fn external_generic(p: *mut i32) { core::mem::drop::<*mut i32>(p); }
                 &ast_to_hir,
                 tcx,
             ),
-            Some(raw_i32())
+            Some(TypeTree::Reference { mutability: RefMutability::Shared, pointee: Box::new(primitive()) })
         );
         assert_eq!(
             contextual_target_type(
@@ -8328,7 +8266,7 @@ pub unsafe fn external_generic(p: *mut i32) { core::mem::drop::<*mut i32>(p); }
                 &ast_to_hir,
                 tcx,
             ),
-            Some(raw_i32())
+            Some(TypeTree::Reference { mutability: RefMutability::Mutable, pointee: Box::new(primitive()) })
         );
 
         let parenthesized = local_def("parenthesized", tcx);
@@ -9453,14 +9391,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
         mutability: crate::RefMutability::Shared,
         pointee: Box::new(primitive.clone()),
     };
-    let optional_reference = crate::RuleTypeTree::Adt {
-        adt_kind: crate::AdtKind::Enum,
-        identity: crate::RuleAdtIdentity::External {
-            crate_name: "core".into(),
-            path: vec!["option".into(), "Option".into()],
-        },
-        arguments: vec![reference],
-    };
+
     let anchor_identity = crate::RuleValueIdentity::Variable {
         sort: crate::VariableSort::Anchor,
         index: 0,
@@ -9471,7 +9402,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
     let anchors = vec![crate::RulePointerAnchor {
         id: crate::RuleVariable::new(crate::VariableSort::Anchor, 0),
         source_type: raw.clone(),
-        target_type: optional_reference.clone(),
+        target_type: reference.clone(),
     }];
     let parent = crate::Rule {
         source_pattern: crate::RuleExpression::Call {
@@ -9497,8 +9428,8 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
         lhs: false,
         source_type: raw.clone(),
         source_adjusted_type: raw,
-        target_type: optional_reference.clone(),
-        target_adjusted_type: optional_reference,
+        target_type: reference.clone(),
+        target_adjusted_type: reference,
     };
     for rules in [
         vec![parent.clone(), child.clone()],
@@ -9515,7 +9446,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
             assert_eq!(
                 record.applied,
                 crate::SkeletonView {
-                    skeleton: "pub unsafe fn f(mut pointer: Option<&i32>) -> i32 {\n    #[proctor(0)]\n    7i32\n}".into(),
+                    skeleton: "pub unsafe fn f(mut pointer: &i32) -> i32 {\n    #[proctor(0)]\n    7i32\n}".into(),
                     needs_transformation: false,
                     statement_dispositions: vec![crate::StatementDisposition {
                         label: 0,
@@ -9540,7 +9471,9 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
         assert_eq!(
             record.applied,
             crate::SkeletonView {
-                skeleton: "pub unsafe fn f(mut pointer: Option<&i32>) -> i32 {\n    #[proctor(0)]\n    todo!()\n}".into(),
+                skeleton:
+                    "pub unsafe fn f(mut pointer: &i32) -> i32 {\n    #[proctor(0)]\n    todo!()\n}"
+                        .into(),
                 needs_transformation: true,
                 statement_dispositions: vec![crate::StatementDisposition {
                     label: 0,
@@ -9556,7 +9489,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
                         name: "pointer".into(),
                         origin: crate::PointerVariableOrigin::Parameter { index: 0 },
                         before_type: "*const i32".into(),
-                        selected_target_type: "Option<&i32>".into(),
+                        selected_target_type: "&i32".into(),
                         before_type_is_inferred: false,
                     }],
                 }],

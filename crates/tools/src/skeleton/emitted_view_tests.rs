@@ -54,13 +54,7 @@ fn rule_for_region(
         .unwrap()
         .clone();
     annotate_function(&mut item, &FxHashSet::default());
-    let decisions = initial_pointer_decisions(
-        &pointer_replacer::Config::default(),
-        PointerDecisionOptions {
-            assume_nonnegative_offsets: true,
-        },
-        tcx,
-    );
+    let decisions = initial_pointer_decisions(tcx).unwrap();
     let catalog = rule_binding_catalog(&item, function, &decisions, &ast_to_hir, tcx);
     let ItemKind::Fn(box function_item) = &item.kind else { unreachable!() };
     let mut statements = FxHashMap::default();
