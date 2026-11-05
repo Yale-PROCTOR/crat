@@ -45,7 +45,7 @@ fn subject(value: &MechanicalSubjectKey) -> Subject {
                 key,
                 slot_depth,
             } => Some((owner.local_def_index.as_u32(), key.clone(), *slot_depth)),
-            MechanicalSubjectKey::Local { .. } | MechanicalSubjectKey::Field { .. } => None,
+            MechanicalSubjectKey::Local { .. } => None,
         },
         local: match value {
             MechanicalSubjectKey::Local {
@@ -53,7 +53,7 @@ fn subject(value: &MechanicalSubjectKey) -> Subject {
                 mir_local,
                 slot_depth,
             } => Some((owner.local_def_index.as_u32(), *mir_local, *slot_depth)),
-            MechanicalSubjectKey::Field { .. } | MechanicalSubjectKey::Generated { .. } => None,
+            MechanicalSubjectKey::Generated { .. } => None,
         },
     }
 }
@@ -93,15 +93,13 @@ fn key(value: &MechanicalObligationKey) -> Key {
             CanonicalLocation::Hir { owner, .. } => Some(owner.local_def_index.as_u32()),
             CanonicalLocation::Mir { .. }
             | CanonicalLocation::Declaration { .. }
-            | CanonicalLocation::Generated { .. }
-            | CanonicalLocation::StaticRoot { .. } => None,
+            | CanonicalLocation::Generated { .. } => None,
         },
         hir_item_local_id: match value.site.location {
             CanonicalLocation::Hir { item_local_id, .. } => Some(item_local_id),
             CanonicalLocation::Mir { .. }
             | CanonicalLocation::Declaration { .. }
-            | CanonicalLocation::Generated { .. }
-            | CanonicalLocation::StaticRoot { .. } => None,
+            | CanonicalLocation::Generated { .. } => None,
         },
         argument_index: value.site.argument_index,
         slot_depth: value.site.slot_depth,
@@ -436,7 +434,6 @@ fn negative(value: &NegativeWriteEvidence) -> String {
         NegativeWriteEvidence::FosterImmutable => "foster-immutable".into(),
         NegativeWriteEvidence::LibcReadOnly(contract) => format!("libc-read-only:{contract}"),
         NegativeWriteEvidence::Missing => "negative-write-absent".into(),
-        NegativeWriteEvidence::Writes => "callee-writes".into(),
     }
 }
 

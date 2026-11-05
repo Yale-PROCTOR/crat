@@ -9,13 +9,6 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct OwnerId(pub u32);
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct FieldClassId {
-    pub owner: OwnerId,
-    pub field: u32,
-}
-
 /// An exact occurrence index, assigned by the compiler-side site inventory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SiteId {

@@ -5795,89 +5795,15 @@ pub(crate) fn ast_emitted_source_from(
 /// itself.
 #[derive(Default)]
 pub(crate) struct TextDiff {
-    pub compared: usize,
-    pub equal: usize,
     /// Offsets where the AST layer rendered something the span layer did not
     /// write. Capped for the artifact; `differing` is the uncapped count.
     pub examples: Vec<String>,
-    pub differing: usize,
-    /// AST rewrites with no span-layer edit at that offset, and vice versa.
-    pub unmatched_ast: usize,
-    /// **Arm 1's pinned residue: 2,039.** Computed over arm 1's renders alone,
-    /// so it stays the number it was pinned as after arm 2 lands.
-    pub unmatched_span: usize,
 
-    /// Arm 2's own differential: `Slice`/`Opt` declarations plus their use
-    /// rewrites, against the same plan at the same offsets.
-    pub arm2_compared: usize,
-    pub arm2_equal: usize,
-    pub arm2_differing: usize,
-    pub arm2_unmatched_ast: usize,
-
-    /// **ARM 3's differential, against the `SeamAdapter` edits.**
-    ///
-    /// A separate offset map from `KindDecision`'s, because the two
-    /// justifications are separate populations: folding them would make arm 1's
-    /// pinned `unmatched_span` move for a reason that has nothing to do with
-    /// arm 1.
-    ///
-    /// **This is the milestone's first genuinely two-derivation comparison.**
-    /// At arms 1–2 both sides were built from the same decision-layer string;
-    /// here the AST side composes nodes structurally while the span side writes
-    /// a `format!`, so equality at 421 edits is evidence rather than a
-    /// tautology.
-    pub arm3_compared: usize,
-    pub arm3_equal: usize,
-    pub arm3_differing: usize,
-    pub arm3_unmatched_ast: usize,
-    /// `SeamAdapter` offsets arm 3 never reached — the seam conservation bound.
-    pub sa_unmatched_span: usize,
-    pub sa_edits: usize,
-    pub sa_offsets: usize,
     /// Arm 3's own share of the joint whitespace split, so the pre-stated line
     /// is readable without unpicking the joint accumulator.
     pub ws_real_seam: usize,
     pub differing_seam: usize,
 
-    /// **ARM 4's TASK 0.** Every plan edit by justification, counted in its own
-    /// pass — see [`JustificationCensus`].
-    pub justifications: JustificationCensus,
-    /// The plan's edit count derived without reading any justification — the
-    /// independent denominator the conservation gate uses.
-    pub plan_edits: usize,
-
-    /// **THE CONSERVATION BOUND.** `KindDecision` offsets that NEITHER arm
-    /// reached.
-    ///
-    /// `KindDecision` is constructed at exactly two sites in the shipping
-    /// pipeline — the use edit and the declaration edit — and arms 3 and 4 carry
-    /// `SeamAdapter` and (today) nothing. So this population is arms 1+2's in
-    /// full, and its residue is expected **0**, not merely smaller.
-    pub kd_unmatched_span: usize,
-    /// Instrument integrity, both uncapped: the `KindDecision` edit count and
-    /// the number of distinct offsets they occupy. **Equal unless two edits
-    /// collide on one offset**, which would make the offset-keyed join lossy —
-    /// silently, and in the direction that flatters the bound.
-    pub kd_edits: usize,
-    pub kd_offsets: usize,
-    /// **ARM 3 TASK 0** — how the placed seam spans relate to the use-edit
-    /// spans. NOT gated: this is the measurement that decides whether arm 3's
-    /// `refused` can be nonzero, and gating a number before knowing it is the
-    /// mistake this slice exists to avoid.
-    pub seam_use_surface: SeamUseSurface,
-    /// **Two use edits carrying one span**, one of which was overwritten when
-    /// the map was built. Corpus expectation 0, GATED — the collision counter
-    /// this join was missing while every other join in the file had one.
-    pub use_key_collisions: usize,
-    /// **Two table entries sharing one `(fn_did, hir_id)`** in the DECLARATION
-    /// join — the counter this file's other two joins had since arm 2 and this
-    /// one did not. Registered as a finding at the phase-4 boundary and repaired
-    /// here; corpus expectation 0, GATED.
-    pub decision_key_collisions: usize,
-    /// **A declaration render whose offset lies strictly inside a use edit's
-    /// range** — the containment case the two-pass split does not remove.
-    /// Corpus expectation 0, GATED. See `transform_inner`'s doc.
-    pub decl_render_inside_use_edit: usize,
     /// ⚠ **JOINT ACROSS BOTH ARMS, despite sitting in the arm-2 block.**
     /// `arms_full` calls `compare_renders` three times against ONE `TextDiff`,
     /// so this field and `ws_equal`/`ws_real`/`pairs`/`examples` accumulate arm
@@ -5918,15 +5844,6 @@ pub(crate) struct TextDiff {
     /// `examples` field is truncated at 120 chars by `report::sanitize`, which
     /// is why the evidence does not live there.
     pub pairs: Vec<(u32, &'static str, String, String)>,
-    /// Files whose base offset could not be resolved from the source map.
-    ///
-    /// The join adds a file's own base back to each `Edit::lo`, which is
-    /// file-relative. The lookup previously fell back to `0` **silently**,
-    /// which would place every one of that file's edits at a wrong absolute
-    /// offset and present as unmatched rather than as a broken instrument. The
-    /// fallback is kept, so no pinned number moves; what is added is that it is
-    /// now counted.
-    pub base_unresolved: usize,
 }
 
 /// **The seam-vs-use collision surface** (arm 3, task 0).
@@ -6195,16 +6112,12 @@ fn compare_renders(
 #[derive(Clone, Default)]
 pub(crate) struct RevertSet {
     pub fns: FxHashSet<LocalDefId>,
-    #[cfg(test)]
-    pub names: FxHashSet<String>,
     /// Exact raw-boundary atom IDs selected by the verifier.
     pub atom_names: FxHashSet<String>,
     /// Subject closures implied by those exact IDs. This pair is the AST-side
     /// identity; it lets one subject be withheld without reverting siblings in
     /// the same function.
     pub atom_subjects: FxHashSet<(LocalDefId, HirId)>,
-    #[cfg(test)]
-    pub subjects: usize,
 }
 
 impl RevertSet {
@@ -6754,9 +6667,7 @@ pub(crate) fn oracle_reverts(
     // Shared held-fixed inputs are guarded AT THE INPUT, because a differential
     // cannot see its own premise being wrong.
     let mut wanted: FxHashSet<&str> = FxHashSet::default();
-    let mut subjects = 0usize;
     for line in body.lines().map(str::trim).filter(|l| !l.is_empty()) {
-        subjects += 1;
         let Some((owner, tail)) = line.rsplit_once("::") else {
             return Err(format!(
                 "malformed revert line {line:?} in {path:?}: expected \
@@ -6786,7 +6697,7 @@ pub(crate) fn oracle_reverts(
     // and report the offenders. **No id-format redesign here** — a
     // `DefId`-carrying revert format is the real fix and is registered, not
     // built.
-    resolve_reverts(tcx, &wanted, subjects, path)
+    resolve_reverts(tcx, &wanted, path)
 }
 
 /// Historical text-oracle name→`LocalDefId` resolution. Production never calls
@@ -6801,7 +6712,6 @@ pub(crate) fn oracle_reverts(
 fn resolve_reverts(
     tcx: rustc_middle::ty::TyCtxt<'_>,
     wanted: &FxHashSet<&str>,
-    subjects: usize,
     path: &str,
 ) -> Result<RevertSet, String> {
     let mut out = FxHashSet::default();
@@ -6835,12 +6745,8 @@ fn resolve_reverts(
     }
     Ok(RevertSet {
         fns: out,
-        #[cfg(test)]
-        names: seen,
         atom_names: FxHashSet::default(),
         atom_subjects: FxHashSet::default(),
-        #[cfg(test)]
-        subjects,
     })
 }
 
@@ -6881,12 +6787,8 @@ pub(crate) fn revert_set_from_classes_and_atoms(
 ) -> Result<RevertSet, String> {
     let mut out = RevertSet {
         fns: classes.iter().map(|class| class.local_def_id()).collect(),
-        #[cfg(test)]
-        names: FxHashSet::default(),
         atom_names: FxHashSet::default(),
         atom_subjects: FxHashSet::default(),
-        #[cfg(test)]
-        subjects: classes.len(),
     };
     if atoms.is_empty() {
         return Ok(out);

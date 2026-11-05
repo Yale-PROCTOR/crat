@@ -824,9 +824,7 @@ impl CandidateIndex {
             CurrentForm::Ref { nullable: true, .. } => &self.nullable_declines,
             CurrentForm::Ref {
                 nullable: false, ..
-            }
-            | CurrentForm::Slice
-            | CurrentForm::Other => &self.declines,
+            } => &self.declines,
         };
         let Some(candidate) = self.by_subject.get(&node) else {
             return Selection::Keep(KeepReason::NoContractOperation);

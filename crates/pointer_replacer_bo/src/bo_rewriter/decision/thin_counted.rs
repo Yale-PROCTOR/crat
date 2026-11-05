@@ -1,6 +1,4 @@
 //! Caller array/count evidence for typed thin forwarding parameters.
-#[cfg(test)]
-use rustc_hir::HirId;
 use rustc_hir::{
     Expr, ExprKind, Node, PatKind, StmtKind,
     def::Res,

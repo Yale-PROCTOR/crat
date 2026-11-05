@@ -5674,7 +5674,6 @@ pub(crate) fn plan(
                 NegativeWriteEvidence::FosterImmutable
                     | NegativeWriteEvidence::LibcReadOnly(_)
                     | NegativeWriteEvidence::Missing
-                    | NegativeWriteEvidence::Writes
             ) {
                 MechanicalMechanism::SharedRefToMutRaw
             } else {

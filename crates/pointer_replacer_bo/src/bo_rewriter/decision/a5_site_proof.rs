@@ -145,10 +145,6 @@ pub(crate) struct A5SeamProofIndex {
     unavailable: Option<&'static str>,
     world: &'static str,
     guard: &'static str,
-    #[allow(dead_code)]
-    global_setup_wall_s: f64,
-    #[allow(dead_code)]
-    pair_classification_wall_s: f64,
     /// wave-6p (R400-4): disjointness certificates consulted when the audited
     /// verdict is not `Clear`. Absent until attached; never attached to an
     /// unavailable index, so the certificates ride only the attested world.
@@ -185,10 +181,8 @@ impl A5SeamProofIndex {
             );
         };
 
-        let started = std::time::Instant::now();
         let audits = audit_overlap_site_branches(program, slots, origins.native_flows());
-        let global_setup_wall_s = started.elapsed().as_secs_f64();
-        Self::from_audits(program.tcx, program, audits, global_setup_wall_s)
+        Self::from_audits(program.tcx, program, audits)
     }
 
     fn unavailable(reason: &'static str, world: &'static str, guard: &'static str) -> Self {
@@ -197,8 +191,6 @@ impl A5SeamProofIndex {
             unavailable: Some(reason),
             world,
             guard,
-            global_setup_wall_s: 0.0,
-            pair_classification_wall_s: 0.0,
             certificates: None,
         }
     }
@@ -272,9 +264,7 @@ impl A5SeamProofIndex {
         tcx: TyCtxt<'_>,
         program: &RustProgram<'_>,
         audits: Vec<OverlapSiteBranchAudit>,
-        global_setup_wall_s: f64,
     ) -> Self {
-        let started = std::time::Instant::now();
         let functions = program
             .functions
             .iter()
@@ -308,8 +298,6 @@ impl A5SeamProofIndex {
             unavailable: None,
             world: ATTESTED_WORLD,
             guard: ATTESTED_GUARD,
-            global_setup_wall_s,
-            pair_classification_wall_s: started.elapsed().as_secs_f64(),
             certificates: None,
         }
     }
@@ -392,16 +380,6 @@ impl A5SeamProofIndex {
 
     pub(crate) fn guard(&self) -> &'static str {
         self.guard
-    }
-
-    #[cfg(test)]
-    pub(crate) fn global_setup_wall_s(&self) -> f64 {
-        self.global_setup_wall_s
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pair_classification_wall_s(&self) -> f64 {
-        self.pair_classification_wall_s
     }
 }
 

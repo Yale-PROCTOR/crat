@@ -797,13 +797,11 @@ impl Uses<'_, '_> {
     /// declaration, an `&mut` of it, an exclusive cursor, or a destination that
     /// is itself a candidate of this family all fall back to the hold.
     fn ephemeral_copy(&self, e: &hir::Expr<'_>) -> Option<(hir::HirId, hir::HirId)> {
-        struct Paths<'a, 'tcx> {
-            #[allow(dead_code)]
-            tcx: ty::TyCtxt<'tcx>,
+        struct Paths<'a> {
             binding: hir::HirId,
             sites: Vec<&'a hir::Expr<'a>>,
         }
-        impl<'v> Visitor<'v> for Paths<'v, '_> {
+        impl<'v> Visitor<'v> for Paths<'v> {
             fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
                 if local(e) == Some(self.binding) {
                     self.sites.push(e);
@@ -837,7 +835,6 @@ impl Uses<'_, '_> {
             return None;
         }
         let mut paths = Paths {
-            tcx,
             binding: destination,
             sites: vec![],
         };

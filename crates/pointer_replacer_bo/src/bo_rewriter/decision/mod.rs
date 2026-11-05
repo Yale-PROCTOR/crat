@@ -646,9 +646,6 @@ pub(crate) enum DegradeReason {
     /// of a same-object PAIR seam. Its class may still apply the safe sibling
     /// signature edit and the call-level raw-view bridge atomically.
     PairRawView,
-    /// BO decided owning; Box forms and the drop policy arrive in S3.
-    #[allow(dead_code)]
-    KindOwning,
     /// Box wave-1 filter failure, preserving the exact first-failure class.
     BoxFailure {
         failure: box_facts::BoxPlanFailure,
@@ -981,7 +978,6 @@ impl DegradeReason {
             DegradeReason::SignatureClassHeld { .. } => "signature-class-held",
             DegradeReason::KindRaw => "kind-raw",
             DegradeReason::PairRawView => "pair-raw-view",
-            DegradeReason::KindOwning => "kind-owning",
             DegradeReason::BoxFailure { failure } => failure.key(),
             DegradeReason::RawPointerOperation { .. } => "raw-pointer-operation",
             DegradeReason::CallSiteNotAdapted => "call-site-not-adapted",
@@ -1363,8 +1359,6 @@ pub(crate) struct Ctx<'a, 'tcx> {
     /// wave-6l relay 071: the field-carried allocation lengths.
     // R823-3: unread while relay 071's narrowing is reverted (the masked hold
     // reads it again in 56).
-    #[allow(dead_code)]
-    pub(crate) field_alloc: &'a field_alloc::Licences,
     pub(crate) counted_void: &'a counted_void::Contracts,
     /// wave-6a W6A-T1: flexible-tail struct transactions (derived once).
     pub(crate) flexible_tails: &'a flexible_tail::Transactions,
@@ -3004,7 +2998,6 @@ fn decide_one_ladder(ctx: &Ctx<'_, '_>, subject: &Subject) -> Decision {
     let &Ctx {
         tcx,
         // R823-3: read again by the masked hold when the narrowing returns.
-        field_alloc: _,
         io_domain,
         counted_void: _,
         flexible_tails: _,

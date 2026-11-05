@@ -5,8 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use super::matched::CallKey;
 use super::{
     super::{
         origin_evidence::SourceCallee,

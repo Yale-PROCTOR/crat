@@ -74,8 +74,6 @@ pub(crate) struct OverlapPlan {
     pub(crate) effective_overlaps: FxHashMap<LocalDefId, ParameterOverlap>,
     pub(crate) coarse_pairs: Vec<(SlotRef, SlotRef)>,
     pub(crate) planned_marks: Vec<PlannedCopyMark>,
-    #[cfg(test)]
-    pub(crate) site_ledger: Vec<OverlapSiteRow>,
     pub(crate) summary_artifact: OverlapSummaryArtifact,
     pub(crate) stats: OverlapProducerStats,
     /// `overlap-partner-disjoint:type-rule(…)`, one per removed pair.
@@ -102,8 +100,6 @@ impl OverlapPlan {
             effective_overlaps: FxHashMap::default(),
             coarse_pairs: Vec::new(),
             planned_marks: Vec::new(),
-            #[cfg(test)]
-            site_ledger: Vec::new(),
             summary_artifact: render_summary_artifact(&fixpoint, OverlapMode::Baseline, &guard),
             stats: OverlapProducerStats::default(),
             type_disjoint: Vec::new(),
@@ -164,20 +160,6 @@ impl OverlapPlan {
 /// One call site's overlap pair, classified by the mutability of its two sides.
 #[derive(Clone, Debug)]
 pub(crate) struct OverlapSiteRow {
-    #[cfg(test)]
-    pub(crate) caller: u32,
-    #[cfg(test)]
-    pub(crate) location: MirLocationKey,
-    #[cfg(test)]
-    pub(crate) target: u32,
-    #[cfg(test)]
-    pub(crate) left_parameter: u32,
-    #[cfg(test)]
-    pub(crate) right_parameter: u32,
-    #[cfg(test)]
-    pub(crate) left_actual: SlotKey,
-    #[cfg(test)]
-    pub(crate) right_actual: SlotKey,
     pub(crate) class: WitnessMutability,
 }
 
@@ -1200,50 +1182,10 @@ pub(crate) fn produce_overlap_plan(
     stats.planned_marks = planned.len();
     stats.raw_site_pairs = site_classes.len();
     let site_ledger = site_classes
-        .into_iter()
-        .map(
-            |(
-                (
-                    caller,
-                    location,
-                    target,
-                    left_parameter,
-                    right_parameter,
-                    left_actual,
-                    right_actual,
-                ),
-                classes,
-            )| {
-                // Outside tests a row is its class only: the receipt counts classes.
-                #[cfg(not(test))]
-                let _ = (
-                    caller,
-                    location,
-                    target,
-                    left_parameter,
-                    right_parameter,
-                    left_actual,
-                    right_actual,
-                );
-                OverlapSiteRow {
-                    #[cfg(test)]
-                    caller,
-                    #[cfg(test)]
-                    location,
-                    #[cfg(test)]
-                    target,
-                    #[cfg(test)]
-                    left_parameter,
-                    #[cfg(test)]
-                    right_parameter,
-                    #[cfg(test)]
-                    left_actual,
-                    #[cfg(test)]
-                    right_actual,
-                    class: join_classes(classes),
-                }
-            },
-        )
+        .into_values()
+        .map(|classes| OverlapSiteRow {
+            class: join_classes(classes),
+        })
         .collect::<Vec<_>>();
     for site in &site_ledger {
         match site.class {
@@ -1266,8 +1208,6 @@ pub(crate) fn produce_overlap_plan(
         effective_overlaps,
         coarse_pairs: coarse.into_values().collect(),
         planned_marks: planned,
-        #[cfg(test)]
-        site_ledger,
         summary_artifact,
         stats,
         type_disjoint,

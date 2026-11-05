@@ -300,7 +300,6 @@ pub(crate) fn hold_is_final(decision: &Decision) -> bool {
         | DegradeReason::SignatureClassHeld { .. }
         | DegradeReason::KindRaw
         | DegradeReason::PairRawView
-        | DegradeReason::KindOwning
         | DegradeReason::BoxFailure { .. }
         | DegradeReason::RawPointerOperation { .. }
         | DegradeReason::CallSiteNotAdapted

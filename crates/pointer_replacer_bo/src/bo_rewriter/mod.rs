@@ -794,12 +794,6 @@ pub(crate) enum DeliveryForm {
         optional: bool,
         slice: bool,
     },
-    /// **R674-6 (iii-b)** — a subject the ledger delivers by OWNER VIEW (R622-1
-    /// (1)): degraded on its own, its declaration typed safe by another plan's
-    /// surviving edit. It has no decided form, so the tree side confirms the
-    /// one thing the ledger claims: the declaration carries a safe form.
-    #[allow(dead_code)]
-    OwnerView,
 }
 
 fn delivery_form(decision: &decision::Decision) -> Option<DeliveryForm> {
@@ -8622,7 +8616,6 @@ fn finish_decide<'tcx>(
              $exposure:expr, $return_receivers:expr $(,)?) => {
                 decision::Ctx {
                     tcx,
-                    field_alloc: &field_alloc_licences,
                     counted_void: &counted_void,
                     flexible_tails: &flexible_tails,
                     box_params: &box_params,
@@ -11724,11 +11717,6 @@ pub(crate) struct BoxPlanArtifact {
     pub(crate) tsv: String,
     pub(crate) bridges: String,
     pub(crate) default_fill_candidates: String,
-    pub(crate) endpoints: String,
-    pub(crate) subjects: String,
-    pub(crate) a5_global_setup_wall_s: f64,
-    pub(crate) a5_pair_classification_wall_s: f64,
-    pub(crate) a5_receipt_render_wall_s: f64,
 }
 
 fn box_mir_drop_policies(
@@ -11810,7 +11798,6 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
         &ctx.constructions,
         &ctx.model,
     );
-    let endpoints = ctx.box_facts.endpoints_tsv();
     let default_fill_candidates = ctx.box_facts.default_fill_candidates_tsv(
         tcx,
         &ctx.subjects,
@@ -11818,11 +11805,6 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
         &ctx.constructions,
         &ctx.model,
     );
-    let a5_global_setup_wall_s = ctx.a5_site_proofs.global_setup_wall_s();
-    let a5_pair_classification_wall_s = ctx.a5_site_proofs.pair_classification_wall_s();
-    let receipt_started = std::time::Instant::now();
-    let _receipt = seam_tsv_from_table(tcx, &table);
-    let a5_receipt_render_wall_s = receipt_started.elapsed().as_secs_f64();
     let decisions = table
         .entries
         .iter()
@@ -11932,11 +11914,6 @@ pub(crate) fn box_plan_artifact(tcx: TyCtxt<'_>) -> Result<BoxPlanArtifact, Stri
         tsv: output,
         bridges,
         default_fill_candidates,
-        endpoints,
-        subjects,
-        a5_global_setup_wall_s,
-        a5_pair_classification_wall_s,
-        a5_receipt_render_wall_s,
     })
 }
 
@@ -13043,61 +13020,23 @@ pub(crate) struct FreeSites {
 /// index projection would otherwise be invisible to it. Collected here rather
 /// than by a second walk so the overlap check and the census cannot disagree
 /// about which sites are unresolved.
-pub(crate) struct UnresolvedFree {
-    #[allow(dead_code)]
-    pub(crate) cause: &'static str,
-    #[allow(dead_code)]
-    pub(crate) site: String,
-    #[allow(dead_code)]
-    pub(crate) locals: Vec<(rustc_hir::def_id::LocalDefId, rustc_hir::HirId)>,
-}
+pub(crate) struct UnresolvedFree {}
 
 pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId]) -> FreeSites {
     use rustc_hir::intravisit::Visitor;
 
     /// Every binding a subexpression resolves to, in source order.
-    struct Bindings(Vec<rustc_hir::HirId>);
-    impl<'tcx> Visitor<'tcx> for Bindings {
-        fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
-            if let rustc_hir::ExprKind::Path(rustc_hir::QPath::Resolved(_, path)) = &e.kind
-                && let rustc_hir::def::Res::Local(hid) = path.res
-            {
-                self.0.push(hid);
-            }
-            rustc_hir::intravisit::walk_expr(self, e);
-        }
-    }
-
-    struct V<'a, 'tcx> {
-        tcx: TyCtxt<'tcx>,
+    struct V<'a> {
         out: &'a mut FreeSites,
         /// R763 — the program's deallocator function pointers ([`deallocator_statics`]).
         dealloc_statics: &'a rustc_hash::FxHashSet<rustc_hir::def_id::DefId>,
     }
-    impl V<'_, '_> {
-        fn unresolved(
-            &mut self,
-            cause: &'static str,
-            e: &rustc_hir::Expr<'_>,
-            arg: &rustc_hir::Expr<'_>,
-        ) {
-            let mut bindings = Bindings(Vec::new());
-            bindings.visit_expr(arg);
-            let mut locals: Vec<_> = bindings
-                .0
-                .into_iter()
-                .map(|hid| (hid.owner.def_id, hid))
-                .collect();
-            locals.sort_by_key(|(_, hid)| hid.local_id.as_u32());
-            locals.dedup();
-            self.out.unresolved.push(UnresolvedFree {
-                cause,
-                site: self.tcx.sess.source_map().span_to_diagnostic_string(e.span),
-                locals,
-            });
+    impl V<'_> {
+        fn unresolved(&mut self) {
+            self.out.unresolved.push(UnresolvedFree {});
         }
     }
-    impl<'tcx> Visitor<'tcx> for V<'_, 'tcx> {
+    impl<'tcx> Visitor<'tcx> for V<'_> {
         fn visit_expr(&mut self, e: &'tcx rustc_hir::Expr<'tcx>) {
             if let rustc_hir::ExprKind::Call(callee, args) = &e.kind
                 && (matches!(&callee.kind,
@@ -13119,12 +13058,12 @@ pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId])
                         if let rustc_hir::def::Res::Local(hid) = path.res {
                             self.out.resolved.push((hid, cast, e.span));
                         } else {
-                            self.unresolved("non-local-path", e, inner);
+                            self.unresolved();
                         }
                     }
-                    rustc_hir::ExprKind::Field(..) => self.unresolved("field", e, inner),
-                    rustc_hir::ExprKind::Index(..) => self.unresolved("index", e, inner),
-                    _ => self.unresolved("other", e, inner),
+                    rustc_hir::ExprKind::Field(..) => self.unresolved(),
+                    rustc_hir::ExprKind::Index(..) => self.unresolved(),
+                    _ => self.unresolved(),
                 }
             }
             rustc_hir::intravisit::walk_expr(self, e);
@@ -13141,7 +13080,6 @@ pub(crate) fn free_sites(tcx: TyCtxt<'_>, fns: &[rustc_hir::def_id::LocalDefId])
             continue;
         };
         let mut v = V {
-            tcx,
             out: &mut sites,
             dealloc_statics: &dealloc_statics,
         };

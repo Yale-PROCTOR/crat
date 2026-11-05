@@ -207,7 +207,6 @@ pub(crate) mod fixture {
     pub(crate) struct Receipts {
         pub(crate) subjects: String,
         pub(crate) arm_outcomes: String,
-        pub(crate) class_collisions: String,
         pub(crate) family_receipts: String,
         /// The ownership-fields candidate audit: one row per model-Owning
         /// subject with its native status and hold (ownership-fields 031).
@@ -281,7 +280,6 @@ pub(crate) mod fixture {
         Receipts {
             subjects: capture.subject_receipt,
             arm_outcomes: capture.raw_boundary_artifacts.arm_outcomes,
-            class_collisions: capture.raw_boundary_artifacts.class_collisions,
             ownership_native: capture.raw_boundary_artifacts.ownership_native.clone(),
             family_receipts: format!(
                 "{:#?}",

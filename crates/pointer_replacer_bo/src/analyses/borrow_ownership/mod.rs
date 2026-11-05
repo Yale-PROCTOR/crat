@@ -33,8 +33,6 @@ pub(crate) mod param_overlap;
 // The call-result reseat destinations (`x = f(x)`) the exit finalization spares, for a
 // MIR-walk count.
 #[cfg(test)]
-pub(crate) use infer::reseat_destinations;
-#[cfg(test)]
 mod copy_lend_guard_tests;
 #[cfg(test)]
 mod copy_lend_mut_tests;

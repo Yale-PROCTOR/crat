@@ -44,8 +44,6 @@ use super::{Ctx, Decision, DeclShape, Subject, SubjectKind, declaration, seam};
 use crate::bo_rewriter::{additive::FamilyStage, bridge_receipt::SignatureClassId};
 
 pub(crate) struct CallResultValue {
-    #[allow(dead_code)]
-    pub(crate) initializer: Span,
     pub(crate) pointee: String,
     pub(crate) callee: LocalDefId,
     /// R801-2: the premise the view rides — `Some` where no dereference lies on
@@ -115,22 +113,20 @@ fn local_callee(tcx: TyCtxt<'_>, expr: &Expr<'_>) -> Option<LocalDefId> {
 /// form has an image for AND one that keeps the view inside this frame: the
 /// null test, a dereference (`*cmd`, `(*cmd).field`), or a field access. A
 /// `return`, a store, a cast and a call argument are all refused here.
-struct Uses<'tcx> {
-    #[allow(dead_code)]
-    tcx: TyCtxt<'tcx>,
+struct Uses {
     binding: HirId,
     ok: bool,
     seen_null_test: bool,
 }
 
-impl<'tcx> Uses<'tcx> {
+impl Uses {
     fn is_the_local(&self, expr: &Expr<'_>) -> bool {
         matches!(expr.kind, ExprKind::Path(QPath::Resolved(_, path))
             if matches!(path.res, Res::Local(hir) if hir == self.binding))
     }
 }
 
-impl<'tcx> Visitor<'tcx> for Uses<'tcx> {
+impl<'tcx> Visitor<'tcx> for Uses {
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
         match expr.kind {
             ExprKind::MethodCall(segment, receiver, args, _)
@@ -165,7 +161,6 @@ impl<'tcx> Visitor<'tcx> for Uses<'tcx> {
 fn uses_are_closed(tcx: TyCtxt<'_>, subject: &Subject) -> bool {
     let Some(body_id) = tcx.hir_node_by_def_id(subject.fn_did).body_id() else { return false };
     let mut uses = Uses {
-        tcx,
         binding: subject.hir_id,
         ok: true,
         seen_null_test: false,
@@ -870,7 +865,6 @@ pub(crate) fn value(tcx: TyCtxt<'_>, subject: &Subject) -> Option<CallResultValu
         return None;
     }
     Some(CallResultValue {
-        initializer: initializer.span,
         pointee: declaration::pointee_source(tcx, *pointee),
         callee,
         // R801-2: (b) no longer refuses; it decides the receipt.

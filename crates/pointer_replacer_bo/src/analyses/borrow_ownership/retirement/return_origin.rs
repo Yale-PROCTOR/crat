@@ -67,8 +67,6 @@ mod producer {
     use std::collections::VecDeque;
 
     use rustc_hash::FxHashMap;
-    #[cfg(test)]
-    use rustc_middle::mir::BasicBlock;
     use rustc_middle::{
         mir::{
             Body, CastKind, Const, Local, Operand, Place, Rvalue, START_BLOCK, StatementKind,

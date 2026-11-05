@@ -59,10 +59,10 @@ pub(crate) const OUTSIDE_BYTES_DISJOINT: bool = true;
 /// A call's callee, as `analyses::mir::CallKind` classifies it (that module is private
 /// to `analyses`, whose tree this module must not touch).
 enum CallKind {
-    FreeStanding(LocalDefId),
+    FreeStanding,
     LibC(rustc_span::Symbol),
     RustLib(DefId),
-    Impl(LocalDefId),
+    Impl,
     /// A call through a function pointer.
     Closure,
     Dynamic,
@@ -91,9 +91,9 @@ fn as_call<'a, 'tcx>(
     let func = match func.constant().map(|c| *c.ty().kind()) {
         Some(TyKind::FnDef(callee, _)) => match callee.as_local() {
             Some(local) => match tcx.hir_node_by_def_id(local) {
-                rustc_hir::Node::Item(_) => CallKind::FreeStanding(local),
+                rustc_hir::Node::Item(_) => CallKind::FreeStanding,
                 rustc_hir::Node::ForeignItem(item) => CallKind::LibC(item.ident.name),
-                rustc_hir::Node::ImplItem(_) => CallKind::Impl(local),
+                rustc_hir::Node::ImplItem(_) => CallKind::Impl,
                 _ => CallKind::Dynamic,
             },
             None => CallKind::RustLib(callee),
@@ -340,8 +340,6 @@ enum Obj {
     /// Memory a library contract returns, per call site.
     Opaque(LocalDefId, BasicBlock),
     Stack(LocalDefId, Local),
-    /// A pointer-typed constant into memory of no item, per pointee type.
-    Static(TyId),
     /// A static item.
     Global(DefId),
     /// Anonymous constant memory a constant or a static's initializer points to.
@@ -398,9 +396,6 @@ impl Key {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum FreshWay {
     Arg(LocalDefId, usize),
-    Field(DefId, usize),
-    Cell(TyId),
-    Init,
 }
 
 /// Where a retained pointer was loaded from: its retaining place.
@@ -1035,7 +1030,7 @@ impl<'tcx> Relation<'tcx> {
                         self.call_targets(&body, block).is_empty()
                             || !self.foreign_targets(&body, block).is_empty()
                     }
-                    CallKind::RustLib(_) | CallKind::FreeStanding(_) | CallKind::Impl(_) => false,
+                    CallKind::RustLib(_) | CallKind::FreeStanding | CallKind::Impl => false,
                 };
                 if !calls_back {
                     continue;
@@ -1240,7 +1235,7 @@ impl<'tcx> Relation<'tcx> {
             Obj::Sub(id) => self.sub_types[id as usize].is_some_and(|ty| is(self.types[ty])),
             Obj::Stack(f, local) => is(self.body(f).local_decls[local].ty),
             Obj::Global(d) => is(self.tcx.type_of(d).instantiate_identity()),
-            Obj::Static(id) | Obj::External(id) => is(self.types[id]),
+            Obj::External(id) => is(self.types[id]),
             Obj::Alloc(..) | Obj::Opaque(..) | Obj::Fresh(_) => {
                 let types: Vec<Ty<'tcx>> = self
                     .obj_types
@@ -1451,7 +1446,6 @@ impl<'tcx> Relation<'tcx> {
         matches!(
             obj,
             Obj::Global(_)
-                | Obj::Static(_)
                 | Obj::Anon(_)
                 | Obj::External(_)
                 | Obj::Opaque(..)
@@ -1599,7 +1593,7 @@ impl<'tcx> Relation<'tcx> {
                             && self.foreign_targets(&body, block).is_empty()
                             || self.foreign_targets(&body, block).into_iter().any(retains)
                     }
-                    CallKind::RustLib(_) | CallKind::FreeStanding(_) | CallKind::Impl(_) => false,
+                    CallKind::RustLib(_) | CallKind::FreeStanding | CallKind::Impl => false,
                 };
                 if foreign {
                     for arg in call.args.iter() {
@@ -1964,7 +1958,7 @@ impl<'tcx> Relation<'tcx> {
             Obj::Sub(id) => self.sub_types[id as usize].map(|t| self.types[t]),
             Obj::Stack(f, local) => Some(self.body(f).local_decls[local].ty),
             Obj::Global(d) => Some(self.tcx.type_of(d).instantiate_identity()),
-            Obj::Static(id) | Obj::External(id) => Some(self.types[id]),
+            Obj::External(id) => Some(self.types[id]),
             Obj::Alloc(..) | Obj::Opaque(..) | Obj::Fresh(_) => {
                 let types: Vec<Ty<'tcx>> = self
                     .obj_types
@@ -2929,8 +2923,8 @@ impl<'tcx> Relation<'tcx> {
                                 }
                                 false
                             }
-                            CallKind::FreeStanding(_)
-                            | CallKind::Impl(_)
+                            CallKind::FreeStanding
+                            | CallKind::Impl
                             | CallKind::Closure
                             | CallKind::Dynamic => self.allocating_call(&body, block),
                         };
@@ -3042,8 +3036,8 @@ impl<'tcx> Relation<'tcx> {
                             None => true,
                         },
                         CallKind::RustLib(_) => false,
-                        CallKind::FreeStanding(_)
-                        | CallKind::Impl(_)
+                        CallKind::FreeStanding
+                        | CallKind::Impl
                         | CallKind::Closure
                         | CallKind::Dynamic => true,
                     };
@@ -3342,10 +3336,7 @@ impl<'tcx> Relation<'tcx> {
                     }
                 }
             }
-            CallKind::FreeStanding(_)
-            | CallKind::Impl(_)
-            | CallKind::Closure
-            | CallKind::Dynamic => {
+            CallKind::FreeStanding | CallKind::Impl | CallKind::Closure | CallKind::Dynamic => {
                 if is_ptr(dst_ty) && self.allocating_call(body, block) {
                     let site = Obj::Alloc(f, block);
                     // R2b: the caller's site object takes the wrapper's object's contents.
@@ -3789,10 +3780,7 @@ impl<'tcx> Relation<'tcx> {
                     vec![String::new()]
                 }
             }
-            CallKind::FreeStanding(_)
-            | CallKind::Impl(_)
-            | CallKind::Closure
-            | CallKind::Dynamic => {
+            CallKind::FreeStanding | CallKind::Impl | CallKind::Closure | CallKind::Dynamic => {
                 vec![]
             }
         }
@@ -4116,7 +4104,7 @@ impl<'tcx> Relation<'tcx> {
 
     fn types_of(&self, obj: Obj) -> FxHashSet<TyId> {
         match obj {
-            Obj::Static(id) | Obj::External(id) => FxHashSet::from_iter([id]),
+            Obj::External(id) => FxHashSet::from_iter([id]),
             _ => self.obj_types.get(&obj).cloned().unwrap_or_default(),
         }
     }
@@ -4564,8 +4552,8 @@ impl<'tcx> Relation<'tcx> {
                         }) => arg(i),
                         _ => false,
                     },
-                    CallKind::FreeStanding(_)
-                    | CallKind::Impl(_)
+                    CallKind::FreeStanding
+                    | CallKind::Impl
                     | CallKind::Closure
                     | CallKind::Dynamic => self.call_targets(body, block).iter().any(|&g| {
                         self.from_param
@@ -4821,10 +4809,7 @@ impl<'tcx> Relation<'tcx> {
                         sources.extend(arg(i));
                     }
                 }
-                CallKind::FreeStanding(_)
-                | CallKind::Impl(_)
-                | CallKind::Closure
-                | CallKind::Dynamic
+                CallKind::FreeStanding | CallKind::Impl | CallKind::Closure | CallKind::Dynamic
                     if self.on(Rule::ReturnedAlias) =>
                 {
                     // 2.5: a callee's return may also not derive from the argument.
@@ -4842,8 +4827,8 @@ impl<'tcx> Relation<'tcx> {
                 }
                 CallKind::RustLib(_)
                 | CallKind::LibC(_)
-                | CallKind::FreeStanding(_)
-                | CallKind::Impl(_)
+                | CallKind::FreeStanding
+                | CallKind::Impl
                 | CallKind::Closure
                 | CallKind::Dynamic => {}
             }

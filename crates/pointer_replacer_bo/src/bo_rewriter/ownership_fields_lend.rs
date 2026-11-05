@@ -23,8 +23,6 @@ pub struct EdgeKey {
 pub enum Payload {
     #[allow(dead_code)]
     Sized(String),
-    #[allow(dead_code)]
-    Slice(String),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FormalForm {
@@ -46,10 +44,6 @@ pub struct Formal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retention {
     T1NoRetention,
-    #[allow(dead_code)]
-    Unknown,
-    #[allow(dead_code)]
-    Retains,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetentionProof {
@@ -59,8 +53,6 @@ pub struct RetentionProof {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestedUse {
     Lend,
-    #[allow(dead_code)]
-    Move,
 }
 #[derive(Clone, Debug)]
 pub struct LendSite {
@@ -278,7 +270,6 @@ pub fn plan_call(inventory: &CallInventory, sites: &[LendSite]) -> Result<LendPl
         let code = match (&site.payload, formal.form) {
             (_, FormalForm::MutableReference) => format!("&mut *({})", site.place),
             (_, FormalForm::SharedReference) => format!("&*({})", site.place),
-            (Payload::Slice(_), FormalForm::MutableRaw) => format!("({}).as_mut_ptr()", site.place),
             (Payload::Sized(_), FormalForm::MutableRaw) => {
                 format!("core::ptr::from_mut(&mut *({}))", site.place)
             }

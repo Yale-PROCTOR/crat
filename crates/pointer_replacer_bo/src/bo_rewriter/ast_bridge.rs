@@ -79,8 +79,6 @@ pub(crate) fn item_span_with_attrs(item: &rustc_ast::Item) -> rustc_span::Span {
 /// FINDING, not a silent assumption.* This walk reports containment rather than
 /// assuming its absence.
 pub(crate) struct SubstStats {
-    #[allow(dead_code)]
-    pub functions: usize,
     /// Function spans that CONTAIN another function's span. Must be 0, or
     /// function-granular substitution is not non-overlapping after all.
     pub nested: usize,
@@ -218,7 +216,6 @@ pub(crate) fn splice_fn_prints_per_file(
 
     let sm = tcx.sess.source_map();
     let mut s = SubstStats {
-        functions: printed.len(),
         nested: 0,
         unrenderable: 0,
         span_starts_at_attr: 0,

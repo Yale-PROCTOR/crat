@@ -2,7 +2,7 @@
 use std::cell::Cell;
 use std::collections::BTreeSet;
 #[cfg(test)]
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::bit_set::DenseBitSet;
@@ -157,10 +157,6 @@ pub(crate) struct BoConstruction {
     pub(crate) esc_minimal: super::esc_minimal::EscMinimalSelection,
     #[cfg(test)]
     pub(crate) stats: BoOwnEmissionStats,
-    #[cfg(test)]
-    pub(crate) emit_elapsed: Duration,
-    #[cfg(test)]
-    pub(crate) coherence_elapsed: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -176,50 +172,11 @@ pub(crate) struct VerifiedBo {
     pub(crate) summary_artifact: super::param_overlap::OverlapSummaryArtifact,
     #[cfg(test)]
     pub(crate) mark_artifact: String,
-    #[cfg(test)]
-    pub(crate) site_artifact: String,
-    #[cfg(test)]
-    pub(crate) nullable_artifact: String,
-    #[cfg(test)]
-    pub(crate) field_ref_artifact: String,
     pub(crate) receipt: String,
     #[cfg(test)]
     pub(crate) round_stats: super::borrow_verify::RoundStats,
-    #[cfg(test)]
-    pub(crate) esc_minimal: super::esc_minimal::EscMinimalSelection,
-    #[cfg(test)]
-    pub(crate) selector_sources: usize,
-    #[cfg(test)]
-    pub(crate) selector_sinks: usize,
-    #[cfg(test)]
-    pub(crate) emission_stats: BoOwnEmissionStats,
-    #[cfg(test)]
-    pub(crate) construction_emit_elapsed: Duration,
-    #[cfg(test)]
-    pub(crate) construction_coherence_elapsed: Duration,
-    #[cfg(test)]
-    pub(crate) check_sat_count: usize,
-    #[cfg(test)]
-    pub(crate) hard_check_count: usize,
-    #[cfg(test)]
-    pub(crate) optimize_materialization_count: usize,
-    #[cfg(test)]
-    pub(crate) lazy_plain_hard_check_count: usize,
-    #[cfg(test)]
-    pub(crate) lazy_tracked_recheck_count: usize,
-    #[cfg(test)]
-    pub(crate) lazy_plain_materialization_count: usize,
-    #[cfg(test)]
-    pub(crate) hard_check_elapsed: Duration,
-    #[cfg(test)]
-    pub(crate) optimize_materialization_elapsed: Duration,
     /// How many return-refinement links the construction added.
     pub(crate) return_refined_links: usize,
-    /// The copy marks the overlap plan proposed.
-    #[cfg(test)]
-    pub(crate) planned_copy_marks: BTreeSet<CopyMarkKey>,
-    #[cfg(test)]
-    pub(crate) producer_stats: super::overlap_producer::OverlapProducerStats,
 }
 
 /// Typed diagnostic for every `None` boundary before the production overlap
@@ -564,41 +521,6 @@ fn overlap_mark_artifact(
             mark.key.shared_side,
             mark.key.pointee_type,
             retained.contains(&mark.key),
-        ));
-    }
-    out
-}
-
-/// The overlap site ledger as a table.
-#[cfg(test)]
-pub(crate) fn overlap_site_artifact(mode: OverlapMode, plan: &OverlapPlan) -> String {
-    let mut out = String::from(
-        "caller\tblock\tstatement\ttarget\tleft_parameter\tright_parameter\tleft_variant\tleft_owner\tleft_slot\tright_variant\tright_owner\tright_slot\tclass\ta5_world\ta5_mode\ta5_abi_guard\n",
-    );
-    for site in &plan.site_ledger {
-        let class = match site.class {
-            super::param_overlap::WitnessMutability::MutMut => "mut_mut",
-            super::param_overlap::WitnessMutability::MutReadOnly { .. } => "mut_read_only",
-            super::param_overlap::WitnessMutability::SharedShared => "shared_shared",
-        };
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-            site.caller,
-            site.location.block,
-            site.location.statement_index,
-            site.target,
-            site.left_parameter,
-            site.right_parameter,
-            site.left_actual.variant,
-            site.left_actual.owner,
-            site.left_actual.slot,
-            site.right_actual.variant,
-            site.right_actual.owner,
-            site.right_actual.slot,
-            class,
-            OverlapWorld::ClosedWorldFrozenGraph.label(),
-            mode.label(),
-            plan.abi_guard.stamp(),
         ));
     }
     out
@@ -1142,8 +1064,6 @@ fn construct_bo_into_with_esc(
     );
     crate::phase_log::mark("bc:ownership_constraints", "start", "");
     crate::analysis_budget::check("bc:ownership_constraints")?;
-    #[cfg(test)]
-    let t = Instant::now();
     let (stats, selectors) = super::source_events::with_inventory(&source_events, || match mode {
         CopyLendMode::LendArm => emit_crate_ownership_constraints_with_copy_lends(
             &crate_ctxt,
@@ -1171,10 +1091,6 @@ fn construct_bo_into_with_esc(
     );
     #[cfg(not(test))]
     let _ = stats;
-    #[cfg(test)]
-    let emit_elapsed = t.elapsed();
-    #[cfg(test)]
-    let t = Instant::now();
     if let Some(tracker) = solver.tracker() {
         tracker.set_context("coherence");
     }
@@ -1223,8 +1139,6 @@ fn construct_bo_into_with_esc(
     let array_fields = super::array_fields::constrain(program, slots, solver, &mut nullability);
     crate::phase_log::mark("bc:array_fields", "end", "");
     super::export::record(|export| export.array_fields = Some(array_fields.clone()));
-    #[cfg(test)]
-    let coherence_elapsed = t.elapsed();
     crate::phase_log::mark("bc:qualifier_facts", "start", "");
     crate::analysis_budget::check("bc:qualifier_facts")?;
     let qualifier_facts = super::qualifier_facts::collect(program, slots, mut_facts, &nullability);
@@ -1263,10 +1177,6 @@ fn construct_bo_into_with_esc(
         esc_minimal,
         #[cfg(test)]
         stats,
-        #[cfg(test)]
-        emit_elapsed,
-        #[cfg(test)]
-        coherence_elapsed,
     })
 }
 
@@ -1844,12 +1754,6 @@ fn solve_bo_overlap_config_with_source_events(
                     &selected_model_sha256,
                 ),
                 #[cfg(test)]
-                site_artifact: overlap_site_artifact(mode, &plan),
-                #[cfg(test)]
-                nullable_artifact: baseline_nullability.artifact.clone(),
-                #[cfg(test)]
-                field_ref_artifact: baseline_a14.artifact.clone(),
-                #[cfg(test)]
                 summary_artifact: plan.summary_artifact.clone(),
                 baseline_model: baseline_model.clone(),
                 model: baseline_model,
@@ -1858,41 +1762,7 @@ fn solve_bo_overlap_config_with_source_events(
                 retained_copy_plans: Vec::new(),
                 #[cfg(test)]
                 round_stats: baseline_round_stats,
-                #[cfg(test)]
-                esc_minimal: baseline_construction.esc_minimal.clone(),
-                #[cfg(test)]
-                selector_sources: baseline_construction.selectors.sources().len(),
-                #[cfg(test)]
-                selector_sinks: baseline_construction.selectors.sinks().len(),
-                #[cfg(test)]
-                emission_stats: baseline_construction.stats,
-                #[cfg(test)]
-                construction_emit_elapsed: baseline_construction.emit_elapsed,
-                #[cfg(test)]
-                construction_coherence_elapsed: baseline_construction.coherence_elapsed,
-                #[cfg(test)]
-                check_sat_count: baseline_solver.check_sat_count(),
-                #[cfg(test)]
-                hard_check_count: baseline_solver.hard_check_count(),
-                #[cfg(test)]
-                optimize_materialization_count: baseline_solver.optimize_materialization_count(),
-                #[cfg(test)]
-                lazy_plain_hard_check_count: baseline_solver.lazy_plain_hard_check_count(),
-                #[cfg(test)]
-                lazy_tracked_recheck_count: baseline_solver.lazy_tracked_recheck_count(),
-                #[cfg(test)]
-                lazy_plain_materialization_count: baseline_solver
-                    .lazy_plain_materialization_count(),
-                #[cfg(test)]
-                hard_check_elapsed: baseline_solver.hard_check_elapsed(),
-                #[cfg(test)]
-                optimize_materialization_elapsed: baseline_solver
-                    .optimize_materialization_elapsed(),
                 return_refined_links: 0,
-                #[cfg(test)]
-                planned_copy_marks: BTreeSet::new(),
-                #[cfg(test)]
-                producer_stats: plan.stats,
             },
             0,
         ));
@@ -1980,12 +1850,6 @@ fn solve_bo_overlap_config_with_source_events(
                         &selected_model_sha256,
                     ),
                     #[cfg(test)]
-                    site_artifact: overlap_site_artifact(mode, &plan),
-                    #[cfg(test)]
-                    nullable_artifact: nullability.artifact,
-                    #[cfg(test)]
-                    field_ref_artifact: opacity.artifact,
-                    #[cfg(test)]
                     summary_artifact: plan.summary_artifact.clone(),
                     baseline_model,
                     model,
@@ -1994,43 +1858,7 @@ fn solve_bo_overlap_config_with_source_events(
                     retained_copy_plans: Vec::new(),
                     #[cfg(test)]
                     round_stats,
-                    #[cfg(test)]
-                    esc_minimal: construction.esc_minimal.clone(),
-                    #[cfg(test)]
-                    selector_sources: construction.selectors.sources().len(),
-                    #[cfg(test)]
-                    selector_sinks: construction.selectors.sinks().len(),
-                    #[cfg(test)]
-                    emission_stats: construction.stats,
-                    #[cfg(test)]
-                    construction_emit_elapsed: construction.emit_elapsed,
-                    #[cfg(test)]
-                    construction_coherence_elapsed: construction.coherence_elapsed,
-                    #[cfg(test)]
-                    check_sat_count: solver.check_sat_count(),
-                    #[cfg(test)]
-                    hard_check_count: solver.hard_check_count(),
-                    #[cfg(test)]
-                    optimize_materialization_count: solver.optimize_materialization_count(),
-                    #[cfg(test)]
-                    lazy_plain_hard_check_count: solver.lazy_plain_hard_check_count(),
-                    #[cfg(test)]
-                    lazy_tracked_recheck_count: solver.lazy_tracked_recheck_count(),
-                    #[cfg(test)]
-                    lazy_plain_materialization_count: solver.lazy_plain_materialization_count(),
-                    #[cfg(test)]
-                    hard_check_elapsed: solver.hard_check_elapsed(),
-                    #[cfg(test)]
-                    optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
                     return_refined_links: refined_links,
-                    #[cfg(test)]
-                    planned_copy_marks: plan
-                        .planned_marks
-                        .iter()
-                        .map(|mark| mark.key.clone())
-                        .collect(),
-                    #[cfg(test)]
-                    producer_stats: plan.stats,
                 },
                 refined_links,
             ));
@@ -2058,12 +1886,6 @@ fn solve_bo_overlap_config_with_source_events(
                     &selected_model_sha256,
                 ),
                 #[cfg(test)]
-                site_artifact: overlap_site_artifact(mode, &plan),
-                #[cfg(test)]
-                nullable_artifact: baseline_nullability.artifact.clone(),
-                #[cfg(test)]
-                field_ref_artifact: baseline_a14.artifact.clone(),
-                #[cfg(test)]
                 summary_artifact: plan.summary_artifact.clone(),
                 baseline_model: baseline_model.clone(),
                 model: baseline_model,
@@ -2072,45 +1894,7 @@ fn solve_bo_overlap_config_with_source_events(
                 retained_copy_plans: Vec::new(),
                 #[cfg(test)]
                 round_stats: baseline_round_stats,
-                #[cfg(test)]
-                esc_minimal: baseline_construction.esc_minimal.clone(),
-                #[cfg(test)]
-                selector_sources: baseline_construction.selectors.sources().len(),
-                #[cfg(test)]
-                selector_sinks: baseline_construction.selectors.sinks().len(),
-                #[cfg(test)]
-                emission_stats: baseline_construction.stats,
-                #[cfg(test)]
-                construction_emit_elapsed: baseline_construction.emit_elapsed,
-                #[cfg(test)]
-                construction_coherence_elapsed: baseline_construction.coherence_elapsed,
-                #[cfg(test)]
-                check_sat_count: baseline_solver.check_sat_count(),
-                #[cfg(test)]
-                hard_check_count: baseline_solver.hard_check_count(),
-                #[cfg(test)]
-                optimize_materialization_count: baseline_solver.optimize_materialization_count(),
-                #[cfg(test)]
-                lazy_plain_hard_check_count: baseline_solver.lazy_plain_hard_check_count(),
-                #[cfg(test)]
-                lazy_tracked_recheck_count: baseline_solver.lazy_tracked_recheck_count(),
-                #[cfg(test)]
-                lazy_plain_materialization_count: baseline_solver
-                    .lazy_plain_materialization_count(),
-                #[cfg(test)]
-                hard_check_elapsed: baseline_solver.hard_check_elapsed(),
-                #[cfg(test)]
-                optimize_materialization_elapsed: baseline_solver
-                    .optimize_materialization_elapsed(),
                 return_refined_links: 0,
-                #[cfg(test)]
-                planned_copy_marks: plan
-                    .planned_marks
-                    .iter()
-                    .map(|mark| mark.key.clone())
-                    .collect(),
-                #[cfg(test)]
-                producer_stats: plan.stats,
             },
             0,
         ));
@@ -2242,12 +2026,6 @@ fn solve_bo_overlap_config_with_source_events(
                 &selected_model_sha256,
             ),
             #[cfg(test)]
-            site_artifact: overlap_site_artifact(mode, &plan),
-            #[cfg(test)]
-            nullable_artifact: nullability.artifact,
-            #[cfg(test)]
-            field_ref_artifact: opacity.artifact,
-            #[cfg(test)]
             summary_artifact: plan.summary_artifact.clone(),
             model,
             baseline_model,
@@ -2256,43 +2034,7 @@ fn solve_bo_overlap_config_with_source_events(
             retained_copy_plans,
             #[cfg(test)]
             round_stats,
-            #[cfg(test)]
-            esc_minimal: construction.esc_minimal.clone(),
-            #[cfg(test)]
-            selector_sources: construction.selectors.sources().len(),
-            #[cfg(test)]
-            selector_sinks: construction.selectors.sinks().len(),
-            #[cfg(test)]
-            emission_stats: construction.stats,
-            #[cfg(test)]
-            construction_emit_elapsed: construction.emit_elapsed,
-            #[cfg(test)]
-            construction_coherence_elapsed: construction.coherence_elapsed,
-            #[cfg(test)]
-            check_sat_count: solver.check_sat_count(),
-            #[cfg(test)]
-            hard_check_count: solver.hard_check_count(),
-            #[cfg(test)]
-            optimize_materialization_count: solver.optimize_materialization_count(),
-            #[cfg(test)]
-            lazy_plain_hard_check_count: solver.lazy_plain_hard_check_count(),
-            #[cfg(test)]
-            lazy_tracked_recheck_count: solver.lazy_tracked_recheck_count(),
-            #[cfg(test)]
-            lazy_plain_materialization_count: solver.lazy_plain_materialization_count(),
-            #[cfg(test)]
-            hard_check_elapsed: solver.hard_check_elapsed(),
-            #[cfg(test)]
-            optimize_materialization_elapsed: solver.optimize_materialization_elapsed(),
             return_refined_links: refined_links,
-            #[cfg(test)]
-            planned_copy_marks: plan
-                .planned_marks
-                .iter()
-                .map(|mark| mark.key.clone())
-                .collect(),
-            #[cfg(test)]
-            producer_stats: plan.stats,
         },
         refined_links,
     ))

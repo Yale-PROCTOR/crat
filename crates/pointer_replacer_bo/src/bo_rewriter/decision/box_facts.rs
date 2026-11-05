@@ -238,29 +238,10 @@ fn flexible_tail_evidence(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecordedEquation {
-    Linear {
-        left: Var,
-        right: Var,
-        result: Var,
-    },
-    Assume {
-        var: Var,
-        value: bool,
-    },
-    Equal {
-        left: Var,
-        right: Var,
-    },
-    LessEqual {
-        left: Var,
-        right: Var,
-    },
-    #[allow(dead_code)]
-    EqMin {
-        result: Var,
-        left: Var,
-        right: Var,
-    },
+    Linear { left: Var, right: Var, result: Var },
+    Assume { var: Var, value: bool },
+    Equal { left: Var, right: Var },
+    LessEqual { left: Var, right: Var },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -441,22 +422,6 @@ fn replay_one(
                 changed |= assign(values, left, NotOwn)?;
             }
         }
-        RecordedEquation::EqMin {
-            result,
-            left,
-            right,
-        } => {
-            if values[result] == MustOwn {
-                changed |= assign(values, left, MustOwn)?;
-                changed |= assign(values, right, MustOwn)?;
-            }
-            if values[left] == NotOwn || values[right] == NotOwn {
-                changed |= assign(values, result, NotOwn)?;
-            }
-            if values[left] == MustOwn && values[right] == MustOwn {
-                changed |= assign(values, result, MustOwn)?;
-            }
-        }
         RecordedEquation::Linear {
             left,
             right,
@@ -526,16 +491,6 @@ pub(crate) fn render_equations(equations: &[RecordedEquation]) -> String {
             RecordedEquation::LessEqual { left, right } => {
                 format!("less-equal\t{}\t{}", left.as_u32(), right.as_u32())
             }
-            RecordedEquation::EqMin {
-                result,
-                left,
-                right,
-            } => format!(
-                "eq-min\t{}\t{}\t{}",
-                result.as_u32(),
-                left.as_u32(),
-                right.as_u32()
-            ),
         })
         .collect::<Vec<_>>();
     rows.sort();
@@ -1426,7 +1381,6 @@ impl<'a, 'tcx> MinimalWalk<'a, 'tcx> {
             equations: self.equations,
             version_sites: self.version_sites,
             endpoints,
-            replay_error,
             canonical_sha256: String::new(),
             move_edges: self.move_edges,
             transparent_move_edges: self.transparent_move_edges,
@@ -1521,8 +1475,6 @@ pub(crate) struct BoxOwnershipFacts {
     equations: Vec<RecordedEquation>,
     version_sites: Vec<VersionSite>,
     endpoints: Vec<EndpointFact>,
-    #[allow(dead_code)]
-    replay_error: Option<String>,
     canonical_sha256: String,
     move_edges: Vec<(SlotRef, SlotRef)>,
     transparent_move_edges: Vec<(SlotRef, SlotRef)>,

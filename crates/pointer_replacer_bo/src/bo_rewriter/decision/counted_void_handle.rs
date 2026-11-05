@@ -4,8 +4,6 @@
 //! `&mut T` / `&T`; the body stays as written, since `&mut T as *mut T` is a
 //! legal cast; a raw argument bridges to it at the call, and a raw callee that
 //! receives it takes the ordinary safe-to-raw bridge.
-#[cfg(test)]
-use rustc_hir::PatKind;
 use rustc_hir::{
     Expr, ExprKind, Node,
     def::Res,

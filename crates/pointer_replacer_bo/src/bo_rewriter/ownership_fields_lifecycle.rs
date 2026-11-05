@@ -9,34 +9,18 @@ pub enum DropShape {
     Leaf,
     /// Legacy edges are mandatory; absence cannot certify a smaller value.
     Fields(Vec<OwnerId>),
-    #[allow(dead_code)]
-    OwnedFields(Vec<DropEdge>),
-    #[allow(dead_code)]
-    Unknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DropEdge {
-    pub payload: OwnerId,
-    pub optional: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseKind {
     #[allow(dead_code)]
     ScopeExit,
-    #[allow(dead_code)]
-    Overwrite,
-    #[allow(dead_code)]
-    Unwind,
 }
 
 impl CloseKind {
     pub fn receipt(self) -> &'static str {
         match self {
             Self::ScopeExit => "waiver-drop(scope-exit)",
-            Self::Overwrite => "waiver-drop(overwrite)",
-            Self::Unwind => "waiver-drop(unwind)",
         }
     }
 }
@@ -114,10 +98,7 @@ fn recursive(payload: OwnerId, graph: &BTreeMap<OwnerId, DropShape>) -> Result<b
             Some(DropShape::Fields(children)) => {
                 stack.extend(children.iter().rev().map(|child| (*child, false)));
             }
-            Some(DropShape::OwnedFields(children)) => {
-                stack.extend(children.iter().rev().map(|child| (child.payload, false)));
-            }
-            None | Some(DropShape::Unknown) => return Err(CloseHold::UnknownShape(node)),
+            None => return Err(CloseHold::UnknownShape(node)),
         }
     }
     Ok(cycle)

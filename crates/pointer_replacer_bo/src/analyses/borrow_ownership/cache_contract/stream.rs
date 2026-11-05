@@ -12,10 +12,6 @@ use serde::{
 };
 use serde_json::Value;
 
-#[cfg(test)]
-use crate::analyses::borrow_ownership::origin_evidence::OriginAvailability;
-#[cfg(test)]
-use crate::analyses::borrow_ownership::origin_evidence::OriginMissing;
 use crate::analyses::borrow_ownership::{
     cache_contract::{CompleteEntry, SCHEMA, SemanticInputs, semantic_key},
     origin_evidence::OriginEvidence,

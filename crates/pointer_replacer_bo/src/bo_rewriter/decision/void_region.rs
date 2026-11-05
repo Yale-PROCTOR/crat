@@ -153,9 +153,6 @@ struct Chain {
     written: Option<Span>,
     /// The inner accessor this chain continues, if any.
     inner: Option<LocalDefId>,
-    /// The parameter binding.
-    #[allow(dead_code)]
-    param: HirId,
     param_name: String,
 }
 
@@ -470,7 +467,6 @@ fn read_chain<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<Chain> {
             returned: whole.span,
             written: Some(value.span),
             inner: None,
-            param: subject.hir_id,
             param_name,
         });
     }
@@ -505,7 +501,6 @@ fn read_chain<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<Chain> {
             returned: returned.span,
             written: None,
             inner: None,
-            param: subject.hir_id,
             param_name,
         });
     }
@@ -529,7 +524,6 @@ fn read_chain<'tcx>(tcx: TyCtxt<'tcx>, subject: &Subject) -> Option<Chain> {
         returned: returned.span,
         written: None,
         inner: None,
-        param: subject.hir_id,
         param_name,
     };
     if is_param_path(base, subject.hir_id) {

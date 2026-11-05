@@ -5444,8 +5444,6 @@ pub(crate) enum RawBoundaryBlockReason {
     Depth2StorageShape,
     ContractInvalid,
     TemplateUnavailable,
-    #[allow(dead_code)]
-    WaiverUnconfirmed,
     ReturnedChildPermission,
 }
 
@@ -5656,7 +5654,6 @@ impl RawBoundaryBlockReason {
             Self::Depth2StorageShape => "depth2-storage-shape-held",
             Self::ContractInvalid => "raw-boundary-contract-invalid",
             Self::TemplateUnavailable => "raw-boundary-template-unavailable",
-            Self::WaiverUnconfirmed => "raw-boundary-waiver-unconfirmed",
             Self::ReturnedChildPermission => "raw-boundary-returned-child-permission",
         }
     }
@@ -5789,14 +5786,9 @@ pub(crate) fn template_for(
     ownership: Option<super::raw_boundary_contracts::OwnershipContract>,
     has_negative_write_evidence: bool,
 ) -> Result<BridgeTemplate, RawBoundaryBlockReason> {
-    #[cfg(test)]
-    use super::box_facts::BoxShape;
     use super::{Decision, raw_boundary_contracts::OwnershipContract};
 
-    if matches!(
-        ownership,
-        Some(OwnershipContract::AtomicSourceSink | OwnershipContract::Produce)
-    ) {
+    if matches!(ownership, Some(OwnershipContract::AtomicSourceSink)) {
         return Err(RawBoundaryBlockReason::OwnershipTransfer);
     }
     if let Some(depth2) = target.depth2.as_ref() {

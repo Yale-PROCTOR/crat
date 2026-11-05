@@ -86,17 +86,6 @@ pub(crate) enum BlockReason {
     /// It therefore needs a **decision-time** gate; there is no compile-time
     /// backstop to catch it if the test is wrong. Banked rule 2, 2026-08-09.
     FlowsIntoRawParam,
-    /// The member's binding reaches a parameter that converts to a **different
-    /// form** — `&mut [T]` or `Option<&mut T>`, not `&mut T`.
-    ///
-    /// **Its own variant because the hazard class is different, not because the
-    /// wording is nicer.** `&mut T` into `*mut T` coerces silently; `&mut T`
-    /// into `&mut [T]` is `E0308`. Banked rule 1 — the checked region versus
-    /// the unchecked one — is exactly this distinction, so a census that
-    /// reported both as `flows-into-raw-param` would file a compiler-caught
-    /// revert risk under a silent-UB reason.
-    #[allow(dead_code)]
-    FlowsIntoOtherForm,
     /// The same silent coercion, into a **pinned** callee — one whose signature
     /// is fixed by a fn-pointer cast and which M1 will never adapt.
     ///
@@ -163,7 +152,6 @@ impl BlockReason {
         match self {
             BlockReason::ArgStaysRaw => "arg-stays-raw",
             BlockReason::FlowsIntoRawParam => "flows-into-raw-param",
-            BlockReason::FlowsIntoOtherForm => "flows-into-other-form",
             BlockReason::FlowsIntoPinnedCallee => "flows-into-pinned-callee",
             BlockReason::CastOfConvertingLocal => "cast-of-converting-local",
             BlockReason::ArgCastFormUnbuilt => "arg-cast-form-unbuilt",

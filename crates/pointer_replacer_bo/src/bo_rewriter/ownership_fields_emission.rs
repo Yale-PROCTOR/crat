@@ -1,10 +1,6 @@
 //! Typed emission plans over supplied grants. This is not a grant producer or
 //! an AST parser. Expressions/types are compiler-rendered inputs at integration.
 use super::EvidenceKey;
-#[cfg(test)]
-use super::lifecycle::CloseKind;
-#[cfg(test)]
-use super::lifecycle::ClosePlan;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -14,11 +10,7 @@ pub enum Kind {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GrantStatus {
-    #[allow(dead_code)]
-    Candidate,
     Selected,
-    #[allow(dead_code)]
-    Retracted,
 }
 #[derive(Clone, Debug)]
 pub struct Grant {
@@ -62,11 +54,7 @@ pub enum EmitHold {
     LiveReference,
     Protector,
     MissingEvidence(&'static str),
-    #[allow(dead_code)]
-    WrongClose,
     SinkIdentity,
-    #[allow(dead_code)]
-    Construction,
 }
 
 /// Private validated permit, returned only after exact-key evidence checks.
@@ -123,47 +111,12 @@ pub fn admit_call(grant: &Grant, facts: &OwnCallFacts) -> Result<OwnCallPermit, 
     Ok(OwnCallPermit { key: facts.key })
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OwnerType {
-    pub pointee: String,
-    pub optional: bool,
-}
-#[cfg(test)]
-impl OwnerType {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Emitted {
     pub code: String,
     pub key: EvidenceKey,
     pub receipt: &'static str,
 }
-
-#[cfg(test)]
-/// Local-only suppression carrier. Fields keep the declared Option<Box<_>>
-/// interface; field/aggregate cleanup needs a separate transaction lowering.
-#[derive(Clone, Debug)]
-pub struct LeakLocal {
-    key: EvidenceKey,
-    name: String,
-    ty: OwnerType,
-    suppressed_closes: Vec<ClosePlan>,
-}
-
-#[cfg(test)]
-/// Complete adapter-supplied implicit-exit inventory for one local generation.
-/// A single scope/overwrite receipt cannot authorize unconditional suppression.
-#[derive(Clone, Debug)]
-pub struct LeakCoverage {
-    pub local: EvidenceKey,
-    pub completeness: Option<EvidenceKey>,
-    pub closes: Vec<ClosePlan>,
-}
-
-#[cfg(test)]
-impl LeakCoverage {}
-
-#[cfg(test)]
-impl LeakLocal {}
 
 pub fn consume_argument(
     permit: &OwnCallPermit,
@@ -200,26 +153,3 @@ pub fn explicit_free(
         receipt: "c-free-site-drop",
     })
 }
-
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub struct AggregateField {
-    pub field: super::FieldClassId,
-    pub name: String,
-    pub ty: OwnerType,
-    pub generation: EvidenceKey,
-}
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub struct LeakAggregate {
-    key: EvidenceKey,
-    owner: super::OwnerId,
-    type_name: String,
-    name: String,
-    fields: std::collections::BTreeMap<super::FieldClassId, AggregateField>,
-}
-#[cfg(test)]
-impl LeakAggregate {}
-
-#[cfg(test)]
-impl LeakAggregate {}

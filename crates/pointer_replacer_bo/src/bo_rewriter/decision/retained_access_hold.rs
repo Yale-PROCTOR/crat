@@ -426,8 +426,7 @@ fn reads_retention(disposition: &RawBoundaryDisposition, site: &RawBoundaryRende
             // and reads no retention here.
             RawBoundaryDisposition::T2 { waiver_id, .. } => *waiver_id == RAW_BOUNDARY_WAIVER_ID,
             RawBoundaryDisposition::Blocked { reason, .. } => match reason {
-                RawBoundaryBlockReason::PositiveRetention
-                | RawBoundaryBlockReason::WaiverUnconfirmed => true,
+                RawBoundaryBlockReason::PositiveRetention => true,
                 RawBoundaryBlockReason::SiteUnresolved
                 | RawBoundaryBlockReason::SubjectUnrooted
                 | RawBoundaryBlockReason::SubjectNotSafe

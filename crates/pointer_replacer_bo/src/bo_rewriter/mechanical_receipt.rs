@@ -192,12 +192,6 @@ pub(crate) enum MechanicalSubjectKey {
         mir_local: u32,
         slot_depth: u32,
     },
-    #[allow(dead_code)]
-    Field {
-        owner: DefId,
-        field_index: u32,
-        slot_depth: u32,
-    },
     Generated {
         owner: LocalDefId,
         key: String,
@@ -216,11 +210,6 @@ impl MechanicalSubjectKey {
                 "local:{}:{mir_local}:depth={slot_depth}",
                 owner.local_def_index.as_u32()
             ),
-            Self::Field {
-                owner,
-                field_index,
-                slot_depth,
-            } => format!("field:{owner:?}:{field_index}:depth={slot_depth}"),
             Self::Generated {
                 owner,
                 key,
@@ -253,8 +242,6 @@ pub(crate) enum CanonicalLocation {
         defining_class: SignatureClassId,
         key: String,
     },
-    #[allow(dead_code)]
-    StaticRoot { owner: LocalDefId, root_index: u32 },
 }
 
 impl CanonicalLocation {
@@ -283,10 +270,6 @@ impl CanonicalLocation {
                 defining_class,
                 key,
             } => format!("generated:{}:{key}", defining_class.order_key()),
-            Self::StaticRoot { owner, root_index } => format!(
-                "static-root:{}:{root_index}",
-                owner.local_def_index.as_u32()
-            ),
         }
     }
 }
@@ -501,11 +484,7 @@ impl MechanicalMechanism {
 pub(crate) enum MechanicalTerminalReason {
     ClassReverted(String),
     ProgramDegradedUnmodifiedInput,
-    #[allow(dead_code)]
-    PreCompileDegraded(String),
     RbNegativeWriteAbsent,
-    #[allow(dead_code)]
-    CalleeWrites,
     PositiveRetention,
     SliceUseDestinationUnbuilt(String),
     /// **The CALLEE side is absent** — no terminal contract exists at the
@@ -527,14 +506,6 @@ pub(crate) enum MechanicalTerminalReason {
     Cursor,
     BoxFamily,
     #[allow(dead_code)]
-    FreedSlot,
-    #[allow(dead_code)]
-    AnalysisRaw,
-    #[allow(dead_code)]
-    ForeignItem,
-    #[allow(dead_code)]
-    ImplItem,
-    #[allow(dead_code)]
     IoDomain,
     EvidenceMissing(String),
     /// **R450-3.** The adapter was not held for want of evidence — it was
@@ -549,11 +520,9 @@ impl MechanicalTerminalReason {
         match self {
             Self::ClassReverted(reason) => format!("class-reverted:{reason}"),
             Self::ProgramDegradedUnmodifiedInput => "program-degraded-unmodified-input".to_owned(),
-            Self::PreCompileDegraded(reason) => format!("degraded-pre-compile:{reason}"),
             Self::RbNegativeWriteAbsent => {
                 "raw-boundary-shared-to-mut:negative-write-absent".to_owned()
             }
-            Self::CalleeWrites => "raw-boundary-shared-to-mut:callee-writes".to_owned(),
             Self::PositiveRetention => "positive-retention".to_owned(),
             Self::SliceUseDestinationUnbuilt(form) => {
                 format!("slice-use-destination-unbuilt:{form}")
@@ -565,10 +534,6 @@ impl MechanicalTerminalReason {
             }
             Self::Cursor => "cursor".to_owned(),
             Self::BoxFamily => "box-family".to_owned(),
-            Self::FreedSlot => "freed-slot".to_owned(),
-            Self::AnalysisRaw => "analysis-raw".to_owned(),
-            Self::ForeignItem => "foreign-item".to_owned(),
-            Self::ImplItem => "impl-item".to_owned(),
             Self::IoDomain => "io-domain".to_owned(),
             Self::EvidenceMissing(evidence) => format!("evidence-missing:{evidence}"),
             Self::SupersededByDestination(form) => {
@@ -675,8 +640,6 @@ pub(crate) enum NegativeWriteEvidence {
     FosterImmutable,
     LibcReadOnly(String),
     Missing,
-    #[allow(dead_code)]
-    Writes,
 }
 
 impl NegativeWriteEvidence {
@@ -686,7 +649,6 @@ impl NegativeWriteEvidence {
             Self::FosterImmutable => "foster-immutable".to_owned(),
             Self::LibcReadOnly(contract) => format!("libc-read-only:{contract}"),
             Self::Missing => "negative-write-absent".to_owned(),
-            Self::Writes => "callee-writes".to_owned(),
         }
     }
 
@@ -720,8 +682,6 @@ pub(crate) enum HoistSafety {
     Place,
     #[allow(dead_code)]
     SideEffectFreeUnconditional,
-    #[allow(dead_code)]
-    Unhoistable(String),
 }
 
 impl HoistSafety {
@@ -730,7 +690,6 @@ impl HoistSafety {
             Self::NotApplicable => "not-applicable".to_owned(),
             Self::Place => "place".to_owned(),
             Self::SideEffectFreeUnconditional => "side-effect-free-unconditional".to_owned(),
-            Self::Unhoistable(reason) => format!("unhoistable:{reason}"),
         }
     }
 }
@@ -1135,7 +1094,6 @@ impl MechanicalObligationEvent {
                 self.terminal_reason.as_ref(),
                 Some(
                     MechanicalTerminalReason::RbNegativeWriteAbsent
-                        | MechanicalTerminalReason::CalleeWrites
                         | MechanicalTerminalReason::PositiveRetention
                         | MechanicalTerminalReason::SliceUseDestinationUnbuilt(_)
                         | MechanicalTerminalReason::TerminalContractMissing
@@ -1143,10 +1101,6 @@ impl MechanicalObligationEvent {
                         | MechanicalTerminalReason::CompositionCrossingUnhoistable(_)
                         | MechanicalTerminalReason::Cursor
                         | MechanicalTerminalReason::BoxFamily
-                        | MechanicalTerminalReason::FreedSlot
-                        | MechanicalTerminalReason::AnalysisRaw
-                        | MechanicalTerminalReason::ForeignItem
-                        | MechanicalTerminalReason::ImplItem
                         | MechanicalTerminalReason::IoDomain
                         | MechanicalTerminalReason::EvidenceMissing(_)
                 )

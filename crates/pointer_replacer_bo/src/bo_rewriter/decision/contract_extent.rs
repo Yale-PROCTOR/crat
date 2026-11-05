@@ -10,26 +10,11 @@ use crate::analyses::borrow_ownership::SlotKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CurrentForm {
-    Ref {
-        mutable: bool,
-        nullable: bool,
-    },
-    #[allow(dead_code)]
-    Slice,
-    #[allow(dead_code)]
-    Other,
+    Ref { mutable: bool, nullable: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NonLengthHold {
-    #[allow(dead_code)]
-    Uninitialized,
-    #[allow(dead_code)]
-    MissingRangeAlias,
-    #[allow(dead_code)]
-    Evaluation,
-    #[allow(dead_code)]
-    ReturnCustody,
     Existing(String),
 }
 
@@ -57,8 +42,6 @@ pub(crate) struct SubjectFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CountGap {
     UnitsUnproved,
-    #[allow(dead_code)]
-    TransportMissing,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -226,7 +209,6 @@ pub(crate) fn decline(summary: &UseSummary) -> Option<DeclineCause> {
 pub(crate) enum KeepReason {
     /// R397-6(b): declined before selection; the ladder resumes unchanged.
     Declined(DeclineCause),
-    ExistingForm,
     ModelNotRef,
     Depth,
     NoContractOperation,
@@ -250,9 +232,7 @@ pub(crate) fn select(
     sites: &[ContractSite],
     backing: Option<&BackingExtent>,
 ) -> Selection {
-    let CurrentForm::Ref { mutable, nullable } = subject.form else {
-        return Selection::Keep(KeepReason::ExistingForm);
-    };
+    let CurrentForm::Ref { mutable, nullable } = subject.form;
     if subject.model_kind != Some(SlotKind::Ref) {
         return Selection::Keep(KeepReason::ModelNotRef);
     }
