@@ -330,34 +330,218 @@ pub unsafe fn read(a: *const left::Holder, b: *const right::Holder) -> i64 { *(*
 }
 
 #[test]
-fn configured_api_exposure_preserves_transitive_struct_fields_only() {
+fn configured_api_exposure_preserves_transitive_array_fields_and_promotes_thin_fields() {
     let source = r#"
-pub struct Inner { pub pointer: *const i32 }
+#[repr(C)] pub struct Inner { pub pointer: *const i32, pub buffer: *const u8 }
 pub type Alias = Inner;
 pub enum Outer { Value(Alias), Empty }
 pub struct Private { pub pointer: *const i32 }
 #[export_name = "external_api"] pub unsafe extern "C" fn exported(value: *const Outer) -> *const Outer { value }
 pub unsafe fn private_read(value: *const Private) -> i32 { *(*value).pointer }
-pub unsafe fn public_read(value: *const Inner) -> i32 { *(*value).pointer }
+pub unsafe fn public_read(value: *const Inner) -> i32 { if (*value).pointer.is_null() { 0 } else { *(*value).pointer + *(*value).buffer.offset(1) as i32 } }
 extern "C" { fn foreign(value: *const Private); }
 pub unsafe fn invoke(value: *const Private) { foreign(value); }
 "#;
-    let records = run_compiler_on_str(source, |tcx| {
-        make_skeletons_with_api(
+    let (records, frozen) = run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_api(
             source,
             None,
             &FxHashSet::from_iter(["external_api".to_owned()]),
             tcx,
         )
-        .unwrap()
+        .unwrap();
+        let frozen = crate::freeze_project(source, &records, tcx).unwrap();
+        (records, frozen)
     })
     .unwrap();
     for name in ["Inner", "Alias", "Outer"] {
         let record = type_record(&records, name);
-        assert_eq!(record.source_definition, record.target_definition, "{name}");
+        assert_ne!(record.source_definition, record.target_definition, "{name}");
     }
+    let inner = &type_record(&records, "Inner").target_definition;
+    assert!(inner.contains("pointer: Option<&'"), "{inner}");
+    assert!(inner.contains("buffer: *const u8"), "{inner}");
     let private = type_record(&records, "Private");
     assert_ne!(private.source_definition, private.target_definition);
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+
+    let unprotected = generate(source);
+    assert!(
+        type_record(&unprotected, "Inner")
+            .target_definition
+            .contains("[u8]")
+    );
+}
+
+#[test]
+fn api_exposed_thin_fields_preserve_layout_and_support_transformed_bodies() {
+    let source = r#"
+extern "C" { fn malloc(size: usize) -> *mut i32; fn free(pointer: *mut i32); }
+#[repr(C)] pub struct Data { pub tag: u8, pub pointer: *const i32, pub mutable: *mut i32, pub optional: *const i32, pub optional_mutable: *mut i32, pub owned: *mut i32, pub optional_owned: *mut i32 }
+pub unsafe fn make(pointer: *const i32, mutable: *mut i32, optional: *const i32, optional_mutable: *mut i32) -> Data {
+    Data { tag: 1, pointer, mutable, optional, optional_mutable, owned: malloc(core::mem::size_of::<i32>()), optional_owned: malloc(core::mem::size_of::<i32>()) }
+}
+pub unsafe fn read(value: *mut Data) -> i32 {
+    *(*value).mutable = 3;
+    if !(*value).optional_mutable.is_null() { *(*value).optional_mutable = 5; }
+    let extra = if (*value).optional.is_null() { 0 } else { *(*value).optional };
+    *(*value).pointer + extra
+}
+pub unsafe fn release(value: Data) { free(value.owned); if !value.optional_owned.is_null() { free(value.optional_owned); } }
+"#;
+    let layout = |tcx: ty::TyCtxt<'_>| {
+        let did = local_def("Data", tcx);
+        let layout = tcx
+            .layout_of(
+                ty::TypingEnv::post_analysis(tcx, did)
+                    .as_query_input(tcx.type_of(did).instantiate_identity()),
+            )
+            .unwrap();
+        (
+            layout.size.bytes(),
+            layout.align.abi.bytes(),
+            (0..7)
+                .map(|index| layout.fields.offset(index).bytes())
+                .collect::<Vec<_>>(),
+        )
+    };
+    let (records, original_layout) = run_compiler_on_str(source, |tcx| {
+        (
+            make_skeletons_with_api(
+                source,
+                None,
+                &FxHashSet::from_iter(["make".to_owned()]),
+                tcx,
+            )
+            .unwrap(),
+            layout(tcx),
+        )
+    })
+    .unwrap();
+    let definition = &type_record(&records, "Data").target_definition;
+    for expected in [
+        "pointer: &'",
+        "mut i32",
+        "optional: Option<&'",
+        "optional_mutable: Option<&'",
+        "owned: Box<i32>",
+        "optional_owned: Option<Box<i32>>",
+    ] {
+        assert!(definition.contains(expected), "{definition}");
+    }
+    assert!(!definition.contains("*const"), "{definition}");
+    assert!(!definition.contains("*mut"), "{definition}");
+    let target = format!(
+        "{definition}\n{} {{ Data {{ tag: 1, pointer, mutable, optional, optional_mutable, owned: Box::new(0), optional_owned: Some(Box::new(0)) }} }}\n{} {{ *value.mutable = 3; if let Some(pointer) = value.optional_mutable.as_deref_mut() {{ *pointer = 5; }} *value.pointer + value.optional.map_or(0, |pointer| *pointer) }}\n{} {{ drop(value.owned); drop(value.optional_owned); }}",
+        function(&records, "make").target_signature,
+        function(&records, "read").target_signature,
+        function(&records, "release").target_signature,
+    );
+    run_compiler_on_str(&target, |tcx| {
+        utils::type_check(tcx);
+        assert_eq!(original_layout, layout(tcx));
+    })
+    .expect(&target);
+}
+
+#[test]
+fn api_exposure_blocks_array_layers_without_blocking_nested_thin_layers() {
+    for (body, expected) in [
+        ("**(*value).pointer", "&&"),
+        ("*(*(*value).pointer).offset(1)", "&*"),
+        ("**(*value).pointer.offset(1)", "*&"),
+    ] {
+        let source = format!(
+            "#[repr(C)] pub struct Holder {{ pub pointer: *const *const i32 }} pub unsafe fn api(value: *const Holder) -> i32 {{ {body} }}"
+        );
+        let (records, frozen) = run_compiler_on_str(&source, |tcx| {
+            let records = make_skeletons_with_api(
+                &source,
+                None,
+                &FxHashSet::from_iter(["api".to_owned()]),
+                tcx,
+            )
+            .unwrap();
+            let frozen = crate::freeze_project(&source, &records, tcx).unwrap();
+            (records, frozen)
+        })
+        .unwrap();
+        let definition = &type_record(&records, "Holder").target_definition;
+        run_compiler_on_str(definition, |_| {
+            let parsed = utils::ast::parse_crate(definition.clone());
+            let ItemKind::Struct(_, _, fields) = &parsed.items[0].kind else { unreachable!() };
+            assert_eq!(
+                indirections(&fields.fields()[0].ty),
+                expected,
+                "{definition}"
+            );
+        })
+        .unwrap();
+        assert!(!definition.contains("[i32]"), "{definition}");
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    }
+}
+
+#[test]
+fn api_exposure_preserves_optional_and_owned_array_fields() {
+    let source = r#"
+extern "C" { fn malloc(size: usize) -> *mut i32; fn free(pointer: *mut i32); }
+#[repr(C)] pub struct Data { pub optional: *const i32, pub owned: *mut i32, pub optional_owned: *mut i32 }
+pub unsafe fn make() -> Data { Data { optional: core::ptr::null(), owned: malloc(4 * core::mem::size_of::<i32>()), optional_owned: malloc(4 * core::mem::size_of::<i32>()) } }
+pub unsafe fn read(value: *const Data) -> i32 { if (*value).optional.is_null() { 0 } else { *(*value).optional.offset(1) } }
+pub unsafe fn release(value: Data) { free(value.owned); if !value.optional_owned.is_null() { free(value.optional_owned); } }
+"#;
+    let records = run_compiler_on_str(source, |tcx| {
+        make_skeletons_with_api(
+            source,
+            None,
+            &FxHashSet::from_iter(["make".to_owned()]),
+            tcx,
+        )
+        .unwrap()
+    })
+    .unwrap();
+    let data = type_record(&records, "Data");
+    assert_eq!(data.source_definition, data.target_definition);
+    let unprotected = generate(source);
+    let target = &type_record(&unprotected, "Data").target_definition;
+    assert!(target.contains("Option<&'"), "{target}");
+    assert!(target.contains("[i32]"), "{target}");
+    assert!(target.contains("Box<[i32]>"), "{target}");
+    assert!(target.contains("Option<Box<[i32]>>"), "{target}");
+}
+
+#[test]
+fn api_exposure_preserves_layout_of_enums_and_rust_struct_containers() {
+    for container in [
+        "pub enum Container { Value(Inner), Empty }",
+        "pub type Container = Option<Inner>;",
+        "pub struct Container { pub value: usize, pub inner: Inner }",
+    ] {
+        let source = format!(
+            "#[repr(C)] pub struct Inner {{ pub pointer: *const i32 }} {container} pub unsafe fn api(value: *const Container) {{ let _ = value; }} pub unsafe fn read(value: *const Inner) -> i32 {{ *(*value).pointer }}"
+        );
+        let records = run_compiler_on_str(&source, |tcx| {
+            make_skeletons_with_api(
+                &source,
+                None,
+                &FxHashSet::from_iter(["api".to_owned()]),
+                tcx,
+            )
+            .unwrap()
+        })
+        .unwrap();
+        let inner = type_record(&records, "Inner");
+        assert_eq!(
+            inner.source_definition, inner.target_definition,
+            "{container}"
+        );
+        assert!(
+            type_record(&generate(&source), "Inner")
+                .target_definition
+                .contains("pointer: &'")
+        );
+    }
 }
 
 #[test]

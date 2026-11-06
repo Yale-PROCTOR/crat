@@ -131,7 +131,7 @@ pub(super) fn initial_pointer_decisions_for_api(
         types: TypeLifetimes::default(),
         type_arguments: FxHashMap::default(),
     };
-    let protected = struct_types::protected_structs(tcx, api);
+    let (exposed, layout_sensitive) = struct_types::api_structs(tcx, api);
     for &slot in analysis.kinds.keys() {
         let SlotRef::Field(slot) = slot else { continue };
         let field = analysis.slots.field_slots.slot(slot);
@@ -190,7 +190,11 @@ pub(super) fn initial_pointer_decisions_for_api(
                             sizes.iter().any(|bytes| bytes.is_none() || *bytes != size)
                         }));
             let optional = slot.is_some_and(|slot| representations.nullable.contains(&slot));
-            let kind = if protected.contains(&owner.struct_did) || inner.is_c_void(tcx) {
+            // A new non-null field can change enum discriminants or Rust field ordering.
+            let protected = exposed.contains(&owner.struct_did)
+                && (array
+                    || (depth == 0 && !optional && layout_sensitive.contains(&owner.struct_did)));
+            let kind = if protected || inner.is_c_void(tcx) {
                 PtrKind::Raw(mutability.is_mut())
             } else {
                 representation(kind, mutable, mutability.is_mut(), array, optional)
