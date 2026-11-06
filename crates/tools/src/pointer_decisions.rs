@@ -85,6 +85,7 @@ pub(super) struct InitialPointerDecisions {
     nested: FxHashMap<PointerTarget, Vec<PointerLayer>>,
     pub bounds: FxHashMap<LocalDefId, Vec<(Symbol, Symbol)>>,
     pub fields: FxHashMap<StructFieldSlot, Vec<PointerLayer>>,
+    pub foreign_types: FxHashSet<LocalDefId>,
     pub types: TypeLifetimes,
     pub type_arguments: FxHashMap<(LocalDefId, usize), BTreeMap<FieldRegion, Symbol>>,
 }
@@ -128,6 +129,7 @@ pub(super) fn initial_pointer_decisions_for_api(
         nested: FxHashMap::default(),
         bounds: FxHashMap::default(),
         fields: FxHashMap::default(),
+        foreign_types: struct_types::foreign_types(tcx),
         types: TypeLifetimes::default(),
         type_arguments: FxHashMap::default(),
     };
@@ -140,7 +142,10 @@ pub(super) fn initial_pointer_decisions_for_api(
         else {
             continue;
         };
-        if field.depth != 0 || analysis.slots.field_slots.is_array_field(owner) {
+        if field.depth != 0
+            || analysis.slots.field_slots.is_array_field(owner)
+            || result.foreign_types.contains(&owner.struct_did)
+        {
             continue;
         }
         let definition = tcx.adt_def(owner.struct_did);

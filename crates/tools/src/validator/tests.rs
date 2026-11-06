@@ -1332,7 +1332,6 @@ fn invalid_expected_skeleton_is_setup_error() {
         "unsafe fn f() { #[proctor(0)] macro_rules! local { () => {}; } }",
         "unsafe fn f((x, y): (i32, i32)) { #[proctor(0)] return; }",
         "unsafe fn f<T>(x: T) { #[proctor(0)] return; }",
-        "unsafe fn f<'a: 'static>(x: &'a i32) { #[proctor(0)] return; }",
         "unsafe fn f<'a>(x: &'a i32) where 'a: 'static { #[proctor(0)] return; }",
         "unsafe fn f<#[allow(unused)] 'a>(x: &'a i32) { #[proctor(0)] return; }",
         "unsafe fn f<'a>(x: &'a i32) where { #[proctor(0)] return; }",
@@ -1668,6 +1667,25 @@ fn matching_lifetime_generic_declaration_is_valid() {
 }
 
 #[test]
+fn lifetime_outlives_bounds_are_supported_and_must_match_exactly() {
+    let skeleton =
+        "unsafe fn f<'a: 'b, 'b>(mut input: &'a i32) -> &'b i32 { #[proctor(0)] todo!() }";
+    let valid = skeleton.replace("todo!()", "input");
+    assert_valid(skeleton, &valid);
+    let static_bound =
+        "unsafe fn f<'a: 'static>(mut input: &'a i32) -> &'a i32 { #[proctor(0)] todo!() }";
+    assert_valid(static_bound, &static_bound.replace("todo!()", "input"));
+    for changed in [
+        valid.replace("'a: 'b", "'a"),
+        valid.replace("'a: 'b", "'a: 'static"),
+        valid.replace("'a: 'b", "'a: 'b + 'static"),
+        valid.replace("<'a: 'b, 'b>", "<'b, 'a: 'b>"),
+    ] {
+        assert_codes(skeleton, &changed, &["generic_parameter_mismatch"]);
+    }
+}
+
+#[test]
 fn omitted_lifetime_declaration_is_rejected_even_when_types_match() {
     assert_codes(
         r#"unsafe fn f<'a>(mut input: &'a i32) -> &'a i32 {
@@ -1707,7 +1725,7 @@ fn lifetime_parameter_order_is_exact() {
 }
 
 #[test]
-fn attributes_bounds_type_const_and_where_generics_are_rejected() {
+fn attributes_type_const_where_and_unexpected_lifetime_bounds_are_rejected() {
     let skeleton = r#"unsafe fn f<'a>(mut input: &'a i32) -> &'a i32 {
         #[proctor(0)] todo!()
     }"#;
