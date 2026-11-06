@@ -61,8 +61,12 @@ pub fn analyze_pointers(tcx: TyCtxt<'_>) -> Result<AcceptedPointerAnalysis, Stri
     {
         let OwnerNode::Item(item) = owner.node() else { continue };
         match item.kind {
-            ItemKind::Fn { .. } => program.functions.push(item.owner_id.def_id),
-            ItemKind::Struct(..) => program.structs.push(item.owner_id.def_id),
+            ItemKind::Fn { .. } if !item.span.in_derive_expansion() => {
+                program.functions.push(item.owner_id.def_id)
+            }
+            ItemKind::Struct(..) if !item.span.in_derive_expansion() => {
+                program.structs.push(item.owner_id.def_id)
+            }
             _ => {}
         }
     }

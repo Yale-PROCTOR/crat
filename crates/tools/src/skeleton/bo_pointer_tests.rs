@@ -179,7 +179,7 @@ fn existing_static_and_named_return_lifetimes_remain_usable() {
 }
 
 #[test]
-fn preserved_fields_and_globals_keep_original_types() {
+fn struct_fields_change_while_globals_keep_original_types() {
     let source = r#"
 pub struct Holder { pub pointer: *const *const i32 }
 static mut GLOBAL: *const *const i32 = core::ptr::null();
@@ -188,7 +188,7 @@ pub unsafe fn read(holder: *const Holder) -> i32 { **(*holder).pointer }
     let records = generate(source);
     assert!(
         type_record(&records, "Holder")
-            .definition
+            .source_definition
             .contains("pointer: *const *const i32")
     );
     assert!(
@@ -196,10 +196,290 @@ pub unsafe fn read(holder: *const Holder) -> i32 { **(*holder).pointer }
             .declaration
             .contains("*const *const i32")
     );
-    assert_stub_signatures_compile(
-        &records,
-        "pub struct Holder { pub pointer: *const *const i32 }\n",
+    let holder = type_record(&records, "Holder");
+    assert!(
+        holder.target_definition.contains("pointer: &'"),
+        "{}",
+        holder.target_definition
     );
+    assert_stub_signatures_compile(&records, &holder.target_definition);
+}
+
+fn compile_target_bodies(source: &str, bodies: &[(&str, &str)]) -> Vec<ItemRecord> {
+    let records = generate(source);
+    let definitions = records
+        .iter()
+        .filter_map(|record| match record {
+            ItemRecord::Type(record) => Some(record.target_definition.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let functions = bodies
+        .iter()
+        .map(|(name, body)| format!("{} {{ {body} }}", function(&records, name).target_signature))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let target = format!("{definitions}\n{functions}");
+    run_compiler_on_str(&target, utils::type_check).expect(&target);
+    records
+}
+
+#[test]
+fn field_borrow_lifetimes_support_construction_setters_and_getters() {
+    let source = r#"
+pub struct Holder { pub pointer: *const i32 }
+pub unsafe fn make(pointer: *const i32) -> Holder { Holder { pointer } }
+pub unsafe fn set(holder: *mut Holder, pointer: *const i32) { (*holder).pointer = pointer; }
+pub unsafe fn get(holder: *const Holder) -> *const i32 { (*holder).pointer }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("make", "Holder { pointer }"),
+            ("set", "holder.pointer = pointer;"),
+            ("get", "holder.pointer"),
+        ],
+    );
+    let holder = type_record(&records, "Holder");
+    assert!(holder.source_definition.contains("*const i32"));
+    assert!(
+        holder.target_definition.contains("&'"),
+        "{}",
+        holder.target_definition
+    );
+    assert!(function(&records, "set").target_signature.contains(":"));
+}
+
+#[test]
+fn field_lifetimes_propagate_through_aliases_containers_and_enums() {
+    let source = r#"
+#[derive(Clone, Copy)] pub struct Holder { pub pointer: *const i32 }
+pub type Alias = Holder;
+#[derive(Clone, Copy)] pub struct Container { pub holder: Alias }
+#[derive(Clone, Copy)] pub enum Choice { Value(Container), Empty }
+pub unsafe fn make(pointer: *const i32) -> Choice { Choice::Value(Container { holder: Holder { pointer } }) }
+pub unsafe fn read(holder: *const Holder) -> i32 { *(*holder).pointer }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            (
+                "make",
+                "Choice::Value(Container { holder: Holder { pointer } })",
+            ),
+            ("read", "*holder.pointer"),
+        ],
+    );
+    for name in ["Holder", "Alias", "Container", "Choice"] {
+        let record = type_record(&records, name);
+        assert_ne!(record.source_definition, record.target_definition, "{name}");
+        assert!(
+            record.target_definition.contains("<'"),
+            "{}",
+            record.target_definition
+        );
+    }
+}
+
+#[test]
+fn mutable_fields_remove_incompatible_derives_from_containers() {
+    let source = r#"
+#[derive(Clone, Copy, Debug)] pub struct Holder { pub pointer: *mut i32 }
+#[derive(Clone, Copy, Debug)] pub struct Container { pub holder: Holder }
+#[derive(Clone, Copy, Debug)] pub enum Choice { Value(Container), Empty }
+pub unsafe fn make(pointer: *mut i32) -> Holder { Holder { pointer } }
+pub unsafe fn write(holder: *mut Holder) { *(*holder).pointer = 7; }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("make", "Holder { pointer }"),
+            ("write", "*holder.pointer = 7;"),
+        ],
+    );
+    for name in ["Holder", "Container", "Choice"] {
+        let target = &type_record(&records, name).target_definition;
+        assert!(!target.contains("Copy"), "{target}");
+        assert!(!target.contains("Clone"), "{target}");
+        assert!(target.contains("Debug"), "{target}");
+    }
+}
+
+#[test]
+fn field_lifetimes_keep_multiple_structs_and_module_identities_distinct() {
+    let source = r#"
+pub mod left { pub struct Holder { pub pointer: *const i32 } }
+pub mod right { pub struct Holder { pub pointer: *const i64 } }
+pub unsafe fn make(p: *const i32, q: *const i64) -> (left::Holder, right::Holder) {
+    (left::Holder { pointer: p }, right::Holder { pointer: q })
+}
+pub unsafe fn read(a: *const left::Holder, b: *const right::Holder) -> i64 { *(*a).pointer as i64 + *(*b).pointer }
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    assert!(
+        !frozen.target_source.contains("*const"),
+        "{}",
+        frozen.target_source
+    );
+}
+
+#[test]
+fn configured_api_exposure_preserves_transitive_struct_fields_only() {
+    let source = r#"
+pub struct Inner { pub pointer: *const i32 }
+pub type Alias = Inner;
+pub enum Outer { Value(Alias), Empty }
+pub struct Private { pub pointer: *const i32 }
+#[export_name = "external_api"] pub unsafe extern "C" fn exported(value: *const Outer) -> *const Outer { value }
+pub unsafe fn private_read(value: *const Private) -> i32 { *(*value).pointer }
+pub unsafe fn public_read(value: *const Inner) -> i32 { *(*value).pointer }
+extern "C" { fn foreign(value: *const Private); }
+pub unsafe fn invoke(value: *const Private) { foreign(value); }
+"#;
+    let records = run_compiler_on_str(source, |tcx| {
+        make_skeletons_with_api(
+            source,
+            None,
+            &FxHashSet::from_iter(["external_api".to_owned()]),
+            tcx,
+        )
+        .unwrap()
+    })
+    .unwrap();
+    for name in ["Inner", "Alias", "Outer"] {
+        let record = type_record(&records, name);
+        assert_eq!(record.source_definition, record.target_definition, "{name}");
+    }
+    let private = type_record(&records, "Private");
+    assert_ne!(private.source_definition, private.target_definition);
+}
+
+#[test]
+fn pointer_arrays_and_union_fields_remain_raw() {
+    let source = r#"
+#[derive(Clone, Copy)] pub struct Holder { pub pointer: *mut i32 }
+pub union Storage { pub holder: Holder, pub bits: usize }
+pub struct Array { pub pointers: [*const i32; 2] }
+pub unsafe fn write(holder: *mut Holder) { *(*holder).pointer = 7; }
+pub unsafe fn read(array: *const Array) -> i32 { *(*array).pointers[0] }
+pub unsafe fn local(pointer: *const i32) -> i32 { let values: [*const i32; 1] = [pointer]; *values[0] }
+"#;
+    let records = generate(source);
+    for name in ["Holder", "Storage", "Array"] {
+        let record = type_record(&records, name);
+        assert_eq!(record.source_definition, record.target_definition, "{name}");
+    }
+    assert!(
+        function(&records, "local")
+            .baseline
+            .skeleton
+            .contains("[*const i32; 1]")
+    );
+}
+
+#[test]
+fn field_lifetimes_follow_aggregate_values_and_nested_field_returns() {
+    let source = r#"
+pub struct Holder { pub pointer: *const *const i32 }
+pub struct Container { pub holder: Holder }
+pub enum Choice { Value(Container), Empty }
+pub unsafe fn identity(value: Holder) -> Holder { value }
+pub unsafe fn forward(value: Holder) -> Holder { identity(value) }
+pub unsafe fn container(value: Container) -> Container { value }
+pub unsafe fn choice(value: Choice) -> Choice { value }
+pub unsafe fn pair(value: (Holder, Holder)) -> (Holder, Holder) { value }
+pub unsafe fn get(value: *const Holder) -> *const *const i32 { (*value).pointer }
+pub unsafe fn read(value: *const Holder) -> i32 { **(*value).pointer }
+"#;
+    compile_target_bodies(
+        source,
+        &[
+            ("identity", "value"),
+            ("forward", "identity(value)"),
+            ("container", "value"),
+            ("choice", "value"),
+            ("pair", "value"),
+            ("get", "value.pointer"),
+            ("read", "**value.pointer"),
+        ],
+    );
+}
+
+#[test]
+fn pointer_fields_preserve_lifetimes_of_aliases_to_compound_types() {
+    let source = r#"
+pub struct Holder { pub pointer: *const i32 }
+pub type Pair = (Holder, Holder);
+pub type Array = [Holder; 2];
+pub type Pointer = *const Pair;
+pub struct Outer { pub pair: *const Pair, pub array: *const Array, pub pointer: Pointer }
+pub unsafe fn read(value: *const Outer) -> bool { (*value).pair.is_null() }
+pub unsafe fn read_holder(value: *const Holder) -> i32 { *(*value).pointer }
+"#;
+    let records = generate(source);
+    let target = records
+        .iter()
+        .map(|record| match record {
+            ItemRecord::Type(record) => record.target_definition.clone(),
+            ItemRecord::Function(record) => format!("{} {{ todo!() }}", record.target_signature),
+            _ => String::new(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    run_compiler_on_str(&target, utils::type_check).expect(&target);
+    assert!(
+        type_record(&records, "Outer")
+            .target_definition
+            .contains("Pair<'")
+    );
+}
+
+#[test]
+fn incompatible_comparison_and_debug_derives_are_removed() {
+    let source = r#"
+#[derive(PartialEq, Eq)] pub struct Float { pub pointer: *const f32 }
+pub struct Plain { pub value: i32 }
+#[derive(Debug)] pub struct Holder { pub pointer: *const Plain }
+#[derive(Debug)] pub enum Container { Value(Holder), Empty }
+pub unsafe fn read_float(value: *const Float) -> f32 { *(*value).pointer }
+pub unsafe fn read(value: *const Holder) -> i32 { (*(*value).pointer).value }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("read_float", "*value.pointer"),
+            ("read", "value.pointer.value"),
+        ],
+    );
+    let float = &type_record(&records, "Float").target_definition;
+    assert!(float.contains("derive(PartialEq)"), "{float}");
+    for name in ["Holder", "Container"] {
+        assert!(
+            !type_record(&records, name)
+                .target_definition
+                .contains("derive(Debug)")
+        );
+    }
+}
+
+#[test]
+fn union_copy_requirements_follow_optional_structs_with_owning_fields() {
+    let source = r#"
+extern "C" { fn malloc(size: usize) -> *mut i32; fn free(pointer: *mut i32); }
+#[derive(Clone, Copy)] pub struct Holder { pub pointer: *mut i32 }
+pub union Storage { pub holder: Option<Holder>, pub bits: usize }
+pub unsafe fn allocate() -> Holder { Holder { pointer: malloc(core::mem::size_of::<i32>()) } }
+pub unsafe fn release(value: Holder) { free(value.pointer); }
+"#;
+    let records = generate(source);
+    let holder = type_record(&records, "Holder");
+    assert_eq!(holder.source_definition, holder.target_definition);
 }
 
 #[test]
@@ -482,7 +762,7 @@ fn allocation_extent_survives_preserved_struct_field_initializers() {
     assert!(signature.ends_with("Box<[i32]>"), "{signature}");
     assert!(
         type_record(&records, "Holder")
-            .definition
+            .source_definition
             .contains("p: *mut i32")
     );
     assert_stub_signatures_compile(&records, "pub struct Holder { p: *mut i32 }");
@@ -525,4 +805,180 @@ fn diverging_bodies_admit_reference_return_types_without_input_origins() {
         let transformed = format!("{signature} {{ {body} }}");
         run_compiler_on_str(&transformed, utils::type_check).expect(&transformed);
     }
+}
+
+#[test]
+fn mutable_field_getters_reborrow_for_the_container_lifetime() {
+    let source = r#"
+pub struct Holder { pub pointer: *mut i32 }
+pub unsafe fn get(holder: *mut Holder) -> *mut i32 { (*holder).pointer }
+pub unsafe fn write(holder: *mut Holder) { *get(holder) = 7; }
+pub unsafe fn read(holder: *const Holder) -> i32 { *(*holder).pointer }
+"#;
+    compile_target_bodies(
+        source,
+        &[
+            ("get", "&mut *holder.pointer"),
+            ("write", "*get(holder) = 7;"),
+            ("read", "*holder.pointer"),
+        ],
+    );
+    let source = r#"
+pub struct Holder { pub pointer: *mut *mut i32 }
+pub unsafe fn make(pointer: *mut *mut i32) -> Holder { Holder { pointer } }
+pub unsafe fn get(holder: *mut Holder) -> *mut *mut i32 { (*holder).pointer }
+pub unsafe fn write(holder: *mut Holder) { **get(holder) = 7; }
+"#;
+    compile_target_bodies(
+        source,
+        &[
+            ("make", "Holder { pointer }"),
+            ("get", "&mut *holder.pointer"),
+            ("write", "**get(holder) = 7;"),
+        ],
+    );
+}
+
+#[test]
+fn compatible_default_and_marker_derives_are_preserved() {
+    let source = r#"
+pub struct Plain { pub value: i32 }
+#[derive(Clone, Copy)] pub struct Unchanged { pub marker: core::marker::PhantomData<Plain> }
+#[derive(Default)] pub enum UnchangedChoice { #[default] Empty, Value(Plain) }
+pub struct Holder { pub pointer: *mut i32 }
+#[derive(Clone, Copy, Debug, Default)] pub struct Marker { pub marker: core::marker::PhantomData<Holder> }
+#[derive(Default)] pub enum Choice { #[default] Empty, Value(Holder) }
+pub unsafe fn write(holder: *mut Holder) { *(*holder).pointer = 7; }
+"#;
+    let records = compile_target_bodies(source, &[("write", "*holder.pointer = 7;")]);
+    for name in ["Unchanged", "UnchangedChoice"] {
+        let record = type_record(&records, name);
+        assert_eq!(record.source_definition, record.target_definition);
+    }
+    assert!(
+        type_record(&records, "Marker")
+            .target_definition
+            .contains("derive(Clone, Copy, Debug, Default)")
+    );
+    assert!(
+        type_record(&records, "Choice")
+            .target_definition
+            .contains("derive(Default)")
+    );
+}
+
+#[test]
+fn existing_nominal_lifetimes_remain_distinct_and_keep_argument_order() {
+    let source = r#"
+pub struct Holder<'a> { pub original: &'a i32, pub pointer: *const i32 }
+pub unsafe fn identity<'a>(value: Holder<'a>) -> Holder<'a> { value }
+pub unsafe fn read(value: *const Holder<'static>) -> i32 { *(*value).pointer }
+"#;
+    let records =
+        compile_target_bodies(source, &[("identity", "value"), ("read", "*value.pointer")]);
+    let holder = &type_record(&records, "Holder").target_definition;
+    assert!(holder.contains("Holder<'b, 'a>"), "{holder}");
+}
+
+#[test]
+fn zeroable_derives_follow_the_selected_reference_form() {
+    let source = r#"
+#[derive(bytemuck::Zeroable)] pub struct Holder { pub pointer: *const i32 }
+#[derive(bytemuck::Zeroable)] pub struct Nullable { pub pointer: *const i32 }
+pub unsafe fn read(value: *const Holder) -> i32 { *(*value).pointer }
+pub unsafe fn optional(value: *const Nullable) -> i32 { if (*value).pointer.is_null() { 0 } else { *(*value).pointer } }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("read", "*value.pointer"),
+            ("optional", "value.pointer.map_or(0, |pointer| *pointer)"),
+        ],
+    );
+    assert!(
+        !type_record(&records, "Holder")
+            .target_definition
+            .contains("Zeroable")
+    );
+    assert!(
+        type_record(&records, "Nullable")
+            .target_definition
+            .contains("Zeroable")
+    );
+}
+
+#[test]
+fn copy_union_manually_drop_fields_retain_raw_owners() {
+    let source = r#"
+extern "C" { fn malloc(size: usize) -> *mut i32; fn free(pointer: *mut i32); }
+#[derive(Clone, Copy)] pub struct Holder { pub pointer: *mut i32 }
+#[derive(Clone, Copy)] pub union Storage { pub holder: core::mem::ManuallyDrop<Holder>, pub bits: usize }
+pub unsafe fn allocate() -> Holder { Holder { pointer: malloc(core::mem::size_of::<i32>()) } }
+pub unsafe fn release(value: Holder) { free(value.pointer); }
+"#;
+    let records = generate(source);
+    let record = type_record(&records, "Holder");
+    assert_eq!(record.source_definition, record.target_definition);
+}
+
+#[test]
+fn struct_field_representations_include_optional_slice_and_owned_forms() {
+    let source = r#"
+extern "C" { fn malloc(size: usize) -> *mut i32; fn free(pointer: *mut i32); }
+pub struct Data { pub pointer: *const i32, pub optional: *const i32, pub bytes: *const u8, pub optional_bytes: *const u8, pub owned: *mut i32, pub owned_array: *mut i32 }
+pub unsafe fn make(pointer: *const i32, optional: *const i32, bytes: *const u8, optional_bytes: *const u8) -> Data {
+    Data { pointer, optional, bytes, optional_bytes, owned: malloc(core::mem::size_of::<i32>()), owned_array: malloc(4 * core::mem::size_of::<i32>()) }
+}
+pub unsafe fn read(value: *const Data) -> i32 { let number = if (*value).optional.is_null() { 0 } else { *(*value).optional }; let byte = if (*value).optional_bytes.is_null() { 0 } else { *(*value).optional_bytes.offset(1) as i32 }; number + byte + *(*value).pointer + *(*value).bytes.offset(1) as i32 }
+pub unsafe fn release(value: Data) { free(value.owned); free(value.owned_array); }
+"#;
+    let records = generate(source);
+    let target = &type_record(&records, "Data").target_definition;
+    assert!(target.contains("Option<&'"), "{target}");
+    assert!(target.contains("[u8]"), "{target}");
+    assert!(target.contains("Box<i32>"), "{target}");
+    assert!(target.contains("Box<[i32]>"), "{target}");
+    assert_stub_signatures_compile(&records, target);
+}
+
+#[test]
+fn owned_fields_support_allocation_reads_and_release() {
+    let source = r#"
+extern "C" { fn malloc(size: usize) -> *mut i32; fn free(pointer: *mut i32); }
+pub struct Holder { pub pointer: *mut i32 }
+pub unsafe fn allocate() -> Holder { let pointer = malloc(core::mem::size_of::<i32>()); *pointer = 7; Holder { pointer } }
+pub unsafe fn get(holder: *const Holder) -> i32 { *(*holder).pointer }
+pub unsafe fn release(holder: Holder) { free(holder.pointer); }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("allocate", "Holder { pointer: Box::new(7) }"),
+            ("get", "*holder.pointer"),
+            ("release", "drop(holder.pointer);"),
+        ],
+    );
+    assert!(
+        type_record(&records, "Holder")
+            .target_definition
+            .contains("Box<i32>")
+    );
+}
+
+#[test]
+fn readonly_aliases_of_mutable_field_containers_keep_shared_views() {
+    let source = r#"
+pub struct Holder { pub pointer: *mut i32 }
+pub unsafe fn write(holder: *mut Holder) { *(*holder).pointer = 7; }
+pub unsafe fn read(left: *mut Holder, right: *mut Holder) -> i32 { *(*left).pointer + *(*right).pointer }
+pub unsafe fn repeated(holder: *mut Holder) -> i32 { read(holder, holder) }
+"#;
+    compile_target_bodies(
+        source,
+        &[
+            ("write", "*holder.pointer = 7;"),
+            ("read", "*left.pointer + *right.pointer"),
+            ("repeated", "read(holder, holder)"),
+        ],
+    );
 }

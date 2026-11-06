@@ -156,6 +156,7 @@ pub mod nested {
     use crate::Context;
     pub(crate) unsafe fn echo<'a>(p: &'a Context) -> &'a Context { p }
 }
+
 fn main() {}
 "#;
     let frozen = freeze(source);
@@ -180,9 +181,9 @@ fn main() {}
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        ["analysis_source", "functions", "target_source"]
+        ["analysis_source", "functions", "target_source", "types"]
     );
-    for field in ["analysis_source", "functions", "target_source"] {
+    for field in ["analysis_source", "functions", "target_source", "types"] {
         let mut missing = value.clone();
         missing.as_object_mut().unwrap().remove(field);
         assert!(frozen_project_from_json(&missing.to_string()).is_err());
@@ -915,4 +916,62 @@ fn unstructured_rewrites_every_member_of_a_recursive_scc_together() {
     )
     .unwrap();
     run_compiler_on_str(&assembled, |_| ()).unwrap();
+}
+
+#[test]
+fn transformed_types_remain_fixed_through_replacement_assembly_and_finalization() {
+    let source = r#"
+pub const LIMIT: i32 = 4;
+pub struct Holder { pub pointer: *const i32 }
+pub unsafe fn get(holder: *const Holder) -> *const i32 { (*holder).pointer }
+"#;
+    let frozen = freeze(source);
+    assert_ne!(
+        frozen.types[0].source_definition,
+        frozen.types[0].target_definition
+    );
+    let function = &frozen.functions[0];
+    let returned = function
+        .record
+        .baseline
+        .skeleton
+        .replace("todo!()", "holder.pointer");
+    let output = transform_frozen_scc(&frozen, &request(function, Some(&returned)))
+        .unwrap()
+        .0;
+    run_compiler_on_str(&output.replacement.source, utils::type_check)
+        .expect(&output.replacement.source);
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[AcceptedScc {
+            members: vec![function.record.id],
+            source: output.replacement.source.clone(),
+        }],
+    )
+    .unwrap();
+    let finalized = finalize_frozen_project(&frozen, &assembled, "library", &[]).unwrap();
+    run_compiler_on_str(&finalized.source, utils::type_check).expect(&finalized.source);
+    assert!(
+        finalized
+            .source
+            .contains(&frozen.types[0].target_definition)
+    );
+    for source in [
+        assembled.replace("LIMIT: i32 = 4", "LIMIT: i32 = 5"),
+        assembled.replace(
+            &frozen.types[0].target_definition,
+            &frozen.types[0].source_definition,
+        ),
+    ] {
+        assert!(
+            check_frozen_project_sources(&frozen, &frozen.analysis_source, Some(&source), false)
+                .is_err()
+        );
+        assert!(finalize_frozen_project(&frozen, &source, "library", &[]).is_err());
+    }
+    let mut tampered = frozen.clone();
+    tampered.target_source = tampered
+        .target_source
+        .replace("LIMIT: i32 = 4", "LIMIT: i32 = 5");
+    assert!(frozen_project_from_json(&serde_json::to_string(&tampered).unwrap()).is_err());
 }

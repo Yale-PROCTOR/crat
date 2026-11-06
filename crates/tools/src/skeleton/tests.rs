@@ -3783,9 +3783,16 @@ fn record_variants_serialize_only_their_defined_fields() {
     );
     assert_eq!(
         keys(2),
-        ["id", "path", "kind", "definition", "dependencies"]
-            .into_iter()
-            .collect()
+        [
+            "id",
+            "path",
+            "kind",
+            "source_definition",
+            "target_definition",
+            "dependencies"
+        ]
+        .into_iter()
+        .collect()
     );
     assert_eq!(
         objects[0]["proctor_libc_function_paths"],
@@ -3891,7 +3898,7 @@ fn flattens_inline_modules_in_recursive_source_order() {
     );
     assert!(
         type_record(&records, "outer::S")
-            .definition
+            .source_definition
             .contains("#[derive(Clone, Copy)]")
     );
 }
@@ -3986,10 +3993,14 @@ fn type_records_preserve_complete_definitions() {
     );
     assert!(
         type_record(&records, "S")
-            .definition
+            .source_definition
             .contains("#[derive(Clone, Copy)]")
     );
-    assert!(type_record(&records, "S").definition.contains("#[repr(C)]"));
+    assert!(
+        type_record(&records, "S")
+            .source_definition
+            .contains("#[repr(C)]")
+    );
     assert_eq!(type_record(&records, "Alias").dependencies, [0, 1]);
 }
 
@@ -5131,10 +5142,14 @@ fn named_types_fixture() -> &'static str {
 #[test]
 fn does_not_change_named_type_or_global_declarations() {
     let records = generate(named_types_fixture());
-    assert!(type_record(&records, "S").definition.contains("*mut i32"));
+    assert!(
+        type_record(&records, "S")
+            .source_definition
+            .contains("*mut i32")
+    );
     assert!(
         type_record(&records, "Alias")
-            .definition
+            .source_definition
             .contains("*const i32")
     );
     assert_eq!(
@@ -6901,7 +6916,14 @@ pub unsafe fn move_future(mut left: FutureField, right: FutureField) -> i32 {
         overrides
             .changed_fields
             .insert(variant.fields()[0].def_id.to_def_id());
-        make_skeletons_with_preservation_overrides(source, None, tcx, &overrides).unwrap()
+        make_skeletons_with_preservation_overrides(
+            source,
+            None,
+            tcx,
+            &overrides,
+            &FxHashSet::default(),
+        )
+        .unwrap()
     })
     .unwrap();
     assert_eq!(
@@ -6929,7 +6951,14 @@ pub unsafe fn scalar_caller(value: i32) -> i32 { scalar_callee(value) }
         overrides
             .changed_local_signatures
             .insert(local_def("scalar_callee", tcx));
-        make_skeletons_with_preservation_overrides(source, None, tcx, &overrides).unwrap()
+        make_skeletons_with_preservation_overrides(
+            source,
+            None,
+            tcx,
+            &overrides,
+            &FxHashSet::default(),
+        )
+        .unwrap()
     })
     .unwrap();
     assert_eq!(

@@ -22,6 +22,10 @@ use rustc_middle::{
 };
 use rustc_span::{Symbol, def_id::LocalDefId};
 
+mod lifetime_flow;
+mod struct_types;
+pub(super) use struct_types::{FieldRegion, TypeLifetimes};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PtrKind {
     Raw(bool),
@@ -80,6 +84,9 @@ pub(super) struct InitialPointerDecisions {
     pub bindings: FxHashMap<HirId, PtrKind>,
     nested: FxHashMap<PointerTarget, Vec<PointerLayer>>,
     pub bounds: FxHashMap<LocalDefId, Vec<(Symbol, Symbol)>>,
+    pub fields: FxHashMap<StructFieldSlot, Vec<PointerLayer>>,
+    pub types: TypeLifetimes,
+    pub type_arguments: FxHashMap<(LocalDefId, usize), BTreeMap<FieldRegion, Symbol>>,
 }
 
 impl InitialPointerDecisions {
@@ -95,11 +102,21 @@ impl InitialPointerDecisions {
             !matches!(target, PointerTarget::Input(owner, _) | PointerTarget::Output(owner) if *owner == function)
         });
         self.bounds.remove(&function);
+        self.type_arguments
+            .retain(|(owner, _), _| *owner != function);
     }
 }
 
+#[cfg(test)]
 pub(super) fn initial_pointer_decisions(
     tcx: TyCtxt<'_>,
+) -> Result<InitialPointerDecisions, String> {
+    initial_pointer_decisions_for_api(tcx, &FxHashSet::default())
+}
+
+pub(super) fn initial_pointer_decisions_for_api(
+    tcx: TyCtxt<'_>,
+    api: &FxHashSet<String>,
 ) -> Result<InitialPointerDecisions, String> {
     let analysis = analyze_pointers(tcx)?;
     let representations = representation_facts(&analysis, tcx);
@@ -110,7 +127,86 @@ pub(super) fn initial_pointer_decisions(
         bindings: FxHashMap::default(),
         nested: FxHashMap::default(),
         bounds: FxHashMap::default(),
+        fields: FxHashMap::default(),
+        types: TypeLifetimes::default(),
+        type_arguments: FxHashMap::default(),
     };
+    let protected = struct_types::protected_structs(tcx, api);
+    for &slot in analysis.kinds.keys() {
+        let SlotRef::Field(slot) = slot else { continue };
+        let field = analysis.slots.field_slots.slot(slot);
+        let pointer_replacer_bo::analyses::borrow_ownership::slots::SlotOwner::Field(owner) =
+            field.owner
+        else {
+            continue;
+        };
+        if field.depth != 0 || analysis.slots.field_slots.is_array_field(owner) {
+            continue;
+        }
+        let definition = tcx.adt_def(owner.struct_did);
+        let original = definition.non_enum_variant().fields
+            [rustc_abi::FieldIdx::from_usize(owner.field_index)]
+        .ty(
+            tcx,
+            ty::GenericArgs::identity_for_item(tcx, owner.struct_did),
+        );
+        let mut current = original;
+        let mut layers = Vec::new();
+        while let TyKind::RawPtr(inner, mutability) = *current.kind() {
+            let depth = layers.len();
+            let slot = (depth < usize::from(MAX_SLOT_DEPTH))
+                .then(|| {
+                    analysis
+                        .slots
+                        .field_slots
+                        .slot_for_field_depth(owner, depth as u8)
+                })
+                .flatten()
+                .map(SlotRef::Field);
+            let kind = slot
+                .and_then(|slot| analysis.kinds.get(&slot))
+                .copied()
+                .unwrap_or(SlotKind::Raw);
+            let mutable = mutability.is_mut()
+                && analysis
+                    .mutability
+                    .struct_field_fact(owner.struct_did, owner.field_index, depth)
+                    .is_none_or(|fact| fact.is_mutable());
+            let array = analysis
+                .fatness
+                .struct_field_fact(owner.struct_did, owner.field_index, depth)
+                .is_some_and(|fact| fact.is_arr())
+                || (kind == SlotKind::Owning
+                    && slot
+                        .and_then(|slot| representations.allocations.get(&slot))
+                        .is_some_and(|sizes| {
+                            let size = tcx
+                                .layout_of(
+                                    ty::TypingEnv::post_analysis(tcx, owner.struct_did)
+                                        .as_query_input(inner),
+                                )
+                                .ok()
+                                .map(|layout| layout.size.bytes());
+                            sizes.iter().any(|bytes| bytes.is_none() || *bytes != size)
+                        }));
+            let optional = slot.is_some_and(|slot| representations.nullable.contains(&slot));
+            let kind = if protected.contains(&owner.struct_did) || inner.is_c_void(tcx) {
+                PtrKind::Raw(mutability.is_mut())
+            } else {
+                representation(kind, mutable, mutability.is_mut(), array, optional)
+            };
+            layers.push(PointerLayer {
+                kind,
+                lifetime: None,
+            });
+            current = inner;
+        }
+        struct_types::mutable_ancestors(original, &mut layers);
+        result.fields.insert(owner, layers);
+    }
+    struct_types::retain_union_compatible_fields(&mut result.fields, tcx);
+    result.types = TypeLifetimes::new(&mut result.fields, tcx);
+    let lifetime_flow = lifetime_flow::LifetimeFlow::new(&analysis, &result.types, tcx);
     for (&function, universe) in &analysis.slots.fn_local_slots {
         let body = tcx
             .mir_drops_elaborated_and_const_checked(function)
@@ -156,14 +252,15 @@ pub(super) fn initial_pointer_decisions(
                     )
                 })?;
                 let mutable = source_mutability.is_mut()
-                    && if depth == 0 {
-                        analysis.is_mutable(function, local)
-                    } else {
-                        analysis
-                            .mutability
-                            .function_body_fact(function, local.index(), depth.into())
-                            .is_none_or(|fact| fact.is_mutable())
-                    };
+                    && (representations.mutable.contains(&slot)
+                        || if depth == 0 {
+                            analysis.is_mutable(function, local)
+                        } else {
+                            analysis
+                                .mutability
+                                .function_body_fact(function, local.index(), depth.into())
+                                .is_none_or(|fact| fact.is_mutable())
+                        });
                 let array = analysis
                     .fatness
                     .function_body_fact(function, local.index(), depth.into())
@@ -187,17 +284,7 @@ pub(super) fn initial_pointer_decisions(
                 } else if inner.is_c_void(tcx) {
                     PtrKind::Raw(source_mutability.is_mut())
                 } else {
-                    match (kind, array, optional) {
-                        (SlotKind::Raw, _, _) => PtrKind::Raw(source_mutability.is_mut()),
-                        (SlotKind::Ref, false, false) => PtrKind::Ref(mutable),
-                        (SlotKind::Ref, false, true) => PtrKind::OptRef(mutable),
-                        (SlotKind::Ref, true, false) => PtrKind::Slice(mutable),
-                        (SlotKind::Ref, true, true) => PtrKind::OptSlice(mutable),
-                        (SlotKind::Owning, false, false) => PtrKind::Box,
-                        (SlotKind::Owning, false, true) => PtrKind::OptBox,
-                        (SlotKind::Owning, true, false) => PtrKind::BoxedSlice,
-                        (SlotKind::Owning, true, true) => PtrKind::OptBoxedSlice,
-                    }
+                    representation(*kind, mutable, source_mutability.is_mut(), array, optional)
                 };
                 layers.push(PointerLayer {
                     kind,
@@ -206,10 +293,19 @@ pub(super) fn initial_pointer_decisions(
                 original = inner;
             }
             if !layers.is_empty() {
+                struct_types::mutable_ancestors(declaration.ty, &mut layers);
                 locals.insert(local, layers);
             }
         }
-        let bounds = signature_lifetimes(function, arguments, &analysis, &mut locals, tcx)?;
+        let bounds = signature_lifetimes(
+            function,
+            arguments,
+            &analysis,
+            &lifetime_flow,
+            &mut locals,
+            &mut result,
+            tcx,
+        )?;
         result.bounds.insert(function, bounds);
         let mut signature = SigDecision {
             input_decs: vec![None; arguments],
@@ -250,6 +346,26 @@ pub(super) fn initial_pointer_decisions(
     Ok(result)
 }
 
+fn representation(
+    kind: SlotKind,
+    mutable: bool,
+    source_mutable: bool,
+    array: bool,
+    optional: bool,
+) -> PtrKind {
+    match (kind, array, optional) {
+        (SlotKind::Raw, _, _) => PtrKind::Raw(source_mutable),
+        (SlotKind::Ref, false, false) => PtrKind::Ref(mutable),
+        (SlotKind::Ref, false, true) => PtrKind::OptRef(mutable),
+        (SlotKind::Ref, true, false) => PtrKind::Slice(mutable),
+        (SlotKind::Ref, true, true) => PtrKind::OptSlice(mutable),
+        (SlotKind::Owning, false, false) => PtrKind::Box,
+        (SlotKind::Owning, false, true) => PtrKind::OptBox,
+        (SlotKind::Owning, true, false) => PtrKind::BoxedSlice,
+        (SlotKind::Owning, true, true) => PtrKind::OptBoxedSlice,
+    }
+}
+
 fn carries_lifetime(kind: PtrKind) -> bool {
     matches!(
         kind,
@@ -261,7 +377,9 @@ fn signature_lifetimes(
     function: LocalDefId,
     arguments: usize,
     analysis: &AcceptedPointerAnalysis,
+    lifetime_flow: &lifetime_flow::LifetimeFlow,
     locals: &mut FxHashMap<Local, Vec<PointerLayer>>,
+    decisions: &mut InitialPointerDecisions,
     tcx: TyCtxt<'_>,
 ) -> Result<Vec<(Symbol, Symbol)>, String> {
     let mut keys = BTreeSet::new();
@@ -269,12 +387,22 @@ fn signature_lifetimes(
         if let Some(layers) = locals.get(&Local::from_usize(index)) {
             for (depth, layer) in layers.iter().enumerate() {
                 if carries_lifetime(layer.kind) {
-                    keys.insert((index, depth));
+                    keys.insert((index, depth, None));
                 }
             }
         }
     }
     let source_signature = tcx.fn_sig(function).instantiate_identity().skip_binder();
+    for index in 0..=arguments {
+        let source = if index == 0 {
+            source_signature.output()
+        } else {
+            source_signature.inputs()[index - 1]
+        };
+        for region in decisions.types.regions_of(source) {
+            keys.insert((index, region.depth, Some(region)));
+        }
+    }
     let mut fixed = BTreeMap::new();
     let mut source_regions = FxHashMap::default();
     for index in 0..=arguments {
@@ -289,7 +417,7 @@ fn signature_lifetimes(
                 source_regions
                     .entry(*region)
                     .or_insert_with(Vec::new)
-                    .push((index, depth));
+                    .push((index, depth, None));
                 let name = match region.kind() {
                     ty::RegionKind::ReStatic => Some(Symbol::intern("static")),
                     ty::RegionKind::ReEarlyParam(parameter) => Some(parameter.name),
@@ -302,7 +430,7 @@ fn signature_lifetimes(
                 if let Some(name) = name {
                     let name = name.as_str().trim_start_matches('\'').to_owned();
                     if name != "_" && !name.is_empty() {
-                        fixed.insert((index, depth), Symbol::intern(&name));
+                        fixed.insert((index, depth, None), Symbol::intern(&name));
                     }
                 }
             }
@@ -329,15 +457,55 @@ fn signature_lifetimes(
     }
     if let Some(summary) = analysis.origins.get(&function) {
         let key_of = |slot: &SignatureSlot| {
-            if slot.place.field.is_some() {
-                return None;
-            }
             let local = match slot.place.root {
                 SignatureRoot::Return => 0,
                 SignatureRoot::Arg(local) => local.index(),
             };
-            let key = (local, usize::from(slot.place.deref_depth + slot.depth));
-            keys.contains(&key).then_some(key)
+            let region = slot.place.field.map(|field| FieldRegion {
+                owner: field.struct_did,
+                field: field.field_index,
+                depth: usize::from(slot.depth),
+            });
+            let key = (
+                local,
+                region.map_or(usize::from(slot.place.deref_depth + slot.depth), |region| {
+                    region.depth
+                }),
+                region,
+            );
+            if keys.contains(&key) {
+                Some(key)
+            } else if region.is_some_and(|region| {
+                decisions
+                    .fields
+                    .get(&StructFieldSlot {
+                        struct_did: region.owner,
+                        field_index: region.field,
+                    })
+                    .and_then(|layers| layers.get(region.depth))
+                    .is_some_and(|layer| {
+                        matches!(
+                            layer.kind,
+                            PtrKind::Box
+                                | PtrKind::OptBox
+                                | PtrKind::BoxedSlice
+                                | PtrKind::OptBoxedSlice
+                        )
+                    })
+            }) {
+                locals
+                    .get(&Local::from_usize(local))
+                    .and_then(|layers| {
+                        layers
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find(|(_, layer)| carries_lifetime(layer.kind))
+                    })
+                    .map(|(depth, _)| (local, depth, None))
+            } else {
+                None
+            }
         };
         for (source, source_slot) in summary.slots.iter_enumerated() {
             let Some(source_key) = key_of(source_slot) else { continue };
@@ -349,6 +517,49 @@ fn signature_lifetimes(
             }
         }
     }
+    flows.extend(lifetime_flow.flows(function, &keys));
+    flows = flows
+        .into_iter()
+        .map(|(source, target)| {
+            if target.0 == 0
+                && target.1 == 0
+                && target.2.is_none()
+                && let Some(region) = source.2
+                && decisions
+                    .fields
+                    .get(&StructFieldSlot {
+                        struct_did: region.owner,
+                        field_index: region.field,
+                    })
+                    .and_then(|layers| layers.get(region.depth))
+                    .is_some_and(|layer| {
+                        matches!(
+                            layer.kind,
+                            PtrKind::Ref(true)
+                                | PtrKind::OptRef(true)
+                                | PtrKind::Slice(true)
+                                | PtrKind::OptSlice(true)
+                                | PtrKind::Box
+                                | PtrKind::OptBox
+                                | PtrKind::BoxedSlice
+                                | PtrKind::OptBoxedSlice
+                        )
+                    })
+                && let Some((depth, _)) =
+                    locals.get(&Local::from_usize(source.0)).and_then(|layers| {
+                        layers
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            .find(|(_, layer)| carries_lifetime(layer.kind))
+                    })
+            {
+                ((source.0, depth, None), target)
+            } else {
+                (source, target)
+            }
+        })
+        .collect();
     let ties = flows
         .iter()
         .filter_map(|&(source, target)| {
@@ -371,6 +582,7 @@ fn signature_lifetimes(
         keys.iter().any(|key| key.0 == 0) && return_has_no_borrowed_value(function, tcx);
     for &key in &keys {
         if key.0 == 0
+            && key.2.is_none()
             && !fixed.contains_key(&key)
             && !no_borrowed_return
             && !flows
@@ -441,10 +653,20 @@ fn signature_lifetimes(
         .iter()
         .filter(|(source, target)| source.0 != target.0)
         .flat_map(|(source, target)| [source.0, target.0])
+        .chain(
+            keys.iter()
+                .filter_map(|key| key.2.is_some().then_some(key.0)),
+        )
         .chain([0])
         .collect::<BTreeSet<_>>();
-    for (&(local, depth), group) in &groups {
-        if needed.contains(&local) {
+    for (&(local, depth, region), group) in &groups {
+        if let Some(region) = region {
+            decisions
+                .type_arguments
+                .entry((function, local))
+                .or_default()
+                .insert(region, names[group]);
+        } else if needed.contains(&local) {
             locals.get_mut(&Local::from_usize(local)).unwrap()[depth].lifetime = Some(names[group]);
         }
     }
@@ -475,13 +697,13 @@ fn signature_lifetimes(
     {
         for (depth, outer) in layers.iter().enumerate() {
             if let Some(outer) = fixed
-                .get(&(local.index(), depth))
+                .get(&(local.index(), depth, None))
                 .copied()
                 .or(outer.lifetime)
             {
                 for (index, layer) in layers.iter().enumerate().skip(depth + 1) {
                     let Some(inner) = fixed
-                        .get(&(local.index(), index))
+                        .get(&(local.index(), index, None))
                         .copied()
                         .or(layer.lifetime)
                     else {
@@ -494,7 +716,7 @@ fn signature_lifetimes(
             }
         }
     }
-    for (&(local, depth), &name) in &fixed {
+    for (&(local, depth, _), &name) in &fixed {
         if let Some(layer) = locals
             .get_mut(&Local::from_usize(local))
             .and_then(|layers| layers.get_mut(depth))
@@ -512,6 +734,7 @@ fn signature_lifetimes(
 struct RepresentationFacts {
     nullable: FxHashSet<SlotRef>,
     allocations: FxHashMap<SlotRef, FxHashSet<Option<u64>>>,
+    mutable: FxHashSet<SlotRef>,
 }
 
 fn representation_facts(
@@ -519,6 +742,35 @@ fn representation_facts(
     tcx: TyCtxt<'_>,
 ) -> RepresentationFacts {
     let mut nullable = analysis.nullable.clone();
+    let mut mutable = FxHashSet::default();
+    for &slot in analysis.kinds.keys() {
+        let SlotRef::Field(id) = slot else { continue };
+        let field = analysis.slots.field_slots.slot(id);
+        let pointer_replacer_bo::analyses::borrow_ownership::slots::SlotOwner::Field(owner) =
+            field.owner
+        else {
+            unreachable!()
+        };
+        let definition = tcx.adt_def(owner.struct_did);
+        let mut source = definition.non_enum_variant().fields
+            [rustc_abi::FieldIdx::from_usize(owner.field_index)]
+        .ty(
+            tcx,
+            ty::GenericArgs::identity_for_item(tcx, owner.struct_did),
+        );
+        for _ in 0..field.depth {
+            let TyKind::RawPtr(inner, _) = source.kind() else { break };
+            source = *inner;
+        }
+        if matches!(source.kind(), TyKind::RawPtr(_, mutability) if mutability.is_mut())
+            && analysis
+                .mutability
+                .struct_field_fact(owner.struct_did, owner.field_index, field.depth.into())
+                .is_none_or(|fact| fact.is_mutable())
+        {
+            mutable.insert(slot);
+        }
+    }
     let mut null_tests = FxHashSet::default();
     let mut allocations = FxHashMap::<SlotRef, FxHashSet<Option<u64>>>::default();
     let mut edges = Vec::new();
@@ -655,6 +907,9 @@ fn representation_facts(
             changed |= nullable.insert(slot);
         }
         for &(source, target) in &edges {
+            if mutable.contains(&target) {
+                changed |= mutable.insert(source);
+            }
             if nullable.contains(&source) {
                 changed |= nullable.insert(target);
             }
@@ -672,6 +927,7 @@ fn representation_facts(
     RepresentationFacts {
         nullable,
         allocations,
+        mutable,
     }
 }
 

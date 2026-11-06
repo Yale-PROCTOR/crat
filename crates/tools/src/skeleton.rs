@@ -27,6 +27,8 @@ use rustc_span::{
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
 
+#[cfg(test)]
+use crate::pointer_decisions::initial_pointer_decisions;
 use crate::{
     AdtIdentity, AdtKind, BinaryOperator, BindingMutability, BorrowKind, ByRefKind, Expression,
     FieldIdentity, Literal, LoadedRuleSet, Pattern, PointerVariableMetadata, PointerVariableOrigin,
@@ -38,7 +40,8 @@ use crate::{
         semantic_type_tree,
     },
     pointer_decisions::{
-        InitialPointerDecisions, PointerLayer, PointerTarget, PtrKind, initial_pointer_decisions,
+        InitialPointerDecisions, PointerLayer, PointerTarget, PtrKind,
+        initial_pointer_decisions_for_api,
     },
     preservation::{make_disposition_forest, validate_skeleton_views},
     printf::{eligible_printf_statement, supported_printf_call},
@@ -90,7 +93,8 @@ pub struct TypeRecord {
     pub id: u64,
     pub path: String,
     pub kind: ItemKindName,
-    pub definition: String,
+    pub source_definition: String,
+    pub target_definition: String,
     pub dependencies: Vec<u64>,
 }
 
@@ -180,11 +184,21 @@ pub fn make_skeletons_with_rules(
     rules: Option<&RuleDocument>,
     tcx: TyCtxt<'_>,
 ) -> Result<Vec<ItemRecord>, GenerationError> {
+    make_skeletons_with_api(source, rules, &FxHashSet::default(), tcx)
+}
+
+pub fn make_skeletons_with_api(
+    source: &str,
+    rules: Option<&RuleDocument>,
+    api: &FxHashSet<String>,
+    tcx: TyCtxt<'_>,
+) -> Result<Vec<ItemRecord>, GenerationError> {
     make_skeletons_with_preservation_overrides(
         source,
         rules,
         tcx,
         &PreservationDecisionOverrides::default(),
+        api,
     )
 }
 
@@ -193,6 +207,7 @@ fn make_skeletons_with_preservation_overrides(
     rules: Option<&RuleDocument>,
     tcx: TyCtxt<'_>,
     preservation_overrides: &PreservationDecisionOverrides,
+    api: &FxHashSet<String>,
 ) -> Result<Vec<ItemRecord>, GenerationError> {
     let mut surface = utils::ast::parse_crate(source.to_owned());
     reject_unsupported_function_generics(&surface.items, &mut vec![])?;
@@ -221,11 +236,12 @@ fn make_skeletons_with_preservation_overrides(
         .iter()
         .map(|item| (item.def_id.to_def_id(), item.id))
         .collect();
-    let mut decisions = initial_pointer_decisions(tcx).map_err(|message| GenerationError {
-        kind: GenerationErrorKind::PointerAnalysis,
-        function_path: String::new(),
-        message,
-    })?;
+    let mut decisions =
+        initial_pointer_decisions_for_api(tcx, api).map_err(|message| GenerationError {
+            kind: GenerationErrorKind::PointerAnalysis,
+            function_path: String::new(),
+            message,
+        })?;
     for item in &raw_items {
         let ItemKind::Fn(function) = &item.item.kind else { continue };
         if !function.sig.decl.c_variadic() {
@@ -428,15 +444,155 @@ fn make_record(
         }
         ItemKindName::TyAlias | ItemKindName::Enum | ItemKindName::Struct | ItemKindName::Union => {
             let mut item = surface.item.clone();
-            sanitize_item(&mut item);
+            let source_definition = pprust::item_to_string(&item);
+            apply_target_definition(
+                &mut item,
+                surface.def_id,
+                decisions,
+                ast_to_hir,
+                &surface.path,
+                tcx,
+            )?;
             Ok(ItemRecord::Type(TypeRecord {
                 id: surface.id,
                 path: surface.path,
                 kind: surface.kind,
-                definition: pprust::item_to_string(&item),
+                source_definition,
+                target_definition: pprust::item_to_string(&item),
                 dependencies,
             }))
         }
+    }
+}
+
+fn apply_target_definition<'tcx>(
+    item: &mut Item,
+    did: LocalDefId,
+    decisions: &InitialPointerDecisions,
+    ast_to_hir: &utils::ir::AstToHir,
+    path: &str,
+    tcx: TyCtxt<'tcx>,
+) -> Result<(), GenerationError> {
+    let names = decisions.types.plans.get(&did);
+    let speller = TypeSpeller::new(did, ast_to_hir, tcx);
+    let rewrite = |target: &mut Ty,
+                   source: ty::Ty<'tcx>,
+                   layers: &[PointerLayer]|
+     -> Result<(), GenerationError> {
+        let source_hint = target.clone();
+        if let Some((outer, inner)) = layers.split_first()
+            && (decision_changes_type(outer.kind, source) || nested_changes_type(inner, source))
+        {
+            *target = target_type(
+                source,
+                outer.kind,
+                outer.lifetime,
+                inner,
+                Some(target),
+                &speller,
+                path,
+                "struct field",
+            )?;
+        }
+        decisions.types.rewrite_ty(
+            target,
+            source,
+            layers,
+            names,
+            ast_to_hir,
+            Some(&source_hint),
+            tcx,
+        );
+        Ok(())
+    };
+    let generics = match &mut item.kind {
+        ItemKind::Struct(_, generics, variant) => {
+            let arguments = ty::GenericArgs::identity_for_item(tcx, did);
+            for (index, field) in variant_fields_mut(variant).iter_mut().enumerate() {
+                let source = tcx.adt_def(did).non_enum_variant().fields
+                    [rustc_abi::FieldIdx::from_usize(index)]
+                .ty(tcx, arguments);
+                let layers = decisions.fields.get(
+                    &pointer_replacer_bo::analyses::borrow_ownership::slots::StructFieldSlot {
+                        struct_did: did,
+                        field_index: index,
+                    },
+                );
+                rewrite(
+                    &mut field.ty,
+                    source,
+                    layers.map(Vec::as_slice).unwrap_or_default(),
+                )?;
+            }
+            generics
+        }
+        ItemKind::Enum(_, generics, definition) => {
+            let arguments = ty::GenericArgs::identity_for_item(tcx, did);
+            for (variant, source_variant) in definition
+                .variants
+                .iter_mut()
+                .zip(tcx.adt_def(did).variants().iter())
+            {
+                for (field, source_field) in variant_fields_mut(&mut variant.data)
+                    .iter_mut()
+                    .zip(source_variant.fields.iter())
+                {
+                    rewrite(&mut field.ty, source_field.ty(tcx, arguments), &[])?;
+                }
+            }
+            generics
+        }
+        ItemKind::TyAlias(alias) => {
+            if let Some(target) = &mut alias.ty {
+                rewrite(target, tcx.type_of(did).instantiate_identity(), &[])?;
+            }
+            &mut alias.generics
+        }
+        _ => return Ok(()),
+    };
+    if let Some(names) = names {
+        add_lifetime_params(generics, &names.values().copied().collect::<Vec<_>>());
+    }
+    if let Some(invalid) = decisions.types.invalid_derives.get(&did) {
+        let mut rebuilt = rustc_ast::AttrVec::new();
+        for attribute in item.attrs.drain(..) {
+            if !attribute.has_name(sym::derive) {
+                rebuilt.push(attribute);
+                continue;
+            }
+            let Some(list) = attribute.meta_item_list() else {
+                rebuilt.push(attribute);
+                continue;
+            };
+            let kept = list
+                .iter()
+                .filter_map(|item| item.meta_item())
+                .filter(|meta| {
+                    !meta
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|segment| invalid.contains(&segment.ident.name))
+                })
+                .map(|meta| pprust::path_to_string(&meta.path))
+                .collect::<Vec<_>>();
+            if !kept.is_empty() {
+                rebuilt.extend(utils::ast::parse_attr(format!(
+                    "#[derive({})]",
+                    kept.join(", ")
+                )));
+            }
+        }
+        item.attrs = rebuilt;
+    }
+    Ok(())
+}
+
+fn variant_fields_mut(variant: &mut rustc_ast::VariantData) -> &mut [rustc_ast::FieldDef] {
+    match variant {
+        rustc_ast::VariantData::Struct { fields, .. }
+        | rustc_ast::VariantData::Tuple(fields, _) => fields,
+        rustc_ast::VariantData::Unit(_) => &mut [],
     }
 }
 
@@ -1364,6 +1520,14 @@ fn apply_target_signature<'a, 'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> Result<(), GenerationError> {
     let ItemKind::Fn(box function) = &mut item.kind else { unreachable!() };
+    let source_inputs = function
+        .sig
+        .decl
+        .inputs
+        .iter()
+        .map(|parameter| parameter.ty.clone())
+        .collect::<Vec<_>>();
+    let source_output = function.sig.decl.output.clone();
     let force_main_argv = is_supported_two_argument_main_0(function);
     function.sig.header.safety = Safety::Unsafe(DUMMY_SP);
     let Some(decision) = decisions.signatures.data.get(&def_id) else {
@@ -1554,6 +1718,76 @@ fn apply_target_signature<'a, 'tcx>(
     }
     if force_main_argv {
         function.sig.decl.inputs[1].ty = P(utils::ast::parse_ty("&mut [&mut [i8]]".to_owned()));
+    }
+    let nominal_lifetimes = decisions
+        .type_arguments
+        .iter()
+        .filter(|((owner, _), _)| *owner == def_id)
+        .flat_map(|(_, names)| names.values().copied())
+        .collect::<Vec<_>>();
+    add_lifetime_params(&mut function.generics, &nominal_lifetimes);
+    for (index, parameter) in function
+        .sig
+        .decl
+        .inputs
+        .iter_mut()
+        .take(source_signature.inputs().len())
+        .enumerate()
+    {
+        let layers = decision.input_decs[index]
+            .map(|kind| {
+                std::iter::once(PointerLayer {
+                    kind,
+                    lifetime: decision.input_lifetimes[index],
+                })
+                .chain(
+                    decisions
+                        .nested(PointerTarget::Input(def_id, index))
+                        .iter()
+                        .copied(),
+                )
+                .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        decisions.types.rewrite_ty(
+            &mut parameter.ty,
+            source_signature.inputs()[index],
+            &layers,
+            decisions.type_arguments.get(&(def_id, index + 1)),
+            type_speller.ast_to_hir,
+            Some(&source_inputs[index]),
+            tcx,
+        );
+    }
+    if let FnRetTy::Ty(output) = &mut function.sig.decl.output {
+        let layers = decision
+            .output_dec
+            .map(|kind| {
+                std::iter::once(PointerLayer {
+                    kind,
+                    lifetime: decision.output_lifetime,
+                })
+                .chain(
+                    decisions
+                        .nested(PointerTarget::Output(def_id))
+                        .iter()
+                        .copied(),
+                )
+                .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        decisions.types.rewrite_ty(
+            output,
+            source_signature.output(),
+            &layers,
+            decisions.type_arguments.get(&(def_id, 0)),
+            type_speller.ast_to_hir,
+            match &source_output {
+                FnRetTy::Ty(ty) => Some(&**ty),
+                _ => None,
+            },
+            tcx,
+        );
     }
     Ok(())
 }
@@ -4608,7 +4842,35 @@ impl MutVisitor for Skeletonizer<'_, '_> {
                     }),
             };
             match ty {
-                Ok(ty) => local.ty = ty.map(P),
+                Ok(ty) => {
+                    let layers = decision
+                        .map(|kind| {
+                            std::iter::once(PointerLayer {
+                                kind,
+                                lifetime: None,
+                            })
+                            .chain(
+                                self.decisions
+                                    .nested(PointerTarget::Binding(hir_id))
+                                    .iter()
+                                    .copied(),
+                            )
+                            .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    local.ty = ty.map(|mut ty| {
+                        self.decisions.types.rewrite_ty(
+                            &mut ty,
+                            inferred,
+                            &layers,
+                            None,
+                            self.ast_to_hir,
+                            local.ty.as_deref(),
+                            self.tcx,
+                        );
+                        P(ty)
+                    });
+                }
                 Err(error) => {
                     self.error = Some(error);
                     return smallvec![stmt];

@@ -6,11 +6,13 @@ extern crate rustc_ast;
 extern crate rustc_ast_pretty;
 extern crate rustc_hash;
 extern crate rustc_hir;
+extern crate rustc_infer;
 extern crate rustc_interface;
 extern crate rustc_middle;
 extern crate rustc_parse;
 extern crate rustc_session;
 extern crate rustc_span;
+extern crate rustc_trait_selection;
 extern crate smallvec;
 extern crate thin_vec;
 

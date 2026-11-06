@@ -76,6 +76,7 @@ impl<'tcx> AstToHirMapper<'tcx> {
             if !expanded {
                 let hitem = self.tcx.hir_item(*hitem);
                 if hitem.span.is_dummy()
+                    || hitem.span.in_derive_expansion()
                     || self
                         .tcx
                         .is_automatically_derived(hitem.owner_id.to_def_id())
