@@ -1077,14 +1077,28 @@ fn validate_supported_transformation(
     if function.generics.params.iter().any(|parameter| {
         !matches!(parameter.kind, GenericParamKind::Lifetime)
             || !parameter.attrs.is_empty()
-            || !parameter.bounds.is_empty()
+            || parameter
+                .bounds
+                .iter()
+                .any(|bound| !matches!(bound, rustc_ast::GenericBound::Outlives(_)))
     }) || function.generics.where_clause.has_where_token
     {
         return Err(item_error(
             ReplacementErrorKind::InvalidTransformation,
             requested,
-            "returned generics must contain only unbounded, unattributed named lifetimes and no where clause"
+            "returned generics must contain only unattributed named lifetimes with lifetime bounds and no where clause"
                 .to_owned(),
+        ));
+    }
+    let expected = parse_replacement_skeleton(requested)?;
+    let ItemKind::Fn(expected) = &expected.kind else { unreachable!() };
+    if crate::validator::lifetime_generic_declaration(&function.generics)
+        != crate::validator::lifetime_generic_declaration(&expected.generics)
+    {
+        return Err(item_error(
+            ReplacementErrorKind::InvalidTransformation,
+            requested,
+            "copy the exact target lifetime parameters and bounds".to_owned(),
         ));
     }
     Ok(())

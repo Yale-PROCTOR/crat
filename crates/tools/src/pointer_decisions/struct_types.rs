@@ -5,7 +5,11 @@ use rustc_ast::{
     AngleBracketedArg, AngleBracketedArgs, GenericArg, GenericArgs, Ty, TyKind as AstTyKind, ptr::P,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{self as hir, def::Res};
+use rustc_hir::{
+    self as hir,
+    def::Res,
+    intravisit::{self, Visitor},
+};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::ty::{self, TyCtxt, TyKind};
 use rustc_span::{DUMMY_SP, Symbol, def_id::LocalDefId, sym};
@@ -40,6 +44,72 @@ impl PartialOrd for FieldRegion {
 pub(crate) struct TypeLifetimes {
     pub plans: FxHashMap<LocalDefId, BTreeMap<FieldRegion, Symbol>>,
     pub invalid_derives: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
+}
+
+pub(super) fn foreign_types(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
+    struct TypeVisitor<'tcx> {
+        tcx: TyCtxt<'tcx>,
+        roots: FxHashSet<LocalDefId>,
+        dependencies: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for TypeVisitor<'tcx> {
+        type NestedFilter = rustc_middle::hir::nested_filter::All;
+
+        fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
+            self.tcx
+        }
+
+        fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx, hir::AmbigArg>) {
+            if let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = ty.kind
+                && let Res::Def(_, did) = path.res
+                && let Some(did) = did.as_local()
+            {
+                for parent in self.tcx.hir_parent_id_iter(ty.hir_id) {
+                    match self.tcx.hir_node(parent) {
+                        hir::Node::ForeignItem(_) => {
+                            self.roots.insert(did);
+                            break;
+                        }
+                        hir::Node::Item(item) => {
+                            if matches!(
+                                item.kind,
+                                hir::ItemKind::Struct(..)
+                                    | hir::ItemKind::Enum(..)
+                                    | hir::ItemKind::Union(..)
+                                    | hir::ItemKind::TyAlias(..)
+                            ) {
+                                self.dependencies
+                                    .entry(item.owner_id.def_id)
+                                    .or_default()
+                                    .insert(did);
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            intravisit::walk_ty(self, ty);
+        }
+    }
+
+    let mut visitor = TypeVisitor {
+        tcx,
+        roots: FxHashSet::default(),
+        dependencies: FxHashMap::default(),
+    };
+    tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
+    let mut pending = visitor.roots.into_iter().collect::<Vec<_>>();
+    let mut protected = FxHashSet::default();
+    while let Some(did) = pending.pop() {
+        if protected.insert(did)
+            && let Some(dependencies) = visitor.dependencies.get(&did)
+        {
+            pending.extend(dependencies);
+        }
+    }
+    protected
 }
 
 fn children<'tcx>(ty: ty::Ty<'tcx>, tcx: TyCtxt<'tcx>, values: &mut Vec<ty::Ty<'tcx>>) {

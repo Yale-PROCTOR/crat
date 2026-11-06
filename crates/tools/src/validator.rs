@@ -520,15 +520,16 @@ fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &
     {
         return Err("type and const generics are unsupported");
     }
-    if function
-        .generics
-        .params
-        .iter()
-        .any(|parameter| !parameter.attrs.is_empty() || !parameter.bounds.is_empty())
-        || function.generics.where_clause.has_where_token
+    if function.generics.params.iter().any(|parameter| {
+        !parameter.attrs.is_empty()
+            || parameter
+                .bounds
+                .iter()
+                .any(|bound| !matches!(bound, rustc_ast::GenericBound::Outlives(_)))
+    }) || function.generics.where_clause.has_where_token
     {
         return Err(
-            "lifetime parameter attributes, generic bounds, and where clauses are unsupported",
+            "lifetime parameter attributes, non-lifetime bounds, and where clauses are unsupported",
         );
     }
     Ok(())
@@ -1157,7 +1158,7 @@ fn validate_signature(expected: &ParsedExpected, result: &Item) -> Vec<Validatio
     errors
 }
 
-fn lifetime_generic_declaration(generics: &rustc_ast::Generics) -> String {
+pub(crate) fn lifetime_generic_declaration(generics: &rustc_ast::Generics) -> String {
     let mut item = utils::item!("fn __proctor_generic_probe() {{}}");
     let ItemKind::Fn(box function) = &mut item.kind else { unreachable!() };
     function.generics = generics.clone();

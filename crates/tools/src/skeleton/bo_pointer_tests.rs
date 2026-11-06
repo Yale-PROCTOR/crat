@@ -336,11 +336,12 @@ fn configured_api_exposure_preserves_transitive_array_fields_and_promotes_thin_f
 pub type Alias = Inner;
 pub enum Outer { Value(Alias), Empty }
 pub struct Private { pub pointer: *const i32 }
+pub struct Foreign { pub pointer: *const i32 }
 #[export_name = "external_api"] pub unsafe extern "C" fn exported(value: *const Outer) -> *const Outer { value }
 pub unsafe fn private_read(value: *const Private) -> i32 { *(*value).pointer }
 pub unsafe fn public_read(value: *const Inner) -> i32 { if (*value).pointer.is_null() { 0 } else { *(*value).pointer + *(*value).buffer.offset(1) as i32 } }
-extern "C" { fn foreign(value: *const Private); }
-pub unsafe fn invoke(value: *const Private) { foreign(value); }
+extern "C" { fn foreign(value: *const Foreign); }
+pub unsafe fn invoke(value: *const Foreign) { foreign(value); }
 "#;
     let (records, frozen) = run_compiler_on_str(source, |tcx| {
         let records = make_skeletons_with_api(
@@ -363,6 +364,8 @@ pub unsafe fn invoke(value: *const Private) { foreign(value); }
     assert!(inner.contains("buffer: *const u8"), "{inner}");
     let private = type_record(&records, "Private");
     assert_ne!(private.source_definition, private.target_definition);
+    let foreign = type_record(&records, "Foreign");
+    assert_eq!(foreign.source_definition, foreign.target_definition);
     run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
 
     let unprotected = generate(source);
@@ -371,6 +374,134 @@ pub unsafe fn invoke(value: *const Private) { foreign(value); }
             .target_definition
             .contains("[u8]")
     );
+}
+
+#[test]
+fn foreign_statics_preserve_recursive_definitions_aliases_derives_and_pointer_layers() {
+    let source = r#"
+#[repr(C)] #[derive(Clone, Copy, Debug)] pub struct Stream {
+    pub buffer: *mut u8,
+    pub next: *mut Stream,
+    pub indirect: *const *const i32,
+}
+pub type FILE = Stream;
+extern "C" { static mut stdin: *mut FILE; }
+pub unsafe fn write(stream: *mut FILE) { *(*stream).buffer = 7; }
+pub unsafe fn read(stream: *const FILE) -> i32 { **(*stream).indirect }
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        for name in ["Stream", "FILE"] {
+            let record = type_record(&records, name);
+            assert_eq!(record.source_definition, record.target_definition, "{name}");
+        }
+        assert!(
+            function(&records, "write")
+                .target_signature
+                .contains("&mut FILE")
+        );
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    let reloaded =
+        crate::frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
+    assert_eq!(reloaded, frozen);
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+}
+
+#[test]
+fn foreign_signatures_preserve_nested_types_and_callback_aliases_without_calls() {
+    let definitions = r#"
+#[repr(C)] #[derive(Clone, Copy, Debug)] pub struct Leaf { pub pointer: *mut i32 }
+pub type Alias = Leaf;
+pub struct EnumLeaf { pub pointer: *const i32 }
+pub struct ArrayLeaf { pub pointer: *const i32 }
+pub struct TupleLeaf { pub pointer: *const i32 }
+pub struct GenericLeaf { pub pointer: *const i32 }
+pub enum Choice { Value(EnumLeaf), Empty }
+#[derive(Clone, Copy)] pub union Storage { pub leaf: Leaf, pub bits: usize }
+pub struct Wrapper<T> { pub value: T }
+pub struct Input { pub pointer: *const i32 }
+pub struct Output { pub pointer: *const i32 }
+pub type Callback = unsafe extern "C" fn(*const Input) -> *mut Output;
+pub struct Envelope {
+    pub choice: Choice,
+    pub storage: Storage,
+    pub callback: Callback,
+    pub nested: *const *const Leaf,
+    pub alias: Alias,
+    pub array: [ArrayLeaf; 2],
+    pub tuple: (TupleLeaf, i32),
+    pub generic: Wrapper<GenericLeaf>,
+}
+pub type EnvelopeAlias = Envelope;
+pub unsafe fn write(value: *mut Leaf) { *(*value).pointer = 7; }
+pub unsafe fn read_input(value: *const Input) -> i32 { *(*value).pointer }
+pub unsafe fn read_output(value: *const Output) -> i32 { *(*value).pointer }
+"#;
+    let unprotected = generate(definitions);
+    for name in [
+        "EnumLeaf",
+        "ArrayLeaf",
+        "TupleLeaf",
+        "GenericLeaf",
+        "Input",
+        "Output",
+    ] {
+        let record = type_record(&unprotected, name);
+        assert_ne!(record.source_definition, record.target_definition, "{name}");
+    }
+    for declaration in [
+        "fn consume(value: *const EnvelopeAlias);",
+        "fn produce() -> *mut EnvelopeAlias;",
+    ] {
+        let source = format!("{definitions}\nextern \"C\" {{ {declaration} }}");
+        let frozen = run_compiler_on_str(&source, |tcx| {
+            let records = make_skeletons(&source, tcx).unwrap();
+            for record in &records {
+                if let ItemRecord::Type(record) = record {
+                    assert_eq!(
+                        record.source_definition, record.target_definition,
+                        "{}: {declaration}",
+                        record.path
+                    );
+                }
+            }
+            crate::freeze_project(&source, &records, tcx).unwrap()
+        })
+        .unwrap();
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    }
+}
+
+#[test]
+fn foreign_type_identity_overrides_api_promotion_without_freezing_unrelated_structs() {
+    let source = r#"
+pub mod system { #[repr(C)] #[derive(Clone, Copy)] pub struct Holder { pub pointer: *mut i32 } }
+pub mod local { #[repr(C)] #[derive(Clone, Copy)] pub struct Holder { pub pointer: *mut i32 } }
+extern "C" { fn unused(value: *const system::Holder); }
+pub unsafe fn api(system: *mut system::Holder, local: *mut local::Holder) {
+    *(*system).pointer = 1;
+    *(*local).pointer = 2;
+}
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records =
+            make_skeletons_with_api(source, None, &FxHashSet::from_iter(["api".to_owned()]), tcx)
+                .unwrap();
+        let system = type_record(&records, "system::Holder");
+        assert_eq!(system.source_definition, system.target_definition);
+        let local = type_record(&records, "local::Holder");
+        assert_ne!(local.source_definition, local.target_definition);
+        assert!(
+            !local.target_definition.contains("Copy"),
+            "{}",
+            local.target_definition
+        );
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
 }
 
 #[test]

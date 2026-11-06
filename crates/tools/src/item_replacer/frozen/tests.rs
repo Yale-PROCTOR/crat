@@ -975,3 +975,106 @@ pub unsafe fn get(holder: *const Holder) -> *const i32 { (*holder).pointer }
         .replace("LIMIT: i32 = 4", "LIMIT: i32 = 5");
     assert!(frozen_project_from_json(&serde_json::to_string(&tampered).unwrap()).is_err());
 }
+
+#[test]
+fn generated_list_lifetime_bounds_survive_frozen_loading_validation_and_replacement() {
+    let source = r#"
+#[repr(C)] #[derive(Clone, Copy)] pub struct ListNode { pub value: i32, pub next: *mut ListNode }
+pub unsafe extern "C" fn smallestValue(mut head: *mut ListNode) -> i32 {
+    if !head.is_null() {
+        let mut smallest: i32 = (*head).value;
+        while !(*head).next.is_null() {
+            head = (*head).next;
+            if (*head).value < smallest { smallest = (*head).value; }
+        }
+        return smallest;
+    } else { return -1 };
+}
+"#;
+    let frozen = freeze(source);
+    let frozen = frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    let function = &frozen.functions[0];
+    assert!(function.record.target_signature.contains("'b: 'a"));
+    let returned = format!(
+        r#"{} {{
+        #[proctor(0)] if head.is_some() {{
+            #[proctor(1)] let mut smallest: i32 = head.unwrap().value;
+            #[proctor(2)] while head.unwrap().next.is_some() {{
+                #[proctor(3)] head = head.unwrap().next;
+                #[proctor(4)] if head.unwrap().value < smallest {{
+                    #[proctor(5)] smallest = head.unwrap().value;
+                }}
+            }}
+            #[proctor(6)] return smallest;
+        }} else {{ #[proctor(7)] return -1 }};
+    }}"#,
+        function.record.target_signature
+    );
+    let validation = |transformation| {
+        crate::validate(&crate::ValidationRequest {
+            expected_functions: vec![crate::ExpectedFunction {
+                id: function.record.id,
+                name: function.record.name.clone(),
+                view: function.record.baseline.clone(),
+            }],
+            transformation,
+        })
+    };
+    assert_eq!(
+        validation(returned.clone()),
+        crate::ValidationResponse::Valid
+    );
+    let output = transform_frozen_scc(&frozen, &request(function, Some(&returned)))
+        .unwrap()
+        .0;
+    run_compiler_on_str(&output.replacement.source, utils::type_check)
+        .expect(&output.replacement.source);
+    let unlabeled = (0..8).fold(returned.clone(), |source, label| {
+        source.replace(&format!("#[proctor({label})]"), "")
+    });
+    let unstructured = replace_unstructured_scc(
+        &frozen,
+        &UnstructuredReplacementRequest {
+            members: vec![function.record.id],
+            transformation: unlabeled.clone(),
+        },
+    )
+    .unwrap();
+    run_compiler_on_str(&unstructured.source, utils::type_check).expect(&unstructured.source);
+    for bound in ["'b", "'b: 'static", "'b: 'a + 'static"] {
+        let changed = returned.replace("'b: 'a", bound);
+        assert!(matches!(
+            validation(changed.clone()),
+            crate::ValidationResponse::Invalid { .. }
+        ));
+        assert!(transform_frozen_scc(&frozen, &request(function, Some(&changed))).is_err());
+        assert!(
+            replace_unstructured_scc(
+                &frozen,
+                &UnstructuredReplacementRequest {
+                    members: vec![function.record.id],
+                    transformation: unlabeled.replace("'b: 'a", bound),
+                }
+            )
+            .is_err()
+        );
+    }
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[AcceptedScc {
+            members: vec![function.record.id],
+            source: output.replacement.source,
+        }],
+    )
+    .unwrap();
+    let finalized = finalize_frozen_project(
+        &frozen,
+        &assembled,
+        "library",
+        &["smallestValue".to_owned()],
+    )
+    .unwrap();
+    run_compiler_on_str(&finalized.source, utils::type_check).expect(&finalized.source);
+    assert!(finalized.source.contains("'b: 'a"));
+}
