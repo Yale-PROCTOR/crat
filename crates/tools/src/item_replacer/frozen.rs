@@ -14,6 +14,7 @@ pub struct FrozenProject {
     pub analysis_source: String,
     pub target_source: String,
     pub functions: Vec<FrozenFunction>,
+    pub types: Vec<crate::TypeRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,7 +99,9 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
         ReplacementErrorKind::InvalidRequest,
     )?;
     let target = parse_crate(&frozen.target_source, ReplacementErrorKind::InvalidRequest)?;
-    require_same_context(&analysis, &target)?;
+    let mut expected = analysis.clone();
+    install_frozen_types(&mut expected.items, &frozen.types)?;
+    require_same_context(&expected, &target)?;
     let mut originals = HashMap::new();
     let mut targets = HashMap::new();
     frozen_function_items(&analysis.items, &mut vec![], &mut originals)?;
@@ -291,6 +294,14 @@ pub fn freeze_project(
         &mut occupied,
     )?;
     let mut target = analysis.clone();
+    let types = records
+        .iter()
+        .filter_map(|record| match record {
+            crate::ItemRecord::Type(record) => Some(record.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    install_frozen_types(&mut target.items, &types)?;
     replace_pending_functions(&mut target.items);
     let mut frozen = vec![];
     let mut source_paths = FxHashMap::default();
@@ -375,7 +386,85 @@ pub fn freeze_project(
         analysis_source: pprust::crate_to_string_for_macros(&analysis),
         target_source: pprust::crate_to_string_for_macros(&target),
         functions: frozen,
+        types,
     })
+}
+
+fn install_frozen_types(
+    items: &mut [P<Item>],
+    records: &[crate::TypeRecord],
+) -> Result<(), ReplacementError> {
+    fn replace(
+        items: &mut [P<Item>],
+        path: &[String],
+        record: &crate::TypeRecord,
+    ) -> Result<(), ReplacementError> {
+        for item in items {
+            if let ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(children, ..)) =
+                &mut item.kind
+                && ident.to_string() == path[0]
+                && path.len() > 1
+            {
+                return replace(children, &path[1..], record);
+            }
+            if path.len() == 1
+                && item
+                    .kind
+                    .ident()
+                    .is_some_and(|ident| ident.to_string() == path[0])
+                && matches!(
+                    crate::included_item_kind(item),
+                    Some(
+                        crate::ItemKindName::Struct
+                            | crate::ItemKindName::Enum
+                            | crate::ItemKindName::Union
+                            | crate::ItemKindName::TyAlias
+                    )
+                )
+            {
+                if pprust::item_to_string(item) != record.source_definition {
+                    return Err(global_error(
+                        ReplacementErrorKind::InvalidRequest,
+                        format!("frozen source type differs from `{}`", record.path),
+                    ));
+                }
+                let target = one_item(&record.target_definition)?;
+                if crate::included_item_kind(item) != Some(record.kind)
+                    || crate::included_item_kind(&target) != Some(record.kind)
+                    || target.kind.ident() != item.kind.ident()
+                {
+                    return Err(global_error(
+                        ReplacementErrorKind::InvalidRequest,
+                        format!("frozen target type identity differs from `{}`", record.path),
+                    ));
+                }
+                *item = target;
+                return Ok(());
+            }
+        }
+        Err(global_error(
+            ReplacementErrorKind::InvalidRequest,
+            format!("frozen type `{}` is absent", record.path),
+        ))
+    }
+    let mut ids = HashSet::new();
+    let mut paths = HashSet::new();
+    for record in records {
+        if !ids.insert(record.id) || !paths.insert(record.path.clone()) {
+            return Err(global_error(
+                ReplacementErrorKind::InvalidRequest,
+                "duplicate frozen type identity".to_owned(),
+            ));
+        }
+        let path = valid_full_path(&record.path).ok_or_else(|| {
+            global_error(
+                ReplacementErrorKind::InvalidRequest,
+                "invalid frozen type path".to_owned(),
+            )
+        })?;
+        replace(items, &path, record)?;
+    }
+    Ok(())
 }
 
 struct FrozenReferenceCollector<'a, 'tcx> {
@@ -647,7 +736,8 @@ pub fn finalize_frozen_project(
             ReplacementErrorKind::RewriteFailure,
         )?;
         let mut partial = parse_crate(assembled, ReplacementErrorKind::RewriteFailure)?;
-        require_same_context(&analysis, &partial)?;
+        let target = parse_crate(&frozen.target_source, ReplacementErrorKind::RewriteFailure)?;
+        require_same_context(&target, &partial)?;
         finalize_source_functions(&analysis, &mut partial, target_kind, api)?;
         Ok(FinalizedProject {
             source: pprust::crate_to_string_for_macros(&partial),

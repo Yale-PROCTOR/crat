@@ -200,6 +200,41 @@ fn manifest_for_finalization(input: &str) -> Result<(String, Vec<String>), Strin
     Ok((target_kind, api))
 }
 
+fn skeleton_api_names(project: &Path) -> Result<Vec<String>, String> {
+    let path = project.join("config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let document = text
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|error| format!("invalid config.toml: {error}"))?;
+    let entries = [
+        document.get("c_exposed_fns"),
+        document
+            .get("interface")
+            .and_then(|table| table.get("c_exposed_fns")),
+    ];
+    let mut names = Vec::new();
+    for entry in entries.into_iter().flatten() {
+        let values = entry
+            .as_array()
+            .ok_or_else(|| "config.toml c_exposed_fns must be an array of strings".to_owned())?;
+        for value in values {
+            names.push(
+                value
+                    .as_str()
+                    .ok_or_else(|| {
+                        "config.toml c_exposed_fns must be an array of strings".to_owned()
+                    })?
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(names)
+}
+
 fn validate_replace_output_paths(paths: &[&Path]) -> Result<(), String> {
     for (index, path) in paths.iter().enumerate() {
         for other in &paths[..index] {
@@ -558,8 +593,11 @@ fn main() {
                     .unwrap_or_else(|error| fail("invalid_rules", error))
             });
             let freeze = frozen_output.is_some();
+            let api = skeleton_api_names(&input)
+                .unwrap_or_else(|error| fail("invalid_api_config", error));
             let (records, frozen) = run_compiler_on_path(&source_path, move |tcx| {
-                let records = tools::make_skeletons_with_rules(&source, rules.as_ref(), tcx)
+                let api = api.into_iter().collect();
+                let records = tools::make_skeletons_with_api(&source, rules.as_ref(), &api, tcx)
                     .map_err(|error| format!("{}: {}", error.function_path, error.message))?;
                 let frozen = if freeze {
                     Some(
