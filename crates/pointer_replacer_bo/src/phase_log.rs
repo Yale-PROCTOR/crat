@@ -37,11 +37,56 @@ pub(crate) fn mark(phase: &str, edge: &str, detail: &str) {
     // SAFETY: `Z3_get_estimated_alloc_size` reads z3's global allocation counter; it takes no
     // argument, touches no context, and the symbol is the one z3-sys already links (libz3).
     let z3 = unsafe { Z3_get_estimated_alloc_size() } >> 20;
-    eprintln!("[bo-phase] {phase} {edge} t={t:.1} rss={rss} hwm={hwm} z3={z3} {detail}");
+    // R1468-2 (ii): the allocator's totals on the boundary lines (`start` / `end`) only, not on
+    // the per-row (`retirement:fallback leak`), `z3:query`, tick or slow lines.
+    let heap = if matches!(edge, "start" | "end") {
+        malloc_totals()
+    } else {
+        String::new()
+    };
+    eprintln!("[bo-phase] {phase} {edge} t={t:.1} rss={rss} hwm={hwm} z3={z3}{heap} {detail}");
 }
 
 unsafe extern "C" {
     fn Z3_get_estimated_alloc_size() -> u64;
+}
+
+/// R1468-2 (ii): glibc's `mallinfo2()` in MiB, ` uordblks=<allocated> fordblks=<free, kept in the
+/// arenas> hblkhd=<mmapped>`; empty off glibc.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub(crate) fn malloc_totals() -> String {
+    /// glibc's `struct mallinfo2` (malloc.h, glibc >= 2.33): ten `size_t` fields in this order.
+    #[repr(C)]
+    struct Mallinfo2 {
+        _arena: usize,
+        _ordblks: usize,
+        _smblks: usize,
+        _hblks: usize,
+        hblkhd: usize,
+        _usmblks: usize,
+        _fsmblks: usize,
+        uordblks: usize,
+        fordblks: usize,
+        _keepcost: usize,
+    }
+    unsafe extern "C" {
+        fn mallinfo2() -> Mallinfo2;
+    }
+    // SAFETY: `mallinfo2` takes no argument and returns the struct above by value; it only reads
+    // the allocator's own state, under each arena's lock. glibc >= 2.33 provides the symbol (2.42
+    // on the build and run hosts).
+    let info = unsafe { mallinfo2() };
+    format!(
+        " uordblks={} fordblks={} hblkhd={}",
+        info.uordblks >> 20,
+        info.fordblks >> 20,
+        info.hblkhd >> 20
+    )
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub(crate) fn malloc_totals() -> String {
+    String::new()
 }
 
 thread_local! {
@@ -211,4 +256,62 @@ fn status() -> (u64, u64) {
             .map_or(0, |kb| kb / 1024)
     };
     (field("VmRSS:"), field("VmHWM:"))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The three fields of [`super::malloc_totals`], in order, in MiB.
+    fn totals() -> [usize; 3] {
+        let text = super::malloc_totals();
+        let fields: Vec<(&str, usize)> = text
+            .split_whitespace()
+            .map(|token| {
+                let (key, value) = token.split_once('=').expect("key=value");
+                (key, value.parse().expect("MiB"))
+            })
+            .collect();
+        let keys: Vec<&str> = fields.iter().map(|(key, _)| *key).collect();
+        assert_eq!(keys, ["uordblks", "fordblks", "hblkhd"], "{text}");
+        [fields[0].1, fields[1].1, fields[2].1]
+    }
+
+    /// R1468-2 (ii): the boundary lines' allocator totals read glibc's `mallinfo2`: three MiB
+    /// fields, and a live 256-MiB allocation is counted in the allocated totals (`uordblks` +
+    /// `hblkhd`, whichever route glibc takes). The delta is read in a child process running this
+    /// test alone (the adversarial review's point: other test threads allocate and free).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn r1468_2_ii_the_boundary_lines_read_the_allocator_totals() {
+        const CHILD: &str = "CRAT_R1468_2_II_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let [used, _, mapped] = totals();
+            let held = std::hint::black_box(vec![0u8; 256 << 20]);
+            let [used_held, _, mapped_held] = totals();
+            drop(held);
+            let delta = (used_held + mapped_held) as i64 - (used + mapped) as i64;
+            println!("R1468_2_II delta={delta}");
+            return;
+        }
+        totals();
+        let output = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+            .args([
+                "phase_log::tests::r1468_2_ii_the_boundary_lines_read_the_allocator_totals",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("child test");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "child failed:\n{text}");
+        let delta: i64 = text
+            .lines()
+            .find_map(|line| line.split_once("R1468_2_II delta=").map(|(_, rest)| rest))
+            .unwrap_or_else(|| panic!("no delta line:\n{text}"))
+            .trim()
+            .parse()
+            .expect("delta");
+        assert!((256..=260).contains(&delta), "{text}");
+    }
 }

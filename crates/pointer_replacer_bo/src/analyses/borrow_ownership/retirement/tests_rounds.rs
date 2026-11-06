@@ -213,3 +213,167 @@ fn r1459_2_the_final_retirement_review_is_the_last_round_shared() {
     })
     .unwrap_or_else(|error| error.raise());
 }
+
+/// A cascade whose round-1 replay finds a conflict in both repairs, so the guarded run records a
+/// review and re-solves (the shape of `null_paths_tests`' W69 cascade).
+const R1468_CASCADE: &str = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+    pub unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
+
+fn r1468_program<'tcx>(tcx: rustc_middle::ty::TyCtxt<'tcx>) -> RustProgram<'tcx> {
+    let mut functions = Vec::new();
+    for owner in tcx.hir_crate(()).owners.iter() {
+        let Some(owner) = owner.as_owner() else { continue };
+        let OwnerNode::Item(item) = owner.node() else { continue };
+        if let ItemKind::Fn { .. } = item.kind {
+            functions.push(item.owner_id.def_id);
+        }
+    }
+    RustProgram {
+        tcx,
+        functions,
+        structs: Vec::new(),
+    }
+}
+
+/// R1468-2 (iii)(a) (the user's word "1로 가자." on addendum 1467's option (1)): when the guarded
+/// repair declines and the plain repair restarts at round 0, the guarded run's reviews leave the
+/// capture. After the plain repair accepts, the history holds the plain rounds only (one review per
+/// validation round, calibrated on a plain-only solve), the final review is its last entry, and the
+/// stack-entry acceptance still collects. The decline is forced (`guarded_decline_fault`) at the
+/// guarded run's first re-solve after a validation round. RED at `d530d8655`, where the history
+/// also holds the guarded run's reviews.
+#[test]
+fn r1468_2_a_the_plain_restart_holds_only_the_plain_rounds_reviews() {
+    use crate::analyses::borrow_ownership::{
+        borrow_verify::{RepairMode, guarded_decline_fault},
+        construction::verify_bo_construction_counting,
+        licensing::stack_export,
+    };
+    ::utils::compilation::run_compiler_on_str(R1468_CASCADE, |tcx| {
+        let program = r1468_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solve = || {
+            let solver = KindSolver::new(&slots);
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("production construction");
+            verify_bo_construction_counting(
+                &program,
+                &slots,
+                &origins,
+                &solver,
+                &construction,
+                &facts,
+            )
+        };
+        // The calibration: a plain-only solve records one review per validation round.
+        let ((plain_model, plain_stats), plain_export) =
+            with_bo_export(|| RepairMode::with_override(RepairMode::Plain, solve));
+        assert!(plain_model.is_some(), "the plain repair accepts the fixture");
+        assert!(plain_stats.rounds >= 2, "{plain_stats:?}");
+        assert_eq!(plain_export.retirement_rounds.len(), plain_stats.rounds);
+
+        let (((model, stats), fired), export) =
+            with_bo_export(|| guarded_decline_fault::with_decline(solve));
+        let at_decline = fired.expect("the guarded run reaches a re-solve after a validation round");
+        assert!(
+            at_decline >= 1,
+            "the guarded run recorded no review before it declined: the witness would be inert"
+        );
+        assert!(stats.guarded_fallback.is_some(), "{stats:?}");
+        assert!(model.is_some(), "the plain repair accepts after the fallback: {stats:?}");
+        assert_eq!(
+            export.retirement_rounds.len(),
+            stats.rounds,
+            "the history holds the guarded run's {at_decline} review(s) besides the plain repair's {} rounds",
+            stats.rounds
+        );
+        let final_review = export
+            .source_retirement
+            .as_ref()
+            .expect("final retirement review");
+        assert!(Arc::ptr_eq(
+            final_review,
+            export.retirement_rounds.last().expect("a plain round")
+        ));
+        let accepted = stack_export::collect(&export).expect("the stack-entry acceptance collects");
+        assert_eq!(accepted.retirement_round + 1, stats.rounds);
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// R1468-2 (i): the `verify:decline` line's solver detail (`KindSolver::decline_detail`, printed
+/// verbatim) names a contradiction's decline as a hard Unsat in the drop loop, with its core's
+/// size and the loop's counts (here the plain repair's, which runs after the guarded decline and
+/// declines the same way). The line itself goes to stderr under `CRAT_BO_PHASE_LOG=on`,
+/// which a test cannot read; the two Unknown arms (drop loop, restoration) have no fixture.
+#[test]
+fn r1468_2_i_a_contradiction_declines_as_a_hard_unsat_in_the_drop_loop() {
+    use crate::analyses::borrow_ownership::{
+        construction::verify_bo_construction_counting, slots::SlotId,
+    };
+    ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+        let program = r1468_program(tcx);
+        let slots = CrateSlots::build(&program);
+        let origins = compute_origins(&program);
+        let facts = MutFacts::from_program(&program);
+        let solver = KindSolver::new(&slots);
+        let construction = construct_bo_into(
+            &program,
+            &slots,
+            &origins,
+            &facts,
+            &solver,
+            CopyLendMode::Baseline,
+        )
+        .expect("production construction");
+        let victim = slots
+            .fn_local_slots
+            .iter()
+            .find(|(_, universe)| universe.len() > 0)
+            .map(|(did, _)| SlotRef::Local(*did, SlotId::from_usize(0)))
+            .expect("a local slot");
+        solver.assume(victim, SlotKind::Ref);
+        solver.add_borrow_exclusion(Some(victim), &[]);
+        let (model, _) = verify_bo_construction_counting(
+            &program,
+            &slots,
+            &origins,
+            &solver,
+            &construction,
+            &facts,
+        );
+        assert!(model.is_none());
+        let detail = solver.decline_detail();
+        let field = |key: &str| {
+            detail
+                .split(' ')
+                .find_map(|token| token.strip_prefix(key)?.strip_prefix('='))
+                .unwrap_or_else(|| panic!("no {key} in {detail}"))
+                .to_owned()
+        };
+        assert_eq!(field("failure"), "hard-unsat", "{detail}");
+        assert_eq!(field("phase"), "drop-loop", "{detail}");
+        assert_eq!(field("restored"), "0", "{detail}");
+        assert!(
+            field("core_labels").parse::<usize>().unwrap() >= 2,
+            "{detail}"
+        );
+        let checks: usize = field("hard_checks").parse().unwrap();
+        assert_eq!(
+            checks,
+            field("drops").parse::<usize>().unwrap() + 1,
+            "{detail}"
+        );
+        assert_eq!(field("rechecks"), field("hard_checks"), "{detail}");
+    })
+    .unwrap_or_else(|error| error.raise());
+}

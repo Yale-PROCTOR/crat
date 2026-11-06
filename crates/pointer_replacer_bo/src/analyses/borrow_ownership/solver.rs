@@ -561,6 +561,12 @@ pub struct KindSolver {
     return_port_kept: RefCell<Vec<usize>>,
     mandatory_scope_lengths: RefCell<Vec<usize>>,
     round_model_failure: RefCell<Option<RoundModelFailure>>,
+    /// R1468-2 (i), log only: the latest round-model failure (`round_model_failure` keeps the
+    /// first), the stage of the latest hard query that returned Unknown, and where the latest
+    /// selector relaxation stopped. Read by [`KindSolver::decline_detail`] alone.
+    last_round_model_failure: RefCell<Option<RoundModelFailure>>,
+    last_unknown_query: Cell<&'static str>,
+    last_relax_exit: Cell<Option<RelaxExit>>,
     /// Relay main/388 O2: optimize incumbents accepted / refused (hard-eval failed) by this solver.
     incumbent_accepted: Cell<usize>,
     incumbent_refused: Cell<usize>,
@@ -609,6 +615,16 @@ enum HardRelaxResult {
     Sat(RelaxedSelectors),
     Unsat,
     Unknown,
+}
+
+/// R1468-2 (i), log only: where one selector relaxation stopped, and its counts so far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RelaxExit {
+    phase: &'static str,
+    hard_checks: usize,
+    rechecks: usize,
+    drops: usize,
+    restored: usize,
 }
 
 /// Observation-only first failure from the decomposed round-model path.
@@ -884,6 +900,9 @@ impl KindSolver {
             return_port_kept: RefCell::new(Vec::new()),
             mandatory_scope_lengths: RefCell::new(Vec::new()),
             round_model_failure: RefCell::new(None),
+            last_round_model_failure: RefCell::new(None),
+            last_unknown_query: Cell::new("-"),
+            last_relax_exit: Cell::new(None),
             incumbent_accepted: Cell::new(0),
             incumbent_refused: Cell::new(0),
             demand_capture: RefCell::new(None),
@@ -2719,10 +2738,62 @@ impl KindSolver {
     }
 
     fn record_round_model_failure(&self, failure: RoundModelFailure) {
+        *self.last_round_model_failure.borrow_mut() = Some(failure.clone());
         let mut slot = self.round_model_failure.borrow_mut();
         if slot.is_none() {
             *slot = Some(failure);
         }
+    }
+
+    /// R1468-2 (i), log only: the `verify:decline` line's solver detail -- the latest failure's
+    /// kind, its active selectors, its core's size (not the labels) and z3's reason for an
+    /// Unknown with the query that returned it; where the relaxation stopped (`drop-loop`,
+    /// `restoration`, or `optimize` after a Sat relaxation), with its hard checks, tracked
+    /// rechecks, drops and restorations; and whether the first recorded failure is that one.
+    pub(crate) fn decline_detail(&self) -> String {
+        let latest = self.last_round_model_failure.borrow().clone();
+        let failure = match &latest {
+            None => "failure=none".to_owned(),
+            Some(RoundModelFailure::HardUnsat {
+                active_endpoint_retraction,
+                core_labels,
+            }) => format!(
+                "failure=hard-unsat active_t2={active_endpoint_retraction} core_labels={}",
+                core_labels.len()
+            ),
+            Some(RoundModelFailure::HardUnknown {
+                active_endpoint_retraction,
+                reason,
+            }) => format!(
+                "failure=hard-unknown active_t2={active_endpoint_retraction} query={} reason={reason:?}",
+                self.last_unknown_query.get()
+            ),
+            Some(RoundModelFailure::OptimizeUnsat {
+                active_endpoint_retraction,
+            }) => format!("failure=optimize-unsat active_t2={active_endpoint_retraction}"),
+            Some(RoundModelFailure::OptimizeUnknown {
+                active_endpoint_retraction,
+                reason,
+            }) => format!(
+                "failure=optimize-unknown active_t2={active_endpoint_retraction} reason={reason:?}"
+            ),
+            Some(RoundModelFailure::OptimizeMissingModel {
+                active_endpoint_retraction,
+            }) => format!("failure=optimize-missing-model active_t2={active_endpoint_retraction}"),
+        };
+        let exit = match self.last_relax_exit.get() {
+            None => "phase=none".to_owned(),
+            Some(exit) => format!(
+                "phase={} hard_checks={} rechecks={} drops={} restored={}",
+                exit.phase, exit.hard_checks, exit.rechecks, exit.drops, exit.restored
+            ),
+        };
+        let first = if *self.round_model_failure.borrow() == latest {
+            "same"
+        } else {
+            "earlier"
+        };
+        format!("{failure} {exit} first_failure={first}")
     }
 
     pub(crate) fn round_model_failure(&self) -> Option<RoundModelFailure> {
@@ -2904,6 +2975,9 @@ impl KindSolver {
         );
         let initial_unknown_reason =
             (initial == SatResult::Unknown).then(|| query_reason.unwrap_or_else(|| "-".to_owned()));
+        if initial == SatResult::Unknown {
+            self.last_unknown_query.set("hard-check");
+        }
         hard.solver.pop(1);
         let outcome = if initial == SatResult::Unsat {
             self.lazy_tracked_recheck_count
@@ -2922,6 +2996,7 @@ impl KindSolver {
                 Err(unknown) => {
                     // Unknown cannot provide a retraction core. Keep the
                     // exceptional query once, then run normal housekeeping.
+                    self.last_unknown_query.set("hard-recheck");
                     self.note_demand_query(assumptions, tracked, &[], unknown.reason.clone());
                     self.record_round_model_failure(RoundModelFailure::HardUnknown {
                         active_endpoint_retraction: assumptions.len(),
@@ -3083,6 +3158,20 @@ impl KindSolver {
         self.begin_demand_epoch(selectors);
         let mut assumptions = selectors.all().to_vec();
         let mut dropped = Vec::new();
+        // R1468-2 (i), log only: where this relaxation stops, for the `verify:decline` line.
+        let (checks_before, rechecks_before) = (
+            self.hard_check_count.get(),
+            self.lazy_tracked_recheck_count.get(),
+        );
+        let exit = |phase, drops, restored| {
+            self.last_relax_exit.set(Some(RelaxExit {
+                phase,
+                hard_checks: self.hard_check_count.get() - checks_before,
+                rechecks: self.lazy_tracked_recheck_count.get() - rechecks_before,
+                drops,
+                restored,
+            }));
+        };
         let trace_epoch = SELECTOR_TRACE_CAPTURE.with(|capture| {
             let mut capture = capture.borrow_mut();
             let trace = capture.as_mut()?;
@@ -3124,6 +3213,7 @@ impl KindSolver {
                             active_endpoint_retraction: assumptions.len(),
                             core_labels,
                         });
+                        exit("drop-loop", dropped.len(), 0);
                         return HardRelaxResult::Unsat;
                     }
                     assert!(
@@ -3159,7 +3249,10 @@ impl KindSolver {
                     }
                     dropped.push(assumptions.swap_remove(index));
                 }
-                SatResult::Unknown => return HardRelaxResult::Unknown,
+                SatResult::Unknown => {
+                    exit("drop-loop", dropped.len(), 0);
+                    return HardRelaxResult::Unknown;
+                }
             }
         }
 
@@ -3174,6 +3267,7 @@ impl KindSolver {
                 .sort_key()
                 .cmp(&selectors.keys[right].sort_key())
         });
+        let drops = dropped.len();
         let mut index = 0;
         while index < dropped.len() {
             let selector = dropped[index].clone();
@@ -3215,9 +3309,13 @@ impl KindSolver {
                     assumptions.pop();
                     index += 1;
                 }
-                SatResult::Unknown => return HardRelaxResult::Unknown,
+                SatResult::Unknown => {
+                    exit("restoration", drops, drops - dropped.len());
+                    return HardRelaxResult::Unknown;
+                }
             }
         }
+        exit("relaxed", drops, drops - dropped.len());
 
         if let Some(epoch) = trace_epoch {
             SELECTOR_TRACE_CAPTURE.with(|capture| {
@@ -3373,7 +3471,16 @@ impl KindSolver {
         match self.relax_selectors_hard_typed(hard, selectors) {
             HardRelaxResult::Sat(relaxed) => {
                 let dropped = relaxed.dropped.clone();
-                self.optimized_model_under(&relaxed)
+                let kinds = self.optimized_model_under(&relaxed);
+                if kinds.is_none() {
+                    // R1468-2 (i), log only: the relaxation was Sat; the optimize declined.
+                    self.last_relax_exit
+                        .set(self.last_relax_exit.get().map(|exit| RelaxExit {
+                            phase: "optimize",
+                            ..exit
+                        }));
+                }
+                kinds
                     .map(|kinds| GuardedSolveResult::Sat { kinds, dropped })
                     .unwrap_or(GuardedSolveResult::Unknown)
             }

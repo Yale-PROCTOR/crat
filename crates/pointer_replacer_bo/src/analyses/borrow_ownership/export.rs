@@ -994,6 +994,18 @@ pub(crate) fn begin_round() {
     });
 }
 
+/// R1468-2 (iii)(a): at the plain restart, the declined guarded run's retirement reviews leave the
+/// capture -- the round history and the final review with it. Returns how many reviews left (0 with
+/// no capture armed).
+pub(crate) fn release_retirement_history() -> usize {
+    let mut released = 0;
+    record(|export| {
+        released = std::mem::take(&mut export.retirement_rounds).len();
+        export.source_retirement = None;
+    });
+    released
+}
+
 /// One argument-order application: at `location` (the receiving call) in
 /// `function`, a read of the argument list was not an invalidation of the loan
 /// on `*lent`, whose reborrow `owner` the call receives. The emission owes the

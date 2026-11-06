@@ -7721,7 +7721,7 @@ fn decide_table_perturbed_config<'tcx>(
     crate::phase_log::mark("decide:solve", "start", "");
     // Relay main/388 O2 (R1383-1 R2): a solve any of whose rounds took an optimize incumbent writes
     // its final model to neither the memo nor the on-disk cache.
-    let ((verified, _export), cacheable) =
+    let ((verified, export), cacheable) =
         crate::analyses::borrow_ownership::execution_guard::solve_then_cacheable(cacheable, || {
             with_bo_export(|| {
                 solve_bo_overlap_config(
@@ -7735,6 +7735,9 @@ fn decide_table_perturbed_config<'tcx>(
             })
         });
     crate::phase_log::mark("decide:solve", "end", "");
+    // R1468-2 (iii)(b): nothing reads the solve's capture after it (the cache's `prepare` ran
+    // inside the solve), so it is released here, before the store and the decision.
+    drop(export);
     let Some(verified) = verified else {
         // Relay main/375 §3: a solve the budget ended is that, typed.
         if let Some(exceeded) = crate::analysis_budget::exceeded() {

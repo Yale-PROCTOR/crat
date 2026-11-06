@@ -975,12 +975,28 @@ fn solve_round_counted(
     if planner.is_none() {
         return solve_round_model(solver, selectors, backend, hard);
     }
+    #[cfg(test)]
+    if guarded_decline_fault::fires(stats.rounds) {
+        record_guarded_decline(
+            stats,
+            GuardedDeclineReason::Solver(GuardedSolverDecline::Unknown),
+        );
+        return None;
+    }
     let decline = match solve_guarded_round_model(solver, selectors, backend, hard) {
         GuardedSolveResult::Sat { kinds, dropped } => return Some((kinds, dropped)),
         GuardedSolveResult::Unsat => GuardedSolverDecline::Unsat,
         GuardedSolveResult::Unknown => GuardedSolverDecline::Unknown,
     };
     record_guarded_decline(stats, GuardedDeclineReason::Solver(decline));
+    // R1468-2 (i), log only: the solver's decline, and where its solve stopped.
+    crate::phase_log::sub("verify:decline", "end", || {
+        format!(
+            "decline={decline:?} round={} {}",
+            stats.rounds,
+            solver.decline_detail()
+        )
+    });
     None
 }
 
@@ -1116,12 +1132,24 @@ pub(super) fn verify_to_fixpoint_counting_with_flows_impl(
     if model.is_some() {
         return (model, guarded);
     }
+    let started = std::time::Instant::now();
     solver.pop_scope();
+    // R1468-2 (i), log only.
+    crate::phase_log::sub("verify:pop_scope", "end", || {
+        format!("wall={:.1}s", started.elapsed().as_secs_f64())
+    });
     // Relay main/375 §3: a solve the analysis budget ended is not retried in the plain repair.
     if crate::analysis_budget::exceeded().is_some() {
         return (None, guarded);
     }
     let fallback = GuardedFallback::of(&guarded);
+    // R1468-2 (iii)(a): the declined guarded run's retirement reviews leave the capture before the
+    // plain repair restarts at round 0. Only an acceptance reads the history (`stack_export::accept`,
+    // then `collect` for a cache entry), and the plain run records its own rounds from its first.
+    let released = super::export::release_retirement_history();
+    crate::phase_log::sub("verify:release", "end", || {
+        format!("reviews={released} fallback={}", fallback.reason)
+    });
     let (model, mut stats) = rounds(RepairMode::Plain);
     stats.repair = RepairMode::Guarded;
     stats.guarded_fallback = Some(fallback);
@@ -1696,6 +1724,13 @@ fn verify_rounds(
                             stats.rounds, validation_round,
                             "guarded planner/fixpoint validation-round counters diverged"
                         );
+                        // R1468-2 (i), log only: the planner's decline.
+                        crate::phase_log::sub("verify:decline", "end", || {
+                            format!(
+                                "decline=planner {}",
+                                reason.diagnostic_label(validation_round)
+                            )
+                        });
                         record_guarded_decline(&mut stats, reason);
                         return (None, stats);
                     }
@@ -1799,6 +1834,10 @@ fn planner_empty_round(
             true
         }
         GuardedRoundPlan::Decline { reason, .. } => {
+            // R1468-2 (i), log only: the planner's decline.
+            crate::phase_log::sub("verify:decline", "end", || {
+                format!("decline=planner {}", reason.diagnostic_label(stats.rounds))
+            });
             record_guarded_decline(stats, reason);
             false
         }
@@ -2583,6 +2622,40 @@ mod nb5l_a_prime_menu_tests {
         let m = model(&[(source, SlotKind::Ref), (destination, SlotKind::Raw)]);
         assert_eq!(a_prime_menu(&conflict, &m), vec![source]);
         assert_eq!(representative(&conflict, &m), Some(source));
+    }
+}
+
+/// R1468-2 (iii)(a)'s witness: a guarded solver decline at the first guarded re-solve after a
+/// validation round (round >= 1), so the guarded run has recorded a review and falls back to the
+/// plain repair. Records the history's length when it fires.
+#[cfg(test)]
+pub(crate) mod guarded_decline_fault {
+    thread_local! {
+        static ARMED: std::cell::Cell<Option<Option<usize>>> = const { std::cell::Cell::new(None) };
+    }
+    pub(super) fn fires(round: usize) -> bool {
+        let fire = round >= 1 && ARMED.with(|armed| armed.get()) == Some(None);
+        if fire {
+            let mut history = 0;
+            super::super::export::record(|export| history = export.retirement_rounds.len());
+            ARMED.with(|armed| armed.set(Some(Some(history))));
+        }
+        fire
+    }
+    /// Run `f` armed; returns its result and the history's length at the decline (`None`: it
+    /// never fired).
+    pub(crate) fn with_decline<T>(f: impl FnOnce() -> T) -> (T, Option<usize>) {
+        struct Reset(Option<Option<usize>>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ARMED.with(|armed| armed.set(self.0));
+            }
+        }
+        let reset = Reset(ARMED.with(|armed| armed.replace(Some(None))));
+        let value = f();
+        let fired = ARMED.with(|armed| armed.get()).flatten();
+        drop(reset);
+        (value, fired)
     }
 }
 
