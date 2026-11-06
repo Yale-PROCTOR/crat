@@ -85,7 +85,10 @@ fn reachable_structs<'tcx>(
     structs
 }
 
-pub(super) fn protected_structs(tcx: TyCtxt<'_>, api: &FxHashSet<String>) -> FxHashSet<LocalDefId> {
+pub(super) fn api_structs(
+    tcx: TyCtxt<'_>,
+    api: &FxHashSet<String>,
+) -> (FxHashSet<LocalDefId>, FxHashSet<LocalDefId>) {
     let mut roots = Vec::new();
     for item_id in tcx.hir_crate_items(()).free_items() {
         let item = tcx.hir_item(item_id);
@@ -107,7 +110,25 @@ pub(super) fn protected_structs(tcx: TyCtxt<'_>, api: &FxHashSet<String>) -> FxH
             );
         }
     }
-    reachable_structs(roots, tcx)
+    let mut pending = roots.clone();
+    let mut visited = FxHashSet::default();
+    let mut layout_roots = Vec::new();
+    while let Some(ty) = pending.pop() {
+        if !visited.insert(ty) {
+            continue;
+        }
+        if let TyKind::Adt(definition, _) = ty.kind()
+            && (definition.is_enum()
+                || (!definition.repr().c() && !definition.repr().transparent()))
+        {
+            layout_roots.push(ty);
+        }
+        children(ty, tcx, &mut pending);
+    }
+    (
+        reachable_structs(roots, tcx),
+        reachable_structs(layout_roots, tcx),
+    )
 }
 
 pub(super) fn retain_union_compatible_fields(
