@@ -224,12 +224,31 @@ fn receipt(code: &str, case: Case, backend: TestValidationBackend) {
                 let stats = stats.as_ref().unwrap();
                 assert!(stats.source_retirement_decline.is_empty());
                 assert!(review.unresolved.is_empty());
-                assert!(export.retirement_rounds.iter().any(|round| !round.conflicts.is_empty()),
-                    "changed snapshot needs a concrete retirement-to-target chain");
-                assert_eq!(stats.rounds, 2);
                 if case == Case::DeleteNode {
+                    let rows = model.iter().map(|(&slot, &kind)| (slot_identity(&program, &slots, slot).0, kind)).collect::<std::collections::BTreeMap<_, _>>();
+                    let excluded = super::super::origins::collect_no_borrow_origin_slots(&origins, &slots)
+                        .into_iter().map(|slot| slot_identity(&program, &slots, slot).0).collect::<BTreeSet<_>>();
+                    for key in ["node::field1@d0", "node::field2@d0"] {
+                        assert!(excluded.contains(key), "stored path-incomplete values stay excluded: {excluded:?}");
+                        assert_eq!(rows.get(key), Some(&SlotKind::Raw));
+                    }
+                    for key in ["delete_node::_0@d0", "delete_node::_1@d0"] {
+                        assert_eq!(rows.get(key), Some(&SlotKind::Raw));
+                    }
+                    assert!(!excluded.contains("delete_node::_0@d0"),
+                        "stable recursive flows must not seed an opaque return origin: {excluded:?}");
+                    assert_eq!(stats.rounds, 1);
+                    assert_eq!(stats.commits_conflict, 0);
+                    assert!(export.retirement_rounds.iter().all(|round| round.conflicts.is_empty()));
+                    let frees = source.retirements.keys().filter(|key| key.role == SourceRole::Free).collect::<Vec<_>>();
+                    assert_eq!(frees.len(), 2);
+                    assert_eq!(frees.iter().map(|free| review.terminal[*free]).collect::<Vec<_>>(),
+                        vec![super::EventDisposition::CheckedWithoutConflict; 2]);
                     assert_eq!((stats.dropped_sources, stats.dropped_sinks), (0, 2));
                 } else {
+                    assert!(export.retirement_rounds.iter().any(|round| !round.conflicts.is_empty()),
+                        "changed snapshot needs a concrete retirement-to-target chain");
+                    assert_eq!(stats.rounds, 2);
                     assert_eq!((stats.dropped_sources, stats.dropped_sinks), (1, 0));
                 }
                 let mut rows = model.iter().map(|(&slot, &kind)|
@@ -270,7 +289,7 @@ fn e5_d_receipt_outparam_keeps_stack_nonowning_obligation_separate_from_decline(
 }
 
 #[test]
-fn e5_d_receipt_delete_node_snapshot_has_actual_retirement_target_chains() {
+fn delete_node_receipt_records_proactive_field_exclusion() {
     receipt(
         DELETE_NODE,
         Case::DeleteNode,

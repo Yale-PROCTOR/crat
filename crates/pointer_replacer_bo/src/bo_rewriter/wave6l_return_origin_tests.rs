@@ -994,28 +994,14 @@ unsafe extern "C" fn lil_parse(mut lil: *mut Lil, mut argc: i32) -> i32 {
 }
 "#;
 
-/// Pin (wave 2, an export gap, not a rule): the pointer VALUE read out of a
-/// pointer-array field (`*((*lil).cmd).offset(i)`) has no origin edge into
-/// the return in the NB5-O summary (the field slot is carried at depth 0
-/// only), so the callee earns nothing and the caller stays typed-held with
-/// `lifetime-origin-absent`. The owner keeps its other deliveries.
+/// Tracking the pointer value stored in an indexed field does not authorize the
+/// standalone return bridge for that inner pointer layer. The callee stays raw;
+/// its null-tested receiver can still use the local Option adapter.
 #[test]
-fn w6l_pointer_value_read_from_a_pointer_array_field_is_held_origin_absent() {
+fn pointer_array_field_origin_does_not_authorize_a_return_bridge() {
     let observed = observe(LIL_FIND);
     let cmd = decision_of(&observed, "lil_parse::cmd");
-    // **Superseded in part by W6L-A8-1** (relay 026): the CALLEE still earns
-    // nothing — the origin edge is still absent, which is what the failure
-    // below pins — but the receiver no longer depends on it. Its own null test
-    // types it `Option<&mut ..>` through the raw pointer's `as_mut()`
-    // (`wave6l_call_result_option_tests`), so the subject is delivered while
-    // the export gap stands. The pin that remains is the one this witness was
-    // written for: no lifetime plan, no callee conversion, no revert.
     assert!(cmd.contains("Opt"), "{cmd}");
-    // No lifetime failure is recorded any more BECAUSE the subject is no
-    // longer a return residual: the eligibility pass only inspects residuals,
-    // so `None` here means "never asked", not "asked and passed". What the
-    // export gap is measured by now is the empty plan set below — the callee
-    // `find_cmd` earns no return permit and keeps its raw interface.
     assert_eq!(
         failure_of(&observed, "lil_parse::cmd"),
         None,
@@ -1034,8 +1020,7 @@ fn w6l_pointer_value_read_from_a_pointer_array_field_is_held_origin_absent() {
     assert_eq!(reverted_count, 0);
     assert_eq!(
         emitted_count, 3,
-        "the two `lil` parameters still deliver, and `lil_parse::cmd` joins \
-         them under W6L-A8-1"
+        "both parameters and the null-tested receiver must still deliver"
     );
 }
 

@@ -63,7 +63,7 @@ fn c08_projected_traversal_payload_write_holds() {
 }
 
 #[test]
-fn c08_the_holder_field_has_no_store_under_the_record() {
+fn aggregate_holder_initializer_has_exact_owning_store() {
     let fixture = inspect_attested_frame(CODE);
     let accepted = fixture.export.stack_entry_final.as_ref().unwrap();
     let snapshot = fixture
@@ -79,7 +79,43 @@ fn c08_the_holder_field_has_no_store_under_the_record() {
         .iter()
         .find(|p| p.field_key == "Holder::field0@d0")
         .unwrap();
-    assert!(field.stores.is_empty(), "{field:#?}");
+    assert!(field.supported(), "{field:#?}");
+    let [store] = field.stores.as_slice() else { panic!("one aggregate holder store: {field:#?}") };
+    assert_eq!(store.site.function, "caller");
+    assert!(store.by_move);
+    assert!(
+        snapshot
+            .metadata
+            .field_support_inputs
+            .stores
+            .iter()
+            .any(|original| original.site == store.site && original.aggregate),
+        "the owning store must be the actual Holder initializer"
+    );
+    let source = snapshot
+        .metadata
+        .equations
+        .iter()
+        .find(|row| {
+            row.point.construction == store.meet.source.endpoint.construction
+                && row.ordinal == store.meet.source.endpoint.ordinal
+        })
+        .unwrap();
+    assert_eq!(source.operation, "source");
+    assert_eq!(source.point.function.as_deref(), Some("caller"));
+    assert_eq!(source.endpoint.as_ref().unwrap().callee, "malloc");
+    let super::matched::TerminalTarget::Free(free) = store.meet.terminal.target else {
+        panic!("holder store must reach its original free: {store:#?}")
+    };
+    let sink = snapshot
+        .metadata
+        .equations
+        .iter()
+        .find(|row| row.point.construction == free.construction && row.ordinal == free.ordinal)
+        .unwrap();
+    assert_eq!(sink.operation, "sink");
+    assert_eq!(sink.point.function.as_deref(), Some("caller"));
+    assert_eq!(sink.endpoint.as_ref().unwrap().callee, "free");
 }
 
 #[test]

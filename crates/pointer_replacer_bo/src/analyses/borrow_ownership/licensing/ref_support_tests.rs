@@ -55,9 +55,9 @@ fn context(facts: &Facts) -> (Candidate, ConsumedOutput, Meet, Meet) {
 }
 
 #[test]
-fn c05_ref_support_holds_the_ifl3_field_unsupported_under_the_record() {
+fn aggregate_initializer_supports_the_exact_consumed_field_output() {
     with_facts(IFL3, |facts| {
-        let (candidate, _, _, _) = context(facts);
+        let (candidate, certificate, free, output) = context(facts);
         let frozen = facts.licensing.as_ref().unwrap();
         let proofs = field_support::audit(
             facts,
@@ -69,8 +69,34 @@ fn c05_ref_support_holds_the_ifl3_field_unsupported_under_the_record() {
             .iter()
             .find(|field| field.field_key == candidate.field_key)
             .unwrap();
-        assert!(!field.supported(), "{field:#?}");
-        assert!(field.stores.is_empty(), "{field:#?}");
+        assert!(field.supported(), "{field:#?}");
+        let [store] = field.stores.as_slice() else {
+            panic!("one aggregate field store: {field:#?}")
+        };
+        assert_eq!(store.site.function, "f");
+        assert_eq!(store.site.place.local, candidate.cell_place.local);
+        assert_eq!(store.destination_def, candidate.scalar_before);
+        assert!(store.by_move);
+        assert_eq!(store.meet, free);
+        assert!(
+            matches!(store.meet.source.lineage, SourceLineage::Exact(ref calls) if calls.is_empty())
+        );
+        let source = facts
+            .equations
+            .iter()
+            .find(|row| {
+                row.point.construction == store.meet.source.endpoint.construction
+                    && row.ordinal == store.meet.source.endpoint.ordinal
+            })
+            .unwrap();
+        assert_eq!(source.operation, "source");
+        assert_eq!(source.endpoint.as_ref().unwrap().callee, "malloc");
+        assert!(
+            store.discharged_outputs.iter().any(|discharge| {
+                discharge.certificate == certificate && discharge.output == output
+            }),
+            "the same-call free must discharge the retained projected output"
+        );
     });
 }
 

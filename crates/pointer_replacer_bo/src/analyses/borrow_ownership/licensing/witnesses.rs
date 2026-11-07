@@ -282,7 +282,7 @@ pub unsafe fn f() -> i32 {
 }
 
 #[test]
-fn ol07_under_the_record_the_ifl3_payload_and_field_stay_raw() {
+fn aggregate_initialized_payload_and_field_own_until_the_callee_free() {
     // The literal sequence: aggregate, read, callee free, return saved scalar.
     // Use an accepted frame's explicit frozen-graph attestation. The
     // unattested public-entry case remains a separate conservative control.
@@ -312,8 +312,8 @@ pub unsafe fn f() -> i32 {
     assert_kinds(
         &fixture,
         &[
-            ("f::owner", SlotKind::Raw),
-            ("H.ptr", SlotKind::Raw),
+            ("f::owner", SlotKind::Owning),
+            ("H.ptr", SlotKind::Owning),
             ("release::h", SlotKind::Ref),
         ],
     );

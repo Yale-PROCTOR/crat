@@ -183,10 +183,9 @@ pub(crate) fn derive_callee(
             *origin != return_origin && summary.subset.contains(*origin, return_origin)
         })
         .collect::<Vec<_>>();
-    if sources
-        .iter()
-        .any(|(_, slot)| !slot.place.parents.is_empty())
-    {
+    if sources.iter().any(|(_, slot)| {
+        !slot.place.parents.is_empty() || (slot.place.field.is_some() && slot.depth != 0)
+    }) {
         return Err(LifetimeFailure::FieldHeld);
     }
     if sources.is_empty() {

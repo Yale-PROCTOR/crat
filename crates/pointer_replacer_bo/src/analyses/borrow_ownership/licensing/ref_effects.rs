@@ -1528,7 +1528,7 @@ pub unsafe fn f() -> i32 {
     }
 
     #[test]
-    fn c05_the_reference_field_permission_is_unsat_under_the_record() {
+    fn aggregate_initialized_field_permission_is_satisfiable() {
         super::super::graph_tests::with_solver_facts(IFL3, |facts, _, slots| {
             use crate::analyses::borrow_ownership::solver::KindSolver;
             let formation = facts
@@ -1551,7 +1551,7 @@ pub unsafe fn f() -> i32 {
             probe.constrain_reference_field_effects(facts).unwrap();
             assert_eq!(
                 probe.check_with_assumptions(&[guard.clone()]),
-                z3::SatResult::Unsat
+                z3::SatResult::Sat
             );
         });
     }
@@ -1586,7 +1586,7 @@ pub unsafe fn f() -> i32 {
     }
 
     #[test]
-    fn c05_the_permission_guard_is_unsat_before_any_endpoint_is_withdrawn() {
+    fn aggregate_field_permission_retains_all_original_endpoints() {
         super::super::graph_tests::with_solver_facts(IFL3, |facts, _, slots| {
             use crate::analyses::borrow_ownership::solver::KindSolver;
             let effect = &Plan::build(facts).candidates[0];
@@ -1605,9 +1605,24 @@ pub unsafe fn f() -> i32 {
                 .predicate;
             let probe = KindSolver::new(slots);
             probe.constrain_reference_field_effects(facts).unwrap();
+            let mut assumptions = vec![guard.clone()];
+            assumptions.extend(
+                facts
+                    .guards
+                    .iter()
+                    .filter(|binding| {
+                        facts.equations.iter().any(|row| {
+                            row.point.construction == binding.equation.construction
+                                && row.ordinal == binding.equation.ordinal
+                                && matches!(row.operation.as_str(), "source" | "sink")
+                        })
+                    })
+                    .map(|binding| binding.predicate.clone()),
+            );
+            assert_eq!(assumptions.len(), 3, "formation, malloc, and free guards");
             assert_eq!(
-                probe.check_with_assumptions(&[guard.clone()]),
-                z3::SatResult::Unsat
+                probe.check_with_assumptions(&assumptions),
+                z3::SatResult::Sat
             );
         });
     }
@@ -1622,10 +1637,11 @@ pub unsafe fn f() -> i32 {
     }
 
     #[test]
-    fn c05_under_the_record_the_ifl3_field_settles_raw() {
+    fn aggregate_initialized_field_owns_under_complete_caller_coverage() {
         use crate::analyses::borrow_ownership::SlotKind;
         let fixture = super::super::tests::inspect_attested_frame(IFL3);
-        fixture.assert_kind("H.ptr", SlotKind::Raw);
+        fixture.assert_kind("H.ptr", SlotKind::Owning);
+        fixture.assert_kind("f::owner", SlotKind::Owning);
         fixture.assert_kind("release::h", SlotKind::Ref);
     }
 }

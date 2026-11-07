@@ -151,13 +151,15 @@ fn origin_summaries_from_flows(flows: origin_flow::OriginFlowResults) -> OriginS
         .iter()
         .map(|(&f, result)| {
             let summary = &result.summary;
+            let mut unknown = summary.unknown_targets.clone();
+            unknown.union(&summary.cutoff_targets);
             (
                 f,
                 build_origin_summary(
                     summary.slots.clone(),
                     &summary.value_flows,
                     &summary.storage_aliases,
-                    summary.unknown_targets.clone(),
+                    unknown,
                 ),
             )
         })
@@ -202,6 +204,12 @@ pub(crate) fn collect_no_borrow_origin_slots(
     let mut out = vec![];
     for (&f, summary) in origins.iter() {
         for slot in summary.unknown.iter() {
+            if let Some(native) = origins.try_native_flows().and_then(|flows| flows.get(&f))
+                && !native.summary.unknown_targets.contains(slot)
+                && !native.summary.cutoff_writes.contains(slot)
+            {
+                continue;
+            }
             if let Some(r) = signature_slot_to_ref(summary.slots[slot], f, slots) {
                 out.push(r);
             }
@@ -445,6 +453,138 @@ mod tests {
 
     fn has(edges: &[(String, String)], sub: &str, sup: &str) -> bool {
         edges.iter().any(|(a, b)| a == sub && b == sup)
+    }
+
+    #[test]
+    fn bounded_recursive_choices_keep_known_pointer_origins() {
+        let facts = origin_facts(
+            r#"
+struct Node { next: *const Node }
+unsafe fn pick(node: *const Node, flag: bool) -> *const Node {
+    if flag { node } else { (*node).next }
+}
+"#,
+        );
+        let facts = &facts["pick"];
+        assert!(has(&facts.subset, "arg1@0", "return@0"));
+        assert!(has(&facts.subset, "arg1*.field0@0", "return@0"));
+        assert!(
+            !facts.unknown.iter().any(|slot| slot == "return@0"),
+            "{:?}",
+            facts.unknown
+        );
+        assert!(
+            !facts
+                .subset
+                .iter()
+                .any(|(source, target)| source.starts_with("return*") && target == "return@0")
+        );
+    }
+
+    #[test]
+    fn recursive_field_writes_do_not_seed_opaque_origins_from_provisional_summaries() {
+        ::utils::compilation::run_compiler_on_str(
+            r#"
+struct Node { next: *mut Node }
+unsafe fn relink(node: *mut Node, count: u32) -> *mut Node {
+    if count != 0 { (*node).next = relink((*node).next, count - 1); }
+    node
+}
+"#,
+            |tcx| {
+                let program = build_program(tcx);
+                let summaries = compute_origins_native(&program);
+                for result in summaries.native_flows().values() {
+                    assert!(
+                        result.summary.unknown_targets.is_empty(),
+                        "{:?}",
+                        result.summary
+                    );
+                }
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pointer_view_writes_propagate_without_aliasing_value_copies_or_siblings() {
+        let facts = origin_facts(
+            r#"
+#[derive(Clone, Copy)] struct Entry { value: *const i32 }
+struct Pair { left: Entry, right: Entry }
+struct Number { value: i32 }
+struct Other { number: i32 }
+unsafe extern "C" { fn opaque() -> *const i32; fn change(entry: *mut Entry); }
+unsafe fn known(p: *mut Entry, value: *const i32) -> *const i32 {
+    let q = p; (*q).value = value; (*p).value
+}
+unsafe fn unknown(p: *mut Entry) -> *const i32 {
+    let q = p; (*q).value = opaque(); (*p).value
+}
+unsafe fn effect(p: *mut Entry) -> *const i32 {
+    let q = p; change(q); (*p).value
+}
+unsafe fn set(p: *mut Entry, value: *const i32) { (*p).value = value; }
+unsafe fn call_known(p: *mut Entry, value: *const i32) -> *const i32 {
+    let q = p; set(q, value); (*p).value
+}
+unsafe fn call_unknown(p: *mut Entry) -> *const i32 {
+    let q = p; set(q, opaque()); (*p).value
+}
+unsafe fn reborrowed(p: *mut Entry, value: *const i32) -> *const i32 {
+    let q = p; (*q).value = &*value; (*p).value
+}
+unsafe fn interior(p: *mut Entry, value: *const Number) -> *const i32 {
+    let q = p; (*q).value = &raw const (*value).value; (*p).value
+}
+unsafe fn copied(entry: Entry) -> *const i32 {
+    let mut copy = entry; copy.value = opaque(); entry.value
+}
+unsafe fn sibling(pair: *mut Pair) -> *const i32 {
+    let q = &raw mut (*pair).left; (*q).value = opaque(); (*pair).right.value
+}
+unsafe fn written_sibling(pair: *mut Pair) -> *const i32 {
+    let q = &raw mut (*pair).left; (*q).value = opaque(); (*pair).left.value
+}
+unsafe fn incompatible(other: *const Other) -> *const i32 {
+    (*(other as *const Entry)).value
+}
+"#,
+        );
+        for name in ["known", "call_known", "reborrowed", "interior"] {
+            assert!(
+                has(&facts[name].subset, "arg2@0", "return@0"),
+                "{name}: {:?}",
+                facts[name].subset
+            );
+        }
+        for name in [
+            "known",
+            "call_known",
+            "reborrowed",
+            "interior",
+            "copied",
+            "sibling",
+        ] {
+            assert!(
+                !facts[name].unknown.iter().any(|slot| slot == "return@0"),
+                "{name}: {:?}",
+                facts[name].unknown
+            );
+        }
+        for name in [
+            "unknown",
+            "effect",
+            "call_unknown",
+            "written_sibling",
+            "incompatible",
+        ] {
+            assert!(
+                facts[name].unknown.iter().any(|slot| slot == "return@0"),
+                "{name}: {:?}",
+                facts[name].unknown
+            );
+        }
     }
 
     #[test]

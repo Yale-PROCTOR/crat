@@ -106,7 +106,8 @@ pub unsafe fn f(p: *const u8, alias: *mut u8) -> u8 {
                 });
                 assert!(stats.commits_conflict > 0, "retirement must trigger a real repair round");
                 assert!(stats.source_retirement_decline.is_empty(), "this fixture has complete retirement coverage");
-                if !l2 {
+                // Accepted guarded repairs are checked through the exported rounds and Ref-unsat probe.
+                if force_ref && !l2 {
                     assert!(commits.iter().any(|commit| commit.target == target
                         && commit.conflict.issuer == Some(target) && commit.conflict.requirers.is_empty()),
                         "Mode-A must commit the exact entry-only retirement target");
@@ -152,4 +153,9 @@ pub unsafe fn f(p: *const u8, alias: *mut u8) -> u8 {
 #[test]
 fn e5_p_forced_unrepaired_entry_declines_without_an_ordinary_loan_conflict() {
     check_rounds(true);
+}
+
+#[test]
+fn entry_retirement_repairs_the_original_reference_before_acceptance() {
+    check_rounds(false);
 }

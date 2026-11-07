@@ -313,15 +313,18 @@ pub(crate) fn certify_metadata(
         || target.target.kind_slot != OriginAvailability::Present(return_key)
         || target.incoming.iter().any(|key| {
             key.root != parameter_key
-                || !key.parents.is_empty()
                 || key.depth != 0
                 || match &key.field {
                     None => {
-                        key.root_dereferences != 0
+                        !key.parents.is_empty()
+                            || key.root_dereferences != 0
                             || key.kind_slot != OriginAvailability::Present(parameter_key.clone())
                     }
                     Some(field) => {
                         key.root_dereferences != 1
+                            || key.parents.iter().any(|(derefs, field)| {
+                                *derefs != 1 || !fields.contains(field.as_str())
+                            })
                             || !fields.contains(field.as_str())
                             || key.kind_slot != OriginAvailability::Present(field.clone())
                     }
@@ -352,9 +355,9 @@ mod tests {
 
     const CODE: &str = r#"
 pub struct Node {left:*mut Node}
-pub unsafe fn minimum(node:*mut Node)->*mut Node {
-    let left=(*node).left;
-    left
+pub unsafe fn minimum(mut node:*mut Node)->*mut Node {
+    while !(*node).left.is_null() {node=(*node).left;}
+    node
 }
 pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
     let left=minimum(first);
@@ -363,24 +366,8 @@ pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
 }
 "#;
 
-    fn with_correspondence_metadata(code: &str, check: impl FnOnce(&Facts) + Send) {
-        with_facts(code, move |facts| {
-            let mut facts = facts.clone();
-            // Isolate metadata validation under assumed caller corroboration. The actual
-            // direct-field calls are checked separately without this fixture adjustment.
-            for call in &mut facts.traversal_native.as_mut().unwrap().calls {
-                assert!(!call.caller_value_flow);
-                call.caller_value_flow = true;
-            }
-            facts.licensing = Some(std::rc::Rc::new(
-                super::super::snapshot::FrozenTransport::build(&facts).unwrap(),
-            ));
-            check(&facts);
-        });
-    }
-
     fn with_calls(check: impl FnOnce(&Facts, &[traversal_call::Candidate]) + Send) {
-        with_correspondence_metadata(CODE, move |facts| {
+        with_facts(CODE, move |facts| {
             assert_eq!(facts.constructions, 1);
             let calls = traversal_call::discover(facts);
             assert_eq!(calls.len(), 2, "two independent call identities");
@@ -620,7 +607,7 @@ pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
     }
 
     #[test]
-    fn unbounded_recursive_traversal_origins_are_held() {
+    fn recursive_traversal_has_certified_reader_origins() {
         let code = r#"
 pub struct Node {left:*mut Node}
 pub unsafe fn minimum(mut node:*mut Node)->*mut Node {
@@ -636,13 +623,17 @@ pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
         with_facts(code, |facts| {
             let calls = traversal_call::discover(facts);
             assert_eq!(calls.len(), 2);
-            expect_hold(facts, &calls[0], HoldReason::UnknownReturnOrigin);
+            certify(facts, &calls[0]).unwrap();
         });
     }
 
     #[test]
     fn direct_field_calls_without_caller_root_flow_are_held() {
-        with_facts(CODE, |facts| {
+        let code = CODE.replace(
+            "while !(*node).left.is_null() {node=(*node).left;}\n    node",
+            "(*node).left",
+        );
+        with_facts(&code, |facts| {
             let calls = traversal_call::discover(facts);
             assert_eq!(calls.len(), 2);
             expect_hold(facts, &calls[0], HoldReason::CallerFlowAbsent);
@@ -693,10 +684,10 @@ pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
                 "pub struct Node {left:*mut Node,right:*mut Node}",
             )
             .replace(
-                "let left=(*node).left;",
-                "let discarded=(*node).right;let _seen=discarded.is_null();let left=(*node).left;",
+                "while !(*node).left.is_null()",
+                "let discarded=(*node).right;let _seen=discarded.is_null();while !(*node).left.is_null()",
             );
-        with_correspondence_metadata(&code, |facts| {
+        with_facts(&code, |facts| {
             let candidate = traversal_call::discover(facts).remove(0);
             certify(facts, &candidate).unwrap();
             assert!(
