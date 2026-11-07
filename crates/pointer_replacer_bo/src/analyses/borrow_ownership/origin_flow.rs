@@ -1,8 +1,8 @@
 //! BO-native interprocedural origin-flow derivation.
 //!
-//! This module mirrors the frozen production `borrow::lifetime_flow` semantics over BO-owned slot
-//! and summary types. A fine-grained differential against the production analysis established
-//! equality of every function, ordered slot, subset edge, and unknown-membership entry.
+//! Uses BO-owned slots and summaries, with explicit foreign pointer-return contracts and
+//! conservative byte-write effects. The legacy lifetime-flow derivation remains a differential
+//! oracle for their shared language fragment.
 
 use std::cell::Cell;
 #[cfg(test)]
@@ -26,6 +26,7 @@ use rustc_middle::{
 use rustc_span::def_id::{DefId, LocalDefId};
 
 use super::{
+    boundary_table::pointer_return_contract,
     origin_summary::{OriginSlot, SignaturePlace, SignatureRoot, SignatureSlot},
     slots::{SlotOwner, StructFieldSlot},
 };
@@ -93,6 +94,7 @@ pub(crate) struct NativeOriginSummary {
     pub value_flows: SparseBitMatrix<OriginSlot, OriginSlot>,
     pub storage_aliases: SparseBitMatrix<OriginSlot, OriginSlot>,
     pub unknown_targets: DenseBitSet<OriginSlot>,
+    written_pointees: DenseBitSet<OriginSlot>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -201,6 +203,7 @@ pub(crate) struct BodyOriginFlow {
     value_flows: SparseBitMatrix<OriginSlot, OriginSlot>,
     storage_aliases: SparseBitMatrix<OriginSlot, OriginSlot>,
     unknown_targets: DenseBitSet<OriginSlot>,
+    written_pointees: DenseBitSet<OriginSlot>,
 }
 
 #[derive(Clone, Debug)]
@@ -396,6 +399,7 @@ impl PartialEq for NativeOriginSummary {
             && same_matrix(&self.value_flows, &other.value_flows)
             && same_matrix(&self.storage_aliases, &other.storage_aliases)
             && self.unknown_targets == other.unknown_targets
+            && self.written_pointees == other.written_pointees
     }
 }
 
@@ -408,6 +412,7 @@ impl PartialEq for BodyOriginFlow {
             && same_matrix(&self.value_flows, &other.value_flows)
             && same_matrix(&self.storage_aliases, &other.storage_aliases)
             && self.unknown_targets == other.unknown_targets
+            && self.written_pointees == other.written_pointees
     }
 }
 
@@ -754,6 +759,7 @@ impl BodyOriginFlow {
             value_flows: SparseBitMatrix::new(domain_size),
             storage_aliases: SparseBitMatrix::new(domain_size),
             unknown_targets: DenseBitSet::new_empty(domain_size),
+            written_pointees: DenseBitSet::new_empty(domain_size),
         }
     }
 
@@ -946,6 +952,40 @@ impl BodyOriginFlow {
         union_matrix_into(&mut combined, &self.storage_aliases);
         self.value_flows = transitive_closure(&combined, self.slots.len());
 
+        // Recover typed pointees erased by casts to void pointers before applying byte writes.
+        let mut written = self.written_pointees.clone();
+        for source in self.slots.indices() {
+            if self
+                .written_pointees
+                .iter()
+                .any(|target| self.value_flows.contains(source, target))
+            {
+                written.insert(source);
+            }
+        }
+        self.written_pointees = written.clone();
+        for source in written.iter() {
+            if let Some(targets) = self.value_flows.row(source) {
+                self.written_pointees.union(targets);
+            }
+        }
+        for source in self.written_pointees.iter() {
+            for depth in 1..MAX_SIGNATURE_SLOT_DEPTH {
+                if let Some(target) = self.slot_after(source, depth) {
+                    self.unknown_targets.insert(target);
+                }
+            }
+            if let OriginOwner::Local(local) = self.slots[source].owner {
+                for (target, slot) in self.slots.iter_enumerated() {
+                    if let OriginOwner::Field(field) = slot.owner
+                        && field.base == local
+                        && field.deref_depth > self.slots[source].depth
+                    {
+                        self.unknown_targets.insert(target);
+                    }
+                }
+            }
+        }
         let mut unknown = self.unknown_targets.clone();
         for source in self.unknown_targets.iter() {
             if let Some(targets) = self.value_flows.row(source) {
@@ -966,7 +1006,7 @@ impl BodyOriginFlow {
         body: &Body<'_>,
         internal_unknown: &DenseBitSet<OriginSlot>,
     ) -> NativeOriginSummary {
-        let mut slots = IndexVec::new();
+        let mut slots = IndexVec::<OriginSlot, SignatureSlot>::new();
         let mut internal_to_summary = FxHashMap::default();
 
         for local in std::iter::once(RETURN_PLACE).chain(body.args_iter()) {
@@ -1017,6 +1057,7 @@ impl BodyOriginFlow {
         let mut value_flows = SparseBitMatrix::new(slots.len());
         let mut storage_aliases = SparseBitMatrix::new(slots.len());
         let mut unknown_targets = DenseBitSet::new_empty(slots.len());
+        let mut written_pointees = DenseBitSet::new_empty(slots.len());
 
         for source in self.value_flows.rows() {
             let Some(&summary_source) = internal_to_summary.get(&source) else {
@@ -1059,11 +1100,20 @@ impl BodyOriginFlow {
             }
         }
 
+        for written in self.written_pointees.iter() {
+            if let Some(&target) = internal_to_summary.get(&written)
+                && matches!(slots[target].place.root, SignatureRoot::Arg(_))
+            {
+                written_pointees.insert(target);
+            }
+        }
+
         NativeOriginSummary {
             slots,
             value_flows,
             storage_aliases,
             unknown_targets,
+            written_pointees,
         }
     }
 
@@ -1552,15 +1602,17 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
             return true;
         }
 
-        if is_known_c_string_search_return_call(&call.func, self.tcx) {
-            self.assign_known_return_from_operand(destination, &arg0.node, location);
-            return true;
-        }
-
-        if is_known_memchr_return_call(&call.func, self.tcx)
-            && self.operand_is_slice_like_ref(&arg0.node)
+        if let Some(contract) = pointer_return_contract(&call.func)
+            && let Some(argument) = call.args.get(contract.argument)
         {
-            self.assign_known_return_from_operand(destination, &arg0.node, location);
+            self.assign_known_return_from_operand(destination, &argument.node, location);
+            for &index in contract.writes {
+                if let Some(argument) = call.args.get(index) {
+                    for target in self.operand_slots(&argument.node, location) {
+                        self.flow.written_pointees.insert(target);
+                    }
+                }
+            }
             return true;
         }
 
@@ -1603,6 +1655,11 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         call: &MirFunctionCall<'_, 'tcx>,
         summary: &NativeOriginSummary,
     ) {
+        for written in summary.written_pointees.iter() {
+            if let Some(target) = self.instantiate_signature_slot(call, summary.slots[written]) {
+                self.flow.written_pointees.insert(target);
+            }
+        }
         for source in summary.value_flows.rows() {
             let Some(source_slot) = self.instantiate_signature_slot(call, summary.slots[source])
             else {
@@ -1917,32 +1974,6 @@ fn is_known_slice_split_return_call(func: &CallKind, tcx: TyCtxt<'_>) -> bool {
         name,
         "split_at" | "split_at_mut" | "split_at_unchecked" | "split_at_mut_unchecked"
     )
-}
-
-fn is_known_c_string_search_return_call(func: &CallKind, tcx: TyCtxt<'_>) -> bool {
-    match func {
-        CallKind::FreeStanding(def_id) | CallKind::Impl(def_id) => {
-            is_known_c_string_search_name(tcx.item_name(def_id.to_def_id()).as_str())
-        }
-        CallKind::RustLib(def_id) => is_known_c_string_search_name(tcx.item_name(*def_id).as_str()),
-        CallKind::LibC(name) => is_known_c_string_search_name(name.as_str()),
-        CallKind::Closure | CallKind::Dynamic => false,
-    }
-}
-
-fn is_known_memchr_return_call(func: &CallKind, tcx: TyCtxt<'_>) -> bool {
-    match func {
-        CallKind::FreeStanding(def_id) | CallKind::Impl(def_id) => {
-            tcx.item_name(def_id.to_def_id()).as_str() == "memchr"
-        }
-        CallKind::RustLib(def_id) => tcx.item_name(*def_id).as_str() == "memchr",
-        CallKind::LibC(name) => name.as_str() == "memchr",
-        CallKind::Closure | CallKind::Dynamic => false,
-    }
-}
-
-fn is_known_c_string_search_name(name: impl PartialEq<&'static str>) -> bool {
-    name == "strchr" || name == "strrchr" || name == "strstr"
 }
 
 fn place_deref_depth(place: Place<'_>) -> Option<u8> {

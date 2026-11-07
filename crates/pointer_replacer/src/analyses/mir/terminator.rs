@@ -44,7 +44,7 @@ impl<'tcx> TerminatorExt<'tcx> for Terminator<'tcx> {
 
 pub enum CallKind {
     FreeStanding(LocalDefId),
-    /// Extern functions in **C2Rust** generated programs all come from _libc_
+    /// Foreign C functions, identified by their linker symbol.
     LibC(Symbol),
     /// Library calls mostly come from _stdlib_
     RustLib(DefId),
@@ -53,18 +53,37 @@ pub enum CallKind {
     Dynamic,
 }
 
+pub fn foreign_c_symbol(tcx: TyCtxt<'_>, callee: DefId) -> Option<Symbol> {
+    (tcx.is_foreign_item(callee)
+        && matches!(
+            tcx.fn_sig(callee)
+                .instantiate_identity()
+                .skip_binder()
+                .abi
+                .name(),
+            "C" | "C-unwind" | "system" | "system-unwind"
+        ))
+    .then(|| {
+        tcx.codegen_fn_attrs(callee)
+            .link_name
+            .unwrap_or_else(|| tcx.item_name(callee))
+    })
+}
+
 impl CallKind {
     pub fn new<'tcx>(tcx: TyCtxt<'tcx>, func: &Operand<'tcx>) -> CallKind {
         if let Some(func) = func.constant() {
             let ty = func.ty();
             let &FnDef(callee, _) = ty.kind() else { unreachable!() };
 
+            if let Some(symbol) = foreign_c_symbol(tcx, callee) {
+                return CallKind::LibC(symbol);
+            }
+
             if let Some(local_did) = callee.as_local() {
                 match tcx.hir_node_by_def_id(local_did) {
                     rustc_hir::Node::Item(_) => CallKind::FreeStanding(local_did),
-                    rustc_hir::Node::ForeignItem(foreign_item) => {
-                        CallKind::LibC(foreign_item.ident.name)
-                    }
+                    rustc_hir::Node::ForeignItem(_) => CallKind::RustLib(callee),
                     rustc_hir::Node::ImplItem(_) => CallKind::Impl(local_did),
                     rustc_hir::Node::TraitItem(_) => CallKind::Dynamic,
                     _ => unreachable!(),

@@ -629,18 +629,20 @@ impl Discharges {
             match single_definition(&body, local)? {
                 Definition::Copy(p) => place = PlaceKey::from_place(p),
                 Definition::Call(callee, first) => {
-                    let name = tcx.item_name(callee).to_string();
-                    let allocated = match name.as_str() {
-                        "malloc" | "calloc" | "aligned_alloc" | "strdup" | "strndup" => true,
+                    let symbol = crate::analyses::mir::foreign_c_symbol(tcx, callee);
+                    let allocated = match symbol.as_ref().map(|symbol| symbol.as_str()) {
+                        Some("malloc" | "calloc" | "aligned_alloc" | "strdup" | "strndup") => true,
                         // `realloc` may return its old block: fresh only when
                         // the old block is (its first argument, walked the same way).
-                        "realloc" => {
+                        Some("realloc") => {
                             first.is_some_and(|old| fresh_value(tcx, function, &body, old, 0))
                         }
                         _ => callee.as_local().is_some_and(|f| returns_fresh(tcx, f, 0)),
                     };
-                    return allocated
-                        .then(|| (format!("{name}@{}", tcx.def_path_str(function)), function));
+                    return allocated.then(|| {
+                        let name = symbol.unwrap_or_else(|| tcx.item_name(callee));
+                        (format!("{name}@{}", tcx.def_path_str(function)), function)
+                    });
                 }
             }
         }
@@ -1133,10 +1135,12 @@ fn fresh_value<'tcx>(
     match single_definition(body, local) {
         Some(Definition::Copy(p)) => fresh_value(tcx, function, body, p, depth + 1),
         Some(Definition::Call(callee, _)) => {
-            matches!(
-                tcx.item_name(callee).as_str(),
-                "malloc" | "calloc" | "aligned_alloc" | "strdup" | "strndup"
-            ) || callee
+            crate::analyses::mir::foreign_c_symbol(tcx, callee).is_some_and(|symbol| {
+                matches!(
+                    symbol.as_str(),
+                    "malloc" | "calloc" | "aligned_alloc" | "strdup" | "strndup"
+                )
+            }) || callee
                 .as_local()
                 .is_some_and(|f| returns_fresh(tcx, f, depth + 1))
         }
@@ -1189,10 +1193,12 @@ fn returns_fresh(tcx: TyCtxt<'_>, function: LocalDefId, depth: usize) -> bool {
             let Some((callee, _)) = func.const_fn_def() else {
                 return false;
             };
-            let fresh = matches!(
-                tcx.item_name(callee).as_str(),
-                "malloc" | "calloc" | "aligned_alloc" | "strdup" | "strndup"
-            ) || callee
+            let fresh = crate::analyses::mir::foreign_c_symbol(tcx, callee).is_some_and(|symbol| {
+                matches!(
+                    symbol.as_str(),
+                    "malloc" | "calloc" | "aligned_alloc" | "strdup" | "strndup"
+                )
+            }) || callee
                 .as_local()
                 .is_some_and(|f| returns_fresh(tcx, f, depth + 1));
             if !fresh {

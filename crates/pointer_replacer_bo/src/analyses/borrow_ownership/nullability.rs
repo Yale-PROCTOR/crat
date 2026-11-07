@@ -8,11 +8,13 @@ use rustc_middle::{
 use rustc_span::def_id::LocalDefId;
 
 use super::{
+    boundary_table::pointer_return_contract,
     crate_slots::CrateSlots,
     resolve::{ResolvedSlot, resolve_place},
     slots::StructFieldSlot,
     solver::SlotRef,
 };
+use crate::analyses::mir::CallKind;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct NullabilityFacts {
@@ -151,6 +153,19 @@ pub(crate) fn analyze(
                 continue;
             };
             let name = tcx.item_name(*def_id);
+            if let Some(contract) = pointer_return_contract(&CallKind::new(tcx, func))
+                && let Some(target) = resolve(slots, fn_did, body, *destination)
+            {
+                if contract.nullable {
+                    null_literal.insert(target);
+                } else if let Some(place) = args
+                    .get(contract.argument)
+                    .and_then(|argument| argument.node.place())
+                    && let Some(source) = resolve(slots, fn_did, body, place)
+                {
+                    edges.push((source, target));
+                }
+            }
             if matches!(name.as_str(), "null" | "null_mut")
                 && let Some(target) = resolve(slots, fn_did, body, *destination)
             {

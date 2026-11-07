@@ -434,6 +434,165 @@ mod tests {
         edges.iter().any(|(a, b)| a == sub && b == sup)
     }
 
+    #[test]
+    fn foreign_search_return_origins_follow_raw_void_casts_and_link_names() {
+        let facts = origin_facts(
+            r#"
+use core::ffi::c_void;
+unsafe extern "C" {
+    fn memchr(p: *const c_void, c: i32, n: usize) -> *mut c_void;
+    #[link_name = "memchr"] fn search(p: *const c_void, c: i32, n: usize) -> *mut c_void;
+    fn strchr(p: *const i8, c: i32) -> *mut i8;
+    fn strrchr(p: *const i8, c: i32) -> *mut i8;
+    fn strstr(p: *const i8, needle: *const i8) -> *mut i8;
+}
+unsafe fn typed(p: *const u8, n: usize) -> *mut u8 { memchr(p as *const c_void, 7, n) as *mut u8 }
+unsafe fn erased(p: *const c_void, n: usize) -> *mut c_void { search(p, 7, n) }
+unsafe fn forward(p: *const u8, n: usize) -> *mut u8 { typed(p, n) }
+unsafe fn external(p: *const u8, n: usize) -> *mut u8 { libc::memchr(p as *const c_void, 7, n) as *mut u8 }
+unsafe fn first(p: *const i8) -> *mut i8 { strchr(p, 7) }
+unsafe fn last(p: *const i8) -> *mut i8 { strrchr(p, 7) }
+unsafe fn substring(p: *const i8, needle: *const i8) -> *mut i8 { strstr(p, needle) }
+"#,
+        );
+        for name in [
+            "typed",
+            "erased",
+            "forward",
+            "external",
+            "first",
+            "last",
+            "substring",
+        ] {
+            let fact = &facts[name];
+            assert!(
+                has(&fact.subset, "arg1@0", "return@0"),
+                "{name}: {:?}",
+                fact.subset
+            );
+            assert!(
+                !fact.unknown.iter().any(|slot| slot == "return@0"),
+                "{name}: {:?}",
+                fact.unknown
+            );
+        }
+        assert!(!has(&facts["substring"].subset, "arg2@0", "return@0"));
+    }
+
+    #[test]
+    fn libc_contracts_do_not_override_local_bodies_or_fresh_and_opaque_calls() {
+        let facts = origin_facts(
+            r#"
+use core::ffi::c_void;
+mod user {
+    pub unsafe fn memchr(_p: *mut u8, other: *mut u8) -> *mut u8 { other }
+}
+unsafe extern "C" {
+    #[link_name = "opaque"] fn memchr(p: *const c_void, c: i32, n: usize) -> *mut c_void;
+    fn malloc(n: usize) -> *mut c_void;
+    fn strdup(p: *const i8) -> *mut i8;
+    fn realloc(p: *mut c_void, n: usize) -> *mut c_void;
+}
+unsafe fn local(p: *mut u8, other: *mut u8) -> *mut u8 { user::memchr(p, other) }
+unsafe fn opaque(p: *const u8, n: usize) -> *mut u8 { memchr(p as *const c_void, 7, n) as *mut u8 }
+unsafe fn allocated(n: usize) -> *mut u8 { malloc(n) as *mut u8 }
+unsafe fn duplicate(p: *const i8) -> *mut i8 { strdup(p) }
+unsafe fn resized(p: *mut u8, n: usize) -> *mut u8 { realloc(p as *mut c_void, n) as *mut u8 }
+"#,
+        );
+        assert!(has(&facts["local"].subset, "arg2@0", "return@0"));
+        assert!(!has(&facts["local"].subset, "arg1@0", "return@0"));
+        for name in ["opaque", "allocated", "duplicate", "resized"] {
+            assert!(
+                facts[name].unknown.iter().any(|slot| slot == "return@0"),
+                "{name}"
+            );
+            assert!(!has(&facts[name].subset, "arg1@0", "return@0"), "{name}");
+        }
+    }
+
+    #[test]
+    fn copy_returns_keep_the_destination_origin_and_overwrite_pointer_storage() {
+        for name in [
+            "memcpy", "memmove", "memset", "strcpy", "strncpy", "strcat", "strncat", "fgets",
+        ] {
+            let (declaration, arguments) = match name {
+                "memset" => ("dst: *mut c_void, value: i32, n: usize", "dst, 0, n"),
+                "fgets" => (
+                    "dst: *mut c_void, n: i32, stream: *const c_void",
+                    "dst, n as i32, src",
+                ),
+                "strcpy" | "strcat" => ("dst: *mut c_void, src: *const c_void", "dst, src"),
+                _ => (
+                    "dst: *mut c_void, src: *const c_void, n: usize",
+                    "dst, src, n",
+                ),
+            };
+            let source = format!(
+                r#"
+use core::ffi::c_void;
+unsafe extern "C" {{ fn {name}({declaration}) -> *mut c_void; }}
+unsafe fn erased(dst: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {{ {name}({arguments}) }}
+unsafe fn typed(dst: *mut *mut i32, src: *const *mut i32, n: usize) -> *mut *mut i32 {{ erased(dst as *mut c_void, src as *const c_void, n) as *mut *mut i32 }}
+unsafe fn loaded(dst: *mut *mut i32, src: *const *mut i32, n: usize) -> *mut i32 {{ *typed(dst, src, n) }}
+struct Holder {{ pointer: *mut i32 }}
+unsafe fn structure(dst: *mut Holder, src: *const Holder, n: usize) {{ erased(dst as *mut c_void, src as *const c_void, n); }}
+"#
+            );
+            let facts = origin_facts(&source);
+            for function in ["erased", "typed"] {
+                assert!(
+                    has(&facts[function].subset, "arg1@0", "return@0"),
+                    "{name}/{function}"
+                );
+                assert!(
+                    !has(&facts[function].subset, "arg2@0", "return@0"),
+                    "{name}/{function}"
+                );
+                assert!(
+                    !facts[function]
+                        .unknown
+                        .iter()
+                        .any(|slot| slot == "return@0"),
+                    "{name}/{function}"
+                );
+            }
+            assert!(
+                facts["typed"].unknown.iter().any(|slot| slot == "arg1@1"),
+                "{name}: {:?}",
+                facts["typed"].unknown
+            );
+            assert!(
+                facts["typed"].unknown.iter().any(|slot| slot == "return@1"),
+                "{name}: {:?}",
+                facts["typed"].unknown
+            );
+            assert!(
+                facts["loaded"]
+                    .unknown
+                    .iter()
+                    .any(|slot| slot == "return@0"),
+                "{name}: {:?}",
+                facts["loaded"].unknown
+            );
+            assert!(
+                facts["structure"]
+                    .unknown
+                    .iter()
+                    .any(|slot| slot == "arg1*.field0@0"),
+                "{name}: {:?}",
+                facts["structure"].unknown
+            );
+            if name != "fgets" {
+                assert!(
+                    !facts["typed"].unknown.iter().any(|slot| slot == "arg2@1"),
+                    "{name}: {:?}",
+                    facts["typed"].unknown
+                );
+            }
+        }
+    }
+
     /// A callee that returns its arg ⇒ the return origin ⊇ the arg origin.
     #[test]
     fn nb3_id_flow_through() {

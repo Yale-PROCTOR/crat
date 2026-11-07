@@ -11,13 +11,13 @@
 //! no model at any stage can mark a source `Ref`.
 //!
 //! Allocator recognition mirrors the ownership boundary EXACTLY: a callee is a source only
-//! if it is an extern `Node::ForeignItem` whose `ident` is a `boundary_table` ForeignC source
-//! (`infer.rs` routes only `ForeignItem` callees to `libc_call`; a crate-local fn named
+//! if it is a foreign C declaration whose linker symbol is a `boundary_table` source
+//! (`infer.rs` uses the same resolved-symbol gate for `libc_call`; a crate-local fn named
 //! `malloc` emits no source, so it must not be flagged here either — matching by bare name
 //! would over-demote it). COUPLING INVARIANT: this gate is exactly the ownership source set
 //! ONLY because the boundary's other arms (`Item`→`Boundary::call`, `ImplItem` TODO,
 //! `library_call`/`unknown_call`) emit `borrow`, never `source`. If a future boundary change
-//! sources a non-`ForeignItem` callee, this gate would under-match (an unsound `Ref` could
+//! sources a non-foreign callee, this gate would under-match (an unsound `Ref` could
 //! survive) — revisit it then.
 //!
 //! Scope / known misses (deferred; sound — none over-demote):
@@ -42,7 +42,7 @@ use rustc_middle::{
 
 use super::{boundary_table, coherence::CopyLendPair, crate_slots::CrateSlots, solver::SlotRef};
 
-/// Whether `func` resolves to an extern allocator declaration — gated on `Node::ForeignItem`
+/// Whether `func` resolves to a foreign C allocator declaration — matched by linker symbol
 /// exactly like the ownership boundary (`infer.rs`), so a crate-local fn merely *named*
 /// `malloc` (a wrapper / user fn) is NOT treated as a source. The name set is the
 /// boundary table's ForeignC `Source` rows.
@@ -50,14 +50,8 @@ fn is_allocator_call(tcx: TyCtxt<'_>, func: &Operand<'_>) -> bool {
     let Some((def_id, _)) = func.const_fn_def() else {
         return false;
     };
-    let Some(local) = def_id.as_local() else {
-        return false; // library / non-local callee — never a libc source
-    };
-    matches!(
-        tcx.hir_node_by_def_id(local),
-        rustc_hir::Node::ForeignItem(fi)
-            if boundary_table::sources_foreign().any(|name| name == fi.ident.as_str())
-    )
+    crate::analyses::mir::foreign_c_symbol(tcx, def_id)
+        .is_some_and(|symbol| boundary_table::sources_foreign().any(|name| name == symbol.as_str()))
 }
 
 /// Depth-0 slots of locals that hold a heap allocation: bare-local allocator-call

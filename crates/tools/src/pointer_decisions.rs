@@ -183,15 +183,15 @@ pub(super) fn initial_pointer_decisions_for_api(
                 .and_then(|slot| analysis.kinds.get(&slot))
                 .copied()
                 .unwrap_or(SlotKind::Raw);
-            let mutable = mutability.is_mut()
-                && analysis
-                    .mutability
-                    .struct_field_fact(owner.struct_did, owner.field_index, depth)
-                    .is_none_or(|fact| fact.is_mutable());
-            let array = analysis
-                .fatness
+            let mutable = analysis
+                .mutability
                 .struct_field_fact(owner.struct_did, owner.field_index, depth)
-                .is_some_and(|fact| fact.is_arr())
+                .is_none_or(|fact| fact.is_mutable());
+            let array = slot.is_some_and(|slot| representations.arrays.contains(&slot))
+                || analysis
+                    .fatness
+                    .struct_field_fact(owner.struct_did, owner.field_index, depth)
+                    .is_some_and(|fact| fact.is_arr())
                 || (kind == SlotKind::Owning
                     && slot
                         .and_then(|slot| representations.allocations.get(&slot))
@@ -274,20 +274,20 @@ pub(super) fn initial_pointer_decisions_for_api(
                             tcx.def_path_str(function)
                         )
                     })?;
-                    let mutable = source_mutability.is_mut()
-                        && (representations.mutable.contains(&slot)
-                            || if depth == 0 {
-                                analysis.is_mutable(function, local)
-                            } else {
-                                analysis
-                                    .mutability
-                                    .function_body_fact(function, local.index(), depth.into())
-                                    .is_none_or(|fact| fact.is_mutable())
-                            });
-                    let array = analysis
-                        .fatness
-                        .function_body_fact(function, local.index(), depth.into())
-                        .is_some_and(|fact| fact.is_arr())
+                    let mutable = representations.mutable.contains(&slot)
+                        || if depth == 0 {
+                            analysis.is_mutable(function, local)
+                        } else {
+                            analysis
+                                .mutability
+                                .function_body_fact(function, local.index(), depth.into())
+                                .is_none_or(|fact| fact.is_mutable())
+                        };
+                    let array = representations.arrays.contains(&slot)
+                        || analysis
+                            .fatness
+                            .function_body_fact(function, local.index(), depth.into())
+                            .is_some_and(|fact| fact.is_arr())
                         || (*kind == SlotKind::Owning
                             && representations.allocations.get(&slot).is_some_and(|sizes| {
                                 let element_size = tcx
@@ -798,6 +798,7 @@ struct RepresentationFacts {
     nullable: FxHashSet<SlotRef>,
     allocations: FxHashMap<SlotRef, FxHashSet<Option<u64>>>,
     mutable: FxHashSet<SlotRef>,
+    arrays: FxHashSet<SlotRef>,
 }
 
 fn representation_facts(
@@ -806,6 +807,7 @@ fn representation_facts(
 ) -> RepresentationFacts {
     let mut nullable = analysis.nullable.clone();
     let mut mutable = FxHashSet::default();
+    let mut arrays = FxHashSet::default();
     for &slot in analysis.kinds.keys() {
         let SlotRef::Field(id) = slot else { continue };
         let field = analysis.slots.field_slots.slot(id);
@@ -825,13 +827,21 @@ fn representation_facts(
             let TyKind::RawPtr(inner, _) = source.kind() else { break };
             source = *inner;
         }
-        if matches!(source.kind(), TyKind::RawPtr(_, mutability) if mutability.is_mut())
+        if matches!(source.kind(), TyKind::RawPtr(..))
             && analysis
                 .mutability
                 .struct_field_fact(owner.struct_did, owner.field_index, field.depth.into())
                 .is_none_or(|fact| fact.is_mutable())
         {
             mutable.insert(slot);
+        }
+        if matches!(source.kind(), TyKind::RawPtr(..))
+            && analysis
+                .fatness
+                .struct_field_fact(owner.struct_did, owner.field_index, field.depth.into())
+                .is_some_and(|fact| fact.is_arr())
+        {
+            arrays.insert(slot);
         }
     }
     let mut null_tests = FxHashSet::default();
@@ -973,6 +983,9 @@ fn representation_facts(
             if mutable.contains(&target) {
                 changed |= mutable.insert(source);
             }
+            if arrays.contains(&target) {
+                changed |= arrays.insert(source);
+            }
             if nullable.contains(&source) {
                 changed |= nullable.insert(target);
             }
@@ -991,6 +1004,7 @@ fn representation_facts(
         nullable,
         allocations,
         mutable,
+        arrays,
     }
 }
 
@@ -1081,7 +1095,7 @@ impl<'tcx> Visitor<'tcx> for SourceFacts<'_, 'tcx> {
         if let hir::ExprKind::Call(callee, arguments) = expression.kind
             && let TyKind::FnDef(definition, _) = *typeck.expr_ty(callee).kind()
             && let Some(symbol) =
-                crate::observation::local_c_foreign_function_symbol(definition, self.tcx)
+                pointer_replacer_bo::analyses::mir::foreign_c_symbol(self.tcx, definition)
         {
             let size = match (symbol.as_str(), arguments) {
                 ("malloc" | "xmalloc", [size]) | ("realloc", [_, size]) => {

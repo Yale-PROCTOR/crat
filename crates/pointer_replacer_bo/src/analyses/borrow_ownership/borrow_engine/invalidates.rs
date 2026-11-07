@@ -1060,16 +1060,9 @@ fn exact_foreign_sink<'tcx>(func: &Operand<'tcx>, body: &Body<'tcx>, tcx: TyCtxt
     let TyKind::FnDef(def_id, _) = func.ty(body, tcx).kind() else {
         return false;
     };
-    let Some(local_did) = def_id.as_local() else {
+    let Some(name) = crate::analyses::mir::foreign_c_symbol(tcx, *def_id) else {
         return false;
     };
-    if !matches!(
-        tcx.hir_node_by_def_id(local_did),
-        rustc_hir::Node::ForeignItem(_)
-    ) {
-        return false;
-    }
-    let name = tcx.item_name(*def_id);
     boundary_table::lookup(name.as_str(), Matcher::ForeignC)
         .is_some_and(|entry| entry.roles == [Role::Sink])
 }

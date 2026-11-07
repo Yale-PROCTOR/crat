@@ -881,7 +881,9 @@ pub(crate) fn symbol_key(
         .as_local()
         .is_some_and(|local| body_functions.contains(&local));
     ForeignSymbolKey {
-        symbol: tcx.item_name(callee).to_string(),
+        symbol: crate::analyses::mir::foreign_c_symbol(tcx, callee)
+            .unwrap_or_else(|| tcx.item_name(callee))
+            .to_string(),
         path: tcx.def_path_str(callee),
         abi: format!("{:?}", sig.abi),
         signature: format!("{sig:?}"),
