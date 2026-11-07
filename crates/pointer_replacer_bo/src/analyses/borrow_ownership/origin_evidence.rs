@@ -89,6 +89,7 @@ impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for OriginAvailabi
 #[serde(deny_unknown_fields)]
 pub(crate) struct SignatureKey {
     pub(crate) root: String,
+    pub(crate) parents: Vec<(u8, String)>,
     pub(crate) root_dereferences: u8,
     pub(crate) field: Option<String>,
     pub(crate) depth: u8,
@@ -271,6 +272,17 @@ pub(crate) fn signature_key(
     };
     SignatureKey {
         root: slot_key::local_key(tcx, function, root.as_usize(), 0),
+        parents: signature
+            .place
+            .parents
+            .iter()
+            .map(|step| {
+                (
+                    step.deref_depth,
+                    slot_key::field_key(tcx, step.field.struct_did, step.field.field_index, 0),
+                )
+            })
+            .collect(),
         root_dereferences: signature.place.deref_depth,
         field,
         depth: signature.depth,

@@ -30,8 +30,38 @@ pub enum SignatureRoot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FieldStep {
+    pub deref_depth: u8,
+    pub field: StructFieldSlot,
+}
+
+pub(crate) const MAX_FIELD_PATH_DEPTH: usize = 3;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FieldPath {
+    steps: [Option<FieldStep>; MAX_FIELD_PATH_DEPTH - 1],
+}
+
+impl FieldPath {
+    pub fn iter(&self) -> impl Iterator<Item = FieldStep> + '_ {
+        self.steps.iter().flatten().copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.steps[0].is_none()
+    }
+
+    pub(crate) fn push(&mut self, step: FieldStep) -> Option<()> {
+        *self.steps.iter_mut().find(|entry| entry.is_none())? = Some(step);
+        Some(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SignaturePlace {
     pub root: SignatureRoot,
+    // Dereference counts are relative to the preceding field, or the root for the first step.
+    pub parents: FieldPath,
     pub deref_depth: u8,
     pub field: Option<StructFieldSlot>,
 }

@@ -226,6 +226,181 @@ fn compile_target_bodies(source: &str, bodies: &[(&str, &str)]) -> Vec<ItemRecor
 }
 
 #[test]
+fn nested_field_returns_keep_the_terminal_reference_lifetime() {
+    let source = r#"
+pub struct Entry { pub value: *const i32 }
+pub struct Map { pub entries: *const Entry }
+pub struct Tree { pub map: *const Map }
+pub unsafe fn lookup(map: *const Map, i: isize) -> *const i32 {
+    let entries = (*map).entries;
+    let item = entries.offset(i);
+    (*item).value
+}
+pub unsafe fn get(tree: *const Tree, i: isize) -> *const i32 { lookup((*tree).map, i) }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("lookup", "map.entries[i as usize].value"),
+            ("get", "lookup(tree.map, i)"),
+        ],
+    );
+    for name in ["lookup", "get"] {
+        let signature = &function(&records, name).target_signature;
+        assert!(signature.contains("-> &'"), "{signature}");
+        assert!(signature.ends_with("i32"), "{signature}");
+    }
+}
+
+#[test]
+fn projected_struct_fields_and_value_copies_preserve_borrowed_returns() {
+    let source = r#"
+pub struct Entry { pub value: *const i32 }
+pub struct Pair { pub left: Entry, pub right: Entry }
+pub unsafe fn read(entry: *const Entry) -> *const i32 { (*entry).value }
+pub unsafe fn left(pair: *const Pair) -> *const i32 { read(&raw const (*pair).left) }
+pub unsafe fn copied(pair: Pair) -> *const i32 { let entry = pair.left; read(&entry) }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("read", "entry.value"),
+            ("left", "read(&pair.left)"),
+            ("copied", "let entry = pair.left; read(&entry)"),
+        ],
+    );
+    for name in ["read", "left", "copied"] {
+        let signature = &function(&records, name).target_signature;
+        assert!(signature.contains("-> &'"), "{signature}");
+    }
+}
+
+#[test]
+fn nested_void_values_and_unsupported_paths_retain_raw_returns() {
+    let source = r#"
+use core::ffi::c_void;
+pub struct Node { pub number: i32 }
+pub struct Entry { pub value: *mut c_void }
+pub struct Map { pub entries: *const Entry }
+pub struct Tree { pub map: *const Map }
+pub struct Outer { pub tree: *const Tree }
+pub unsafe fn lookup(map: *const Map, i: isize) -> *mut c_void { (*(*map).entries.offset(i)).value }
+pub unsafe fn get(tree: *const Tree, i: isize) -> *mut Node { lookup((*tree).map, i) as *mut Node }
+pub unsafe fn deeper(outer: *const Outer) -> *mut Node { get((*outer).tree, 0) }
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        for name in ["get", "deeper"] {
+            let signature = &function(&records, name).target_signature;
+            assert!(signature.ends_with("*mut Node"), "{signature}");
+        }
+        assert!(
+            type_record(&records, "Entry")
+                .target_definition
+                .contains("value: *mut c_void")
+        );
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+}
+
+#[test]
+fn raw_container_links_cannot_supply_owned_field_borrow_lifetimes() {
+    let source = r#"
+unsafe extern "C" { fn malloc(size: usize) -> *mut i32; fn free(p: *mut i32); }
+#[repr(C)] pub struct Entry { pub value: *mut i32 }
+#[repr(C)] pub struct Map { pub entries: *const Entry }
+pub unsafe fn allocate() -> Entry { let value = malloc(core::mem::size_of::<i32>()); *value = 7; Entry { value } }
+pub unsafe fn release(entry: Entry) { free(entry.value); }
+pub unsafe fn get(map: *const Map, i: isize) -> *const i32 { &*(*(*map).entries.offset(i)).value as *const i32 }
+pub unsafe extern "C" fn api(_map: *const Map) {}
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records =
+            make_skeletons_with_api(source, None, &FxHashSet::from_iter(["api".to_owned()]), tcx)
+                .unwrap();
+        let entry = &type_record(&records, "Entry").target_definition;
+        assert!(entry.contains("Box<i32>"), "{entry}");
+        let map = &type_record(&records, "Map").target_definition;
+        assert!(map.contains("entries: *const Entry"), "{map}");
+        let signature = &function(&records, "get").target_signature;
+        assert!(signature.ends_with("*const i32"), "{signature}");
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    compile_target_bodies(source, &[("get", "&*map.entries[i as usize].value")]);
+}
+
+#[test]
+fn raw_outer_field_layers_cannot_supply_mutable_inner_borrow_lifetimes() {
+    let source = r#"
+#[repr(C)] pub struct Holder { pub cells: *const *mut i32 }
+pub unsafe fn get(holder: *const Holder, i: isize) -> *mut i32 { *(*holder).cells.offset(i) }
+pub unsafe fn write(holder: *const Holder, i: isize) { *get(holder, i) = 9; }
+pub unsafe extern "C" fn api(_holder: *const Holder) {}
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records =
+            make_skeletons_with_api(source, None, &FxHashSet::from_iter(["api".to_owned()]), tcx)
+                .unwrap();
+        let definition = &type_record(&records, "Holder").target_definition;
+        assert!(definition.contains("cells: *const &'"), "{definition}");
+        assert!(definition.contains("mut i32"), "{definition}");
+        let signature = &function(&records, "get").target_signature;
+        assert!(signature.ends_with("*mut i32"), "{signature}");
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+}
+
+#[test]
+fn recursive_traversals_outside_the_origin_domain_retain_raw_returns() {
+    let source = r#"
+pub struct Link { pub next: *mut Link }
+pub unsafe fn walk(mut head: *mut Link) -> *mut Link {
+    while !(*head).next.is_null() { head = (*head).next; }
+    head
+}
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        let signature = &function(&records, "walk").target_signature;
+        assert!(signature.ends_with("*mut Link"), "{signature}");
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+}
+
+#[test]
+fn unresolved_allocated_field_contents_do_not_block_owning_returns() {
+    let source = r#"
+unsafe extern "C" { fn malloc(size: usize) -> *mut core::ffi::c_void; fn free(p: *mut core::ffi::c_void); }
+pub struct Holder { pub value: *const i32 }
+pub unsafe fn make(p: *const i32) -> *mut Holder {
+    let holder = malloc(core::mem::size_of::<Holder>()) as *mut Holder;
+    (*holder).value = p;
+    holder
+}
+pub unsafe fn release(holder: *mut Holder) { free(holder as *mut core::ffi::c_void); }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("make", "Box::new(Holder { value: p as *const i32 })"),
+            ("release", "drop(holder);"),
+        ],
+    );
+    let signature = &function(&records, "make").target_signature;
+    assert!(signature.ends_with("Box<Holder>"), "{signature}");
+    let definition = &type_record(&records, "Holder").target_definition;
+    assert!(definition.contains("value: *const i32"), "{definition}");
+}
+
+#[test]
 fn memchr_void_casts_produce_slice_inputs_and_nullable_borrowed_returns() {
     let source = r#"
 use core::ffi::c_void;

@@ -977,37 +977,22 @@ pub unsafe fn get(holder: *const Holder) -> *const i32 { (*holder).pointer }
 }
 
 #[test]
-fn generated_list_lifetime_bounds_survive_frozen_loading_validation_and_replacement() {
+fn generated_nested_reference_bounds_survive_frozen_loading_validation_and_replacement() {
     let source = r#"
-#[repr(C)] #[derive(Clone, Copy)] pub struct ListNode { pub value: i32, pub next: *mut ListNode }
-pub unsafe extern "C" fn smallestValue(mut head: *mut ListNode) -> i32 {
-    if !head.is_null() {
-        let mut smallest: i32 = (*head).value;
-        while !(*head).next.is_null() {
-            head = (*head).next;
-            if (*head).value < smallest { smallest = (*head).value; }
-        }
-        return smallest;
-    } else { return -1 };
-}
+pub unsafe fn identity(head: *const *const i32) -> *const *const i32 { head }
 "#;
     let frozen = freeze(source);
     let frozen = frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
     run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
     let function = &frozen.functions[0];
-    assert!(function.record.target_signature.contains("'b: 'a"));
+    assert!(
+        function.record.target_signature.contains("'b: 'a"),
+        "{}",
+        function.record.target_signature
+    );
     let returned = format!(
         r#"{} {{
-        #[proctor(0)] if head.is_some() {{
-            #[proctor(1)] let mut smallest: i32 = head.unwrap().value;
-            #[proctor(2)] while head.unwrap().next.is_some() {{
-                #[proctor(3)] head = head.unwrap().next;
-                #[proctor(4)] if head.unwrap().value < smallest {{
-                    #[proctor(5)] smallest = head.unwrap().value;
-                }}
-            }}
-            #[proctor(6)] return smallest;
-        }} else {{ #[proctor(7)] return -1 }};
+        #[proctor(0)] head
     }}"#,
         function.record.target_signature
     );
@@ -1030,7 +1015,7 @@ pub unsafe extern "C" fn smallestValue(mut head: *mut ListNode) -> i32 {
         .0;
     run_compiler_on_str(&output.replacement.source, utils::type_check)
         .expect(&output.replacement.source);
-    let unlabeled = (0..8).fold(returned.clone(), |source, label| {
+    let unlabeled = (0..1).fold(returned.clone(), |source, label| {
         source.replace(&format!("#[proctor({label})]"), "")
     });
     let unstructured = replace_unstructured_scc(
@@ -1068,13 +1053,8 @@ pub unsafe extern "C" fn smallestValue(mut head: *mut ListNode) -> i32 {
         }],
     )
     .unwrap();
-    let finalized = finalize_frozen_project(
-        &frozen,
-        &assembled,
-        "library",
-        &["smallestValue".to_owned()],
-    )
-    .unwrap();
+    let finalized =
+        finalize_frozen_project(&frozen, &assembled, "library", &["identity".to_owned()]).unwrap();
     run_compiler_on_str(&finalized.source, utils::type_check).expect(&finalized.source);
     assert!(finalized.source.contains("'b: 'a"));
 }
