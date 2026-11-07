@@ -368,11 +368,23 @@ pub unsafe fn walk(mut head: *mut Link) -> *mut Link {
     let frozen = run_compiler_on_str(source, |tcx| {
         let records = make_skeletons(source, tcx).unwrap();
         let signature = &function(&records, "walk").target_signature;
-        assert!(signature.ends_with("*mut Link"), "{signature}");
+        assert!(signature.ends_with("*mut Link<'a>"), "{signature}");
+        let definition = &type_record(&records, "Link").target_definition;
+        assert!(
+            definition.contains("next: Option<&'a Link<'a>>"),
+            "{definition}"
+        );
         crate::freeze_project(source, &records, tcx).unwrap()
     })
     .unwrap();
     run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    compile_target_bodies(
+        source,
+        &[(
+            "walk",
+            "let mut node = head.unwrap(); while let Some(next) = node.next { node = next; } node as *const Link<'_> as *mut Link<'_>",
+        )],
+    );
 }
 
 #[test]

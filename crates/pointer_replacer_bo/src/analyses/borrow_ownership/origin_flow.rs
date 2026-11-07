@@ -96,7 +96,11 @@ pub(crate) struct NativeOriginSummary {
     pub value_flows: SparseBitMatrix<OriginSlot, OriginSlot>,
     pub storage_aliases: SparseBitMatrix<OriginSlot, OriginSlot>,
     pointee_copies: SparseBitMatrix<OriginSlot, OriginSlot>,
+    stores: SparseBitMatrix<OriginSlot, OriginSlot>,
+    written_slots: DenseBitSet<OriginSlot>,
     pub unknown_targets: DenseBitSet<OriginSlot>,
+    pub cutoff_targets: DenseBitSet<OriginSlot>,
+    pub cutoff_writes: DenseBitSet<OriginSlot>,
     written_pointees: DenseBitSet<OriginSlot>,
 }
 
@@ -286,9 +290,15 @@ pub(crate) struct BodyOriginFlow {
     value_flows: SparseBitMatrix<OriginSlot, OriginSlot>,
     storage_aliases: SparseBitMatrix<OriginSlot, OriginSlot>,
     pointee_copies: SparseBitMatrix<OriginSlot, OriginSlot>,
+    // Copies share possible field storage, but only actual stores flow back to other views.
+    field_aliases: SparseBitMatrix<OriginSlot, OriginSlot>,
+    stores: SparseBitMatrix<OriginSlot, OriginSlot>,
+    written_slots: DenseBitSet<OriginSlot>,
     field_descendants: FxHashMap<OriginSlot, Vec<(OriginSlot, FieldPlace)>>,
     erased_pointers: DenseBitSet<OriginSlot>,
     unknown_targets: DenseBitSet<OriginSlot>,
+    cutoff_targets: DenseBitSet<OriginSlot>,
+    cutoff_writes: DenseBitSet<OriginSlot>,
     written_pointees: DenseBitSet<OriginSlot>,
 }
 
@@ -351,24 +361,49 @@ pub(crate) fn analyze_program_origin_flow(program: &RustProgram<'_>) -> OriginFl
 
     let call_graph = CallGraphPostOrder::new(program);
     for scc in call_graph.sccs() {
-        loop {
-            let mut changed = false;
-
-            for &did in scc {
-                let did = did.expect_local();
-                let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
-                let result =
-                    analyze_body_origin_flow_result(tcx, &body, &summaries, &program_functions);
-
-                if results.get(&did) != Some(&result) {
-                    summaries.insert(did, result.summary.clone());
-                    results.insert(did, result);
-                    changed = true;
-                }
+        let recursive = scc.len() > 1
+            || scc.first().is_some_and(|&did| {
+                tcx.mir_drops_elaborated_and_const_checked(did.expect_local())
+                    .borrow()
+                    .basic_blocks
+                    .iter()
+                    .any(|block| {
+                        block
+                            .terminator()
+                            .as_call(tcx)
+                            .and_then(|call| call.func.did())
+                            == Some(did)
+                    })
+            });
+        // Absence of an argument origin is meaningful only after recursive flows settle.
+        for seed_unrooted_fields in [false, true] {
+            if !seed_unrooted_fields && !recursive {
+                continue;
             }
+            loop {
+                let mut changed = false;
 
-            if !changed {
-                break;
+                for &did in scc {
+                    let did = did.expect_local();
+                    let body = tcx.mir_drops_elaborated_and_const_checked(did).borrow();
+                    let result = analyze_body_origin_flow_result(
+                        tcx,
+                        &body,
+                        &summaries,
+                        &program_functions,
+                        seed_unrooted_fields,
+                    );
+
+                    if results.get(&did) != Some(&result) {
+                        summaries.insert(did, result.summary.clone());
+                        results.insert(did, result);
+                        changed = true;
+                    }
+                }
+
+                if !changed {
+                    break;
+                }
             }
         }
     }
@@ -447,6 +482,7 @@ fn analyze_body_origin_flow_result<'tcx>(
     body: &Body<'tcx>,
     callee_summaries: &FxHashMap<LocalDefId, NativeOriginSummary>,
     program_functions: &FxHashSet<LocalDefId>,
+    seed_unrooted_fields: bool,
 ) -> OriginFlowResult {
     let mut body_flow = BodyOriginFlow::new(tcx, body);
     let derived_place_sources = compute_derived_place_sources(tcx, body, &body_flow);
@@ -461,7 +497,7 @@ fn analyze_body_origin_flow_result<'tcx>(
     }
     .visit_body(body);
 
-    let body_flow = body_flow.closed(body);
+    let body_flow = body_flow.closed(body, seed_unrooted_fields);
     let summary = body_flow.to_summary(body);
 
     OriginFlowResult {
@@ -471,7 +507,7 @@ fn analyze_body_origin_flow_result<'tcx>(
 }
 
 fn empty_origin_flow_result<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> OriginFlowResult {
-    let body_flow = BodyOriginFlow::new(tcx, body).closed(body);
+    let body_flow = BodyOriginFlow::new(tcx, body).closed(body, false);
     let summary = body_flow.to_summary(body);
     OriginFlowResult {
         summary,
@@ -485,7 +521,11 @@ impl PartialEq for NativeOriginSummary {
             && same_matrix(&self.value_flows, &other.value_flows)
             && same_matrix(&self.storage_aliases, &other.storage_aliases)
             && same_matrix(&self.pointee_copies, &other.pointee_copies)
+            && same_matrix(&self.stores, &other.stores)
+            && self.written_slots == other.written_slots
             && self.unknown_targets == other.unknown_targets
+            && self.cutoff_targets == other.cutoff_targets
+            && self.cutoff_writes == other.cutoff_writes
             && self.written_pointees == other.written_pointees
     }
 }
@@ -499,7 +539,12 @@ impl PartialEq for BodyOriginFlow {
             && same_matrix(&self.value_flows, &other.value_flows)
             && same_matrix(&self.storage_aliases, &other.storage_aliases)
             && same_matrix(&self.pointee_copies, &other.pointee_copies)
+            && same_matrix(&self.field_aliases, &other.field_aliases)
+            && same_matrix(&self.stores, &other.stores)
+            && self.written_slots == other.written_slots
             && self.unknown_targets == other.unknown_targets
+            && self.cutoff_targets == other.cutoff_targets
+            && self.cutoff_writes == other.cutoff_writes
             && self.written_pointees == other.written_pointees
     }
 }
@@ -866,9 +911,14 @@ impl BodyOriginFlow {
             value_flows: SparseBitMatrix::new(domain_size),
             storage_aliases: SparseBitMatrix::new(domain_size),
             pointee_copies: SparseBitMatrix::new(domain_size),
+            field_aliases: SparseBitMatrix::new(domain_size),
+            stores: SparseBitMatrix::new(domain_size),
+            written_slots: DenseBitSet::new_empty(domain_size),
             field_descendants: FxHashMap::default(),
             erased_pointers: erased,
             unknown_targets: DenseBitSet::new_empty(domain_size),
+            cutoff_targets: DenseBitSet::new_empty(domain_size),
+            cutoff_writes: DenseBitSet::new_empty(domain_size),
             written_pointees: DenseBitSet::new_empty(domain_size),
         }
     }
@@ -917,6 +967,7 @@ impl BodyOriginFlow {
     pub(crate) fn unknown_owner_depths(&self) -> FxHashSet<(SlotOwner, u8)> {
         self.unknown_targets
             .iter()
+            .chain(self.cutoff_targets.iter())
             .filter_map(|slot| {
                 let local_slot = self.slots[slot];
                 slot_owner(local_slot.owner).map(|owner| (owner, local_slot.depth))
@@ -937,7 +988,8 @@ impl BodyOriginFlow {
             .filter(|&source| source == target || self.value_flows.contains(source, target))
             .map(|source| source.index())
             .collect::<std::collections::BTreeSet<_>>();
-        let mut complete = !self.unknown_targets.contains(target);
+        let mut complete =
+            !self.unknown_targets.contains(target) && !self.cutoff_targets.contains(target);
         if caller_reachable_from_unknown {
             complete &= !body.args_iter().any(|argument| {
                 self.slot_for_local(argument, 0).is_some_and(|source| {
@@ -970,7 +1022,16 @@ impl BodyOriginFlow {
                     .then_some(argument.index())
             })
             .collect();
-        Some((arguments, !self.unknown_targets.contains(target)))
+        Some((
+            arguments,
+            !self.unknown_targets.contains(target) && !self.cutoff_targets.contains(target),
+        ))
+    }
+
+    // Used only after a frozen reader transfer independently certifies its parameter root.
+    pub(crate) fn reader_origin_is_known(&self, local: Local) -> bool {
+        self.slot_for_local(local, 0)
+            .is_some_and(|slot| !self.unknown_targets.contains(slot))
     }
 
     pub(crate) fn depth0_storage_alias(&self, left: Local, right: Local) -> bool {
@@ -1047,6 +1108,8 @@ impl BodyOriginFlow {
                 self.add_alias(source, target);
             } else {
                 self.add_copy(source, target);
+                self.stores.insert(source, target);
+                self.written_slots.insert(target);
             }
         }
         let missing = self
@@ -1055,15 +1118,25 @@ impl BodyOriginFlow {
             .filter_map(|(to, slot)| {
                 let OriginOwner::Field(field) = slot.owner else { return None };
                 let relative = field.relative_to(target)?;
-                (relative
-                    .under(source)
-                    .and_then(|field| self.slot_for_owner(OriginOwner::Field(field), slot.depth))
-                    .is_none())
-                .then_some(to)
+                match relative.under(source) {
+                    None => Some((to, true)),
+                    Some(field)
+                        if self
+                            .slot_for_owner(OriginOwner::Field(field), slot.depth)
+                            .is_none() =>
+                    {
+                        Some((to, false))
+                    }
+                    _ => None,
+                }
             })
             .collect::<Vec<_>>();
-        for target in missing {
-            self.mark_unknown(target);
+        for (target, cutoff) in missing {
+            if cutoff {
+                self.cutoff_targets.insert(target);
+            } else {
+                self.mark_unknown(target);
+            }
         }
     }
 
@@ -1089,16 +1162,19 @@ impl BodyOriginFlow {
                     .collect()
             });
         }
-        let descendants = &self.field_descendants[&a];
-        for &(source, field) in descendants {
+        let descendants = self.field_descendants[&a].clone();
+        let mut changed = false;
+        for (source, field) in descendants {
             if let Some(field) = field.under(self.slots[b])
                 && let Some(target) =
                     self.slot_for_owner(OriginOwner::Field(field), self.slots[source].depth)
             {
-                pairs.push((source, target));
+                changed |= source != target && !self.pointee_copies.contains(source, target);
+                self.add_copy(source, target);
+                self.field_aliases.insert(source, target);
+                self.field_aliases.insert(target, source);
             }
         }
-        let mut changed = false;
         for (source, target) in pairs {
             changed |= source != target && !self.storage_aliases.contains(source, target);
             self.add_alias(source, target);
@@ -1117,17 +1193,19 @@ impl BodyOriginFlow {
         }
     }
 
-    fn mark_unknown_place_slots<'tcx, D: HasLocalDecls<'tcx>>(
+    fn invalidate_place_slots<'tcx, D: HasLocalDecls<'tcx>>(
         &mut self,
         local_decls: &D,
         place: Place<'tcx>,
         start_depth: u8,
+        cutoff: bool,
     ) {
         for depth in start_depth..MAX_SIGNATURE_SLOT_DEPTH {
             let Some(slot) = self.slot_for_place(local_decls, place, depth) else {
                 break;
             };
-            self.mark_unknown(slot);
+            self.invalidate_stored_slot(slot, cutoff);
+            self.written_slots.insert(slot);
         }
         if let Some(root) = place_root(local_decls, place) {
             let targets = self
@@ -1143,12 +1221,31 @@ impl BodyOriginFlow {
                 })
                 .collect::<Vec<_>>();
             for target in targets {
-                self.mark_unknown(target);
+                self.invalidate_stored_slot(target, cutoff);
+                self.written_slots.insert(target);
             }
         }
     }
 
-    fn closed(mut self, body: &Body<'_>) -> Self {
+    fn invalidate_stored_slot(&mut self, target: OriginSlot, cutoff: bool) {
+        if cutoff {
+            self.cutoff_targets.insert(target);
+            if matches!(
+                self.slots[target],
+                LocalSlot {
+                    owner: OriginOwner::Field(_),
+                    ..
+                } | LocalSlot { depth: 1.., .. }
+            ) {
+                self.cutoff_writes.insert(target);
+            }
+        } else {
+            self.mark_unknown(target);
+        }
+    }
+
+    fn closed(mut self, body: &Body<'_>, seed_unrooted_fields: bool) -> Self {
+        let stores = self.stores.clone();
         loop {
             let mut combined = SparseBitMatrix::new(self.slots.len());
             union_matrix_into(&mut combined, &self.pointee_copies);
@@ -1167,6 +1264,31 @@ impl BodyOriginFlow {
             let mut changed = false;
             for (source, target) in edges {
                 changed |= self.add_descendant_aliases(source, target);
+            }
+            for source in stores.rows() {
+                for target in stores
+                    .row(source)
+                    .into_iter()
+                    .flat_map(|targets| targets.iter())
+                {
+                    let aliases = self
+                        .field_aliases
+                        .row(target)
+                        .into_iter()
+                        .flat_map(|targets| targets.iter())
+                        .collect::<Vec<_>>();
+                    for alias in aliases {
+                        if self.pointee_copies.contains(source, target) {
+                            changed |=
+                                source != alias && !self.pointee_copies.contains(source, alias);
+                            self.add_copy(source, alias);
+                        } else {
+                            self.add_flow(source, alias);
+                        }
+                        self.stores.insert(source, alias);
+                        self.written_slots.insert(alias);
+                    }
+                }
             }
             if !changed {
                 break;
@@ -1200,17 +1322,21 @@ impl BodyOriginFlow {
             {
                 if let Some(descendants) = self.field_descendants.get(&target) {
                     for &(slot, relative) in descendants {
-                        if relative
-                            .under(self.slots[source])
-                            .and_then(|field| {
-                                self.slot_for_owner(
-                                    OriginOwner::Field(field),
-                                    self.slots[slot].depth,
-                                )
-                            })
-                            .is_none()
-                        {
-                            self.unknown_targets.insert(slot);
+                        match relative.under(self.slots[source]) {
+                            None => {
+                                self.cutoff_targets.insert(slot);
+                            }
+                            Some(field)
+                                if self
+                                    .slot_for_owner(
+                                        OriginOwner::Field(field),
+                                        self.slots[slot].depth,
+                                    )
+                                    .is_none() =>
+                            {
+                                self.unknown_targets.insert(slot);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -1229,6 +1355,8 @@ impl BodyOriginFlow {
             .collect::<Vec<_>>();
         for (source, value) in self.slots.iter_enumerated() {
             if matches!(value.owner, OriginOwner::Field(field) if field.base.index() > body.arg_count)
+                && seed_unrooted_fields
+                && !self.cutoff_targets.contains(source)
                 && !arguments
                     .iter()
                     .any(|&argument| self.value_flows.contains(argument, source))
@@ -1268,13 +1396,65 @@ impl BodyOriginFlow {
                 }
             }
         }
-        let mut unknown = self.unknown_targets.clone();
-        for source in self.unknown_targets.iter() {
-            if let Some(targets) = self.value_flows.row(source) {
-                unknown.union(targets);
+        // Incomplete view paths are not opaque writes or origin-less pointer values.
+        loop {
+            let previous_writes = self.cutoff_writes.clone();
+            let mut cutoffs = self.cutoff_targets.clone();
+            for source in self.cutoff_targets.iter() {
+                if let Some(targets) = self.value_flows.row(source) {
+                    cutoffs.union(targets);
+                }
             }
+            for source in previous_writes.iter() {
+                if let Some(targets) = self.field_aliases.row(source) {
+                    cutoffs.union(targets);
+                    self.cutoff_writes.union(targets);
+                    self.written_slots.union(targets);
+                }
+            }
+            for source in self.stores.rows() {
+                if cutoffs.contains(source) {
+                    for target in self
+                        .stores
+                        .row(source)
+                        .into_iter()
+                        .flat_map(|targets| targets.iter())
+                    {
+                        if matches!(
+                            self.slots[target],
+                            LocalSlot {
+                                owner: OriginOwner::Field(_),
+                                ..
+                            } | LocalSlot { depth: 1.., .. }
+                        ) {
+                            self.cutoff_writes.insert(target);
+                        }
+                    }
+                }
+            }
+            if cutoffs == self.cutoff_targets && previous_writes == self.cutoff_writes {
+                break;
+            }
+            self.cutoff_targets = cutoffs;
         }
-        self.unknown_targets = unknown;
+        loop {
+            let mut unknown = self.unknown_targets.clone();
+            for source in self.unknown_targets.iter() {
+                if let Some(targets) = self.value_flows.row(source) {
+                    unknown.union(targets);
+                }
+                if self.written_slots.contains(source)
+                    && let Some(aliases) = self.field_aliases.row(source)
+                {
+                    unknown.union(aliases);
+                    self.written_slots.union(aliases);
+                }
+            }
+            if unknown == self.unknown_targets {
+                break;
+            }
+            self.unknown_targets = unknown;
+        }
 
         self
     }
@@ -1341,7 +1521,11 @@ impl BodyOriginFlow {
         let mut value_flows = SparseBitMatrix::new(slots.len());
         let mut storage_aliases = SparseBitMatrix::new(slots.len());
         let mut pointee_copies = SparseBitMatrix::new(slots.len());
+        let mut stores = SparseBitMatrix::new(slots.len());
+        let mut written_slots = DenseBitSet::new_empty(slots.len());
         let mut unknown_targets = DenseBitSet::new_empty(slots.len());
+        let mut cutoff_targets = DenseBitSet::new_empty(slots.len());
+        let mut cutoff_writes = DenseBitSet::new_empty(slots.len());
         let mut written_pointees = DenseBitSet::new_empty(slots.len());
 
         for source in self.value_flows.rows() {
@@ -1398,6 +1582,57 @@ impl BodyOriginFlow {
             }
         }
 
+        for source in self.stores.rows() {
+            for target in self
+                .stores
+                .row(source)
+                .into_iter()
+                .flat_map(|targets| targets.iter())
+            {
+                if matches!(
+                    self.slots[target],
+                    LocalSlot {
+                        owner: OriginOwner::Local(_),
+                        depth: 0
+                    }
+                ) {
+                    continue;
+                }
+                let Some(&to) = internal_to_summary.get(&target) else { continue };
+                for (&ancestor, &from) in &internal_to_summary {
+                    if ancestor == source || self.value_flows.contains(ancestor, source) {
+                        stores.insert(from, to);
+                    }
+                }
+            }
+        }
+        for target in self.written_slots.iter() {
+            if matches!(
+                self.slots[target],
+                LocalSlot {
+                    owner: OriginOwner::Local(_),
+                    depth: 0
+                }
+            ) {
+                continue;
+            }
+            if let Some(&target) = internal_to_summary.get(&target) {
+                written_slots.insert(target);
+            }
+        }
+        for target in self.cutoff_targets.iter() {
+            if let Some(&target) = internal_to_summary.get(&target)
+                && observable_value_target(slots[target])
+            {
+                cutoff_targets.insert(target);
+            }
+        }
+        for target in self.cutoff_writes.iter() {
+            if let Some(&target) = internal_to_summary.get(&target) {
+                cutoff_writes.insert(target);
+            }
+        }
+
         for written in self.written_pointees.iter() {
             if let Some(&target) = internal_to_summary.get(&written)
                 && matches!(slots[target].place.root, SignatureRoot::Arg(_))
@@ -1411,7 +1646,11 @@ impl BodyOriginFlow {
             value_flows,
             storage_aliases,
             pointee_copies,
+            stores,
+            written_slots,
             unknown_targets,
+            cutoff_targets,
+            cutoff_writes,
             written_pointees,
         }
     }
@@ -1774,6 +2013,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
 
         for source in sources {
             self.flow.add_copy(source, target);
+            self.flow.stores.insert(source, target);
             self.flow.add_descendant_aliases(source, target);
         }
     }
@@ -1879,6 +2119,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
                     .slot_for_local(place.local, deref_depth.saturating_sub(1))
                 {
                     self.flow.add_copy(source, target);
+                    self.flow.stores.insert(source, target);
                     self.flow.add_descendant_aliases(source, target);
                 }
             }
@@ -1886,6 +2127,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
                 if let Some(deref_depth) = place_deref_interior_depth(place) {
                     if let Some(source) = self.flow.slot_for_local(place.local, deref_depth - 1) {
                         self.flow.add_flow(source, target);
+                        self.flow.stores.insert(source, target);
                     } else {
                         self.flow.mark_unknown(target);
                     }
@@ -1976,6 +2218,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         } else {
             for source in sources {
                 self.flow.add_flow(source, target);
+                self.flow.stores.insert(source, target);
             }
         }
     }
@@ -1986,9 +2229,51 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         summary: &NativeOriginSummary,
     ) {
         let mut unmapped = false;
+        let mut cutoff_effect = false;
+        for written in summary.written_slots.iter() {
+            if let Some(target) = self.instantiate_signature_slot(call, summary.slots[written]) {
+                self.flow.written_slots.insert(target);
+            } else if matches!(summary.slots[written].place.root, SignatureRoot::Arg(_)) {
+                if self.signature_slot_is_cutoff(call, summary.slots[written]) {
+                    cutoff_effect = true;
+                } else {
+                    unmapped = true;
+                }
+            }
+        }
+        for source in summary.stores.rows() {
+            for target in summary
+                .stores
+                .row(source)
+                .into_iter()
+                .flat_map(|targets| targets.iter())
+            {
+                match (
+                    self.instantiate_signature_slot(call, summary.slots[source]),
+                    self.instantiate_signature_slot(call, summary.slots[target]),
+                ) {
+                    (Some(source), Some(target)) => {
+                        self.flow.stores.insert(source, target);
+                    }
+                    (source_slot, target_slot) => {
+                        if (source_slot.is_some()
+                            || self.signature_slot_is_cutoff(call, summary.slots[source]))
+                            && (target_slot.is_some()
+                                || self.signature_slot_is_cutoff(call, summary.slots[target]))
+                        {
+                            cutoff_effect = true;
+                        } else {
+                            unmapped = true;
+                        }
+                    }
+                }
+            }
+        }
         for written in summary.written_pointees.iter() {
             if let Some(target) = self.instantiate_signature_slot(call, summary.slots[written]) {
                 self.flow.written_pointees.insert(target);
+            } else if self.signature_slot_is_cutoff(call, summary.slots[written]) {
+                cutoff_effect = true;
             } else {
                 unmapped = true;
             }
@@ -1999,16 +2284,27 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
                 continue;
             };
             for target in targets.iter() {
+                let is_result = matches!(summary.slots[target].place.root, SignatureRoot::Return)
+                    && summary.slots[target].place.field.is_none()
+                    && summary.slots[target].depth == 0;
                 match (
                     source_slot,
                     self.instantiate_signature_slot(call, summary.slots[target]),
                 ) {
-                    (Some(source), Some(target)) => self.flow.add_flow(source, target),
-                    (_, Some(target)) => {
-                        self.flow.mark_unknown(target);
-                        unmapped = true;
+                    (Some(source), Some(target)) => {
+                        self.flow.add_flow(source, target);
+                        if is_result {
+                            self.flow.stores.insert(source, target);
+                        }
                     }
-                    _ => unmapped = true,
+                    (_, Some(target)) => {
+                        if self.signature_slot_is_cutoff(call, summary.slots[source]) {
+                            self.flow.cutoff_targets.insert(target);
+                        } else {
+                            self.flow.mark_unknown(target);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2042,6 +2338,21 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
                 unmapped = true;
             }
         }
+        for target in summary.cutoff_targets.iter() {
+            if let Some(target) = self.instantiate_signature_slot(call, summary.slots[target]) {
+                self.flow.cutoff_targets.insert(target);
+            }
+        }
+        for target in summary.cutoff_writes.iter() {
+            if let Some(target) = self.instantiate_signature_slot(call, summary.slots[target]) {
+                self.flow.cutoff_targets.insert(target);
+                self.flow.cutoff_writes.insert(target);
+            } else if self.signature_slot_is_cutoff(call, summary.slots[target]) {
+                cutoff_effect = true;
+            } else {
+                unmapped = true;
+            }
+        }
         for source in summary.pointee_copies.rows() {
             let source_slot = self.instantiate_signature_slot(call, summary.slots[source]);
             for target in summary
@@ -2056,13 +2367,46 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
                 ) {
                     self.flow.add_copy(source, target);
                 } else {
-                    unmapped = true;
+                    // The corresponding value-flow target carries any observable cutoff.
                 }
             }
         }
         if unmapped {
             self.mark_unknown_call_effects(call);
+        } else if cutoff_effect {
+            self.invalidate_call_effects(call, true);
         }
+    }
+
+    fn signature_slot_is_cutoff(
+        &self,
+        call: &MirFunctionCall<'_, 'tcx>,
+        slot: SignatureSlot,
+    ) -> bool {
+        let Some(field) = slot.place.field else { return false };
+        let place = match slot.place.root {
+            SignatureRoot::Return => call.destination,
+            SignatureRoot::Arg(local) => {
+                let Some(place) = local
+                    .index()
+                    .checked_sub(1)
+                    .and_then(|index| call.args.get(index))
+                    .and_then(|arg| arg.node.place())
+                else {
+                    return false;
+                };
+                place
+            }
+        };
+        let Some(root) = place_root(self.body, place) else { return false };
+        FieldPlace {
+            base: place.local,
+            parents: slot.place.parents,
+            deref_depth: slot.place.deref_depth,
+            field,
+        }
+        .under(root)
+        .is_none()
     }
 
     fn instantiate_signature_slot(
@@ -2109,14 +2453,19 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
     }
 
     fn mark_unknown_call_effects(&mut self, call: &MirFunctionCall<'_, 'tcx>) {
+        self.invalidate_call_effects(call, false);
+    }
+
+    fn invalidate_call_effects(&mut self, call: &MirFunctionCall<'_, 'tcx>, cutoff: bool) {
         self.flow
-            .mark_unknown_place_slots(self.body, call.destination, 0);
+            .invalidate_place_slots(self.body, call.destination, 0, cutoff);
 
         for arg in call.args {
             let Some(place) = arg.node.place() else {
                 continue;
             };
-            self.flow.mark_unknown_place_slots(self.body, place, 1);
+            self.flow
+                .invalidate_place_slots(self.body, place, 1, cutoff);
         }
     }
 }
@@ -2160,6 +2509,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
                             self.tcx,
                         );
                         if let Some(slot) = self.flow.slot_for_place(self.body, target, 0) {
+                            self.flow.written_slots.insert(slot);
                             self.assign_from_operand(slot, operand, location);
                         } else if let Some(source) = operand.place()
                             && let (Some(source), Some(target)) =
@@ -2177,6 +2527,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
         let Some(target) = self.flow.slot_for_place(self.body, *place, 0) else {
             return;
         };
+        self.flow.written_slots.insert(target);
 
         match rvalue {
             Rvalue::Use(operand)
@@ -2188,6 +2539,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
             Rvalue::CopyForDeref(place) => {
                 for source in self.place_slots_or_derived(*place, location) {
                     self.flow.add_copy(source, target);
+                    self.flow.stores.insert(source, target);
                     self.flow.add_descendant_aliases(source, target);
                 }
             }
@@ -2216,6 +2568,9 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
         let Some(call) = terminator.as_call(self.tcx) else {
             return;
         };
+        if let Some(target) = self.flow.slot_for_place(self.body, call.destination, 0) {
+            self.flow.written_slots.insert(target);
+        }
 
         if self.apply_known_input_return_call(&call, location) {
             return;

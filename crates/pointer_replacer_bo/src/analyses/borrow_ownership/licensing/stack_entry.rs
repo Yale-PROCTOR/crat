@@ -481,7 +481,7 @@ pub unsafe fn f() -> i32 {
     }
 
     #[test]
-    fn c05_stack_entry_of_the_ifl3_call_is_unmatched_under_the_record() {
+    fn aggregate_initialized_field_has_exact_known_stack_entry() {
         with_program(IFL3, |program, slots, facts| {
             // Hypothetical selected set: this tests an evidence producer, not
             // a claim that construction selected any guard or accepted a model.
@@ -493,11 +493,46 @@ pub unsafe fn f() -> i32 {
                 facts,
                 &selected,
                 CallWorld::ClosedProgram,
-            );
-            assert!(
-                matches!(entries, Err(Pending::UnmatchedMetadata)),
-                "{entries:?}"
-            );
+            )
+            .unwrap();
+            let [entry] = entries.as_slice() else { panic!("one exact stack entry: {entries:?}") };
+            let candidate = &selected[0];
+            assert_eq!(entry.construction, candidate.construction);
+            assert_eq!(entry.callee, "release");
+            assert_eq!(entry.parameter, 1);
+            assert_eq!(entry.parameter_slot, "release::_1@d0");
+            assert_eq!(entry.free, candidate.free);
+            assert_eq!(entry.free_point.function.as_deref(), Some("release"));
+            let [caller] = entry.callers.as_slice() else {
+                panic!("one complete caller: {entry:?}")
+            };
+            assert_eq!(caller.call, candidate.call);
+            assert_eq!(caller.cell, candidate.cell_place);
+            assert_eq!(caller.formation, candidate.formation);
+            assert_eq!(caller.field_key, candidate.field_key);
+            let field = facts
+                .licensing
+                .as_ref()
+                .unwrap()
+                .field_support
+                .iter()
+                .find(|field| field.field_key == caller.field_key && field.supported())
+                .unwrap();
+            let [store] = field.stores.as_slice() else {
+                panic!("one supported aggregate store: {field:?}")
+            };
+            assert_eq!(caller.store, store.equation);
+            assert_eq!(caller.source, store.meet.source);
+            let source = facts
+                .equations
+                .iter()
+                .find(|row| {
+                    row.point.construction == caller.source.endpoint.construction
+                        && row.ordinal == caller.source.endpoint.ordinal
+                })
+                .unwrap();
+            assert_eq!(source.operation, "source");
+            assert_eq!(source.endpoint.as_ref().unwrap().callee, "malloc");
         });
     }
 

@@ -377,7 +377,7 @@ fn inputs() -> SemanticInputs {
 }
 
 #[test]
-fn c05_the_final_replay_uses_no_stack_proof_under_the_record() {
+fn aggregate_initialized_field_preserves_stack_proof_in_final_replay() {
     use rustc_hir::{ItemKind, OwnerNode};
 
     use super::super::{
@@ -437,12 +437,52 @@ pub unsafe fn f() -> i32 {
             .expect("attested OL07 accepted model")
         });
         let final_review = captured.source_retirement.as_ref().unwrap();
-        // Under the record the final replay uses no stack proof.
-        assert!(
-            final_review.known_stack_entries.is_empty(),
-            "{:?}",
-            final_review.known_stack_entries
+        let accepted = captured.stack_entry_final.as_ref().unwrap();
+        assert!(accepted.closed_call_world);
+        assert_eq!(accepted.proofs, final_review.known_stack_entries);
+        assert_eq!(
+            captured.retirement_rounds.get(accepted.retirement_round),
+            Some(final_review)
         );
+        let [entry] = final_review.known_stack_entries.as_slice() else {
+            panic!("one final stack proof: {final_review:?}")
+        };
+        assert_eq!(entry.callee, "release");
+        assert_eq!(entry.parameter_slot, "release::_1@d0");
+        let [caller] = entry.callers.as_slice() else { panic!("one complete caller: {entry:?}") };
+        assert_eq!(caller.call.caller, "f");
+        assert_eq!(caller.call.callee, "release");
+        assert_eq!(caller.field_key, "H::field0@d0");
+        let snapshot = captured
+            .ownership_licensing
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|snapshot| snapshot.offset == accepted.snapshot_offset)
+            .unwrap();
+        let source = snapshot
+            .metadata
+            .equations
+            .iter()
+            .find(|row| {
+                row.point.construction == caller.source.endpoint.construction
+                    && row.ordinal == caller.source.endpoint.ordinal
+            })
+            .unwrap();
+        assert_eq!(source.operation, "source");
+        assert_eq!(source.endpoint.as_ref().unwrap().callee, "malloc");
+        let field = snapshot
+            .field_support
+            .iter()
+            .find(|field| field.field_key == caller.field_key && field.supported())
+            .unwrap();
+        let [store] = field.stores.as_slice() else {
+            panic!("one aggregate field store: {field:?}")
+        };
+        assert_eq!(store.equation, caller.store);
+        assert_eq!(store.meet.source, caller.source);
+        assert!(matches!(store.meet.terminal.target,
+            super::super::licensing::matched::TerminalTarget::Free(free) if free == entry.free));
     })
     .unwrap_or_else(|error| error.raise());
 }

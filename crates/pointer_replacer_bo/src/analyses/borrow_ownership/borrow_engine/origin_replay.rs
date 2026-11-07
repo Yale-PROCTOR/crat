@@ -821,7 +821,7 @@ impl NativeConstraintGraph {
                                 .body
                                 .depth0_argument_origins(body, data.borrowed.local)?;
                             let expected = candidate.origin_parameter as usize;
-                            if !complete
+                            if (!complete && !flow.body.reader_origin_is_known(data.borrowed.local))
                                 || roots.len() != 1
                                 || !roots.contains(&expected)
                                 || expected == 0
