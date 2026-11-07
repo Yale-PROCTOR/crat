@@ -386,7 +386,11 @@ where
     'tcx: 'infercx,
     Analysis: AnalysisKind<'infercx, 'db, 'tcx>,
 {
-    fn unknown_call(&mut self, destination: Option<Consume<Range<Var>>>, args: &CallArgs) {
+    pub(super) fn unknown_call(
+        &mut self,
+        destination: Option<Consume<Range<Var>>>,
+        args: &CallArgs,
+    ) {
         if let Some(dest) = destination {
             <Analysis as InferMode>::borrow(self, dest);
         }

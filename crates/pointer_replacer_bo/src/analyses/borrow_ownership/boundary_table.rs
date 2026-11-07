@@ -340,6 +340,31 @@ pub(crate) fn lookup(name: &str, matcher: Matcher) -> Option<&'static Entry> {
         .find(|e| e.name == name && e.matcher == matcher)
 }
 
+pub(crate) struct PointerReturnContract {
+    pub(crate) argument: usize,
+    pub(crate) nullable: bool,
+    pub(crate) writes: &'static [usize],
+}
+
+pub(crate) fn pointer_return_contract(
+    callee: &crate::analyses::mir::CallKind,
+) -> Option<PointerReturnContract> {
+    let crate::analyses::mir::CallKind::LibC(symbol) = callee else { return None };
+    let (nullable, writes): (_, &'static [usize]) = match symbol.as_str() {
+        "memchr" | "strchr" | "strrchr" | "strstr" => (true, &[]),
+        "memcpy" | "memmove" | "memset" | "strcat" | "strncat" | "strcpy" | "strncpy" => {
+            (false, &[0])
+        }
+        "fgets" => (true, &[0, 2]),
+        _ => return None,
+    };
+    Some(PointerReturnContract {
+        argument: 0,
+        nullable,
+        writes,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // PRECONDITION for every test below: the pinned production name lists are
 // literals copied from `analyses/borrow/` (file:line noted per test), valid

@@ -226,6 +226,132 @@ fn compile_target_bodies(source: &str, bodies: &[(&str, &str)]) -> Vec<ItemRecor
 }
 
 #[test]
+fn memchr_void_casts_produce_slice_inputs_and_nullable_borrowed_returns() {
+    let source = r#"
+use core::ffi::c_void;
+unsafe extern "C" {
+    fn memchr(p: *const c_void, c: i32, n: usize) -> *mut c_void;
+    #[link_name = "memchr"] fn malloc(p: *const c_void, c: i32, n: usize) -> *mut c_void;
+}
+pub unsafe fn read(p: *const u8, n: usize) -> *mut u8 {
+    let erased = p as *const c_void;
+    let found = memchr(erased, 7, n);
+    found as *mut u8
+}
+pub unsafe fn alias(p: *const u8, n: usize) -> *mut u8 { malloc(p as *const c_void, 7, n) as *mut u8 }
+pub unsafe fn external(p: *const u8, n: usize) -> *mut u8 { libc::memchr(p as *const c_void, 7, n) as *mut u8 }
+pub unsafe fn write(p: *mut u8, n: usize) -> *mut u8 {
+    let found = memchr(p as *const c_void, 7, n) as *mut u8;
+    if !found.is_null() { *found = 8; }
+    found
+}
+pub unsafe fn mutate(p: *mut u8, n: usize) {
+    let found = write(p, n);
+    if !found.is_null() { *found = 9; }
+}
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("read", "p[..n].iter().find(|byte| **byte == 7)"),
+            ("alias", "p[..n].iter().find(|byte| **byte == 7)"),
+            ("external", "p[..n].iter().find(|byte| **byte == 7)"),
+            (
+                "write",
+                "let index = p[..n].iter().position(|byte| *byte == 7)?; let found = &mut p[index]; *found = 8; Some(found)",
+            ),
+            ("mutate", "if let Some(found) = write(p, n) { *found = 9; }"),
+        ],
+    );
+    for name in ["read", "alias", "external", "write"] {
+        let signature = &function(&records, name).target_signature;
+        assert!(signature.contains("-> Option<&'"), "{signature}");
+        assert!(signature.ends_with("u8>"), "{signature}");
+        assert_eq!(
+            signature.contains("mut [u8]"),
+            name == "write",
+            "{signature}"
+        );
+        assert!(!signature.contains("Box"), "{signature}");
+        assert_eq!(
+            signature.ends_with("mut u8>"),
+            name == "write",
+            "{signature}"
+        );
+    }
+    let skeleton = &function(&records, "read").baseline.skeleton;
+    assert!(skeleton.contains("erased: *const c_void"), "{skeleton}");
+    assert!(skeleton.contains("found: *mut c_void"), "{skeleton}");
+}
+
+#[test]
+fn allocator_extent_uses_the_foreign_symbol_for_aliases_and_external_declarations() {
+    let source = r#"
+unsafe extern "C" {
+    #[link_name = "malloc"] fn memchr(n: usize) -> *mut core::ffi::c_void;
+}
+pub unsafe fn alias() -> *mut i32 {
+    let p = memchr(4 * core::mem::size_of::<i32>()) as *mut i32;
+    *p = 7;
+    p
+}
+pub unsafe fn external() -> *mut i32 {
+    let p = libc::malloc(4 * core::mem::size_of::<i32>()) as *mut i32;
+    *p = 7;
+    p
+}
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("alias", "vec![7, 0, 0, 0].into_boxed_slice()"),
+            ("external", "vec![7, 0, 0, 0].into_boxed_slice()"),
+        ],
+    );
+    for name in ["alias", "external"] {
+        let signature = &function(&records, name).target_signature;
+        assert!(signature.ends_with("Box<[i32]>"), "{signature}");
+    }
+}
+
+#[test]
+fn memchr_writes_promote_const_pointer_sources_to_mutable_borrows() {
+    let source = r#"
+unsafe extern "C" {
+    fn memchr(p: *const core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void;
+}
+pub struct Holder { pub p: *const u8 }
+pub unsafe fn make(p: *const u8) -> Holder { Holder { p } }
+pub unsafe fn write(p: *const u8, n: usize) -> *mut u8 {
+    let found = memchr(p as *const core::ffi::c_void, 7, n) as *mut u8;
+    if !found.is_null() { *found = 8; }
+    found
+}
+pub unsafe fn caller(p: *const u8, n: usize) -> *mut u8 { write(p, n) }
+pub unsafe fn field(h: *mut Holder, n: usize) -> *mut u8 { write((*h).p, n) }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("make", "Holder { p }"),
+            (
+                "write",
+                "let index = p[..n].iter().position(|byte| *byte == 7)?; let found = &mut p[index]; *found = 8; Some(found)",
+            ),
+            ("caller", "write(p, n)"),
+            ("field", "write(h.p, n)"),
+        ],
+    );
+    for name in ["write", "caller"] {
+        let signature = &function(&records, name).target_signature;
+        assert!(signature.contains("mut [u8]"), "{signature}");
+        assert!(signature.contains("-> Option<&'"), "{signature}");
+    }
+    let definition = &type_record(&records, "Holder").target_definition;
+    assert!(definition.contains("mut [u8]"), "{definition}");
+}
+
+#[test]
 fn field_borrow_lifetimes_support_construction_setters_and_getters() {
     let source = r#"
 pub struct Holder { pub pointer: *const i32 }
@@ -1222,7 +1348,7 @@ pub unsafe fn deep(p: *const *const *mut Void) -> *mut Void { **p }
         let read = local_def("read", tcx);
         assert_eq!(
             decisions.signatures.data[&read].input_decs[0],
-            Some(PtrKind::Ref(false))
+            Some(PtrKind::Ref(true))
         );
         assert_eq!(
             decisions.nested(PointerTarget::Input(read, 0))[0].kind,
@@ -1360,7 +1486,10 @@ pub unsafe fn mixed(pointer: *const i32, flag: bool) -> *const i32 {
     let records = generate(source);
     let signature = &function(&records, "mixed").target_signature;
     assert!(signature.ends_with("*const i32"), "{signature}");
-    assert!(signature.contains("pointer: Option<&i32>"), "{signature}");
+    assert!(
+        signature.contains("pointer: Option<&mut i32>"),
+        "{signature}"
+    );
     assert!(!signature.contains('\''), "{signature}");
     assert_stub_signatures_compile(&records, "");
 }

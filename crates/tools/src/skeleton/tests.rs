@@ -9424,7 +9424,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
         pointee: Box::new(primitive.clone()),
     };
     let reference = crate::RuleTypeTree::Reference {
-        mutability: crate::RefMutability::Shared,
+        mutability: crate::RefMutability::Mutable,
         pointee: Box::new(primitive.clone()),
     };
 
@@ -9482,7 +9482,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
             assert_eq!(
                 record.applied,
                 crate::SkeletonView {
-                    skeleton: "pub unsafe fn f(mut pointer: &i32) -> i32 {\n    #[proctor(0)]\n    7i32\n}".into(),
+                    skeleton: "pub unsafe fn f(mut pointer: &mut i32) -> i32 {\n    #[proctor(0)]\n    7i32\n}".into(),
                     needs_transformation: false,
                     statement_dispositions: vec![crate::StatementDisposition {
                         label: 0,
@@ -9508,7 +9508,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
             record.applied,
             crate::SkeletonView {
                 skeleton:
-                    "pub unsafe fn f(mut pointer: &i32) -> i32 {\n    #[proctor(0)]\n    todo!()\n}"
+                    "pub unsafe fn f(mut pointer: &mut i32) -> i32 {\n    #[proctor(0)]\n    todo!()\n}"
                         .into(),
                 needs_transformation: true,
                 statement_dispositions: vec![crate::StatementDisposition {
@@ -9525,7 +9525,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
                         name: "pointer".into(),
                         origin: crate::PointerVariableOrigin::Parameter { index: 0 },
                         before_type: "*const i32".into(),
-                        selected_target_type: "&i32".into(),
+                        selected_target_type: "&mut i32".into(),
                         before_type_is_inferred: false,
                     }],
                 }],

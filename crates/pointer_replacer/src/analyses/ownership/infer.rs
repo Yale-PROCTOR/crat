@@ -687,6 +687,15 @@ where
         if let Some(func) = callee.constant() {
             let ty = func.ty();
             let &FnDef(callee, substs) = ty.kind() else { unreachable!() };
+            if let Some(symbol) = crate::analyses::mir::foreign_c_symbol(infer_cx.tcx, callee) {
+                infer_cx.libc_call(
+                    destination,
+                    &args,
+                    callee,
+                    rustc_span::symbol::Ident::with_dummy_span(symbol),
+                );
+                return;
+            }
             if let Some(local_did) = callee.as_local() {
                 match infer_cx.tcx.hir_node_by_def_id(local_did) {
                     // this crate
@@ -694,9 +703,7 @@ where
                         <Analysis as Boundary>::call(infer_cx, destination, &args, callee)
                     }
                     // extern
-                    rustc_hir::Node::ForeignItem(foreign_item) => {
-                        infer_cx.libc_call(destination, &args, callee, foreign_item.ident)
-                    }
+                    rustc_hir::Node::ForeignItem(_) => infer_cx.unknown_call(destination, &args),
                     // in libxml2.rust/src/xmlschemastypes.rs/{} impl_xmlSchemaValDate/set_mon
                     rustc_hir::Node::ImplItem(_) => { /* TODO */ }
                     _ => unreachable!(),

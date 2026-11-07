@@ -288,10 +288,13 @@ pub(crate) fn analyze(program: &RustProgram<'_>) -> CallTargets {
 /// Classify an already resolved compiler identity using the existing boundary
 /// discipline. This never classifies a local body as ForeignC by its name.
 pub(crate) fn kind_for_target(tcx: TyCtxt<'_>, target: DefId) -> CallKind {
+    if let Some(symbol) = crate::analyses::mir::foreign_c_symbol(tcx, target) {
+        return CallKind::LibC(symbol);
+    }
     let Some(local) = target.as_local() else { return CallKind::RustLib(target) };
     match tcx.hir_node_by_def_id(local) {
         rustc_hir::Node::Item(_) => CallKind::FreeStanding(local),
-        rustc_hir::Node::ForeignItem(item) => CallKind::LibC(item.ident.name),
+        rustc_hir::Node::ForeignItem(_) => CallKind::RustLib(target),
         rustc_hir::Node::ImplItem(_) => CallKind::Impl(local),
         _ => CallKind::Dynamic,
     }

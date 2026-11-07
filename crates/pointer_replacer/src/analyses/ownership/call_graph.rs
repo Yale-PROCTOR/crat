@@ -82,12 +82,8 @@ impl<'me, 'tcx> Visitor<'tcx> for MonotonicityChecker<'me, 'tcx> {
         };
         let ty = func.ty();
         let &FnDef(callee, _) = ty.kind() else { unreachable!() };
-        let Some(local_did) = callee.as_local() else {
-            return;
-        };
-
-        match self.tcx.hir_node_by_def_id(local_did) {
-            rustc_hir::Node::ForeignItem(foreign_item) => match foreign_item.ident.as_str() {
+        if let Some(symbol) = crate::analyses::mir::foreign_c_symbol(self.tcx, callee) {
+            match symbol.as_str() {
                 "free" => {
                     self.this.meet(&FlatSet::Elem(Monotonicity::Dealloc));
                 }
@@ -95,12 +91,16 @@ impl<'me, 'tcx> Visitor<'tcx> for MonotonicityChecker<'me, 'tcx> {
                     self.this.meet(&FlatSet::Elem(Monotonicity::Alloc));
                 }
                 _ => {}
-            },
-            rustc_hir::Node::Item(..) => {
-                let that = self.monotonicity[&callee];
-                self.this.meet(&that);
             }
-            _ => {}
+            return;
+        }
+        let Some(local_did) = callee.as_local() else {
+            return;
+        };
+
+        if let rustc_hir::Node::Item(..) = self.tcx.hir_node_by_def_id(local_did) {
+            let that = self.monotonicity[&callee];
+            self.this.meet(&that);
         }
     }
 }
@@ -159,11 +159,8 @@ impl CallGraph {
                     if let Some(func) = func.constant() {
                         let ty = func.ty();
                         let &FnDef(callee, _) = ty.kind() else { unreachable!() };
-                        if let Some(local_did) = callee.as_local()
-                            && let rustc_hir::Node::ForeignItem(foreign_item) =
-                                tcx.hir_node_by_def_id(local_did)
-                        {
-                            match foreign_item.ident.as_str() {
+                        if let Some(symbol) = crate::analyses::mir::foreign_c_symbol(tcx, callee) {
+                            match symbol.as_str() {
                                 "free" => self.1 += 10,
                                 "malloc" | "calloc" | "realloc" => self.1 += 1,
                                 _ => {}

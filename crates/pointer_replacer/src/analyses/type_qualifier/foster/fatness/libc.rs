@@ -44,7 +44,7 @@ pub fn libc_call<'tcx>(
             );
         }
         // dest is fat, first ptr arg is fat
-        "memset" | "realloc" | "strchr" | "strrchr" => {
+        "memset" | "realloc" | "strchr" | "strrchr" | "memchr" => {
             mark_dest_and_args_bottom(
                 destination,
                 &args[..1.min(args.len())],
