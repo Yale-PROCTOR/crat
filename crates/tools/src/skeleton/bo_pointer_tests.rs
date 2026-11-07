@@ -1056,17 +1056,240 @@ pub unsafe fn deep(p: *const *const *mut Void) -> *mut Void { **p }
 }
 
 #[test]
-fn typed_borrow_returns_from_raw_void_parameters_keep_the_lifetime_error() {
-    let source =
-        "pub unsafe fn cast(p: *const core::ffi::c_void) -> *const i32 { p as *const i32 }";
-    let error =
-        run_compiler_on_str(source, |tcx| make_skeletons(source, tcx).unwrap_err()).unwrap();
-    assert_eq!(error.kind, GenerationErrorKind::PointerAnalysis);
-    assert!(
-        error
-            .message
-            .contains("cannot determine the lifetime of cast return pointer at depth 0")
+fn typed_returns_without_a_lifetime_from_raw_void_parameters_stay_raw() {
+    let source = r#"
+pub unsafe fn shared(p: *const core::ffi::c_void) -> *const i32 { p as *const i32 }
+pub unsafe fn mutable(p: *const core::ffi::c_void) -> *mut i32 { p as *mut i32 }
+pub unsafe fn reference_suffix<'a>(p: *const core::ffi::c_void) -> *const &'a i32 { p as *const &'a i32 }
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("shared", "p as *const i32"),
+            ("mutable", "p as *mut i32"),
+            ("reference_suffix", "p as *const &'a i32"),
+        ],
     );
+    for (name, expected) in [
+        ("shared", "*const i32"),
+        ("mutable", "*mut i32"),
+        ("reference_suffix", "*const &'a i32"),
+    ] {
+        let signature = &function(&records, name).target_signature;
+        assert!(signature.ends_with(expected), "{signature}");
+        if name != "reference_suffix" {
+            assert!(!signature.contains('\''), "{signature}");
+        }
+    }
+}
+
+#[test]
+fn borrowed_returns_from_globals_and_opaque_calls_stay_raw() {
+    let source = r#"
+unsafe extern "C" { fn opaque() -> *mut i32; }
+static mut VALUES: [i32; 2] = [0, 1];
+static mut POINTERS: [*mut i32; 2] = [core::ptr::null_mut(); 2];
+pub unsafe fn global(index: usize) -> *mut i32 {
+    if index >= 2 { core::ptr::null_mut() } else { VALUES.as_mut_ptr().add(index) }
+}
+pub unsafe fn lookup(index: usize) -> *mut i32 { POINTERS[index] }
+pub unsafe fn foreign() -> *mut i32 {
+    let pointer = opaque();
+    if pointer.is_null() { core::ptr::null_mut() } else { pointer }
+}
+pub unsafe fn read() -> i32 { *foreign().add(1) }
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        for name in ["global", "lookup", "foreign"] {
+            let record = function(&records, name);
+            assert!(
+                record.target_signature.ends_with("*mut i32"),
+                "{}",
+                record.target_signature
+            );
+            assert!(
+                !record.target_signature.contains('\''),
+                "{}",
+                record.target_signature
+            );
+        }
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+}
+
+#[test]
+fn unknown_return_alternatives_prevent_borrowing_from_a_known_input() {
+    let source = r#"
+unsafe extern "C" { fn opaque() -> *const i32; }
+pub unsafe fn mixed(pointer: *const i32, flag: bool) -> *const i32 {
+    if flag { pointer } else {
+        let other = opaque();
+        if other.is_null() { core::ptr::null() } else { other }
+    }
+}
+"#;
+    let records = generate(source);
+    let signature = &function(&records, "mixed").target_signature;
+    assert!(signature.ends_with("*const i32"), "{signature}");
+    assert!(signature.contains("pointer: Option<&i32>"), "{signature}");
+    assert!(!signature.contains('\''), "{signature}");
+    assert_stub_signatures_compile(&records, "");
+}
+
+#[test]
+fn unusable_input_origins_do_not_hide_behind_a_borrowable_input() {
+    let source = r#"
+pub unsafe fn cast(pointer: *const core::ffi::c_void) -> *const i32 { pointer as *const i32 }
+pub unsafe fn typed(pointer: *const i32) -> *const i32 { cast(pointer as *const core::ffi::c_void) }
+pub unsafe fn mixed(pointer: *const i32, raw: *const core::ffi::c_void, flag: bool) -> *const i32 {
+    if flag { pointer } else { raw as *const i32 }
+}
+pub unsafe fn mixed_call(pointer: *const i32, raw: *const core::ffi::c_void, flag: bool) -> *const i32 {
+    if flag { pointer } else { cast(raw) }
+}
+"#;
+    let records = generate(source);
+    for name in ["cast", "mixed", "mixed_call"] {
+        let signature = &function(&records, name).target_signature;
+        assert!(signature.ends_with("*const i32"), "{signature}");
+        assert!(!signature.contains('\''), "{signature}");
+    }
+    let typed = &function(&records, "typed").target_signature;
+    assert!(typed.contains("-> &'"), "{typed}");
+    assert_stub_signatures_compile(&records, "");
+}
+
+#[test]
+fn nested_return_fallback_retains_the_borrow_with_a_usable_lifetime() {
+    let source = r#"
+pub unsafe fn cast(pointer: *const *const core::ffi::c_void) -> *const *const i32 {
+    pointer as *const *const i32
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let decisions = tools_pointer_decisions(tcx);
+        let cast = local_def("cast", tcx);
+        assert_eq!(
+            decisions.signatures.data[&cast].output_dec,
+            Some(PtrKind::Ref(false))
+        );
+        assert_eq!(
+            decisions.nested(PointerTarget::Output(cast))[0].kind,
+            PtrKind::Raw(false)
+        );
+        assert_eq!(
+            decisions.nested(PointerTarget::Output(cast))[0].lifetime,
+            None
+        );
+        assert!(decisions.bounds[&cast].is_empty());
+    })
+    .unwrap();
+    let records = compile_target_bodies(
+        source,
+        &[(
+            "cast",
+            "&*(pointer as *const *const core::ffi::c_void as *const *const i32)",
+        )],
+    );
+    let signature = &function(&records, "cast").target_signature;
+    assert!(signature.ends_with("*const i32"), "{signature}");
+}
+
+#[test]
+fn raw_return_dependencies_propagate_without_changing_unrelated_input_borrows() {
+    let source = r#"
+pub struct Cell { pub value: *const i32 }
+pub struct Holder { pub cell: *const Cell }
+unsafe extern "C" { fn unused(value: *const Holder); }
+pub unsafe fn nested(value: *const Holder) -> *const i32 { (*(*value).cell).value }
+pub unsafe fn identity(pointer: *const i32) -> *const i32 { pointer }
+pub unsafe fn mixed(pointer: *const i32, value: *const Holder, flag: bool) -> *const i32 {
+    if flag { pointer } else { nested(value) }
+}
+pub unsafe fn inline(pointer: *const i32, value: *const Holder, flag: bool) -> *const i32 {
+    if flag { pointer } else { (*(*value).cell).value }
+}
+pub unsafe fn reborrow(pointer: *const i32, value: *const Holder, flag: bool) -> *const i32 {
+    if flag { pointer } else { &*nested(value) as *const i32 }
+}
+pub unsafe fn offset(pointer: *const i32, value: *const Holder, flag: bool) -> *const i32 {
+    if flag { pointer } else { nested(value).offset(1) }
+}
+pub unsafe fn forward(pointer: *const i32, value: *const Holder, flag: bool) -> *const i32 {
+    if flag { pointer } else { identity(mixed(pointer, value, flag)) }
+}
+pub unsafe fn recursive(pointer: *const i32, value: *const Holder, count: i32) -> *const i32 {
+    if count == 0 { nested(value) } else { recursive(pointer, value, count - 1) }
+}
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        for name in [
+            "nested",
+            "mixed",
+            "inline",
+            "reborrow",
+            "offset",
+            "forward",
+            "recursive",
+        ] {
+            let signature = &function(&records, name).target_signature;
+            assert!(signature.ends_with("*const i32"), "{signature}");
+            assert!(!signature.contains('\''), "{signature}");
+        }
+        let identity = &function(&records, "identity").target_signature;
+        assert!(identity.contains("-> &'"), "{identity}");
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+}
+
+#[test]
+fn owning_return_layers_survive_fallback_of_a_borrowed_inner_layer() {
+    let source = r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn opaque() -> *mut i32;
+}
+pub unsafe fn borrowed(pointer: *const i32) -> *mut *const i32 {
+    let cell = malloc(core::mem::size_of::<*const i32>()) as *mut *const i32;
+    *cell = pointer;
+    cell
+}
+pub unsafe fn unknown() -> *mut *mut i32 {
+    let cell = malloc(core::mem::size_of::<*mut i32>()) as *mut *mut i32;
+    let pointer = opaque();
+    *cell = if pointer.is_null() { core::ptr::null_mut() } else { pointer };
+    cell
+}
+"#;
+    let records = generate(source);
+    let borrowed = &function(&records, "borrowed").target_signature;
+    assert!(borrowed.contains("Box<&'"), "{borrowed}");
+    let unknown = &function(&records, "unknown").target_signature;
+    assert!(unknown.ends_with("Box<*mut i32>"), "{unknown}");
+    assert!(!unknown.contains('\''), "{unknown}");
+    assert_stub_signatures_compile(&records, "");
+}
+
+#[test]
+fn nullable_owning_returns_do_not_require_borrow_origins() {
+    for (size, expected) in [
+        ("core::mem::size_of::<i32>()", "Option<Box<i32>>"),
+        ("4 * core::mem::size_of::<i32>()", "Option<Box<[i32]>>"),
+    ] {
+        let source = format!(
+            "unsafe extern \"C\" {{ fn malloc(size: usize) -> *mut core::ffi::c_void; }} pub unsafe fn allocate() -> *mut i32 {{ let pointer = malloc({size}) as *mut i32; if pointer.is_null() {{ core::ptr::null_mut() }} else {{ *pointer = 7; pointer }} }}"
+        );
+        let records = generate(&source);
+        let signature = &function(&records, "allocate").target_signature;
+        assert!(signature.ends_with(expected), "{signature}");
+        assert_stub_signatures_compile(&records, "");
+    }
 }
 
 #[test]
