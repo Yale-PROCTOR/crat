@@ -398,7 +398,7 @@ pub unsafe fn read(stream: *const FILE) -> i32 { **(*stream).indirect }
         assert!(
             function(&records, "write")
                 .target_signature
-                .contains("&mut FILE")
+                .contains("*mut FILE")
         );
         crate::freeze_project(source, &records, tcx).unwrap()
     })
@@ -407,6 +407,232 @@ pub unsafe fn read(stream: *const FILE) -> i32 { **(*stream).indirect }
         crate::frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
     assert_eq!(reloaded, frozen);
     run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+}
+
+#[test]
+fn file_pointer_aliases_keep_raw_layers_mutability_and_existing_references() {
+    let source = r#"
+pub struct Stream { pub value: i32 }
+pub type FILE = Stream;
+pub type Alias = FILE;
+pub type Handle = *mut Alias;
+pub unsafe fn shared(pointer: *const FILE) -> *const FILE { let q: *const FILE = pointer; q }
+pub unsafe fn mutable(pointer: *mut FILE) -> *mut FILE { let q: *mut FILE = pointer; q }
+pub unsafe fn nullable(pointer: *mut FILE) -> *mut FILE {
+    let q: *mut FILE = pointer;
+    if q.is_null() { core::ptr::null_mut() } else { q }
+}
+pub unsafe fn nested(pointer: *mut *const Alias) -> *mut *const Alias { let q: *mut *const Alias = pointer; q }
+pub unsafe fn deep(pointer: *const *const *mut FILE) -> *const *const *mut FILE { pointer }
+pub unsafe fn array(pointer: *const [*mut FILE; 2]) -> *const [*mut FILE; 2] { pointer }
+pub unsafe fn alias(pointer: Handle) -> Handle { pointer }
+pub unsafe fn existing<'a>(pointer: &'a mut FILE) -> &'a mut FILE { pointer }
+pub unsafe fn ordinary(pointer: *const i32) -> i32 { *pointer }
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let analysis = pointer_replacer_bo::analyze_pointers(tcx).unwrap();
+        let shared = local_def("shared", tcx);
+        let slot = analysis.slots.fn_local_slots[&shared]
+            .slot_for_local_depth(rustc_middle::mir::Local::from_usize(1), 0)
+            .unwrap();
+        assert_eq!(
+            analysis.kinds
+                [&pointer_replacer_bo::analyses::borrow_ownership::solver::SlotRef::Local(
+                    shared, slot
+                )],
+            pointer_replacer_bo::analyses::borrow_ownership::SlotKind::Ref
+        );
+    })
+    .unwrap();
+    let records = generate(source);
+    for name in [
+        "shared", "mutable", "nullable", "nested", "deep", "array", "existing",
+    ] {
+        let record = function(&records, name);
+        assert_eq!(record.source_signature, record.target_signature, "{name}");
+    }
+    let alias = &function(&records, "alias").target_signature;
+    assert_eq!(signature_indirections(alias), "*");
+    assert!(alias.contains("-> *mut"), "{alias}");
+    let handle = type_record(&records, "Handle");
+    assert_eq!(handle.source_definition, handle.target_definition);
+    for (name, pointer) in [
+        ("shared", "*const FILE"),
+        ("mutable", "*mut FILE"),
+        ("nullable", "*mut FILE"),
+        ("nested", "*mut *const Alias"),
+    ] {
+        let record = function(&records, name);
+        assert!(
+            record
+                .baseline
+                .skeleton
+                .contains(&format!("let mut q: {pointer}")),
+            "{}",
+            record.baseline.skeleton
+        );
+    }
+    assert!(
+        function(&records, "ordinary")
+            .target_signature
+            .contains("&i32")
+    );
+    assert_stub_signatures_compile(
+        &records,
+        "pub struct Stream { pub value: i32 } pub type FILE = Stream; pub type Alias = FILE; pub type Handle = *mut Alias;",
+    );
+}
+
+#[test]
+fn file_definitions_stay_fixed_without_freezing_unrelated_wrapper_fields() {
+    let template = r#"
+pub struct Support { pub pointer: *const i32 }
+#[repr(C)] #[derive(Clone, Copy, Debug)] pub struct StreamType {
+    pub buffer: *mut u8,
+    pub support: *const Support,
+}
+pub type Alias = StreamType;
+pub struct Wrapper { pub handle: *mut Alias, pub indirect: *const *mut Alias, pub values: *const i32 }
+pub unsafe fn read_stream(stream: *const StreamType) -> i32 { *(*(*stream).support).pointer }
+pub unsafe fn read_wrapper(wrapper: *const Wrapper) -> i32 { *(*wrapper).values }
+"#;
+    for name in ["FILE", "_IO_FILE", "__sFILE", "_IO_FILE_plus"] {
+        let source = template.replace("StreamType", name);
+        let records = compile_target_bodies(
+            &source,
+            &[
+                ("read_stream", "*(*(*stream).support).pointer"),
+                ("read_wrapper", "*wrapper.values"),
+            ],
+        );
+        for protected in [name, "Support", "Alias"] {
+            let record = type_record(&records, protected);
+            assert_eq!(
+                record.source_definition, record.target_definition,
+                "{protected}"
+            );
+        }
+        let wrapper = &type_record(&records, "Wrapper").target_definition;
+        assert!(wrapper.contains("handle: *mut Alias"), "{wrapper}");
+        assert!(wrapper.contains("indirect: *const *mut Alias"), "{wrapper}");
+        assert!(wrapper.contains("values: &'"), "{wrapper}");
+        assert!(
+            function(&records, "read_wrapper")
+                .target_signature
+                .contains("&'")
+        );
+    }
+}
+
+#[test]
+fn file_ownership_and_array_inference_cannot_promote_handles_or_fields() {
+    use pointer_replacer_bo::analyses::borrow_ownership::{SlotKind, solver::SlotRef};
+
+    for size in [
+        "core::mem::size_of::<FILE>()",
+        "4 * core::mem::size_of::<FILE>()",
+    ] {
+        let template = r#"
+pub struct FILE { pub value: i32 }
+#[derive(Clone, Copy)] pub struct Holder { pub handle: *mut FILE }
+unsafe extern "C" { fn malloc(size: usize) -> *mut core::ffi::c_void; fn free(pointer: *mut core::ffi::c_void); }
+pub unsafe fn allocate() -> *mut FILE {
+    let pointer: *mut FILE = malloc(ALLOCATION_SIZE) as *mut FILE;
+    (*pointer).value = 7;
+    pointer
+}
+pub unsafe fn nullable() -> *mut FILE {
+    let pointer: *mut FILE = allocate();
+    if pointer.is_null() { core::ptr::null_mut() } else { pointer }
+}
+pub unsafe fn holder() -> Holder { Holder { handle: allocate() } }
+pub unsafe fn release(value: Holder) { free(value.handle as *mut core::ffi::c_void); }
+"#;
+        let source = template.replace("ALLOCATION_SIZE", size);
+        run_compiler_on_str(&source, |tcx| {
+            let analysis = pointer_replacer_bo::analyze_pointers(tcx).unwrap();
+            let allocate = local_def("allocate", tcx);
+            let slot = analysis.slots.fn_local_slots[&allocate]
+                .slot_for_local_depth(rustc_middle::mir::RETURN_PLACE, 0)
+                .unwrap();
+            assert_eq!(
+                analysis.kinds[&SlotRef::Local(allocate, slot)],
+                SlotKind::Owning
+            );
+        })
+        .unwrap();
+        let frozen = run_compiler_on_str(&source, |tcx| {
+            let records = make_skeletons(&source, tcx).unwrap();
+            for name in ["allocate", "nullable"] {
+                let record = function(&records, name);
+                assert_eq!(record.source_signature, record.target_signature, "{name}");
+                assert!(
+                    record
+                        .baseline
+                        .skeleton
+                        .contains("let mut pointer: *mut FILE")
+                );
+            }
+            let holder = type_record(&records, "Holder");
+            assert_eq!(holder.source_definition, holder.target_definition);
+            crate::freeze_project(&source, &records, tcx).unwrap()
+        })
+        .unwrap();
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    }
+}
+
+#[test]
+fn opaque_file_aliases_keep_the_original_pointer_chain() {
+    let source = r#"
+#![feature(extern_types)]
+unsafe extern "C" { pub type Stream; }
+pub type FILE = Stream;
+pub type Alias = FILE;
+pub unsafe fn direct(pointer: *mut Alias) -> *mut Alias { pointer }
+pub unsafe fn nested(pointer: *const *mut Alias) -> *const *mut Alias { pointer }
+"#;
+    let frozen = run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        for name in ["direct", "nested"] {
+            let record = function(&records, name);
+            assert_eq!(record.source_signature, record.target_signature, "{name}");
+        }
+        crate::freeze_project(source, &records, tcx).unwrap()
+    })
+    .unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+}
+
+#[test]
+fn file_policy_holds_do_not_create_unknown_return_origins() {
+    let source = r#"
+pub struct FILE { pub value: i32 }
+pub unsafe fn stop() -> *const FILE { loop {} }
+pub unsafe fn typed(pointer: *const i32, flag: bool) -> *const i32 {
+    if flag { pointer } else { stop() as *const i32 }
+}
+"#;
+    let records = compile_target_bodies(
+        source,
+        &[
+            ("stop", "loop {}"),
+            (
+                "typed",
+                "if flag { pointer } else { &*(stop() as *const i32) }",
+            ),
+        ],
+    );
+    assert!(
+        function(&records, "stop")
+            .target_signature
+            .ends_with("*const FILE")
+    );
+    assert!(
+        function(&records, "typed")
+            .target_signature
+            .contains("-> &'")
+    );
 }
 
 #[test]

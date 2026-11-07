@@ -20,7 +20,10 @@ use rustc_middle::{
     mir::{AggregateKind, Local, Operand, RETURN_PLACE, Rvalue, StatementKind, TerminatorKind},
     ty::{self, TyCtxt, TyKind},
 };
-use rustc_span::{Symbol, def_id::LocalDefId};
+use rustc_span::{
+    Symbol,
+    def_id::{DefId, LocalDefId},
+};
 
 mod lifetime_flow;
 mod return_flow;
@@ -87,11 +90,16 @@ pub(super) struct InitialPointerDecisions {
     pub bounds: FxHashMap<LocalDefId, Vec<(Symbol, Symbol)>>,
     pub fields: FxHashMap<StructFieldSlot, Vec<PointerLayer>>,
     pub foreign_types: FxHashSet<LocalDefId>,
+    file_types: FxHashSet<DefId>,
     pub types: TypeLifetimes,
     pub type_arguments: FxHashMap<(LocalDefId, usize), BTreeMap<FieldRegion, Symbol>>,
 }
 
 impl InitialPointerDecisions {
+    fn preserves_file_type(&self, source: ty::Ty<'_>, tcx: TyCtxt<'_>) -> bool {
+        struct_types::contains_file_type(source, &self.file_types, tcx)
+    }
+
     pub fn nested(&self, target: PointerTarget) -> &[PointerLayer] {
         self.nested
             .get(&target)
@@ -122,6 +130,7 @@ pub(super) fn initial_pointer_decisions_for_api(
 ) -> Result<InitialPointerDecisions, String> {
     let mut analysis = analyze_pointers(tcx)?;
     let representations = representation_facts(&analysis, tcx);
+    let file_types = struct_types::file_types(tcx);
     let mut result = InitialPointerDecisions {
         signatures: SigDecisions {
             data: FxHashMap::default(),
@@ -130,7 +139,8 @@ pub(super) fn initial_pointer_decisions_for_api(
         nested: FxHashMap::default(),
         bounds: FxHashMap::default(),
         fields: FxHashMap::default(),
-        foreign_types: struct_types::foreign_types(tcx),
+        foreign_types: struct_types::foreign_types(tcx, &file_types),
+        file_types,
         types: TypeLifetimes::default(),
         type_arguments: FxHashMap::default(),
     };
@@ -200,11 +210,12 @@ pub(super) fn initial_pointer_decisions_for_api(
             let protected = exposed.contains(&owner.struct_did)
                 && (array
                     || (depth == 0 && !optional && layout_sensitive.contains(&owner.struct_did)));
-            let kind = if protected || inner.is_c_void(tcx) {
-                PtrKind::Raw(mutability.is_mut())
-            } else {
-                representation(kind, mutable, mutability.is_mut(), array, optional)
-            };
+            let kind =
+                if protected || inner.is_c_void(tcx) || result.preserves_file_type(inner, tcx) {
+                    PtrKind::Raw(mutability.is_mut())
+                } else {
+                    representation(kind, mutable, mutability.is_mut(), array, optional)
+                };
             layers.push(PointerLayer {
                 kind,
                 lifetime: None,
@@ -293,7 +304,7 @@ pub(super) fn initial_pointer_decisions_for_api(
                     let optional = representations.nullable.contains(&slot);
                     let kind = if matches!(original.kind(), TyKind::Ref(..)) {
                         PtrKind::Ref(source_mutability.is_mut())
-                    } else if inner.is_c_void(tcx) {
+                    } else if inner.is_c_void(tcx) || result.preserves_file_type(inner, tcx) {
                         PtrKind::Raw(source_mutability.is_mut())
                     } else {
                         representation(*kind, mutable, source_mutability.is_mut(), array, optional)
