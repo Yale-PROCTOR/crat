@@ -208,9 +208,9 @@ mod tests {
 
     const TWO_CALLS: &str = r#"
 pub struct Node {left:*mut Node}
-pub unsafe fn minimum(mut node:*mut Node)->*mut Node {
-    while !(*node).left.is_null() {node=(*node).left;}
-    node
+pub unsafe fn minimum(node:*mut Node)->*mut Node {
+    let left=(*node).left;
+    left
 }
 pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
     let left=minimum(first);
@@ -307,8 +307,8 @@ pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
                 };
                 assert_eq!(&observation.argument, place);
                 assert!(
-                    observation.caller_value_flow,
-                    "existing native caller edge: {:?}",
+                    !observation.caller_value_flow,
+                    "field contents do not imply a container-pointer value edge: {:?}",
                     observation.call
                 );
                 assert!(!observation.callee_returns.is_empty());
@@ -329,9 +329,10 @@ pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
                         .iter()
                         .any(|key| key.root == "minimum::_1@d0"
                             && key.depth == 0
-                            && key.root_dereferences == 0
-                            && key.field.is_none()),
-                    "zero-iteration parameter-to-return relation must remain visible"
+                            && key.root_dereferences == 1
+                            && key.parents.is_empty()
+                            && key.field.is_some()),
+                    "direct field-to-return relation must remain visible"
                 );
             }
         });

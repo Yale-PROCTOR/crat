@@ -277,6 +277,7 @@ pub(crate) fn certify_metadata(
     let return_key = format!("{}::_0@d0", call.callee);
     let target = one(native.callee_returns.iter().filter(|r| {
         r.target.root == return_key
+            && r.target.parents.is_empty()
             && r.target.depth == 0
             && r.target.root_dereferences == 0
             && r.target.field.is_none()
@@ -312,6 +313,7 @@ pub(crate) fn certify_metadata(
         || target.target.kind_slot != OriginAvailability::Present(return_key)
         || target.incoming.iter().any(|key| {
             key.root != parameter_key
+                || !key.parents.is_empty()
                 || key.depth != 0
                 || match &key.field {
                     None => {
@@ -350,9 +352,9 @@ mod tests {
 
     const CODE: &str = r#"
 pub struct Node {left:*mut Node}
-pub unsafe fn minimum(mut node:*mut Node)->*mut Node {
-    while !(*node).left.is_null() {node=(*node).left;}
-    node
+pub unsafe fn minimum(node:*mut Node)->*mut Node {
+    let left=(*node).left;
+    left
 }
 pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
     let left=minimum(first);
@@ -361,8 +363,24 @@ pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
 }
 "#;
 
+    fn with_correspondence_metadata(code: &str, check: impl FnOnce(&Facts) + Send) {
+        with_facts(code, move |facts| {
+            let mut facts = facts.clone();
+            // Isolate metadata validation under assumed caller corroboration. The actual
+            // direct-field calls are checked separately without this fixture adjustment.
+            for call in &mut facts.traversal_native.as_mut().unwrap().calls {
+                assert!(!call.caller_value_flow);
+                call.caller_value_flow = true;
+            }
+            facts.licensing = Some(std::rc::Rc::new(
+                super::super::snapshot::FrozenTransport::build(&facts).unwrap(),
+            ));
+            check(&facts);
+        });
+    }
+
     fn with_calls(check: impl FnOnce(&Facts, &[traversal_call::Candidate]) + Send) {
-        with_facts(CODE, move |facts| {
+        with_correspondence_metadata(CODE, move |facts| {
             assert_eq!(facts.constructions, 1);
             let calls = traversal_call::discover(facts);
             assert_eq!(calls.len(), 2, "two independent call identities");
@@ -582,6 +600,56 @@ pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
         });
     }
     #[test]
+    fn nested_incoming_fields_do_not_match_direct_traversal_origins() {
+        with_calls(|facts, calls| {
+            certify(facts, &calls[0]).unwrap();
+            let mut nested = facts.clone();
+            let flow = native_mut(&mut nested, &calls[0])
+                .callee_returns
+                .iter_mut()
+                .find(|row| row.target.field.is_none() && row.target.depth == 0)
+                .unwrap();
+            let source = flow
+                .incoming
+                .iter_mut()
+                .find(|key| key.field.is_some())
+                .unwrap();
+            source.parents.push((1, "unrepresented-parent".to_owned()));
+            expect_hold(&nested, &calls[0], HoldReason::UnexpectedIncomingOrigin);
+        });
+    }
+
+    #[test]
+    fn unbounded_recursive_traversal_origins_are_held() {
+        let code = r#"
+pub struct Node {left:*mut Node}
+pub unsafe fn minimum(mut node:*mut Node)->*mut Node {
+    while !(*node).left.is_null() {node=(*node).left;}
+    node
+}
+pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
+    let left=minimum(first);
+    let right=minimum(second);
+    if right.is_null() {left} else {right}
+}
+"#;
+        with_facts(code, |facts| {
+            let calls = traversal_call::discover(facts);
+            assert_eq!(calls.len(), 2);
+            expect_hold(facts, &calls[0], HoldReason::UnknownReturnOrigin);
+        });
+    }
+
+    #[test]
+    fn direct_field_calls_without_caller_root_flow_are_held() {
+        with_facts(CODE, |facts| {
+            let calls = traversal_call::discover(facts);
+            assert_eq!(calls.len(), 2);
+            expect_hold(facts, &calls[0], HoldReason::CallerFlowAbsent);
+        });
+    }
+
+    #[test]
     fn c05_traversal_correspondence_duplicate_incoming_origin_is_rejected() {
         with_calls(|facts, calls| {
             certify(facts, &calls[0]).unwrap();
@@ -619,9 +687,16 @@ pub unsafe fn caller(first:*mut Node,second:*mut Node)->*mut Node {
     }
     #[test]
     fn c05_traversal_correspondence_discarded_reader_cannot_explain_return_origin() {
-        let code=CODE.replace("pub struct Node {left:*mut Node}","pub struct Node {left:*mut Node,right:*mut Node}")
-            .replace("while !(*node).left.is_null()", "let discarded=(*node).right;let _seen=discarded.is_null();while !(*node).left.is_null()");
-        with_facts(&code, |facts| {
+        let code = CODE
+            .replace(
+                "pub struct Node {left:*mut Node}",
+                "pub struct Node {left:*mut Node,right:*mut Node}",
+            )
+            .replace(
+                "let left=(*node).left;",
+                "let discarded=(*node).right;let _seen=discarded.is_null();let left=(*node).left;",
+            );
+        with_correspondence_metadata(&code, |facts| {
             let candidate = traversal_call::discover(facts).remove(0);
             certify(facts, &candidate).unwrap();
             assert!(

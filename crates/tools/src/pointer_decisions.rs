@@ -400,6 +400,74 @@ fn carries_lifetime(kind: PtrKind) -> bool {
     )
 }
 
+fn field_borrow_uses_raw_container(
+    slot: &SignatureSlot,
+    locals: &FxHashMap<Local, Vec<PointerLayer>>,
+    decisions: &InitialPointerDecisions,
+    tcx: TyCtxt<'_>,
+) -> bool {
+    let local = match slot.place.root {
+        SignatureRoot::Return => RETURN_PLACE,
+        SignatureRoot::Arg(local) => local,
+    };
+    let parents = slot.place.parents.iter().collect::<Vec<_>>();
+    let root_depth = parents
+        .first()
+        .map_or(slot.place.deref_depth, |step| step.deref_depth);
+    for depth in 0..usize::from(root_depth) {
+        if locals
+            .get(&local)
+            .and_then(|layers| layers.get(depth))
+            .is_none_or(|layer| matches!(layer.kind, PtrKind::Raw(_)))
+        {
+            return true;
+        }
+    }
+    for (index, parent) in parents.iter().enumerate() {
+        let derefs = parents
+            .get(index + 1)
+            .map_or(slot.place.deref_depth, |step| step.deref_depth);
+        let mut source = tcx
+            .adt_def(parent.field.struct_did)
+            .non_enum_variant()
+            .fields[rustc_abi::FieldIdx::from_usize(parent.field.field_index)]
+        .ty(
+            tcx,
+            ty::GenericArgs::identity_for_item(tcx, parent.field.struct_did),
+        );
+        for depth in 0..usize::from(derefs) {
+            match *source.kind() {
+                TyKind::RawPtr(inner, _) => {
+                    if decisions
+                        .fields
+                        .get(&parent.field)
+                        .and_then(|layers| layers.get(depth))
+                        .is_none_or(|layer| matches!(layer.kind, PtrKind::Raw(_)))
+                    {
+                        return true;
+                    }
+                    source = inner;
+                }
+                TyKind::Ref(_, inner, _) => source = inner,
+                _ => return true,
+            }
+        }
+    }
+    if let Some(field) = slot.place.field {
+        for depth in 0..usize::from(slot.depth) {
+            if decisions
+                .fields
+                .get(&field)
+                .and_then(|layers| layers.get(depth))
+                .is_none_or(|layer| matches!(layer.kind, PtrKind::Raw(_)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn signature_lifetimes(
     function: LocalDefId,
     arguments: usize,
@@ -490,6 +558,31 @@ fn signature_lifetimes(
                 field: field.field_index,
                 depth: usize::from(slot.depth),
             });
+            if region.is_some_and(|region| {
+                decisions
+                    .fields
+                    .get(&StructFieldSlot {
+                        struct_did: region.owner,
+                        field_index: region.field,
+                    })
+                    .and_then(|layers| layers.get(region.depth))
+                    .is_some_and(|layer| {
+                        matches!(
+                            layer.kind,
+                            PtrKind::Ref(true)
+                                | PtrKind::OptRef(true)
+                                | PtrKind::Slice(true)
+                                | PtrKind::OptSlice(true)
+                                | PtrKind::Box
+                                | PtrKind::OptBox
+                                | PtrKind::BoxedSlice
+                                | PtrKind::OptBoxedSlice
+                        )
+                    })
+            }) && field_borrow_uses_raw_container(slot, locals, decisions, tcx)
+            {
+                return None;
+            }
             let key = (
                 local,
                 region.map_or(usize::from(slot.place.deref_depth + slot.depth), |region| {

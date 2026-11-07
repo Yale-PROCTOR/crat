@@ -88,6 +88,7 @@ fn key(
     };
     SignatureKey {
         root: slot_key::local_key(program.tcx, function, root.as_usize(), 0),
+        parents: Vec::new(),
         root_dereferences: signature.place.deref_depth,
         field: None,
         depth: signature.depth,
@@ -145,6 +146,32 @@ fn gaps(row: &FunctionEvidence, equations_recorded: bool) {
     assert_eq!(
         row.ownership.conservation,
         OriginMissing::ConservationNotProved
+    );
+}
+
+#[test]
+fn nested_signature_keys_preserve_sibling_paths_to_the_same_field_kind() {
+    inspect(
+        r#"
+pub struct Entry { pub value: *const i32 }
+pub struct Pair { pub left: Entry, pub right: Entry }
+pub unsafe fn left(pair: *const Pair) -> *const i32 { (*pair).left.value }
+"#,
+        |program, slots, origins| {
+            let facts = collect(program, slots, origins, None);
+            let row = function(&facts, "left");
+            let fields = row
+                .signature_slots
+                .iter()
+                .filter(|slot| slot.parents.len() == 1)
+                .collect::<Vec<_>>();
+            assert_eq!(fields.len(), 2);
+            assert_ne!(fields[0].parents, fields[1].parents);
+            assert_eq!(fields[0].kind_slot, fields[1].kind_slot);
+            let bytes = serde_json::to_vec(&facts).unwrap();
+            let decoded: OriginEvidence = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded, facts);
+        },
     );
 }
 

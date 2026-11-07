@@ -183,6 +183,12 @@ pub(crate) fn derive_callee(
             *origin != return_origin && summary.subset.contains(*origin, return_origin)
         })
         .collect::<Vec<_>>();
+    if sources
+        .iter()
+        .any(|(_, slot)| !slot.place.parents.is_empty())
+    {
+        return Err(LifetimeFailure::FieldHeld);
+    }
     if sources.is_empty() {
         // The dead return: no reachable assignment to the return place, and
         // the source's return expression is the bare parameter `root`. The

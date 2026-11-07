@@ -2229,6 +2229,7 @@ mod tests {
         SignatureSlot {
             place: SignaturePlace {
                 root: SignatureRoot::Arg(Local::from_usize(index)),
+                parents: Default::default(),
                 deref_depth: 0,
                 field: None,
             },
@@ -2240,6 +2241,7 @@ mod tests {
         SignatureSlot {
             place: SignaturePlace {
                 root: SignatureRoot::Return,
+                parents: Default::default(),
                 deref_depth: 0,
                 field: None,
             },
@@ -2418,6 +2420,7 @@ mod tests {
         let field = SignatureSlot {
             place: SignaturePlace {
                 root: SignatureRoot::Arg(Local::from_usize(1)),
+                parents: Default::default(),
                 deref_depth: 0,
                 field: Some(crate::analyses::borrow_ownership::slots::StructFieldSlot {
                     struct_did: rustc_hir::def_id::CRATE_DEF_ID,

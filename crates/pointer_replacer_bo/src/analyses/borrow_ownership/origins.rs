@@ -58,6 +58,7 @@ fn wrapped_slot(slot: crate::analyses::borrow::lifetime_flow::SignatureSlot) -> 
     SignatureSlot {
         place: SignaturePlace {
             root,
+            parents: Default::default(),
             deref_depth: slot.place.deref_depth,
             field,
         },
@@ -304,13 +305,25 @@ mod tests {
             SignatureRoot::Return => "return".to_string(),
             SignatureRoot::Arg(local) => format!("arg{}", local.index()),
         };
+        let parents = slot
+            .place
+            .parents
+            .iter()
+            .map(|step| {
+                format!(
+                    "{}.field{}",
+                    "*".repeat(step.deref_depth as usize),
+                    step.field.field_index
+                )
+            })
+            .collect::<String>();
         let derefs = "*".repeat(slot.place.deref_depth as usize);
         let field = slot
             .place
             .field
             .map(|f| format!(".field{}", f.field_index))
             .unwrap_or_default();
-        format!("{root}{derefs}{field}@{}", slot.depth)
+        format!("{root}{parents}{derefs}{field}@{}", slot.depth)
     }
 
     struct Facts {
@@ -432,6 +445,204 @@ mod tests {
 
     fn has(edges: &[(String, String)], sub: &str, sup: &str) -> bool {
         edges.iter().any(|(a, b)| a == sub && b == sup)
+    }
+
+    #[test]
+    fn nested_field_origins_survive_temporaries_calls_offsets_and_void_casts() {
+        let facts = origin_facts(
+            r#"
+struct Entry { value: *const i32 }
+struct Map { entries: *const Entry }
+struct Tree { map: *const Map }
+unsafe fn lookup(map: *const Map, i: isize) -> *const i32 {
+    let entries = (*map).entries;
+    let item = entries.offset(i);
+    (*item).value
+}
+unsafe fn get(tree: *const Tree, i: isize) -> *const i32 { lookup((*tree).map, i) }
+unsafe fn direct(tree: *const Tree) -> *const i32 { (*(*(*tree).map).entries).value }
+unsafe fn cast(tree: *const Tree) -> *const i32 {
+    let raw = (*tree).map as *const core::ffi::c_void;
+    lookup(raw as *const Map, 0)
+}
+unsafe fn erased(p: *const core::ffi::c_void) -> *const core::ffi::c_void { p }
+unsafe fn through_call(tree: *const Tree) -> *const i32 { lookup(erased((*tree).map as *const core::ffi::c_void) as *const Map, 0) }
+unsafe fn reborrow(p: *const core::ffi::c_void) -> *const core::ffi::c_void { &*p }
+unsafe fn through_reborrow(tree: *const Tree) -> *const i32 { lookup(reborrow((*tree).map as *const core::ffi::c_void) as *const Map, 0) }
+unsafe fn added(map: *const Map, i: usize) -> *const i32 { let item = (*map).entries.add(i); (*item).value }
+"#,
+        );
+        assert!(
+            has(
+                &facts["lookup"].subset,
+                "arg1*.field0*.field0@0",
+                "return@0"
+            ),
+            "{:?}",
+            facts["lookup"].subset
+        );
+        assert!(has(
+            &facts["added"].subset,
+            "arg1*.field0*.field0@0",
+            "return@0"
+        ));
+        assert!(!facts["added"].unknown.iter().any(|slot| slot == "return@0"));
+        for name in ["get", "direct", "cast", "through_call", "through_reborrow"] {
+            assert!(
+                has(
+                    &facts[name].subset,
+                    "arg1*.field0*.field0*.field0@0",
+                    "return@0"
+                ),
+                "{name}: {:?}",
+                facts[name].subset
+            );
+            assert!(
+                !facts[name].unknown.iter().any(|slot| slot == "return@0"),
+                "{name}: {:?}",
+                facts[name].unknown
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_nested_paths_stay_distinct_through_projected_arguments() {
+        let facts = origin_facts(
+            r#"
+struct Entry { value: *const i32 }
+struct Pair { left: Entry, right: Entry }
+unsafe fn read(entry: *const Entry) -> *const i32 { (*entry).value }
+unsafe fn left(pair: *const Pair) -> *const i32 { read(&raw const (*pair).left) }
+unsafe fn copied(pair: Pair) -> *const i32 { let entry = pair.left; read(&entry) }
+"#,
+        );
+        assert!(
+            has(&facts["left"].subset, "arg1*.field0.field0@0", "return@0"),
+            "{:?}",
+            facts["left"].subset
+        );
+        assert!(!has(
+            &facts["left"].subset,
+            "arg1*.field1.field0@0",
+            "return@0"
+        ));
+        assert!(
+            has(&facts["copied"].subset, "arg1.field0.field0@0", "return@0"),
+            "{:?}",
+            facts["copied"].subset
+        );
+    }
+
+    #[test]
+    fn unsupported_nested_paths_keep_unknown_alternatives_across_calls() {
+        let facts = origin_facts(
+            r#"
+struct Entry { value: *const i32 }
+struct Map { entries: *const Entry }
+struct Tree { map: *const Map }
+struct Outer { tree: *const Tree }
+unsafe fn get(tree: *const Tree) -> *const i32 { (*(*(*tree).map).entries).value }
+unsafe fn mixed(outer: *const Outer, known: *const i32, flag: bool) -> *const i32 {
+    if flag { known } else { get((*outer).tree) }
+}
+"#,
+        );
+        assert!(has(&facts["mixed"].subset, "arg2@0", "return@0"));
+        assert!(
+            facts["mixed"].unknown.iter().any(|slot| slot == "return@0"),
+            "{:?}",
+            facts["mixed"].unknown
+        );
+    }
+
+    #[test]
+    fn local_nested_cutoffs_and_erased_inputs_cannot_hide_unknown_alternatives() {
+        let facts = origin_facts(
+            r#"
+struct Link { next: *const Link, value: *const i32 }
+unsafe fn deep(root: *const Link) -> *const i32 {
+    let q = (*root).next;
+    (*(*(*q).next).next).value
+}
+unsafe fn mixed(root: *const Link, good: *const Link, flag: bool) -> *const i32 {
+    let q = if flag { good } else { (*(*(*root).next).next).next };
+    (*q).value
+}
+unsafe fn erased(good: *const Link, mut opaque: *const core::ffi::c_void, flag: bool) -> *const i32 {
+    let mut q = good;
+    if flag { q = opaque as *const Link; }
+    opaque = q as *const core::ffi::c_void;
+    q = opaque as *const Link;
+    (*q).value
+}
+unsafe fn initialized(p: *const i32) -> *const i32 { let entry = Link { next: core::ptr::null(), value: p }; entry.value }
+unsafe fn replaced(mut p: *const Link, flag: bool) -> *const i32 {
+    if flag { p = 123usize as *const Link; }
+    (*p).value
+}
+"#,
+        );
+        for name in ["deep", "mixed", "erased", "replaced"] {
+            assert!(
+                facts[name].unknown.iter().any(|slot| slot == "return@0"),
+                "{name}: {:?}",
+                facts[name].unknown
+            );
+        }
+        assert!(has(&facts["initialized"].subset, "arg1@0", "return@0"));
+        assert!(
+            !facts["initialized"]
+                .unknown
+                .iter()
+                .any(|slot| slot == "return@0")
+        );
+    }
+
+    #[test]
+    fn allocated_struct_fields_keep_known_stores_and_unresolved_contents() {
+        let facts = origin_facts(
+            r#"
+struct Holder { value: *const i32 }
+unsafe extern "C" { fn malloc(size: usize) -> *mut core::ffi::c_void; }
+unsafe fn make(p: *const i32) -> *mut Holder {
+    let holder = malloc(core::mem::size_of::<Holder>()) as *mut Holder;
+    (*holder).value = p;
+    holder
+}
+"#,
+        );
+        assert!(
+            has(&facts["make"].subset, "arg1@0", "return*.field0@0"),
+            "{:?}",
+            facts["make"].subset
+        );
+        assert!(
+            facts["make"]
+                .unknown
+                .iter()
+                .any(|slot| slot == "return*.field0@0")
+        );
+    }
+
+    #[test]
+    fn pointer_inspection_does_not_invalidate_nested_field_origins() {
+        let facts = origin_facts(
+            r#"
+struct Entry { value: *const i32 }
+struct Map { entries: *const Entry }
+unsafe fn get(map: *const Map) -> *const i32 {
+    if map.is_null() { return core::ptr::null(); }
+    let _address = map.addr();
+    (*(*map).entries).value
+}
+"#,
+        );
+        assert!(has(
+            &facts["get"].subset,
+            "arg1*.field0*.field0@0",
+            "return@0"
+        ));
+        assert!(!facts["get"].unknown.iter().any(|slot| slot == "return@0"));
     }
 
     #[test]

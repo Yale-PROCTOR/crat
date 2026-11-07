@@ -17,9 +17,9 @@ use rustc_index::{
 use rustc_middle::mir::BasicBlock;
 use rustc_middle::{
     mir::{
-        BinOp, Body, Const, ConstOperand, ConstValue, HasLocalDecls, Local, Location, Operand,
-        Place, PlaceElem, RETURN_PLACE, Rvalue, Statement, StatementKind, Terminator,
-        visit::Visitor,
+        AggregateKind, BinOp, Body, Const, ConstOperand, ConstValue, HasLocalDecls, Local,
+        Location, Operand, Place, PlaceElem, RETURN_PLACE, Rvalue, Statement, StatementKind,
+        Terminator, visit::Visitor,
     },
     ty::{Ty, TyCtxt, TyKind},
 };
@@ -27,7 +27,10 @@ use rustc_span::def_id::{DefId, LocalDefId};
 
 use super::{
     boundary_table::pointer_return_contract,
-    origin_summary::{OriginSlot, SignaturePlace, SignatureRoot, SignatureSlot},
+    origin_summary::{
+        FieldPath, FieldStep, MAX_FIELD_PATH_DEPTH, OriginSlot, SignaturePlace, SignatureRoot,
+        SignatureSlot,
+    },
     slots::{SlotOwner, StructFieldSlot},
 };
 use crate::{
@@ -48,44 +51,43 @@ fn is_borrowing_method(def_id: DefId, tcx: TyCtxt<'_>) -> bool {
     }
 }
 
-fn direct_raw_pointer_field_slot<'tcx, D: HasLocalDecls<'tcx>>(
+fn field_place_for_place<'tcx, D: HasLocalDecls<'tcx>>(
     local_decls: &D,
     place: Place<'tcx>,
-) -> Option<(StructFieldSlot, u8, bool)> {
+) -> Option<(FieldPlace, u8)> {
     let mut base_ty = local_decls.local_decls()[place.local].ty;
     let mut deref_depth = 0u8;
+    let mut steps = Vec::new();
 
-    for (index, projection_elem) in place.projection.iter().enumerate() {
+    for projection_elem in place.projection {
         match projection_elem {
             PlaceElem::Deref => {
                 deref_depth = deref_depth.checked_add(1)?;
                 base_ty = base_ty.builtin_deref(true)?;
             }
-            PlaceElem::Field(field, field_ty) if index + 1 == place.projection.len() => {
+            PlaceElem::Field(field, field_ty) => {
                 let TyKind::Adt(adt_def, _) = base_ty.kind() else {
                     return None;
                 };
                 if !adt_def.did().is_local() || !adt_def.is_struct() || adt_def.is_union() {
                     return None;
                 }
-                let TyKind::RawPtr(_, mutability) = field_ty.kind() else {
-                    return None;
-                };
-                return Some((
-                    StructFieldSlot {
+                steps.push(FieldStep {
+                    deref_depth,
+                    field: StructFieldSlot {
                         struct_did: adt_def.did().expect_local(),
                         field_index: field.index(),
                     },
-                    deref_depth,
-                    mutability.is_mut(),
-                ));
+                });
+                base_ty = field_ty;
+                deref_depth = 0;
             }
             PlaceElem::OpaqueCast(_) => {}
             _ => return None,
         }
     }
 
-    None
+    Some((FieldPlace::from_steps(place.local, steps)?, deref_depth))
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +95,7 @@ pub(crate) struct NativeOriginSummary {
     pub slots: IndexVec<OriginSlot, SignatureSlot>,
     pub value_flows: SparseBitMatrix<OriginSlot, OriginSlot>,
     pub storage_aliases: SparseBitMatrix<OriginSlot, OriginSlot>,
+    pointee_copies: SparseBitMatrix<OriginSlot, OriginSlot>,
     pub unknown_targets: DenseBitSet<OriginSlot>,
     written_pointees: DenseBitSet<OriginSlot>,
 }
@@ -100,8 +103,71 @@ pub(crate) struct NativeOriginSummary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct FieldPlace {
     base: Local,
+    parents: FieldPath,
     deref_depth: u8,
     field: StructFieldSlot,
+}
+
+impl FieldPlace {
+    fn steps(&self) -> impl Iterator<Item = FieldStep> + '_ {
+        self.parents.iter().chain(std::iter::once(FieldStep {
+            deref_depth: self.deref_depth,
+            field: self.field,
+        }))
+    }
+
+    fn from_steps(base: Local, steps: impl IntoIterator<Item = FieldStep>) -> Option<Self> {
+        let mut steps = steps.into_iter();
+        let mut last = steps.next()?;
+        let mut derefs = u16::from(last.deref_depth);
+        let mut parents = FieldPath::default();
+        for step in steps {
+            parents.push(last)?;
+            derefs += u16::from(step.deref_depth);
+            last = step;
+        }
+        if derefs > u16::from(MAX_SIGNATURE_SLOT_DEPTH) {
+            return None;
+        }
+        Some(Self {
+            base,
+            parents,
+            deref_depth: last.deref_depth,
+            field: last.field,
+        })
+    }
+
+    fn under(self, root: LocalSlot) -> Option<Self> {
+        let mut steps = self.steps();
+        let mut first = steps.next()?;
+        first.deref_depth = first.deref_depth.checked_add(root.depth)?;
+        let suffix = std::iter::once(first).chain(steps);
+        match root.owner {
+            OriginOwner::Local(local) => Self::from_steps(local, suffix),
+            OriginOwner::Field(field) => Self::from_steps(field.base, field.steps().chain(suffix)),
+        }
+    }
+
+    fn relative_to(self, root: LocalSlot) -> Option<Self> {
+        let mut steps = self.steps();
+        match root.owner {
+            OriginOwner::Local(local) if local == self.base => {}
+            OriginOwner::Field(field) if field.base == self.base => {
+                for expected in field.steps() {
+                    if steps.next() != Some(expected) {
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        }
+        let mut first = steps.next()?;
+        if first.deref_depth < root.depth {
+            return None;
+        }
+        first.deref_depth -= root.depth;
+        Self::from_steps(self.base, std::iter::once(first).chain(steps))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -114,6 +180,23 @@ enum OriginOwner {
 struct LocalSlot {
     owner: OriginOwner,
     depth: u8,
+}
+
+fn place_root<'tcx, D: HasLocalDecls<'tcx>>(
+    local_decls: &D,
+    place: Place<'tcx>,
+) -> Option<LocalSlot> {
+    if let Some((field, depth)) = field_place_for_place(local_decls, place) {
+        Some(LocalSlot {
+            owner: OriginOwner::Field(field),
+            depth,
+        })
+    } else {
+        Some(LocalSlot {
+            owner: OriginOwner::Local(place.local),
+            depth: place_deref_depth(place)?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +285,9 @@ pub(crate) struct BodyOriginFlow {
     slot_map: FxHashMap<(OriginOwner, u8), OriginSlot>,
     value_flows: SparseBitMatrix<OriginSlot, OriginSlot>,
     storage_aliases: SparseBitMatrix<OriginSlot, OriginSlot>,
+    pointee_copies: SparseBitMatrix<OriginSlot, OriginSlot>,
+    field_descendants: FxHashMap<OriginSlot, Vec<(OriginSlot, FieldPlace)>>,
+    erased_pointers: DenseBitSet<OriginSlot>,
     unknown_targets: DenseBitSet<OriginSlot>,
     written_pointees: DenseBitSet<OriginSlot>,
 }
@@ -375,7 +461,7 @@ fn analyze_body_origin_flow_result<'tcx>(
     }
     .visit_body(body);
 
-    let body_flow = body_flow.closed();
+    let body_flow = body_flow.closed(body);
     let summary = body_flow.to_summary(body);
 
     OriginFlowResult {
@@ -385,7 +471,7 @@ fn analyze_body_origin_flow_result<'tcx>(
 }
 
 fn empty_origin_flow_result<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> OriginFlowResult {
-    let body_flow = BodyOriginFlow::new(tcx, body).closed();
+    let body_flow = BodyOriginFlow::new(tcx, body).closed(body);
     let summary = body_flow.to_summary(body);
     OriginFlowResult {
         summary,
@@ -398,6 +484,7 @@ impl PartialEq for NativeOriginSummary {
         self.slots == other.slots
             && same_matrix(&self.value_flows, &other.value_flows)
             && same_matrix(&self.storage_aliases, &other.storage_aliases)
+            && same_matrix(&self.pointee_copies, &other.pointee_copies)
             && self.unknown_targets == other.unknown_targets
             && self.written_pointees == other.written_pointees
     }
@@ -411,6 +498,7 @@ impl PartialEq for BodyOriginFlow {
             && self.slot_map == other.slot_map
             && same_matrix(&self.value_flows, &other.value_flows)
             && same_matrix(&self.storage_aliases, &other.storage_aliases)
+            && same_matrix(&self.pointee_copies, &other.pointee_copies)
             && self.unknown_targets == other.unknown_targets
             && self.written_pointees == other.written_pointees
     }
@@ -738,26 +826,48 @@ impl BodyOriginFlow {
     fn new<'tcx>(tcx: TyCtxt<'tcx>, body: &Body<'tcx>) -> Self {
         let mut slots = IndexVec::new();
         let mut slot_map = FxHashMap::default();
+        let mut erased_pointers = Vec::new();
+        let erased = |mut ty, depth| {
+            for _ in 0..=depth {
+                ty = pointer_pointee_ty(ty).unwrap();
+            }
+            ty.is_c_void(tcx)
+        };
 
         for (local, local_decl) in body.local_decls.iter_enumerated() {
             for depth in 0..pointer_slot_count(local_decl.ty) {
                 let owner = OriginOwner::Local(local);
                 let slot = slots.push(LocalSlot { owner, depth });
                 slot_map.insert((owner, depth), slot);
+                if erased(local_decl.ty, depth) {
+                    erased_pointers.push(slot);
+                }
             }
-            for field_place in field_places_for_local(tcx, local, local_decl.ty) {
+            for (field_place, ty) in field_places_for_local(tcx, local, local_decl.ty) {
                 let owner = OriginOwner::Field(field_place);
-                let slot = slots.push(LocalSlot { owner, depth: 0 });
-                slot_map.insert((owner, 0), slot);
+                for depth in 0..pointer_slot_count(ty) {
+                    let slot = slots.push(LocalSlot { owner, depth });
+                    slot_map.insert((owner, depth), slot);
+                    if erased(ty, depth) {
+                        erased_pointers.push(slot);
+                    }
+                }
             }
         }
 
         let domain_size = slots.len();
+        let mut erased = DenseBitSet::new_empty(domain_size);
+        for slot in erased_pointers {
+            erased.insert(slot);
+        }
         BodyOriginFlow {
             slots,
             slot_map,
             value_flows: SparseBitMatrix::new(domain_size),
             storage_aliases: SparseBitMatrix::new(domain_size),
+            pointee_copies: SparseBitMatrix::new(domain_size),
+            field_descendants: FxHashMap::default(),
+            erased_pointers: erased,
             unknown_targets: DenseBitSet::new_empty(domain_size),
             written_pointees: DenseBitSet::new_empty(domain_size),
         }
@@ -878,16 +988,10 @@ impl BodyOriginFlow {
         place: Place<'tcx>,
         extra_depth: u8,
     ) -> Option<OriginSlot> {
-        if let Some((field, deref_depth, _)) = direct_raw_pointer_field_slot(local_decls, place)
-            && extra_depth == 0
-        {
+        if let Some((field, deref_depth)) = field_place_for_place(local_decls, place) {
             return self.slot_for_owner(
-                OriginOwner::Field(FieldPlace {
-                    base: place.local,
-                    deref_depth,
-                    field,
-                }),
-                0,
+                OriginOwner::Field(field),
+                deref_depth.checked_add(extra_depth)?,
             );
         }
         let base_depth = place_deref_depth(place)?;
@@ -914,7 +1018,57 @@ impl BodyOriginFlow {
         self.storage_aliases.insert(b, a);
     }
 
-    fn add_descendant_aliases(&mut self, a: OriginSlot, b: OriginSlot) {
+    fn add_copy(&mut self, source: OriginSlot, target: OriginSlot) {
+        self.add_flow(source, target);
+        if source != target {
+            self.pointee_copies.insert(source, target);
+        }
+    }
+
+    fn transfer_fields(&mut self, source: LocalSlot, target: LocalSlot, address: bool) {
+        let mut target = target;
+        if address {
+            target.depth += 1;
+        }
+        let pairs = self
+            .slots
+            .iter_enumerated()
+            .filter_map(|(from, slot)| {
+                let OriginOwner::Field(field) = slot.owner else { return None };
+                let field = field.relative_to(source)?.under(target)?;
+                Some((
+                    from,
+                    self.slot_for_owner(OriginOwner::Field(field), slot.depth)?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (source, target) in pairs {
+            if address {
+                self.add_alias(source, target);
+            } else {
+                self.add_copy(source, target);
+            }
+        }
+        let missing = self
+            .slots
+            .iter_enumerated()
+            .filter_map(|(to, slot)| {
+                let OriginOwner::Field(field) = slot.owner else { return None };
+                let relative = field.relative_to(target)?;
+                (relative
+                    .under(source)
+                    .and_then(|field| self.slot_for_owner(OriginOwner::Field(field), slot.depth))
+                    .is_none())
+                .then_some(to)
+            })
+            .collect::<Vec<_>>();
+        for target in missing {
+            self.mark_unknown(target);
+        }
+    }
+
+    fn add_descendant_aliases(&mut self, a: OriginSlot, b: OriginSlot) -> bool {
+        let mut pairs = Vec::new();
         for offset in 1..=MAX_SIGNATURE_SLOT_DEPTH {
             let Some(a_descendant) = self.slot_after(a, offset) else {
                 break;
@@ -922,12 +1076,45 @@ impl BodyOriginFlow {
             let Some(b_descendant) = self.slot_after(b, offset) else {
                 break;
             };
-            self.add_alias(a_descendant, b_descendant);
+            pairs.push((a_descendant, b_descendant));
         }
+        for root in [a, b] {
+            self.field_descendants.entry(root).or_insert_with(|| {
+                self.slots
+                    .iter_enumerated()
+                    .filter_map(|(source, slot)| {
+                        let OriginOwner::Field(field) = slot.owner else { return None };
+                        Some((source, field.relative_to(self.slots[root])?))
+                    })
+                    .collect()
+            });
+        }
+        let descendants = &self.field_descendants[&a];
+        for &(source, field) in descendants {
+            if let Some(field) = field.under(self.slots[b])
+                && let Some(target) =
+                    self.slot_for_owner(OriginOwner::Field(field), self.slots[source].depth)
+            {
+                pairs.push((source, target));
+            }
+        }
+        let mut changed = false;
+        for (source, target) in pairs {
+            changed |= source != target && !self.storage_aliases.contains(source, target);
+            self.add_alias(source, target);
+        }
+        changed
     }
 
     fn mark_unknown(&mut self, target: OriginSlot) {
         self.unknown_targets.insert(target);
+        let root = self.slots[target];
+        for (slot, value) in self.slots.iter_enumerated() {
+            if matches!(value.owner, OriginOwner::Field(field) if field.relative_to(root).is_some())
+            {
+                self.unknown_targets.insert(slot);
+            }
+        }
     }
 
     fn mark_unknown_place_slots<'tcx, D: HasLocalDecls<'tcx>>(
@@ -942,15 +1129,113 @@ impl BodyOriginFlow {
             };
             self.mark_unknown(slot);
         }
+        if let Some(root) = place_root(local_decls, place) {
+            let targets = self
+                .slots
+                .iter_enumerated()
+                .filter_map(|(target, slot)| {
+                    let OriginOwner::Field(field) = slot.owner else { return None };
+                    let relative = field.relative_to(root)?;
+                    (start_depth == 0
+                        || slot.depth >= start_depth
+                        || relative.steps().any(|step| step.deref_depth >= start_depth))
+                    .then_some(target)
+                })
+                .collect::<Vec<_>>();
+            for target in targets {
+                self.mark_unknown(target);
+            }
+        }
     }
 
-    fn closed(mut self) -> Self {
+    fn closed(mut self, body: &Body<'_>) -> Self {
+        loop {
+            let mut combined = SparseBitMatrix::new(self.slots.len());
+            union_matrix_into(&mut combined, &self.pointee_copies);
+            union_matrix_into(&mut combined, &self.storage_aliases);
+            self.pointee_copies = transitive_closure(&combined, self.slots.len());
+            let edges = self
+                .pointee_copies
+                .rows()
+                .flat_map(|source| {
+                    self.pointee_copies
+                        .row(source)
+                        .into_iter()
+                        .flat_map(move |targets| targets.iter().map(move |target| (source, target)))
+                })
+                .collect::<Vec<_>>();
+            let mut changed = false;
+            for (source, target) in edges {
+                changed |= self.add_descendant_aliases(source, target);
+            }
+            if !changed {
+                break;
+            }
+        }
         self.storage_aliases = transitive_closure(&self.storage_aliases, self.slots.len());
-
         let mut combined = SparseBitMatrix::new(self.slots.len());
         union_matrix_into(&mut combined, &self.value_flows);
         union_matrix_into(&mut combined, &self.storage_aliases);
         self.value_flows = transitive_closure(&combined, self.slots.len());
+        for source in self.pointee_copies.rows() {
+            let source_base = match self.slots[source].owner {
+                OriginOwner::Local(local) => local,
+                OriginOwner::Field(field) => field.base,
+            };
+            if self.erased_pointers.contains(source)
+                && (source_base == RETURN_PLACE || source_base.index() > body.arg_count)
+                && !self.unknown_targets.contains(source)
+                && self.pointee_copies.rows().any(|ancestor| {
+                    !self.erased_pointers.contains(ancestor)
+                        && self.pointee_copies.contains(ancestor, source)
+                })
+            {
+                continue;
+            }
+            for target in self
+                .pointee_copies
+                .row(source)
+                .into_iter()
+                .flat_map(|targets| targets.iter())
+            {
+                if let Some(descendants) = self.field_descendants.get(&target) {
+                    for &(slot, relative) in descendants {
+                        if relative
+                            .under(self.slots[source])
+                            .and_then(|field| {
+                                self.slot_for_owner(
+                                    OriginOwner::Field(field),
+                                    self.slots[slot].depth,
+                                )
+                            })
+                            .is_none()
+                        {
+                            self.unknown_targets.insert(slot);
+                        }
+                    }
+                }
+            }
+        }
+        let arguments = self
+            .slots
+            .iter_enumerated()
+            .filter_map(|(slot, value)| {
+                let local = match value.owner {
+                    OriginOwner::Local(local) => local,
+                    OriginOwner::Field(field) => field.base,
+                };
+                (local != RETURN_PLACE && local.index() <= body.arg_count).then_some(slot)
+            })
+            .collect::<Vec<_>>();
+        for (source, value) in self.slots.iter_enumerated() {
+            if matches!(value.owner, OriginOwner::Field(field) if field.base.index() > body.arg_count)
+                && !arguments
+                    .iter()
+                    .any(|&argument| self.value_flows.contains(argument, source))
+            {
+                self.unknown_targets.insert(source);
+            }
+        }
 
         // Recover typed pointees erased by casts to void pointers before applying byte writes.
         let mut written = self.written_pointees.clone();
@@ -975,14 +1260,11 @@ impl BodyOriginFlow {
                     self.unknown_targets.insert(target);
                 }
             }
-            if let OriginOwner::Local(local) = self.slots[source].owner {
-                for (target, slot) in self.slots.iter_enumerated() {
-                    if let OriginOwner::Field(field) = slot.owner
-                        && field.base == local
-                        && field.deref_depth > self.slots[source].depth
-                    {
-                        self.unknown_targets.insert(target);
-                    }
+            for (target, slot) in self.slots.iter_enumerated() {
+                if let OriginOwner::Field(field) = slot.owner
+                    && field.relative_to(self.slots[source]).is_some()
+                {
+                    self.unknown_targets.insert(target);
                 }
             }
         }
@@ -1023,6 +1305,7 @@ impl BodyOriginFlow {
                 let summary = slots.push(SignatureSlot {
                     place: SignaturePlace {
                         root,
+                        parents: Default::default(),
                         deref_depth: 0,
                         field: None,
                     },
@@ -1046,6 +1329,7 @@ impl BodyOriginFlow {
             let summary = slots.push(SignatureSlot {
                 place: SignaturePlace {
                     root,
+                    parents: field_place.parents,
                     deref_depth: field_place.deref_depth,
                     field: Some(field_place.field),
                 },
@@ -1056,6 +1340,7 @@ impl BodyOriginFlow {
 
         let mut value_flows = SparseBitMatrix::new(slots.len());
         let mut storage_aliases = SparseBitMatrix::new(slots.len());
+        let mut pointee_copies = SparseBitMatrix::new(slots.len());
         let mut unknown_targets = DenseBitSet::new_empty(slots.len());
         let mut written_pointees = DenseBitSet::new_empty(slots.len());
 
@@ -1090,6 +1375,19 @@ impl BodyOriginFlow {
                 storage_aliases.insert(summary_source, summary_target);
             }
         }
+        for source in self.pointee_copies.rows() {
+            let Some(&summary_source) = internal_to_summary.get(&source) else { continue };
+            for target in self
+                .pointee_copies
+                .row(source)
+                .into_iter()
+                .flat_map(|targets| targets.iter())
+            {
+                if let Some(&summary_target) = internal_to_summary.get(&target) {
+                    pointee_copies.insert(summary_source, summary_target);
+                }
+            }
+        }
 
         for target in internal_unknown.iter() {
             let Some(&summary_target) = internal_to_summary.get(&target) else {
@@ -1112,6 +1410,7 @@ impl BodyOriginFlow {
             slots,
             value_flows,
             storage_aliases,
+            pointee_copies,
             unknown_targets,
             written_pointees,
         }
@@ -1135,6 +1434,7 @@ impl BodyOriginFlow {
                         } else {
                             SignatureRoot::Arg(local)
                         },
+                        parents: Default::default(),
                         deref_depth: 0,
                         field: None,
                     },
@@ -1151,6 +1451,7 @@ impl BodyOriginFlow {
                         } else {
                             SignatureRoot::Arg(field.base)
                         },
+                        parents: field.parents,
                         deref_depth: field.deref_depth,
                         field: Some(field.field),
                     },
@@ -1177,8 +1478,11 @@ fn a2_exact_target<'tcx>(
     place: Place<'tcx>,
 ) -> Option<OriginSlot> {
     let target = flow.slot_for_place(body, place, 0)?;
-    let base_depth = if let Some((_, deref_depth, _)) = direct_raw_pointer_field_slot(body, place) {
-        deref_depth
+    let base_depth = if let Some((field, _)) = field_place_for_place(body, place) {
+        if !field.parents.is_empty() {
+            return None;
+        }
+        field.deref_depth
     } else {
         place_deref_depth(place)?
     };
@@ -1391,34 +1695,56 @@ fn slot_owner(owner: OriginOwner) -> Option<SlotOwner> {
 fn field_places_for_local<'tcx>(
     tcx: TyCtxt<'tcx>,
     local: Local,
-    mut ty: Ty<'tcx>,
-) -> Vec<FieldPlace> {
-    let mut fields = vec![];
-    for deref_depth in 0..=MAX_SIGNATURE_SLOT_DEPTH {
-        if let TyKind::Adt(adt_def, args) = ty.kind()
+    ty: Ty<'tcx>,
+) -> Vec<(FieldPlace, Ty<'tcx>)> {
+    fn visit<'tcx>(
+        tcx: TyCtxt<'tcx>,
+        local: Local,
+        ty: Ty<'tcx>,
+        parents: &mut Vec<FieldStep>,
+        deref_depth: u8,
+        total_derefs: u8,
+        fields: &mut Vec<(FieldPlace, Ty<'tcx>)>,
+    ) {
+        if let Some(pointee) = pointer_pointee_ty(ty) {
+            if total_derefs < MAX_SIGNATURE_SLOT_DEPTH {
+                visit(
+                    tcx,
+                    local,
+                    pointee,
+                    parents,
+                    deref_depth + 1,
+                    total_derefs + 1,
+                    fields,
+                );
+            }
+        } else if let TyKind::Adt(adt_def, args) = ty.kind()
             && adt_def.did().is_local()
             && adt_def.is_struct()
-            && !adt_def.is_union()
         {
             for (field_index, field_def) in adt_def.all_fields().enumerate() {
-                if is_direct_raw_ptr_ty(field_def.ty(tcx, args)) {
-                    fields.push(FieldPlace {
-                        base: local,
-                        deref_depth,
-                        field: StructFieldSlot {
-                            struct_did: adt_def.did().expect_local(),
-                            field_index,
-                        },
-                    });
+                let ty = field_def.ty(tcx, args);
+                parents.push(FieldStep {
+                    deref_depth,
+                    field: StructFieldSlot {
+                        struct_did: adt_def.did().expect_local(),
+                        field_index,
+                    },
+                });
+                if is_direct_raw_ptr_ty(ty)
+                    && let Some(place) = FieldPlace::from_steps(local, parents.iter().copied())
+                {
+                    fields.push((place, ty));
                 }
+                if parents.len() < MAX_FIELD_PATH_DEPTH {
+                    visit(tcx, local, ty, parents, 0, total_derefs, fields);
+                }
+                parents.pop();
             }
         }
-
-        let Some(pointee) = pointer_pointee_ty(ty) else {
-            break;
-        };
-        ty = pointee;
     }
+    let mut fields = vec![];
+    visit(tcx, local, ty, &mut Vec::new(), 0, 0, &mut fields);
     fields
 }
 
@@ -1447,7 +1773,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         }
 
         for source in sources {
-            self.flow.add_flow(source, target);
+            self.flow.add_copy(source, target);
             self.flow.add_descendant_aliases(source, target);
         }
     }
@@ -1535,6 +1861,10 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
     }
 
     fn assign_from_place_address(&mut self, target: OriginSlot, place: Place<'tcx>) {
+        if let Some(source) = place_root(self.body, place) {
+            self.flow
+                .transfer_fields(source, self.flow.slots[target], true);
+        }
         match place_deref_depth(place) {
             Some(0) => {
                 if let Some(place_slot) = self.flow.slot_for_place(self.body, place, 0)
@@ -1548,7 +1878,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
                     .flow
                     .slot_for_local(place.local, deref_depth.saturating_sub(1))
                 {
-                    self.flow.add_flow(source, target);
+                    self.flow.add_copy(source, target);
                     self.flow.add_descendant_aliases(source, target);
                 }
             }
@@ -1584,7 +1914,7 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         };
 
         if is_provenance_preserving_pointer_method(&call.func, self.tcx) {
-            self.assign_known_return_from_operand(destination, &arg0.node, location);
+            self.assign_from_operand(destination, &arg0.node, location);
             return true;
         }
 
@@ -1655,44 +1985,52 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         call: &MirFunctionCall<'_, 'tcx>,
         summary: &NativeOriginSummary,
     ) {
+        let mut unmapped = false;
         for written in summary.written_pointees.iter() {
             if let Some(target) = self.instantiate_signature_slot(call, summary.slots[written]) {
                 self.flow.written_pointees.insert(target);
+            } else {
+                unmapped = true;
             }
         }
         for source in summary.value_flows.rows() {
-            let Some(source_slot) = self.instantiate_signature_slot(call, summary.slots[source])
-            else {
-                continue;
-            };
+            let source_slot = self.instantiate_signature_slot(call, summary.slots[source]);
             let Some(targets) = summary.value_flows.row(source) else {
                 continue;
             };
             for target in targets.iter() {
-                let Some(target_slot) =
-                    self.instantiate_signature_slot(call, summary.slots[target])
-                else {
-                    continue;
-                };
-                self.flow.add_flow(source_slot, target_slot);
+                match (
+                    source_slot,
+                    self.instantiate_signature_slot(call, summary.slots[target]),
+                ) {
+                    (Some(source), Some(target)) => self.flow.add_flow(source, target),
+                    (_, Some(target)) => {
+                        self.flow.mark_unknown(target);
+                        unmapped = true;
+                    }
+                    _ => unmapped = true,
+                }
             }
         }
 
         for source in summary.storage_aliases.rows() {
-            let Some(source_slot) = self.instantiate_signature_slot(call, summary.slots[source])
-            else {
-                continue;
-            };
+            let source_slot = self.instantiate_signature_slot(call, summary.slots[source]);
             let Some(targets) = summary.storage_aliases.row(source) else {
                 continue;
             };
             for target in targets.iter() {
-                let Some(target_slot) =
-                    self.instantiate_signature_slot(call, summary.slots[target])
-                else {
-                    continue;
-                };
-                self.flow.add_alias(source_slot, target_slot);
+                match (
+                    source_slot,
+                    self.instantiate_signature_slot(call, summary.slots[target]),
+                ) {
+                    (Some(source), Some(target)) => self.flow.add_alias(source, target),
+                    (source, target) => {
+                        for slot in source.into_iter().chain(target) {
+                            self.flow.mark_unknown(slot);
+                        }
+                        unmapped = true;
+                    }
+                }
             }
         }
 
@@ -1700,7 +2038,30 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
             if let Some(target_slot) = self.instantiate_signature_slot(call, summary.slots[target])
             {
                 self.flow.mark_unknown(target_slot);
+            } else {
+                unmapped = true;
             }
+        }
+        for source in summary.pointee_copies.rows() {
+            let source_slot = self.instantiate_signature_slot(call, summary.slots[source]);
+            for target in summary
+                .pointee_copies
+                .row(source)
+                .into_iter()
+                .flat_map(|targets| targets.iter())
+            {
+                if let (Some(source), Some(target)) = (
+                    source_slot,
+                    self.instantiate_signature_slot(call, summary.slots[target]),
+                ) {
+                    self.flow.add_copy(source, target);
+                } else {
+                    unmapped = true;
+                }
+            }
+        }
+        if unmapped {
+            self.mark_unknown_call_effects(call);
         }
     }
 
@@ -1729,18 +2090,15 @@ impl<'flow, 'summary, 'tcx> FlowVisitor<'flow, 'summary, 'tcx> {
         depth: u8,
     ) -> Option<OriginSlot> {
         if let Some(field) = signature_place.field {
-            if depth != 0 {
-                return None;
+            let root = place_root(self.body, root_place)?;
+            let field = FieldPlace {
+                base: root_place.local,
+                parents: signature_place.parents,
+                deref_depth: signature_place.deref_depth,
+                field,
             }
-            let root_depth = place_deref_depth(root_place)?;
-            return self.flow.slot_for_owner(
-                OriginOwner::Field(FieldPlace {
-                    base: root_place.local,
-                    deref_depth: root_depth.checked_add(signature_place.deref_depth)?,
-                    field,
-                }),
-                0,
-            );
+            .under(root)?;
+            return self.flow.slot_for_owner(OriginOwner::Field(field), depth);
         }
 
         self.flow.slot_for_place(
@@ -1772,6 +2130,47 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
     ) {
         let rvalue_ty = rvalue.ty(self.body, self.tcx);
         if pointer_slot_count(rvalue_ty) == 0 {
+            if !matches!(rvalue_ty.kind(), TyKind::Adt(definition, _) if definition.did().is_local() && definition.is_struct())
+            {
+                return;
+            }
+            match rvalue {
+                Rvalue::Use(operand) | Rvalue::Cast(_, operand, _) => {
+                    if let Some(source) = operand.place()
+                        && let (Some(source), Some(target)) =
+                            (place_root(self.body, source), place_root(self.body, *place))
+                    {
+                        self.flow.transfer_fields(source, target, false);
+                    }
+                }
+                Rvalue::CopyForDeref(source) => {
+                    if let (Some(source), Some(target)) = (
+                        place_root(self.body, *source),
+                        place_root(self.body, *place),
+                    ) {
+                        self.flow.transfer_fields(source, target, false);
+                    }
+                }
+                Rvalue::Aggregate(kind, operands)
+                    if matches!(kind.as_ref(), AggregateKind::Adt(..)) =>
+                {
+                    for (index, operand) in operands.iter_enumerated() {
+                        let target = place.project_deeper(
+                            &[PlaceElem::Field(index, operand.ty(self.body, self.tcx))],
+                            self.tcx,
+                        );
+                        if let Some(slot) = self.flow.slot_for_place(self.body, target, 0) {
+                            self.assign_from_operand(slot, operand, location);
+                        } else if let Some(source) = operand.place()
+                            && let (Some(source), Some(target)) =
+                                (place_root(self.body, source), place_root(self.body, target))
+                        {
+                            self.flow.transfer_fields(source, target, false);
+                        }
+                    }
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -1788,7 +2187,7 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
             }
             Rvalue::CopyForDeref(place) => {
                 for source in self.place_slots_or_derived(*place, location) {
-                    self.flow.add_flow(source, target);
+                    self.flow.add_copy(source, target);
                     self.flow.add_descendant_aliases(source, target);
                 }
             }
@@ -1834,6 +2233,18 @@ impl<'tcx> Visitor<'tcx> for FlowVisitor<'_, '_, 'tcx> {
 
         if let CallKind::RustLib(def_id) = &call.func
             && is_null_pointer_constructor(*def_id, self.tcx)
+        {
+            return;
+        }
+        if let CallKind::RustLib(def_id) = &call.func
+            && !def_id.is_local()
+            && self.tcx.def_kind(*def_id) == rustc_hir::def::DefKind::AssocFn
+            && self.tcx.crate_name(def_id.krate).as_str() == "core"
+            && matches!(
+                self.tcx.def_path(*def_id).data.first().map(|part| part.data),
+                Some(rustc_hir::definitions::DefPathData::TypeNs(name)) if name.as_str() == "ptr"
+            )
+            && matches!(self.tcx.item_name(*def_id).as_str(), "is_null" | "addr")
         {
             return;
         }
