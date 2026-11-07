@@ -12,7 +12,11 @@ use rustc_hir::{
 };
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::ty::{self, TyCtxt, TyKind};
-use rustc_span::{DUMMY_SP, Symbol, def_id::LocalDefId, sym};
+use rustc_span::{
+    DUMMY_SP, Symbol,
+    def_id::{DefId, LocalDefId},
+    sym,
+};
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
 
 use super::{PointerLayer, PtrKind, carries_lifetime};
@@ -46,7 +50,57 @@ pub(crate) struct TypeLifetimes {
     pub invalid_derives: FxHashMap<LocalDefId, FxHashSet<Symbol>>,
 }
 
-pub(super) fn foreign_types(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
+const FILE_TYPE_NAMES: &[&str] = &["FILE", "_IO_FILE", "__sFILE", "_IO_FILE_plus"];
+
+fn file_type_definition(mut source: ty::Ty<'_>) -> Option<DefId> {
+    loop {
+        match source.kind() {
+            TyKind::RawPtr(inner, _)
+            | TyKind::Ref(_, inner, _)
+            | TyKind::Array(inner, _)
+            | TyKind::Slice(inner) => source = *inner,
+            TyKind::Adt(definition, _) => return Some(definition.did()),
+            TyKind::Foreign(definition) => return Some(*definition),
+            _ => return None,
+        }
+    }
+}
+
+pub(super) fn file_types(tcx: TyCtxt<'_>) -> FxHashSet<DefId> {
+    tcx.hir_crate_items(())
+        .free_items()
+        .filter_map(|id| {
+            let item = tcx.hir_item(id);
+            if !matches!(
+                item.kind,
+                hir::ItemKind::Struct(..)
+                    | hir::ItemKind::Enum(..)
+                    | hir::ItemKind::Union(..)
+                    | hir::ItemKind::TyAlias(..)
+            ) || !FILE_TYPE_NAMES.contains(&tcx.item_name(item.owner_id.to_def_id()).as_str())
+            {
+                return None;
+            }
+            file_type_definition(tcx.type_of(item.owner_id.def_id).instantiate_identity())
+        })
+        .collect()
+}
+
+pub(super) fn contains_file_type(
+    source: ty::Ty<'_>,
+    definitions: &FxHashSet<DefId>,
+    tcx: TyCtxt<'_>,
+) -> bool {
+    file_type_definition(source).is_some_and(|definition| {
+        definitions.contains(&definition)
+            || FILE_TYPE_NAMES.contains(&tcx.item_name(definition).as_str())
+    })
+}
+
+pub(super) fn foreign_types(
+    tcx: TyCtxt<'_>,
+    file_types: &FxHashSet<DefId>,
+) -> FxHashSet<LocalDefId> {
     struct TypeVisitor<'tcx> {
         tcx: TyCtxt<'tcx>,
         roots: FxHashSet<LocalDefId>,
@@ -96,7 +150,10 @@ pub(super) fn foreign_types(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
 
     let mut visitor = TypeVisitor {
         tcx,
-        roots: FxHashSet::default(),
+        roots: file_types
+            .iter()
+            .filter_map(|definition| definition.as_local())
+            .collect(),
         dependencies: FxHashMap::default(),
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);

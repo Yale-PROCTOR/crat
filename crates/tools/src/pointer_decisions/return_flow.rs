@@ -45,6 +45,7 @@ pub(super) fn propagate(
             };
             if source.is_raw_ptr()
                 && !inner.is_c_void(tcx)
+                && !decisions.preserves_file_type(inner, tcx)
                 && matches!(layer, Some(PtrKind::Raw(_)))
                 && let Some(slot) = analysis.slots.fn_local_slots[&function]
                     .slot_for_local_depth(RETURN_PLACE, depth)
