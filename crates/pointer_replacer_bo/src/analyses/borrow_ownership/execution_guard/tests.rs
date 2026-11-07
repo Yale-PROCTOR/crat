@@ -125,6 +125,22 @@ fn r1370_the_query_timeout_is_the_sealed_cap_unset_and_the_switch_value_when_set
     }
 }
 
+/// R1475-2 (4): the fresh-hard-solver switch is on for `on` exactly; unset or any other value, off;
+/// the test hook overrides the reading for its scope only.
+#[test]
+fn r1475_2_the_fresh_hard_solver_switch_is_on_for_on_exactly() {
+    assert!(!fresh_from(None));
+    assert!(fresh_from(Some("on")));
+    for value in ["ON", "1", "true", "off", ""] {
+        assert!(!fresh_from(Some(value)), "{value:?}");
+    }
+    if std::env::var_os("CRAT_BO_FRESH_HARD_SOLVER").is_none() {
+        assert!(!fresh_hard_solver(), "the gate's process sets nothing");
+        assert!(fresh_hard_solver_hook::with(true, fresh_hard_solver));
+        assert!(!fresh_hard_solver(), "the hook's scope ended");
+    }
+}
+
 /// Relay main/388 O2 (R1383-1): the budget predicate is the wall against 0.99 of the budget in force.
 #[test]
 fn r1383_o2_the_budget_is_hit_at_ninety_nine_percent_of_the_wall_budget() {

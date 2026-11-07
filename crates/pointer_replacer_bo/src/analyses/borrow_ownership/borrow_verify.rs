@@ -909,6 +909,33 @@ fn loaded_slot<'tcx>(
     }
 }
 
+/// R1475-2 (4): with `CRAT_BO_FRESH_HARD_SOLVER=on`, the solve about to start runs on a hard solver
+/// built now from the Optimize's hard assertions as they stand; the previous solve's solver is
+/// dropped first, so one hard solver is alive at a time, and the solve's synchronization then
+/// appends nothing. The questions do not change. Off, nothing happens here: the repair's one hard
+/// solver is synchronized at the solve's entry, as before. Three lines, log only: `start` before
+/// the drop, `drop` after it (with the allocator totals), `end` after the build.
+fn renew_hard_solver(solver: &KindSolver, hard: &mut Option<HardLoopSolver>, round: usize) {
+    if hard.is_none() || !super::execution_guard::fresh_hard_solver() {
+        return;
+    }
+    crate::phase_log::sub("verify:hard_solver", "start", || format!("round={round}"));
+    let started = std::time::Instant::now();
+    *hard = None;
+    crate::phase_log::sub("verify:hard_solver", "drop", || {
+        format!(
+            "round={round} wall={:.1}s{}",
+            started.elapsed().as_secs_f64(),
+            crate::phase_log::malloc_totals()
+        )
+    });
+    let started = std::time::Instant::now();
+    *hard = Some(solver.hard_loop_solver());
+    crate::phase_log::sub("verify:hard_solver", "end", || {
+        format!("round={round} wall={:.1}s", started.elapsed().as_secs_f64())
+    });
+}
+
 fn solve_round_model(
     solver: &KindSolver,
     selectors: &Selectors,
@@ -973,7 +1000,19 @@ fn solve_round_counted(
     stats: &mut RoundStats,
 ) -> Option<(FxHashMap<SlotRef, SlotKind>, Vec<Bool>)> {
     if planner.is_none() {
-        return solve_round_model(solver, selectors, backend, hard);
+        let solved = solve_round_model(solver, selectors, backend, hard);
+        if solved.is_none() {
+            // R1475-2 (I3), log only: the plain repair's decline, and where its solve stopped
+            // (the latest failure, not the first, which may be the guarded run's).
+            crate::phase_log::sub("verify:decline", "end", || {
+                format!(
+                    "repair=plain round={} {}",
+                    stats.rounds,
+                    solver.decline_detail()
+                )
+            });
+        }
+        return solved;
     }
     #[cfg(test)]
     if guarded_decline_fault::fires(stats.rounds) {
@@ -1216,10 +1255,16 @@ fn verify_rounds(
         format!("wall={:.1}s", started.elapsed().as_secs_f64())
     });
     let started = std::time::Instant::now();
-    let hard =
+    let mut hard =
         matches!(backend, LoopBackend::HardCheckRoundOptimize).then(|| solver.hard_loop_solver());
     crate::phase_log::sub("verify:hard_solver", "end", || {
-        format!("wall={:.1}s", started.elapsed().as_secs_f64())
+        // R1475-2 (4), log only: with the switch on, this build serves round 0's solve.
+        let round = if super::execution_guard::fresh_hard_solver() {
+            "round=0 "
+        } else {
+            ""
+        };
+        format!("{round}wall={:.1}s", started.elapsed().as_secs_f64())
     });
     let mut stats = RoundStats::default();
     // Resolve the repair strategy ONCE per invocation into a local; NO mid-loop re-reads, so the
@@ -1427,6 +1472,7 @@ fn verify_rounds(
             }
             stats.commits_conflict += raw_targets.len();
             stats.commits_per_round.push(raw_targets.len());
+            renew_hard_solver(solver, &mut hard, stats.rounds);
             let started = std::time::Instant::now();
             let solved = solve_round(
                 solver,
@@ -1508,6 +1554,7 @@ fn verify_rounds(
                 }
                 stats.commits_conflict += owning.len();
                 stats.commits_per_round.push(owning.len());
+                renew_hard_solver(solver, &mut hard, stats.rounds);
                 let started = std::time::Instant::now();
                 let solved = solve_round(
                     solver,
@@ -1774,6 +1821,7 @@ fn verify_rounds(
             }
             return (Some(model), stats);
         }
+        renew_hard_solver(solver, &mut hard, stats.rounds);
         model = match solve_round(
             solver,
             selectors,

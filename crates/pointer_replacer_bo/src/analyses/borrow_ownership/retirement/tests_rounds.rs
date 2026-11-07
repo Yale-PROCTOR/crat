@@ -377,3 +377,420 @@ fn r1468_2_i_a_contradiction_declines_as_a_hard_unsat_in_the_drop_loop() {
     })
     .unwrap_or_else(|error| error.raise());
 }
+
+/// R1475-2 (4): beside `R1468_CASCADE` (three solves), a source and a sink in a genuine joint
+/// conflict (`nbs2_mixed_tie_drops_sink_retains_source`'s program), so every solve's relaxation
+/// drops a selector (the sink) -- the witness covers real retractions.
+const R1475_TIE: &str = r#"
+unsafe extern "C" {
+    fn malloc(size: usize) -> *mut core::ffi::c_void;
+    fn free(ptr: *mut core::ffi::c_void);
+}
+unsafe extern "C" { fn retain_for_policy_fixture(x: *mut core::ffi::c_void); }
+pub unsafe fn pass(x: *mut core::ffi::c_void) { retain_for_policy_fixture(x); }
+pub unsafe fn source_side() -> *mut core::ffi::c_void {
+    let m = unsafe { malloc(4) };
+    unsafe { pass(m) };
+    m
+}
+pub unsafe fn sink_side(a: *mut core::ffi::c_void) -> *mut core::ffi::c_void {
+    let b = a;
+    unsafe { pass(b) };
+    unsafe { free(a) };
+    b
+}
+"#;
+
+/// R1475-2 (4): one production verification of the compiled fixture in `mode`, with the fresh-hard-solver
+/// switch read as `fresh` (through the test hook): the model by name (`function#slot=kind`, sorted),
+/// each solve's dropped selectors, the hard-solver events, and the rounds.
+struct R1475Run {
+    model: Option<Vec<String>>,
+    dropped: Vec<Vec<usize>>,
+    trace: crate::analyses::borrow_ownership::solver::SelectorTrace,
+    events: Vec<crate::analyses::borrow_ownership::solver::hard_solver_trace::Event>,
+    rounds: usize,
+}
+
+fn r1475_run(
+    tcx: rustc_middle::ty::TyCtxt<'_>,
+    mode: crate::analyses::borrow_ownership::borrow_verify::RepairMode,
+    fresh: bool,
+) -> R1475Run {
+    use crate::analyses::borrow_ownership::{
+        borrow_verify::RepairMode,
+        construction::verify_bo_construction_counting,
+        execution_guard::fresh_hard_solver_hook,
+        solver::{hard_solver_trace, with_selector_trace},
+    };
+    let program = r1468_program(tcx);
+    let slots = CrateSlots::build(&program);
+    let origins = compute_origins(&program);
+    let facts = MutFacts::from_program(&program);
+    let ((((model, stats), trace), events), _export) = with_bo_export(|| {
+        hard_solver_trace::with(|| {
+            with_selector_trace(|| {
+                fresh_hard_solver_hook::with(fresh, || {
+                    RepairMode::with_override(mode, || {
+                        let solver = KindSolver::new(&slots);
+                        let construction = construct_bo_into(
+                            &program,
+                            &slots,
+                            &origins,
+                            &facts,
+                            &solver,
+                            CopyLendMode::Baseline,
+                        )
+                        .expect("production construction");
+                        verify_bo_construction_counting(
+                            &program,
+                            &slots,
+                            &origins,
+                            &solver,
+                            &construction,
+                            &facts,
+                        )
+                    })
+                })
+            })
+        })
+    });
+    let model = model.map(|model| {
+        let mut rows: Vec<String> = model
+            .iter()
+            .map(|(slot, kind)| match slot {
+                SlotRef::Local(function, id) => format!(
+                    "{}#{}={kind:?}",
+                    tcx.item_name(function.to_def_id()),
+                    id.as_usize()
+                ),
+                SlotRef::Field(id) => format!("field#{}={kind:?}", id.as_usize()),
+            })
+            .collect();
+        rows.sort();
+        rows
+    });
+    let dropped = trace
+        .epochs
+        .iter()
+        .map(|epoch| epoch.final_dropped.clone())
+        .collect();
+    R1475Run {
+        model,
+        dropped,
+        trace,
+        events,
+        rounds: stats.rounds,
+    }
+}
+
+/// R1475-2 (4), the witness (the user's word in the seat's session 11-07, "1번으로 하자.", on
+/// addendum 1474's option (1)): with the switch on, every solve of the repair (plain and guarded)
+/// runs on a hard solver built right before it, from the Optimize's assertions as they stand at that
+/// solve's start -- one build per solve, the solve's synchronization appending nothing -- and the
+/// later solves' builds copy the assertions the repair committed since; every solve retracts a
+/// selector, and on this fixture the decisions, cores and model equal the switch-off run's. RED at
+/// `ad45d2c71`, where one hard solver serves the repair and each later solve synchronizes it.
+#[test]
+fn r1475_2_switch_on_builds_one_hard_solver_per_solve_from_the_optimizes_assertions() {
+    use crate::analyses::borrow_ownership::{
+        borrow_verify::RepairMode, solver::hard_solver_trace::Event,
+    };
+    let code = format!("{R1468_CASCADE}\n{R1475_TIE}");
+    ::utils::compilation::run_compiler_on_str(&code, |tcx| {
+        for mode in [RepairMode::Plain, RepairMode::Guarded] {
+            let on = r1475_run(tcx, mode, true);
+            let off = r1475_run(tcx, mode, false);
+            println!(
+                "R1475_2 {mode:?} on: model={:?} dropped={:?} rounds={} | off: model={:?} dropped={:?} rounds={}",
+                on.model, on.dropped, on.rounds, off.model, off.dropped, off.rounds
+            );
+            let solves: Vec<(usize, usize)> = on
+                .events
+                .iter()
+                .filter_map(|event| match *event {
+                    Event::Solve { optimize, hard } => Some((optimize, hard)),
+                    Event::Build { .. } => None,
+                })
+                .collect();
+            assert!(solves.len() >= 2, "{mode:?}: {:?}", on.events);
+            assert_eq!(
+                on.events.len(),
+                2 * solves.len(),
+                "{mode:?}: one build per solve: {:?}",
+                on.events
+            );
+            for pair in on.events.chunks(2) {
+                let [Event::Build { optimize: built }, Event::Solve { optimize, hard }] = *pair else {
+                    panic!("{mode:?}: a solve not entered right after its own build: {:?}", on.events);
+                };
+                assert_eq!(
+                    (built, hard),
+                    (optimize, optimize),
+                    "{mode:?}: the solve's solver holds the Optimize's assertions at its start: {:?}",
+                    on.events
+                );
+            }
+            assert!(
+                solves.last().unwrap().0 > solves[0].0,
+                "{mode:?}: a later solve's build copies the repair's commits: {:?}",
+                on.events
+            );
+            assert!(on.model.is_some(), "{mode:?}: the fixture accepts");
+            assert!(
+                on.dropped.len() == solves.len() && on.dropped.iter().all(|dropped| !dropped.is_empty()),
+                "{mode:?}: every solve retracts a selector: {:?}",
+                on.dropped
+            );
+            // Here the switch changes no question: the same drop / restore decisions with the same
+            // cores, and the same model. z3 lists a core in its own order, which differs here
+            // between the two solvers ([1, 0] beside [0, 1]); the drop picks by sort key, so the
+            // order is normalized before the comparison. On a large input a new solver may return
+            // another valid core and the path may diverge (allowed, 321 §6 (4)).
+            let normalized = |trace: &crate::analyses::borrow_ownership::solver::SelectorTrace| {
+                let mut trace = trace.clone();
+                for epoch in &mut trace.epochs {
+                    for event in &mut epoch.events {
+                        event.core_selectors.sort_unstable();
+                    }
+                }
+                trace
+            };
+            assert_eq!(normalized(&on.trace), normalized(&off.trace), "{mode:?}");
+            assert_eq!(on.model, off.model, "{mode:?}");
+        }
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// R1475-2 (4), the control: with the switch off, one hard solver per repair, synchronized at each
+/// later solve (it appends the repair's commits), and the fixture's model and dropped selectors
+/// pinned.
+#[test]
+fn r1475_2_switch_off_builds_one_hard_solver_per_repair_and_keeps_the_model() {
+    use crate::analyses::borrow_ownership::{
+        borrow_verify::RepairMode, solver::hard_solver_trace::Event,
+    };
+    let code = format!("{R1468_CASCADE}\n{R1475_TIE}");
+    ::utils::compilation::run_compiler_on_str(&code, |tcx| {
+        for mode in [RepairMode::Plain, RepairMode::Guarded] {
+            let off = r1475_run(tcx, mode, false);
+            let builds = off
+                .events
+                .iter()
+                .filter(|event| matches!(event, Event::Build { .. }))
+                .count();
+            let solves: Vec<(usize, usize)> = off
+                .events
+                .iter()
+                .filter_map(|event| match *event {
+                    Event::Solve { optimize, hard } => Some((optimize, hard)),
+                    Event::Build { .. } => None,
+                })
+                .collect();
+            assert_eq!(
+                builds, 1,
+                "{mode:?}: one build per repair: {:?}",
+                off.events
+            );
+            assert!(solves.len() >= 2, "{mode:?}: {:?}", off.events);
+            assert!(
+                solves.iter().any(|(optimize, hard)| hard < optimize),
+                "{mode:?}: a later solve synchronizes the repair's commits: {:?}",
+                off.events
+            );
+            // As printed with the switch off: f's `b` slot is `Ref` under the guarded repair only,
+            // the tie's slots `Owning`, and each of the three solves drops the sink (selector 1).
+            let ref_f1 = if mode == RepairMode::Guarded {
+                "Ref"
+            } else {
+                "Raw"
+            };
+            let expected: Vec<String> = [
+                "f#0=Raw".to_owned(),
+                format!("f#1={ref_f1}"),
+                "f#2=Raw".to_owned(),
+                "f#3=Raw".to_owned(),
+                "id#0=Ref".to_owned(),
+                "id#1=Ref".to_owned(),
+                "pass#0=Owning".to_owned(),
+                "pass#1=Owning".to_owned(),
+                "sink_side#0=Owning".to_owned(),
+                "sink_side#1=Owning".to_owned(),
+                "sink_side#2=Owning".to_owned(),
+                "sink_side#3=Owning".to_owned(),
+                "sink_side#4=Owning".to_owned(),
+                "source_side#0=Owning".to_owned(),
+                "source_side#1=Owning".to_owned(),
+                "source_side#2=Owning".to_owned(),
+            ]
+            .into();
+            assert_eq!(off.model, Some(expected), "{mode:?}");
+            assert_eq!(off.dropped, vec![vec![1usize]; 3], "{mode:?}");
+            assert_eq!(off.rounds, 3, "{mode:?}");
+        }
+    })
+    .unwrap_or_else(|error| error.raise());
+}
+
+/// R1475-2 (I1) (I3) and (4)'s build lines, read where they are written: stderr under
+/// `CRAT_BO_PHASE_LOG=on`, in a child process running this test alone. Part 1, the plain repair on
+/// the contradiction of `r1468_2_i`: exactly one `verify:decline end` line, the plain repair's
+/// (`repair=plain`, from `decline_detail`: a hard Unsat in the drop loop); one `z3:query stats`
+/// line per scoped hard check, `n` = 1, 2, ... in order, as many as the decline counts, each with
+/// the push / check / pop walls and the eight counters; and round 0's `verify:solve end` summary
+/// times `hard-push` and `hard-pop` once per check. Part 2, the plain repair on `R1468_CASCADE`
+/// with the switch on: one `verify:hard_solver end` line per solve (`round=0`, `1`, `2`), a
+/// `start` and a `drop` line before each later build. `ad45d2c71` writes none of these lines (the
+/// test was not run there: it needs this change's hook).
+#[test]
+fn r1475_2_the_phase_log_lines_of_i1_i3_and_the_builds() {
+    use crate::analyses::borrow_ownership::{
+        borrow_verify::RepairMode, construction::verify_bo_construction_counting,
+        execution_guard::fresh_hard_solver_hook, slots::SlotId,
+    };
+    const CHILD: &str = "CRAT_R1475_2_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert!(crate::phase_log::on(), "the child runs with the log on");
+        let verify = |code: &str, contradiction: bool, fresh: bool| {
+            ::utils::compilation::run_compiler_on_str(code, |tcx| {
+                let program = r1468_program(tcx);
+                let slots = CrateSlots::build(&program);
+                let origins = compute_origins(&program);
+                let facts = MutFacts::from_program(&program);
+                let solver = KindSolver::new(&slots);
+                let construction = construct_bo_into(
+                    &program,
+                    &slots,
+                    &origins,
+                    &facts,
+                    &solver,
+                    CopyLendMode::Baseline,
+                )
+                .expect("production construction");
+                if contradiction {
+                    let victim = slots
+                        .fn_local_slots
+                        .iter()
+                        .find(|(_, universe)| universe.len() > 0)
+                        .map(|(did, _)| SlotRef::Local(*did, SlotId::from_usize(0)))
+                        .expect("a local slot");
+                    solver.assume(victim, SlotKind::Ref);
+                    solver.add_borrow_exclusion(Some(victim), &[]);
+                }
+                let (model, _) = fresh_hard_solver_hook::with(fresh, || {
+                    RepairMode::with_override(RepairMode::Plain, || {
+                        crate::phase_log::with_sub_marks(|| {
+                            verify_bo_construction_counting(
+                                &program,
+                                &slots,
+                                &origins,
+                                &solver,
+                                &construction,
+                                &facts,
+                            )
+                        })
+                    })
+                });
+                assert_eq!(model.is_none(), contradiction);
+            })
+            .unwrap_or_else(|error| error.raise());
+        };
+        eprintln!("R1475_2_PART 1");
+        verify(CODE, true, false);
+        eprintln!("R1475_2_PART 2");
+        verify(R1468_CASCADE, false, true);
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args([
+            "analyses::borrow_ownership::retirement::tests_rounds::r1475_2_the_phase_log_lines_of_i1_i3_and_the_builds",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .env("CRAT_BO_PHASE_LOG", "on")
+        .output()
+        .expect("child test");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "child failed:\n{}\n{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let (part1, part2) = stderr
+        .split_once("R1475_2_PART 2")
+        .unwrap_or_else(|| panic!("no part 2:\n{stderr}"));
+    let part1 = part1
+        .split_once("R1475_2_PART 1")
+        .unwrap_or_else(|| panic!("no part 1:\n{stderr}"))
+        .1;
+    let lines = |text: &'static str, part: &str| -> Vec<String> {
+        part.lines()
+            .filter(|line| line.starts_with(&format!("[bo-phase] {text} ")))
+            .map(str::to_owned)
+            .collect()
+    };
+    let field = |line: &str, key: &str| -> String {
+        line.split(' ')
+            .find_map(|token| token.strip_prefix(key)?.strip_prefix('='))
+            .unwrap_or_else(|| panic!("no {key} in {line}"))
+            .to_owned()
+    };
+    // (I3)
+    let declines = lines("verify:decline end", part1);
+    assert_eq!(declines.len(), 1, "{declines:?}");
+    let decline = &declines[0];
+    assert!(
+        decline.contains(" repair=plain round=0 failure=hard-unsat "),
+        "{decline}"
+    );
+    assert_eq!(field(decline, "phase"), "drop-loop", "{decline}");
+    let checks: usize = field(decline, "hard_checks").parse().unwrap();
+    // (I1)
+    let stats = lines("z3:query stats", part1);
+    assert_eq!(stats.len(), checks, "{stats:?}\n{decline}");
+    for (index, line) in stats.iter().enumerate() {
+        assert_eq!(field(line, "stage"), "hard-check", "{line}");
+        assert_eq!(field(line, "n"), (index + 1).to_string(), "{line}");
+        assert_eq!(field(line, "result"), "Unsat", "{line}");
+        for key in ["push", "check", "pop"] {
+            let wall = field(line, key);
+            assert!(
+                wall.ends_with('s') && wall.trim_end_matches('s').parse::<f64>().is_ok(),
+                "{line}"
+            );
+        }
+        for key in ["conflicts", "decisions", "propagations", "restarts"] {
+            let own: u64 = field(line, key).parse().unwrap();
+            let life: u64 = field(line, &format!("life_{key}")).parse().unwrap();
+            assert!(own <= life, "{line}");
+        }
+    }
+    let solve_end = lines("verify:solve end", part1);
+    assert_eq!(solve_end.len(), 1, "{solve_end:?}");
+    for stage in ["hard-check", "hard-push", "hard-pop"] {
+        assert!(
+            solve_end[0].contains(&format!("{stage}={checks}/")),
+            "{stage}: {}",
+            solve_end[0]
+        );
+    }
+    // (4)'s build lines
+    let builds = lines("verify:hard_solver end", part2);
+    let rounds: Vec<String> = builds.iter().map(|line| field(line, "round")).collect();
+    assert_eq!(rounds, ["0", "1", "2"], "{builds:?}");
+    assert_eq!(lines("verify:hard_solver start", part2).len(), 2);
+    let drops = lines("verify:hard_solver drop", part2);
+    assert_eq!(drops.len(), 2, "{drops:?}");
+    assert!(
+        drops.iter().all(|line| line.contains(" uordblks=")),
+        "{drops:?}"
+    );
+    assert!(
+        lines("verify:hard_solver end", part1)
+            .iter()
+            .all(|line| !line.contains("round="))
+    );
+}

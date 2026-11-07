@@ -26,6 +26,35 @@ use super::{
     ssa::constraint::{Database, Gen, Var},
 };
 
+/// R1475-2 (I1): the search counters a scoped hard check's line prints.
+const SEARCH_COUNTERS: [&str; 4] = ["conflicts", "decisions", "propagations", "restarts"];
+
+/// R1475-2 (I1), log only: z3's [`SEARCH_COUNTERS`] for `solver`, as z3 reports them --
+/// accumulated over the solver's life, not per check (`statistics_tests`); a counter z3 does not
+/// list reads `0`.
+fn search_counters(solver: &Solver) -> [u32; 4] {
+    let statistics = solver.get_statistics();
+    SEARCH_COUNTERS.map(|key| match statistics.value(key) {
+        Some(z3::StatisticsValue::UInt(value)) => value,
+        Some(z3::StatisticsValue::Double(value)) => value as u32,
+        None => 0,
+    })
+}
+
+/// R1475-2 (I1), log only: one check's own counters (`after - before`; z3's counters are 32-bit,
+/// read modulo 2^32) and the solver's life totals after it (`life_*`).
+fn search_statistics(before: [u32; 4], after: [u32; 4]) -> String {
+    let own = SEARCH_COUNTERS
+        .iter()
+        .zip(before.iter().zip(after.iter()))
+        .map(|(key, (before, after))| format!("{key}={}", after.wrapping_sub(*before)));
+    let life = SEARCH_COUNTERS
+        .iter()
+        .zip(after.iter())
+        .map(|(key, after)| format!("life_{key}={after}"));
+    own.chain(life).collect::<Vec<_>>().join(" ")
+}
+
 /// Parameters shared by every production backend and subsequent setter.
 fn fixed_query_params() -> z3::Params {
     let mut params = z3::Params::new();
@@ -481,6 +510,43 @@ pub(crate) struct SelectorTraceEvent {
     /// leave it empty.
     pub core_labels: Vec<String>,
     pub outcome: SelectorTraceOutcome,
+}
+
+/// R1475-2 (4), test only: each hard-solver build and each solve's entry, in order.
+#[cfg(test)]
+pub(crate) mod hard_solver_trace {
+    /// One event: a build (the Optimize's hard-assertion count it copied), or a solve's entry (the
+    /// Optimize's count then, and the hard solver's count before its synchronization).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Event {
+        Build { optimize: usize },
+        Solve { optimize: usize, hard: usize },
+    }
+    thread_local! {
+        static TRACE: std::cell::RefCell<Option<Vec<Event>>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn record(event: Event) {
+        TRACE.with(|trace| {
+            if let Some(trace) = trace.borrow_mut().as_mut() {
+                trace.push(event);
+            }
+        });
+    }
+    /// Run `f` recording the events.
+    pub(crate) fn with<T>(f: impl FnOnce() -> T) -> (T, Vec<Event>) {
+        struct Reset(Option<Vec<Event>>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TRACE.with(|trace| *trace.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset = Reset(TRACE.with(|trace| trace.replace(Some(Vec::new()))));
+        let value = f();
+        let events = TRACE
+            .with(|trace| trace.borrow_mut().take())
+            .unwrap_or_default();
+        (value, events)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2904,6 +2970,10 @@ impl KindSolver {
         for assertion in &assertions {
             solver.assert(assertion);
         }
+        #[cfg(test)]
+        hard_solver_trace::record(hard_solver_trace::Event::Build {
+            optimize: assertions.len(),
+        });
         HardLoopSolver {
             solver,
             synced_assertions: Cell::new(assertions.len()),
@@ -2960,11 +3030,24 @@ impl KindSolver {
         // set is activated with ordinary hard assertions rather than an
         // assumption vector. On UNSAT only, repeat under assumptions so the
         // core retains its typed mandatory/endpoint-retraction identities.
-        hard.solver.push();
-        for literal in &bundle {
-            hard.solver.assert(literal);
-        }
+        // R1475-2 (I1), log only (under `CRAT_BO_PHASE_LOG=on`): the push with the asserts and the
+        // pop timed as their own stages, and after the check z3's search counters, one line per
+        // scoped check. Off, no clock is read and no statistics object is taken.
+        let logged = crate::phase_log::sub_marks_on();
+        let started_push = logged.then(Instant::now);
+        crate::phase_log::z3_query("hard-push", || {
+            hard.solver.push();
+            for literal in &bundle {
+                hard.solver.assert(literal);
+            }
+        });
+        let pushed = started_push.map(|started| started.elapsed());
+        let before = logged.then(|| search_counters(&hard.solver));
+        let started_check = logged.then(Instant::now);
         let initial = crate::phase_log::z3_query("hard-check", || hard.solver.check());
+        let checked = started_check.map(|started| started.elapsed());
+        let statistics =
+            before.map(|before| search_statistics(before, search_counters(&hard.solver)));
         let query_reason = (initial == SatResult::Unknown)
             .then(|| hard.solver.get_reason_unknown())
             .flatten();
@@ -2978,7 +3061,22 @@ impl KindSolver {
         if initial == SatResult::Unknown {
             self.last_unknown_query.set("hard-check");
         }
-        hard.solver.pop(1);
+        let started_pop = logged.then(Instant::now);
+        crate::phase_log::z3_query("hard-pop", || hard.solver.pop(1));
+        if let (Some(started_pop), Some(pushed), Some(checked), Some(statistics)) =
+            (started_pop, pushed, checked, statistics)
+        {
+            let popped = started_pop.elapsed();
+            crate::phase_log::sub("z3:query", "stats", || {
+                format!(
+                    "stage=hard-check n={} result={initial:?} push={:.2}s check={:.2}s pop={:.2}s {statistics}",
+                    crate::phase_log::z3_query_count("hard-check"),
+                    pushed.as_secs_f64(),
+                    checked.as_secs_f64(),
+                    popped.as_secs_f64()
+                )
+            });
+        }
         let outcome = if initial == SatResult::Unsat {
             self.lazy_tracked_recheck_count
                 .set(self.lazy_tracked_recheck_count.get().saturating_add(1));
@@ -3142,6 +3240,11 @@ impl KindSolver {
             !self.is_diagnostic_tracked(),
             "diagnostic-tracked KindSolver must not enter hard selector relaxation"
         );
+        #[cfg(test)]
+        hard_solver_trace::record(hard_solver_trace::Event::Solve {
+            optimize: self.hard_assertion_count(),
+            hard: hard.assertion_count(),
+        });
         hard.sync_from(self);
         let expected_hard = self.mandatory_tracks().len() + selectors.all().len();
         assert_eq!(
@@ -4039,6 +4142,10 @@ mod unknown_tests;
 #[cfg(test)]
 #[path = "solver_incumbent_tests.rs"]
 mod incumbent_tests;
+
+#[cfg(test)]
+#[path = "solver_statistics_tests.rs"]
+mod statistics_tests;
 
 fn is_true(model: &Model, b: &Bool) -> bool {
     model

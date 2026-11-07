@@ -145,6 +145,11 @@ pub(crate) fn z3_query<T>(stage: &'static str, f: impl FnOnce() -> T) -> T {
     result
 }
 
+/// R1475-2 (I1): how many queries of `stage` [`z3_query`] has timed so far (its `n`; log only).
+pub(crate) fn z3_query_count(stage: &'static str) -> usize {
+    Z3_QUERIES.with(|queries| queries.borrow().get(stage).map_or(0, |entry| entry.0))
+}
+
 /// The z3 queries timed so far, per stage: `stage=count/wall` (log only).
 pub(crate) fn z3_summary() -> String {
     Z3_QUERIES.with(|queries| {

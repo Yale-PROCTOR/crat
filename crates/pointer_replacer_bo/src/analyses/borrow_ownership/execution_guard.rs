@@ -14,6 +14,47 @@ pub(crate) fn query_timeout_ms() -> u32 {
     *TIMEOUT.get_or_init(|| timeout_from(std::env::var("CRAT_BO_QUERY_TIMEOUT_MS").ok().as_deref()))
 }
 
+/// R1475-2 (4): whether each solve's hard checks run on a hard solver built at that solve's start
+/// from the Optimize's assertions as they stand, the previous solve's solver dropped first --
+/// `CRAT_BO_FRESH_HARD_SOLVER=on` (a measurement switch, for a run the user's word names only;
+/// never in a gate, never on the 17 or the 376, and not part of the model cache's key). Unset, or
+/// any other value: one hard solver per repair, synchronized at each solve. Read once.
+pub(crate) fn fresh_hard_solver() -> bool {
+    #[cfg(test)]
+    if let Some(on) = fresh_hard_solver_hook::get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| fresh_from(std::env::var("CRAT_BO_FRESH_HARD_SOLVER").ok().as_deref()))
+}
+
+/// [`fresh_hard_solver`]'s reading of the variable's value: `on` exactly, else off.
+fn fresh_from(value: Option<&str>) -> bool {
+    value == Some("on")
+}
+
+/// The test hook for [`fresh_hard_solver`] (tests never set the process environment).
+#[cfg(test)]
+pub(crate) mod fresh_hard_solver_hook {
+    thread_local! {
+        static SET: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    }
+    pub(super) fn get() -> Option<bool> {
+        SET.with(std::cell::Cell::get)
+    }
+    /// Run `f` with the switch read as `on`.
+    pub(crate) fn with<T>(on: bool, f: impl FnOnce() -> T) -> T {
+        struct Reset(Option<bool>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SET.with(|set| set.set(self.0));
+            }
+        }
+        let _reset = Reset(SET.with(|set| set.replace(Some(on))));
+        f()
+    }
+}
+
 /// Relay main/388 O2 (R1382-1 / R1383-1): whether a query's own wall reached the per-query budget in
 /// force -- at least 0.99 of it, for z3's timer granularity. Keyed on the wall, never on z3's reason
 /// string, which read "no reason given" at every measured timeout (main 281 / 282).
