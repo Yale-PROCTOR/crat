@@ -626,10 +626,15 @@ fn r1490_2_w1b_two_processes_equal_one_where_the_precise_replay_changes_the_mode
         "{}",
         a.overlap_receipt
     );
-    assert!(a.model_sha256.is_some(), "{a:?}");
+    // Like with like: the checkpoint's digest and the overlap receipt's `selected_model_sha256` are
+    // both `construction::model_digest` (the solve receipt's `model_sha256` is another function).
+    let selected = a
+        .overlap_receipt
+        .lines()
+        .find_map(|line| line.strip_prefix("selected_model_sha256="))
+        .unwrap_or_else(|| panic!("no selected_model_sha256 in {}", a.overlap_receipt));
     assert_ne!(
-        Some(&stored.model_sha256),
-        a.model_sha256.as_ref(),
+        stored.model_sha256, selected,
         "the precise replay must change the model, or the witness is vacuous"
     );
 }
