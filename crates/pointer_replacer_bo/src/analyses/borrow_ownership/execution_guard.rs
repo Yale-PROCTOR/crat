@@ -55,6 +55,64 @@ pub(crate) mod fresh_hard_solver_hook {
     }
 }
 
+/// R1490-2 (main 326 §5): the two-process checkpoint mode's paths, `(out, in)` --
+/// `CRAT_BO_CHECKPOINT_OUT=<path>` (process 1 writes the baseline checkpoint and ends `checkpointed`)
+/// and `CRAT_BO_CHECKPOINT_IN=<path>` (process 2 resumes from it at the precise stage). Measurement
+/// switches, for a run the user's word names only; never in a gate, never on the 17 or the 376, off
+/// by default, and not part of the model cache's key. An empty value is unset. Read once.
+pub(crate) fn checkpoint_paths() -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    #[cfg(test)]
+    if let Some(paths) = checkpoint_hook::get() {
+        return paths;
+    }
+    static PATHS: std::sync::OnceLock<(Option<std::path::PathBuf>, Option<std::path::PathBuf>)> =
+        std::sync::OnceLock::new();
+    PATHS
+        .get_or_init(|| {
+            checkpoint_paths_from(
+                std::env::var_os("CRAT_BO_CHECKPOINT_OUT"),
+                std::env::var_os("CRAT_BO_CHECKPOINT_IN"),
+            )
+        })
+        .clone()
+}
+
+/// [`checkpoint_paths`]'s reading of the two values: a path each, an empty value unset.
+fn checkpoint_paths_from(
+    out: Option<std::ffi::OsString>,
+    input: Option<std::ffi::OsString>,
+) -> (Option<std::path::PathBuf>, Option<std::path::PathBuf>) {
+    let read = |value: Option<std::ffi::OsString>| {
+        value
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+    };
+    (read(out), read(input))
+}
+
+/// The test hook for [`checkpoint_paths`] (tests never set the process environment in-process).
+#[cfg(test)]
+pub(crate) mod checkpoint_hook {
+    type Paths = (Option<std::path::PathBuf>, Option<std::path::PathBuf>);
+    thread_local! {
+        static SET: std::cell::RefCell<Option<Paths>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn get() -> Option<Paths> {
+        SET.with(|set| set.borrow().clone())
+    }
+    /// Run `f` with the switches read as `paths`.
+    pub(crate) fn with<T>(paths: Paths, f: impl FnOnce() -> T) -> T {
+        struct Reset(Option<Paths>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SET.with(|set| *set.borrow_mut() = self.0.take());
+            }
+        }
+        let _reset = Reset(SET.with(|set| set.borrow_mut().replace(paths)));
+        f()
+    }
+}
+
 /// Relay main/388 O2 (R1382-1 / R1383-1): whether a query's own wall reached the per-query budget in
 /// force -- at least 0.99 of it, for z3's timer granularity. Keyed on the wall, never on z3's reason
 /// string, which read "no reason given" at every measured timeout (main 281 / 282).

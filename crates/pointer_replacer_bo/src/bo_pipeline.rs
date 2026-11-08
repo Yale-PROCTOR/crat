@@ -176,13 +176,24 @@ pub(crate) fn rewrite_bo_with_artifacts(
         // Relay main/375 §3: the analysis budget ended the solve. The program is degraded with
         // the typed reason and the tree is left as the input; the pass succeeds, so the chain's
         // later arms run.
-        Err(error) => match crate::analysis_budget::reason_in(&error) {
-            Some(reason) => {
-                eprintln!("pointer: degraded: {reason}");
-                return budget_receipt(input, reason, analysis_fingerprint);
+        Err(error) => {
+            // R1490-2 (main 326 §1): process 1 of the two-process checkpoint mode published its
+            // checkpoint (recorded by the solve after the write, not read from the error's text).
+            // A typed outcome, not a decline: the tree is left as the input.
+            if let Some(outcome) =
+                crate::analyses::borrow_ownership::baseline_checkpoint::take_written()
+            {
+                eprintln!("pointer: {outcome}");
+                return checkpoint_receipt(input, &outcome, analysis_fingerprint);
             }
-            None => return Err(error),
-        },
+            match crate::analysis_budget::reason_in(&error) {
+                Some(reason) => {
+                    eprintln!("pointer: degraded: {reason}");
+                    return budget_receipt(input, reason, analysis_fingerprint);
+                }
+                None => return Err(error),
+            }
+        }
     };
     crate::phase_log::mark("census", "end", "");
     let receipt = persist_in_place(input, &capture, analysis_fingerprint)?;
@@ -577,6 +588,21 @@ fn budget_receipt(
     })
 }
 
+/// R1490-2: process 1's receipt -- the budget's unmodified-input receipt with its own outcome.
+fn checkpoint_receipt(
+    input: &Path,
+    reason: &str,
+    analysis_fingerprint: String,
+) -> Result<BoReceipt, String> {
+    let receipt = budget_receipt(input, reason, analysis_fingerprint)?;
+    Ok(BoReceipt {
+        outcome: "checkpointed",
+        status: "baseline-checkpoint",
+        solve: format!("BaselineCheckpoint({reason:?})"),
+        ..receipt
+    })
+}
+
 fn persist_in_place(
     input: &Path,
     capture: &E1Capture,
@@ -809,6 +835,32 @@ pub unsafe fn caller() -> i32 {
             receipt
                 .summary()
                 .contains("solve=AnalysisBudget(\"analysis budget (0 s")
+        );
+        assert_eq!(std::fs::read(root.join("lib.rs")).unwrap(), before);
+    }
+
+    /// R1490-2 (W2): process 1's published outcome is a `checkpointed` receipt with the input's
+    /// tree; the record is taken once.
+    #[test]
+    fn r1490_2_a_checkpoint_outcome_is_a_checkpointed_receipt_with_the_input_tree() {
+        use crate::analyses::borrow_ownership::baseline_checkpoint;
+        let text = baseline_checkpoint::checkpointed(std::path::Path::new("/x/b.json"), 7, 99);
+        assert_eq!(text, "checkpointed (/x/b.json, 7 slots, 99 bytes)");
+        let reason = text.as_str();
+        let root = fixture("checkpoint");
+        let before = std::fs::read(root.join("lib.rs")).unwrap();
+        let receipt =
+            super::checkpoint_receipt(&root.join("lib.rs"), reason, "fp".to_owned()).unwrap();
+        assert_eq!(
+            (receipt.outcome, receipt.status),
+            ("checkpointed", "baseline-checkpoint")
+        );
+        assert_eq!(receipt.input_tree_sha256, receipt.emitted_tree_sha256);
+        assert_eq!(receipt.files_changed, 0);
+        assert!(
+            receipt
+                .summary()
+                .contains("solve=BaselineCheckpoint(\"checkpointed (/x/b.json")
         );
         assert_eq!(std::fs::read(root.join("lib.rs")).unwrap(), before);
     }

@@ -7641,6 +7641,9 @@ fn decide_table_perturbed_config<'tcx>(
     // they are two tiers of the same question, so they must not disagree about
     // which program this is.
     let fp = model_cache::fingerprint(&program, a5_mode, attestation);
+    // R1490-2 (main 326 §5): the checkpoint mode is refused with a model cache configured or outside
+    // `PreciseReplay` before either tier is read, so a cache hit never skips its solve silently.
+    crate::analyses::borrow_ownership::baseline_checkpoint::mode(a5_mode)?;
     // The key does not name the A5 mode (S2 D5): only the frame's mode is cached.
     let cacheable = a5_mode == OverlapMode::PreciseReplay
         && attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
@@ -7719,6 +7722,8 @@ fn decide_table_perturbed_config<'tcx>(
     let origin_derivation_wall_s = origin_started.elapsed().as_secs_f64();
     crate::phase_log::mark("decide:origins", "end", "");
     crate::phase_log::mark("decide:solve", "start", "");
+    // R1490-2: no stale checkpoint outcome from an earlier solve on this thread.
+    let _ = crate::analyses::borrow_ownership::baseline_checkpoint::take_outcome();
     // Relay main/388 O2 (R1383-1 R2): a solve any of whose rounds took an optimize incumbent writes
     // its final model to neither the memo nor the on-disk cache.
     let ((verified, export), cacheable) =
@@ -7739,6 +7744,13 @@ fn decide_table_perturbed_config<'tcx>(
     // inside the solve), so it is released here, before the store and the decision.
     drop(export);
     let Some(verified) = verified else {
+        // R1490-2 (main 326 §1): the checkpoint mode's typed outcome -- process 1's `checkpointed`,
+        // or a refused checkpoint.
+        if let Some(outcome) =
+            crate::analyses::borrow_ownership::baseline_checkpoint::take_outcome()
+        {
+            return Err(outcome);
+        }
         // Relay main/375 §3: a solve the budget ended is that, typed.
         if let Some(exceeded) = crate::analysis_budget::exceeded() {
             return Err(format!("degraded: {}", exceeded.reason()));

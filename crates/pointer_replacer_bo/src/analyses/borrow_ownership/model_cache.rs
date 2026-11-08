@@ -271,7 +271,7 @@ pub(crate) fn prepare_error() -> Option<String> {
     PREPARE_ERROR.with(|error| error.borrow().clone())
 }
 
-fn universe(tcx: TyCtxt<'_>, slots: &CrateSlots) -> Option<BTreeMap<String, SlotRef>> {
+pub(crate) fn universe(tcx: TyCtxt<'_>, slots: &CrateSlots) -> Option<BTreeMap<String, SlotRef>> {
     let mut keys = BTreeMap::new();
     for (&function, locals) in &slots.fn_local_slots {
         for index in 0..locals.len() {
@@ -289,7 +289,7 @@ fn universe(tcx: TyCtxt<'_>, slots: &CrateSlots) -> Option<BTreeMap<String, Slot
     }
     Some(keys)
 }
-fn model_map(
+pub(crate) fn model_map(
     tcx: TyCtxt<'_>,
     slots: &CrateSlots,
     model: &FxHashMap<SlotRef, SlotKind>,
@@ -622,7 +622,7 @@ fn kind_label(kind: SlotKind) -> &'static str {
     }
 }
 
-fn parse_kind(kind: &str) -> Option<SlotKind> {
+pub(crate) fn parse_kind(kind: &str) -> Option<SlotKind> {
     match kind {
         "ref" => Some(SlotKind::Ref),
         "raw" => Some(SlotKind::Raw),

@@ -195,11 +195,16 @@ pub(crate) enum OverlapPreledgerDeclineReason {
     PreciseVerification,
     CoarseConstruction,
     CoarseVerification,
+    /// R1490-2: process 1 of the two-process checkpoint mode wrote its checkpoint (a typed
+    /// outcome, not a decline).
+    Checkpointed,
+    /// R1490-2: the checkpoint mode's switches or a checkpoint were refused.
+    CheckpointRefused,
 }
 
 impl OverlapPreledgerDeclineReason {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 11] = [
         Self::BaselineConstruction,
         Self::BaselineVerification,
         Self::OverlapPlanProduction,
@@ -209,6 +214,8 @@ impl OverlapPreledgerDeclineReason {
         Self::PreciseVerification,
         Self::CoarseConstruction,
         Self::CoarseVerification,
+        Self::Checkpointed,
+        Self::CheckpointRefused,
     ];
 
     #[cfg(test)]
@@ -223,6 +230,8 @@ impl OverlapPreledgerDeclineReason {
             Self::PreciseVerification => "precise-verification",
             Self::CoarseConstruction => "coarse-construction",
             Self::CoarseVerification => "coarse-verification",
+            Self::Checkpointed => "baseline-checkpointed",
+            Self::CheckpointRefused => "checkpoint-refused",
         }
     }
 }
@@ -1665,35 +1674,109 @@ fn solve_bo_overlap_config_with_source_events(
     super::export::record_multi_views(multi_views);
     super::copy_relax::install(eligible);
 
-    let baseline_solver = KindSolver::new(slots);
-    crate::phase_log::mark("solve:baseline_construction", "start", "");
-    let baseline_construction =
-        construct_bo_overlap_reference(program, slots, origins, mut_facts, &baseline_solver)
+    // R1490-2 (main 326 §1): the two-process checkpoint mode, `PreciseReplay` only. A refusal ends
+    // the solve before anything is solved.
+    let refuse = |refusal: String| {
+        super::baseline_checkpoint::record_outcome(refusal.clone());
+        OverlapPreledgerDecline::with_detail(
+            OverlapPreledgerDeclineReason::CheckpointRefused,
+            refusal,
+        )
+    };
+    let checkpoint = super::baseline_checkpoint::mode(mode).map_err(refuse)?;
+    // The identity the solve starts from, before the baseline stage: process 1 publishes it (after
+    // checking it again at the write), process 2 compares the checkpoint's with it.
+    let start_identity = match &checkpoint {
+        super::baseline_checkpoint::Mode::Off => None,
+        _ => Some(
+            super::baseline_checkpoint::identity(program, slots, mode, attestation).map_err(
+                |error| {
+                    refuse(format!(
+                        "{}identity (computable != {error})",
+                        super::baseline_checkpoint::REFUSED_HEAD
+                    ))
+                },
+            )?,
+        ),
+    };
+    // The baseline stage's solver and construction live to the end of this function, as without
+    // the switches; process 2 builds neither.
+    let baseline_solver;
+    let baseline_construction;
+    let (baseline_model, baseline_round_stats, baseline_nullability, baseline_a14) =
+        if let super::baseline_checkpoint::Mode::Read(path) = &checkpoint {
+            let started = std::time::Instant::now();
+            let here = start_identity
+                .as_ref()
+                .expect("the identity is computed whenever the mode is on");
+            let loaded = super::baseline_checkpoint::read(path, program, slots, here, model_digest)
+                .map_err(refuse)?;
+            super::baseline_checkpoint::seed_incumbent(loaded.incumbent);
+            crate::phase_log::mark(
+                "solve:checkpoint",
+                "end",
+                &format!(
+                    "read path={} slots={} baseline_rounds={} incumbent={} wall={:.1}s",
+                    path.display(),
+                    loaded.slots,
+                    loaded.stats.rounds,
+                    loaded.incumbent,
+                    started.elapsed().as_secs_f64()
+                ),
+            );
+            // The two baseline artifacts are read only by the Baseline mode and by the ABI guard's
+            // non-refined return, and `refined` holds under `PreciseReplay`: neither is reached.
+            debug_assert!(refined && mode == OverlapMode::PreciseReplay);
+            (
+                loaded.model,
+                loaded.stats,
+                NullabilityArtifacts {
+                    artifact: String::new(),
+                    slots: 0,
+                    fields: 0,
+                },
+                OpacityArtifacts {
+                    artifact: String::new(),
+                    opaque_stores: 0,
+                    unresolved_unresolvable: 0,
+                    nullable_store_fields: 0,
+                },
+            )
+        } else {
+            baseline_solver = KindSolver::new(slots);
+            crate::phase_log::mark("solve:baseline_construction", "start", "");
+            baseline_construction = construct_bo_overlap_reference(
+                program,
+                slots,
+                origins,
+                mut_facts,
+                &baseline_solver,
+            )
             .map_err(|error| {
                 OverlapPreledgerDecline::from_error(
                     OverlapPreledgerDeclineReason::BaselineConstruction,
                     error,
                 )
             })?;
-    crate::phase_log::mark("solve:baseline_construction", "end", "");
-    crate::phase_log::mark("solve:baseline_verify", "start", "");
-    // Relay main/388 walls 3+4 (R1363-1): the verify's `verify:<sub>` / `z3:<sub>` marks, here only.
-    let (baseline_model, baseline_round_stats) = crate::phase_log::with_sub_marks(|| {
-        verify_bo_construction_counting(
-            program,
-            slots,
-            origins,
-            &baseline_solver,
-            &baseline_construction,
-            mut_facts,
-        )
-    });
-    crate::phase_log::mark(
-        "solve:baseline_verify",
-        "end",
-        &format!("rounds={}", baseline_round_stats.rounds),
-    );
-    let baseline_model = baseline_model.ok_or_else(|| {
+            crate::phase_log::mark("solve:baseline_construction", "end", "");
+            crate::phase_log::mark("solve:baseline_verify", "start", "");
+            // Relay main/388 walls 3+4 (R1363-1): the verify's `verify:<sub>` / `z3:<sub>` marks, here only.
+            let (baseline_model, baseline_round_stats) = crate::phase_log::with_sub_marks(|| {
+                verify_bo_construction_counting(
+                    program,
+                    slots,
+                    origins,
+                    &baseline_solver,
+                    &baseline_construction,
+                    mut_facts,
+                )
+            });
+            crate::phase_log::mark(
+                "solve:baseline_verify",
+                "end",
+                &format!("rounds={}", baseline_round_stats.rounds),
+            );
+            let baseline_model = baseline_model.ok_or_else(|| {
         let first = baseline_solver
             .round_model_failure()
             .map(|failure| failure.summary())
@@ -1723,8 +1806,56 @@ fn solve_bo_overlap_config_with_source_events(
             ),
         )
     })?;
-    let baseline_nullability = nullability_artifacts(&baseline_construction);
-    let baseline_a14 = opacity_artifacts(&baseline_construction);
+            if let super::baseline_checkpoint::Mode::Write(path) = &checkpoint {
+                let started = std::time::Instant::now();
+                let bytes = super::baseline_checkpoint::write(
+                    path,
+                    program,
+                    slots,
+                    mode,
+                    attestation,
+                    start_identity
+                        .as_ref()
+                        .expect("the identity is computed whenever the mode is on"),
+                    &baseline_model,
+                    model_digest(&baseline_model),
+                    &baseline_round_stats,
+                )
+                .map_err(|error| {
+                    refuse(format!(
+                        "{}write ({error})",
+                        super::baseline_checkpoint::REFUSED_HEAD
+                    ))
+                })?;
+                crate::phase_log::mark(
+                    "solve:checkpoint",
+                    "end",
+                    &format!(
+                        "write path={} slots={} bytes={bytes} baseline_rounds={} wall={:.1}s",
+                        path.display(),
+                        baseline_model.len(),
+                        baseline_round_stats.rounds,
+                        started.elapsed().as_secs_f64()
+                    ),
+                );
+                let outcome =
+                    super::baseline_checkpoint::checkpointed(path, baseline_model.len(), bytes);
+                // Published: the pass reads this, never the error's text.
+                super::baseline_checkpoint::note_written(outcome.clone());
+                super::baseline_checkpoint::record_outcome(outcome);
+                return Err(OverlapPreledgerDecline::at(
+                    OverlapPreledgerDeclineReason::Checkpointed,
+                ));
+            }
+            let baseline_nullability = nullability_artifacts(&baseline_construction);
+            let baseline_a14 = opacity_artifacts(&baseline_construction);
+            (
+                baseline_model,
+                baseline_round_stats,
+                baseline_nullability,
+                baseline_a14,
+            )
+        };
     if mode == OverlapMode::Baseline {
         let plan = if attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph) {
             OverlapPlan::baseline_attested()
@@ -1945,15 +2076,19 @@ fn solve_bo_overlap_config_with_source_events(
         OverlapMode::Baseline => unreachable!(),
         OverlapMode::PreciseReplay => {
             crate::phase_log::mark("solve:precise_verify", "start", "");
-            let (model, stats) = verify_bo_construction_with_parameter_overlaps(
-                program,
-                slots,
-                origins,
-                &solver,
-                &construction,
-                mut_facts,
-                &plan.effective_overlaps,
-            );
+            // R1490-2 (324 (v-a), task 36): the precise verify's `verify:<sub>` / `z3:<sub>` marks
+            // too (log only), so process 2's run shows its rounds, checks and declines.
+            let (model, stats) = crate::phase_log::with_sub_marks(|| {
+                verify_bo_construction_with_parameter_overlaps(
+                    program,
+                    slots,
+                    origins,
+                    &solver,
+                    &construction,
+                    mut_facts,
+                    &plan.effective_overlaps,
+                )
+            });
             crate::phase_log::mark(
                 "solve:precise_verify",
                 "end",
@@ -2935,6 +3070,8 @@ mod mode_tests {
                 "precise-verification",
                 "coarse-construction",
                 "coarse-verification",
+                "baseline-checkpointed",
+                "checkpoint-refused",
             ]
         );
     }

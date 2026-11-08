@@ -142,6 +142,30 @@ fn r1475_2_the_fresh_hard_solver_switch_is_on_for_on_exactly() {
 }
 
 /// Relay main/388 O2 (R1383-1): the budget predicate is the wall against 0.99 of the budget in force.
+/// R1490-2 (task 4): the two checkpoint switches read a path each; unset and empty are off, and the
+/// pair is returned as given (both set is refused later, by the checkpoint mode).
+#[test]
+fn r1490_2_the_checkpoint_switches_read_a_path_each_and_empty_is_unset() {
+    use std::{ffi::OsString, path::PathBuf};
+    assert_eq!(checkpoint_paths_from(None, None), (None, None));
+    assert_eq!(
+        checkpoint_paths_from(Some(OsString::new()), Some(OsString::new())),
+        (None, None)
+    );
+    assert_eq!(
+        checkpoint_paths_from(Some("/a/b.json".into()), None),
+        (Some(PathBuf::from("/a/b.json")), None)
+    );
+    assert_eq!(
+        checkpoint_paths_from(None, Some("c.json".into())),
+        (None, Some(PathBuf::from("c.json")))
+    );
+    assert_eq!(
+        checkpoint_paths_from(Some("o".into()), Some("i".into())),
+        (Some(PathBuf::from("o")), Some(PathBuf::from("i")))
+    );
+}
+
 #[test]
 fn r1383_o2_the_budget_is_hit_at_ninety_nine_percent_of_the_wall_budget() {
     assert!(budget_hit_at(600_100.0, 600_000));

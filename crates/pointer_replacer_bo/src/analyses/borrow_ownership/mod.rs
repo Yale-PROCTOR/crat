@@ -7,6 +7,7 @@ use std::ops::Range;
 
 pub(crate) mod array_fields;
 mod assoc;
+pub(crate) mod baseline_checkpoint;
 pub(crate) mod borrow_engine;
 pub(crate) mod borrow_fork;
 pub(crate) mod borrow_verify;
