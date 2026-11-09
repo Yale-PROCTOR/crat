@@ -79,6 +79,7 @@ pub(crate) mod realloc;
 pub(crate) mod realloc_ssa;
 pub mod resolve;
 pub(crate) mod retirement;
+pub(crate) mod round_log;
 pub(crate) mod safety_mono;
 pub(crate) mod slot_key;
 pub mod slots;

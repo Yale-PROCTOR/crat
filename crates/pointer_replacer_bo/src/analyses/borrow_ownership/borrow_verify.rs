@@ -1270,6 +1270,8 @@ fn verify_rounds(
     // Resolve the repair strategy ONCE per invocation into a local; NO mid-loop re-reads, so the
     // whole fixpoint runs one consistent strategy. It is stamped into `stats` here.
     stats.repair = repair;
+    // R1500-2: the round instruments' verify number (0, and nothing computed, with the sub-marks off).
+    let verify_seq = super::round_log::begin_verify();
     crate::phase_log::sub("verify:solve", "start", || {
         format!("round=0 repair={repair:?}")
     });
@@ -1448,6 +1450,9 @@ fn verify_rounds(
                 reviewed.conflicts.len()
             ),
         );
+        // R1500-2 (a), log only: the conflict functions.
+        let round_functions =
+            super::round_log::conflicts(program, verify_seq, stats.rounds, &reviewed.conflicts);
         if !reviewed.retirement.unresolved.is_empty() {
             stats.source_retirement_decline = reviewed.retirement.unresolved.clone();
             return (None, stats);
@@ -1472,6 +1477,12 @@ fn verify_rounds(
             }
             stats.commits_conflict += raw_targets.len();
             stats.commits_per_round.push(raw_targets.len());
+            super::round_log::commits_counted(
+                verify_seq,
+                stats.rounds,
+                "retirement-raw",
+                raw_targets.len(),
+            );
             renew_hard_solver(solver, &mut hard, stats.rounds);
             let started = std::time::Instant::now();
             let solved = solve_round(
@@ -1494,6 +1505,15 @@ fn verify_rounds(
             let Some((next, dropped)) = solved else {
                 return (None, stats);
             };
+            // R1500-2 (c), log only.
+            super::round_log::drift(
+                program,
+                verify_seq,
+                stats.rounds,
+                &model,
+                &next,
+                round_functions.as_ref(),
+            );
             model = next;
             record_dropped(&mut stats, selectors, &dropped);
             last_dropped = dropped;
@@ -1554,6 +1574,12 @@ fn verify_rounds(
                 }
                 stats.commits_conflict += owning.len();
                 stats.commits_per_round.push(owning.len());
+                super::round_log::commits_counted(
+                    verify_seq,
+                    stats.rounds,
+                    "field-own",
+                    owning.len(),
+                );
                 renew_hard_solver(solver, &mut hard, stats.rounds);
                 let started = std::time::Instant::now();
                 let solved = solve_round(
@@ -1576,6 +1602,15 @@ fn verify_rounds(
                 let Some((next, dropped)) = solved else {
                     return (None, stats);
                 };
+                // R1500-2 (c), log only.
+                super::round_log::drift(
+                    program,
+                    verify_seq,
+                    stats.rounds,
+                    &model,
+                    &next,
+                    round_functions.as_ref(),
+                );
                 model = next;
                 record_dropped(&mut stats, selectors, &dropped);
                 last_dropped = dropped;
@@ -1710,6 +1745,14 @@ fn verify_rounds(
                         );
                         for action in &actions {
                             solver.add_guarded_commit(action);
+                            // R1500-2 (b), log only.
+                            super::round_log::commit(
+                                program,
+                                slots,
+                                verify_seq,
+                                stats.rounds,
+                                action,
+                            );
                             if ledger && let Some(track) = solver.last_track() {
                                 use super::raw_cause::CommitKind;
                                 let kind = match action.kind {
@@ -1785,6 +1828,9 @@ fn verify_rounds(
             }
         }
         stats.commits_per_round.push(committed);
+        if repair == RepairMode::Plain {
+            super::round_log::commits_counted(verify_seq, stats.rounds, "plain", committed);
+        }
         if committed == 0 {
             // Residual certificate: record the residuals the accepted model
             // TOLERATES. Acceptance is `committed == 0`, not an empty conflict
@@ -1822,7 +1868,7 @@ fn verify_rounds(
             return (Some(model), stats);
         }
         renew_hard_solver(solver, &mut hard, stats.rounds);
-        model = match solve_round(
+        let next = match solve_round(
             solver,
             selectors,
             backend,
@@ -1837,6 +1883,16 @@ fn verify_rounds(
             }
             None => return (None, stats),
         };
+        // R1500-2 (c), log only.
+        super::round_log::drift(
+            program,
+            verify_seq,
+            stats.rounds,
+            &model,
+            &next,
+            round_functions.as_ref(),
+        );
+        model = next;
     }
     // Cap exhaustion — behaviour depends on the repair mode's termination guarantee. The plain
     // repair has a PROVEN linear bound (each round commits ≥1 fresh slot to a
