@@ -387,7 +387,7 @@ fn certify_trace(line: impl FnOnce() -> String) {
             .append(true)
             .open(path)
     {
-        let _ = writeln!(file, "{}", line());
+        let _ = file.write_all(format!("{}\n", line()).as_bytes());
     }
 }
 
