@@ -4,7 +4,7 @@
 
 use std::ffi::OsString;
 
-use super::model_checkpoint::tests::{CASCADE_TIE, child, spawn};
+use super::model_checkpoint::model_checkpoint_tests::{CASCADE_TIE, child, spawn};
 
 /// The end marks between `finish_decide start` and `finish_decide:facts end`, in order (main 336
 /// §B2: one after each collection of `mod.rs`'s fact stretch at `f1dcb012b`).
@@ -101,7 +101,13 @@ fn stretch(stderr: &str) -> (Vec<(String, String, Vec<(String, String)>)>, usize
     (all[start + 1..end].to_vec(), subjects)
 }
 
-fn logged(test: &str, tag: &str) -> (super::model_checkpoint::tests::ChildResult, String) {
+fn logged(
+    test: &str,
+    tag: &str,
+) -> (
+    super::model_checkpoint::model_checkpoint_tests::ChildResult,
+    String,
+) {
     spawn(
         test,
         CASCADE_TIE,

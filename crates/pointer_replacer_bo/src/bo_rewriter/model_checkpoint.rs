@@ -496,4 +496,4 @@ pub(crate) fn hoists(
 
 #[cfg(test)]
 #[path = "model_checkpoint_tests.rs"]
-pub(super) mod tests;
+pub(super) mod model_checkpoint_tests;

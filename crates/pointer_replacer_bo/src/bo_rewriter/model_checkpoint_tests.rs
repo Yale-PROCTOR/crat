@@ -124,18 +124,6 @@ const CHILD_OUT: &str = "CRAT_R1520_2_CHILD_OUT";
 const CHILD_ROOT: &str = "CRAT_R1520_2_CHILD_ROOT";
 const CHILD_ATTEST: &str = "CRAT_R1520_2_CHILD_ATTEST";
 
-/// The switches no child inherits from the parent unless a witness sets them.
-const CLEARED: [&str; 8] = [
-    "CRAT_BO_MODEL_CHECKPOINT_OUT",
-    "CRAT_BO_MODEL_CHECKPOINT_IN",
-    "CRAT_BO_CHECKPOINT_OUT",
-    "CRAT_BO_CHECKPOINT_IN",
-    "CRAT_BO_CACHE_DIR",
-    "CRAT_BO_PHASE_LOG",
-    "CRAT_BO_QUERY_TIMEOUT_MS",
-    "CRAT_BO_CONFLICT_DUMP_DIR",
-];
-
 /// In a child: run the whole rewrite on `CHILD_ROOT` and write the result to `CHILD_OUT`.
 pub(crate) fn child() -> bool {
     let Some(out) = std::env::var_os(CHILD_OUT) else {
@@ -205,12 +193,14 @@ pub(crate) fn spawn(
             "--nocapture",
             "--test-threads=1",
         ])
+        .env_clear()
+        // No CRAT_* variable of this process reaches the child: neither a switch nor one another witness
+        // sets in-process for a moment (e.g. CRAT_W6A_CERTIFY_TRACE under the frame lock). The child gets
+        // the rest of the environment, its own three, and the witness's own switches.
+        .envs(std::env::vars_os().filter(|(name, _)| !name.to_string_lossy().starts_with("CRAT_")))
         .env(CHILD_OUT, &out)
         .env(CHILD_ROOT, dir.join("lib.rs"))
         .env(CHILD_ATTEST, attest);
-    for name in CLEARED {
-        command.env_remove(name);
-    }
     for (name, value) in env {
         command.env(name, value);
     }
@@ -311,7 +301,7 @@ fn r1520_2_w0_unset_changes_nothing_and_out_moves_no_decision() {
         switches(OverlapMode::Baseline, None, (None, None)),
         Ok((None, None))
     );
-    let test = "bo_rewriter::model_checkpoint::tests::r1520_2_w0_unset_changes_nothing_and_out_moves_no_decision";
+    let test = "bo_rewriter::model_checkpoint::model_checkpoint_tests::r1520_2_w0_unset_changes_nothing_and_out_moves_no_decision";
     let (a, a_err) = spawn(test, CASCADE_TIE, "w0-a", "frozen", &[]);
     assert_eq!(a.kind, "emitted", "{a:?}");
     assert!(lines(&a_err).is_empty(), "{a_err}");
@@ -339,7 +329,7 @@ fn r1520_2_w1_out_writes_the_accepted_model_before_finish_decide() {
     if child() {
         return;
     }
-    let test = "bo_rewriter::model_checkpoint::tests::r1520_2_w1_out_writes_the_accepted_model_before_finish_decide";
+    let test = "bo_rewriter::model_checkpoint::model_checkpoint_tests::r1520_2_w1_out_writes_the_accepted_model_before_finish_decide";
     let file = scratch("w1-file").join("model.json");
     let (w, w_err) = spawn(
         test,
@@ -381,7 +371,7 @@ fn r1520_2_w2a_in_decides_from_the_file_as_the_writer_did() {
     if child() {
         return;
     }
-    let test = "bo_rewriter::model_checkpoint::tests::r1520_2_w2a_in_decides_from_the_file_as_the_writer_did";
+    let test = "bo_rewriter::model_checkpoint::model_checkpoint_tests::r1520_2_w2a_in_decides_from_the_file_as_the_writer_did";
     let (w, _, r, r_err, _) = write_then_read(test, CASCADE_TIE, "w2a", &[]);
     assert_read_without_solve(&r, &r_err, &w);
 }
@@ -393,7 +383,7 @@ fn r1520_2_w2b_in_decides_from_the_file_where_the_precise_replay_moved_the_model
     if child() {
         return;
     }
-    let test = "bo_rewriter::model_checkpoint::tests::r1520_2_w2b_in_decides_from_the_file_where_the_precise_replay_moved_the_model";
+    let test = "bo_rewriter::model_checkpoint::model_checkpoint_tests::r1520_2_w2b_in_decides_from_the_file_where_the_precise_replay_moved_the_model";
     let (w, _, r, r_err, checkpoint) = write_then_read(test, OVERLAP, "w2b", &[]);
     assert_ne!(
         checkpoint.model, checkpoint.baseline,
@@ -633,8 +623,7 @@ fn r1520_2_w3b_a_refusal_in_the_decide_never_solves() {
     if child() {
         return;
     }
-    let test =
-        "bo_rewriter::model_checkpoint::tests::r1520_2_w3b_a_refusal_in_the_decide_never_solves";
+    let test = "bo_rewriter::model_checkpoint::model_checkpoint_tests::r1520_2_w3b_a_refusal_in_the_decide_never_solves";
     let file = scratch("w3b-file").join("model.json");
     spawn(
         test,
@@ -717,8 +706,7 @@ fn r1520_2_w4_the_argument_order_rows_ride_across() {
         eprintln!("corpus absent; skipping");
         return;
     };
-    let test =
-        "bo_rewriter::model_checkpoint::tests::r1520_2_w4_the_argument_order_rows_ride_across";
+    let test = "bo_rewriter::model_checkpoint::model_checkpoint_tests::r1520_2_w4_the_argument_order_rows_ride_across";
     let (w, w_err, r, r_err, checkpoint) = write_then_read(test, &code, "w4", &[]);
     let ArgOrder::Rows(rows) = &checkpoint.arg_order else {
         panic!(
@@ -751,6 +739,12 @@ fn r1520_2_w5_the_hoist_copy_equals_model_cache_s() {
         eprintln!("corpus absent; skipping");
         return;
     }
+    // An in-process decide: the frame locks, in their order (the crate-wide one, then ownership-fields'),
+    // so no witness that sets a frame switch or a model override in-process overlaps it.
+    let _frame = super::super::test_model_override::frame_lock();
+    let _fields = super::super::decision::ownership_fields_native::field_form_override::LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     ::utils::compilation::run_compiler_on_path(Path::new(QUADTREE), |tcx| {
         super::super::decide_table(tcx).expect("quadtree decides");
         let program = super::super::collect_program(tcx);
@@ -771,7 +765,7 @@ fn r1520_2_w6_an_incumbent_model_is_written_and_read_as_one() {
     if child() {
         return;
     }
-    let test = "bo_rewriter::model_checkpoint::tests::r1520_2_w6_an_incumbent_model_is_written_and_read_as_one";
+    let test = "bo_rewriter::model_checkpoint::model_checkpoint_tests::r1520_2_w6_an_incumbent_model_is_written_and_read_as_one";
     let mut code = String::new();
     for k in 0..60 {
         code.push_str(&format!(
@@ -811,7 +805,7 @@ fn r1520_2_w7_process_two_names_its_baseline_checkpoint() {
     if child() {
         return;
     }
-    let test = "bo_rewriter::model_checkpoint::tests::r1520_2_w7_process_two_names_its_baseline_checkpoint";
+    let test = "bo_rewriter::model_checkpoint::model_checkpoint_tests::r1520_2_w7_process_two_names_its_baseline_checkpoint";
     let dir = scratch("w7-files");
     let baseline = dir.join("baseline.json");
     let model = dir.join("model.json");
@@ -870,7 +864,7 @@ fn r1520_2_w8_a_failed_write_is_one_line_and_the_decide_goes_on() {
     if child() {
         return;
     }
-    let test = "bo_rewriter::model_checkpoint::tests::r1520_2_w8_a_failed_write_is_one_line_and_the_decide_goes_on";
+    let test = "bo_rewriter::model_checkpoint::model_checkpoint_tests::r1520_2_w8_a_failed_write_is_one_line_and_the_decide_goes_on";
     let (a, _) = spawn(test, CASCADE_TIE, "w8-a", "frozen", &[]);
     let nowhere = scratch("w8-file").join("absent-dir").join("model.json");
     let (b, b_err) = spawn(
