@@ -79,6 +79,7 @@ pub(crate) mod c9;
 pub(crate) mod decision;
 pub(crate) mod fat_facts;
 pub(crate) mod mechanical_receipt;
+pub(crate) mod model_checkpoint;
 // R351 ownership/fields consumers arrive from the preserved lane commits.
 #[cfg(test)]
 mod conformance_tests;
@@ -90,6 +91,8 @@ mod copy_lend_mut_emit_tests;
 mod copy_walk_slice_tests;
 #[cfg(test)]
 mod exclusion_rederivation_tests;
+#[cfg(test)]
+mod fact_marks_tests;
 mod field_reference_ast;
 pub(crate) mod flexible_tail_ast;
 #[cfg(test)]
@@ -7644,6 +7647,25 @@ fn decide_table_perturbed_config<'tcx>(
     // R1490-2 (main 326 §5): the checkpoint mode is refused with a model cache configured or outside
     // `PreciseReplay` before either tier is read, so a cache hit never skips its solve silently.
     crate::analyses::borrow_ownership::baseline_checkpoint::mode(a5_mode)?;
+    // R1520-2 (main 336 §A): the model checkpoint's switches, refused here too, before either tier
+    // is read. With both unset nothing below changes. `IN` decides from the file and never solves.
+    model_checkpoint::clear_loaded();
+    let (model_out, model_in) =
+        model_checkpoint::switches(a5_mode, attestation, model_checkpoint::paths())?;
+    if let Some(path) = model_in {
+        return decide_from_model_checkpoint(
+            tcx,
+            program,
+            slots,
+            mut_facts,
+            &path,
+            &fp,
+            a5_mode,
+            attestation,
+            run_config,
+            perturb,
+        );
+    }
     // The key does not name the A5 mode (S2 D5): only the frame's mode is cached.
     let cacheable = a5_mode == OverlapMode::PreciseReplay
         && attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
@@ -7765,6 +7787,39 @@ fn decide_table_perturbed_config<'tcx>(
         baseline_model: verified.baseline_model.clone(),
         overlap_receipt: verified.receipt.clone(),
     };
+    // R1520-2 (main 336 §A3): the model checkpoint, written before `finish_decide` starts. The
+    // switches admit `OUT` in the frame's mode only, where `cacheable` is false exactly when a round
+    // accepted an optimize incumbent. A failed write is one line; the decide goes on.
+    if let Some(path) = &model_out {
+        let arg_order = model_cache::prepared_arg_order_applied(&fp);
+        let arg_order_label = match &arg_order {
+            Ok(rows) => format!("ok:{}", rows.len()),
+            Err(_) => "not-recorded".to_owned(),
+        };
+        let detail = match model_checkpoint::write(
+            path,
+            &program,
+            &slots,
+            &verified.model,
+            &verified.baseline_model,
+            &verified.receipt,
+            a5_mode,
+            attestation,
+            arg_order,
+            !cacheable,
+            solve_secs,
+        ) {
+            Ok(bytes) => format!(
+                "write path={} slots={} bytes={bytes} model_sha256={model_sha256} arg_order={arg_order_label} incumbent={}",
+                path.display(),
+                verified.model.len(),
+                !cacheable
+            ),
+            Err(error) => format!("write path={} error={error}", path.display()),
+        };
+        eprintln!("{} {detail}", model_checkpoint::LINE_HEAD);
+        crate::phase_log::mark("decide:model_checkpoint", "end", &detail);
+    }
     let cache_entry = if cacheable {
         model_cache::memo_put(&fp, &cached);
         model_cache::store(tcx, &program, &slots, &cached, a5_mode, attestation)
@@ -7806,6 +7861,116 @@ fn decide_table_perturbed_config<'tcx>(
         run_config,
         perturb,
     )
+}
+
+/// R1520-2 (main 336 §A3): the decide from a model checkpoint (`CRAT_BO_MODEL_CHECKPOINT_IN`), as a
+/// cache hit decides: the file is checked against this process, the overlap plan is re-derived from
+/// its baseline and checked against its receipt with no solver, and `finish_decide` runs on its
+/// model. Every refusal is the decide's error; nothing falls through to a solve.
+#[allow(clippy::too_many_arguments)]
+fn decide_from_model_checkpoint<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    program: RustProgram<'tcx>,
+    slots: CrateSlots,
+    mut_facts: MutFacts,
+    path: &std::path::Path,
+    fp: &str,
+    a5_mode: OverlapMode,
+    attestation: Option<WholeProgramAttestation>,
+    run_config: &EmissionRunConfig,
+    perturb: impl FnOnce(&mut Vec<decision::Subject>),
+) -> Result<(decision::DecisionTable, DecideCtx), String> {
+    let started = std::time::Instant::now();
+    crate::phase_log::mark("decide:model_checkpoint", "start", "read");
+    let refuse = |refusal: String| {
+        eprintln!(
+            "{} read path={} {refusal}",
+            model_checkpoint::LINE_HEAD,
+            path.display()
+        );
+        refusal
+    };
+    let loaded =
+        model_checkpoint::read(path, &program, &slots, a5_mode, attestation).map_err(refuse)?;
+    let (retained_copy_plans, origins, origin_derivation_wall_s) = cached_rewriter_plans(
+        &program,
+        &slots,
+        &mut_facts,
+        a5_mode,
+        attestation,
+        &loaded.cached,
+    )
+    .map_err(|error| {
+        refuse(format!(
+            "{}receipt ({error})",
+            model_checkpoint::REFUSED_HEAD
+        ))
+    })?;
+    let detail = format!(
+        "read path={} slots={} model_sha256={} arg_order={} incumbent={} exe={}",
+        path.display(),
+        loaded.slots,
+        loaded.model_sha256,
+        loaded.arg_order.label(),
+        loaded.incumbent,
+        if loaded.same_exe { "same" } else { "other" }
+    );
+    eprintln!("{} {detail}", model_checkpoint::LINE_HEAD);
+    crate::phase_log::mark("decide:model_checkpoint", "end", &detail);
+    model_cache::record_solve(model_cache::SolveProvenance {
+        source: "model-checkpoint",
+        cache_status: if loaded.same_exe {
+            "read-same-exe"
+        } else {
+            "read-other-exe"
+        },
+        fingerprint: fp.to_owned(),
+        model_sha256: loaded.model_sha256,
+        cache_entry: Some(path.display().to_string()),
+        solve_secs: 0.0,
+    });
+    model_checkpoint::set_loaded(loaded.arg_order);
+    finish_decide(
+        tcx,
+        program,
+        slots,
+        mut_facts,
+        loaded.cached.model,
+        retained_copy_plans,
+        loaded.cached.overlap_receipt,
+        DecisionAnalysisCarrier {
+            origins,
+            a5_mode,
+            attestation,
+            cache_load_wall_s: started.elapsed().as_secs_f64(),
+            origin_derivation_wall_s,
+        },
+        run_config,
+        perturb,
+    )
+}
+
+/// R1520-2 (main 336 §B): one log-only line after a collection of `finish_decide`'s fact stretch,
+/// `finish_decide:facts:<name> end` with O(1) counts. Nothing is computed when the phase log is off.
+fn facts_mark(name: &str, detail: impl FnOnce() -> String) {
+    if crate::phase_log::on() {
+        crate::phase_log::mark(&format!("finish_decide:facts:{name}"), "end", &detail());
+    }
+}
+
+/// How often [`facts_progress`] writes inside a per-subject loop.
+const FACTS_PROGRESS_EVERY: usize = 10_000;
+
+/// R1520-2 (main 336 §B2): progress inside one of the fact stretch's per-subject loops, log only:
+/// `done` subjects entered of `of`, at every [`FACTS_PROGRESS_EVERY`]-th and at the last.
+fn facts_progress(name: &str, done: usize, of: usize) {
+    if (done % FACTS_PROGRESS_EVERY == 0 || done == of) && crate::phase_log::on() {
+        crate::phase_log::mark(
+            &format!("finish_decide:facts:{name}"),
+            "progress",
+            &format!("done={done} of={of}"),
+        );
+    }
 }
 
 /// The phases after the solve, shared by the cached and real-solve paths.
@@ -7916,12 +8081,14 @@ fn finish_decide<'tcx>(
     // predicate — a census whose denominator silently gained a population is not
     // the same instrument.
     subjects.extend(collect_local_subjects(tcx, &program, &mut_facts));
+    facts_mark("subjects", || format!("subjects={}", subjects.len()));
     // wave-6f (W6F-3), TEST ONLY: a fixture may stand in for a coming analysis
     // frame by overriding slot kinds by name (era-5c's owned fields). Never
     // compiled into a census binary.
     #[cfg(test)]
     let model = test_model_override::apply(tcx, &program, &slots, &subjects, model);
     let box_facts = decision::box_facts::BoxOwnershipFacts::derive(&program, &slots, &model)?;
+    facts_mark("box_facts", String::new);
 
     // The freed-slot fact, stamped over BOTH universes from ONE walk of the
     // production recognizer — the same `free_sites` the S2-2 census asks. Two
@@ -7932,11 +8099,19 @@ fn finish_decide<'tcx>(
     // BEFORE `perturb`, so a test hook can perturb this field like any other.
     let freed =
         decision::FreedBindings::from_resolved(&free_sites(tcx, &program.functions).resolved);
+    facts_mark("free_sites", String::new);
     // U-2′'s length recovery, from the SAME construction recognizer the facts
     // join reports `len_class` from — one authority, so the flag and the census
     // cannot disagree about which subjects have a recovered length.
     let ctors = decision::construction::collect(tcx, &program.functions);
+    facts_mark("constructions", || {
+        format!("bindings={}", ctors.by_binding.len())
+    });
+    let stamp_of = subjects.len();
+    let mut stamped = 0usize;
     for subject in &mut subjects {
+        stamped += 1;
+        facts_progress("subject_stamp", stamped, stamp_of);
         subject.freed_at = freed.site_of(subject.fn_did, subject.hir_id);
         subject.len_recovered = !matches!(subject.kind, decision::SubjectKind::Param { .. })
             && ctors
@@ -7968,11 +8143,14 @@ fn finish_decide<'tcx>(
             )
         );
     }
+    facts_mark("subject_stamp", String::new);
 
     perturb(&mut subjects);
     let mut declaration_pointees = decision::declaration::collect(tcx, &subjects);
+    facts_mark("declaration", String::new);
     // wave-6l relay 071 (R697-7): the field-carried allocation lengths.
     let field_alloc_licences = decision::field_alloc::Licences::infer(tcx);
+    facts_mark("field_alloc", String::new);
     let mut counted_void =
         decision::counted_void::collect(tcx, &subjects, &mut declaration_pointees, |subject| {
             // BO's kind first (the ladder's own rule): a contract is never
@@ -7989,12 +8167,24 @@ fn finish_decide<'tcx>(
                     )
                 })
         });
+    facts_mark("counted_void", || format!("entries={}", counted_void.len()));
     let (io_domain_subjects, io_domain_budget_exhausted) =
         decision::io_domain::collect(tcx, &subjects);
+    facts_mark("io_domain", || {
+        format!(
+            "subjects={} budget_exhausted={}",
+            io_domain_subjects.len(),
+            io_domain_budget_exhausted
+        )
+    });
     let void_pointee_subjects = decision::void_pointee::collect(tcx, &subjects);
+    facts_mark("void_pointee", String::new);
     let declaration_patterns = decision::declaration_pattern::collect(tcx, &subjects);
+    facts_mark("declaration_pattern", String::new);
     let input_interfaces = decision::interface::collect(tcx, &subjects, &program.functions);
+    facts_mark("interface", String::new);
     let mut facts = decision::emitability::collect(tcx, &program.functions);
+    facts_mark("emitability", String::new);
     let mut void_region = decision::void_region::collect(
         tcx,
         &subjects,
@@ -8004,6 +8194,7 @@ fn finish_decide<'tcx>(
     );
     let void_region_receivers =
         decision::void_region::receivers(tcx, &subjects, &ctors, &void_region);
+    facts_mark("void_region", || format!("entries={}", void_region.len()));
     // Composition seam (wave-6v × wave-6b): one void parameter, one hook. A
     // subject wave-6b's region reader delivers keeps no counted contract —
     // both would plan the same call, and the counted graft would then meet
@@ -8011,10 +8202,12 @@ fn finish_decide<'tcx>(
     counted_void.retain(|key, _| !void_region.contains_key(key));
     let original_body_adapters = facts.body_adapters.clone();
     let thin_extent_subjects = decision::thin_extent::collect(tcx, &facts);
+    facts_mark("thin_extent", String::new);
     // S3.2′-2: the fatness LICENSE and the use-site rewrites, both consumed
     // here in the decision phase and nowhere later — E1's rule that no phase
     // after this one asks an analysis a question.
     let fat = fat_facts::FatFacts::from_program(&program);
+    facts_mark("fat", String::new);
     let subject_fatness = subjects
         .iter()
         .map(|s| ((s.fn_did, s.local), fat.render(s.fn_did, s.local)))
@@ -8029,6 +8222,7 @@ fn finish_decide<'tcx>(
     // becomes load-bearing here — it shipped entry-validated at -3 and read by
     // nothing.
     let sign = sign_facts::SignFacts::from_program(&program);
+    facts_mark("sign", String::new);
     let mutable_of: rustc_hash::FxHashSet<_> = subjects
         .iter()
         .filter(|s| s.mutable)
@@ -8048,6 +8242,9 @@ fn finish_decide<'tcx>(
         &advance_ok,
         &raw_boundary_argument_paths,
     );
+    facts_mark("slice_uses:full", || {
+        format!("entries={}", full_slice_uses.len())
+    });
     // **R517-11 — the cursor CANDIDATES, derived where their facts live.** The
     // C-string exemption yields to a callee parameter the cursor family can
     // admit, and it must do so in THIS pass: a hold lifted by a second pass is
@@ -8063,9 +8260,13 @@ fn finish_decide<'tcx>(
     // It is deliberately a CANDIDATE set and not a prediction of the family's
     // plan: it is read only to KEEP a hold, so over-inclusion costs yield and
     // never soundness.
+    let cursor_of = subjects.len();
+    let mut cursor_done = 0usize;
     let cursor_candidates: decision::local_callee_extent::CursorCandidates = subjects
         .iter()
         .filter(|subject| {
+            cursor_done += 1;
+            facts_progress("cursor_candidates", cursor_done, cursor_of);
             decision::local_callee_extent::is_cursor_candidate(
                 slots
                     .fn_local_slots
@@ -8088,6 +8289,9 @@ fn finish_decide<'tcx>(
             decision::SubjectKind::Local => None,
         })
         .collect();
+    facts_mark("cursor_candidates", || {
+        format!("n={}", cursor_candidates.len())
+    });
     // After `full_slice_uses`, deliberately: a callee parameter that can become
     // `&[T]` carries its own checked extent and is out of this class (R365-2).
     // First pass: no decision is settled yet, so the exemption has the use facts
@@ -8102,6 +8306,7 @@ fn finish_decide<'tcx>(
         None,
         None,
     );
+    facts_mark("local_callee_extent", String::new);
     let return_parameter_nodes = subjects
         .iter()
         .filter(|subject| {
@@ -8119,6 +8324,9 @@ fn finish_decide<'tcx>(
         &facts.return_sites,
         &return_parameter_nodes,
     );
+    facts_mark("slice_uses:returns", || {
+        format!("entries={}", return_slice_uses.len())
+    });
     let prior_slice_uses = decision::emitability::collect_slice_uses_before_family(
         tcx,
         &program.functions,
@@ -8127,6 +8335,9 @@ fn finish_decide<'tcx>(
         &advance_ok,
         &raw_boundary_argument_paths,
     );
+    facts_mark("slice_uses:prior", || {
+        format!("entries={}", prior_slice_uses.len())
+    });
     // **S3.2′-3.** The accessor a subject's uses are rewritten through, chosen
     // per subject by the idiom rule (micro-plan §9c): `unwrap()` where the
     // optional is `Copy` or used once, `as_mut()` otherwise. It has to be
@@ -8136,9 +8347,13 @@ fn finish_decide<'tcx>(
     //
     // `deref` and `index` differ by one `*`: `Option<&mut T>::as_mut().unwrap()`
     // is `&mut &mut T`, two derefs from the pointee, where `unwrap()` is one.
+    let accessor_of = subjects.len();
+    let mut accessor_done = 0usize;
     let opt_accessors: rustc_hash::FxHashMap<_, _> = subjects
         .iter()
         .filter_map(|s| {
+            accessor_done += 1;
+            facts_progress("opt_accessors", accessor_done, accessor_of);
             let name = s.param_name.clone()?;
             let uses = decision::emitability::non_test_use_count(tcx, s.fn_did, s.hir_id);
             let as_mut = s.mutable && uses > 1;
@@ -8159,6 +8374,7 @@ fn finish_decide<'tcx>(
             ))
         })
         .collect();
+    facts_mark("opt_accessors", || format!("n={}", opt_accessors.len()));
     let opt_fat: rustc_hash::FxHashSet<_> = subjects
         .iter()
         .filter(|s| fat.is_array(s.fn_did, s.local))
@@ -8182,6 +8398,9 @@ fn finish_decide<'tcx>(
         &raw_boundary_argument_paths,
         &opt_deferred_uses,
     );
+    facts_mark("opt_uses:provisional", || {
+        format!("entries={}", provisional_opt_uses.len())
+    });
 
     let prior_opt_uses = decision::emitability::collect_opt_uses_before_family(
         tcx,
@@ -8192,6 +8411,9 @@ fn finish_decide<'tcx>(
         &raw_boundary_argument_paths,
         &opt_deferred_uses,
     );
+    facts_mark("opt_uses:prior", || {
+        format!("entries={}", prior_opt_uses.len())
+    });
     // Core keeps the predecessor's raw-path multiplicity rule. The expanded
     // family counts its own deferrals/assignments before choosing reborrows.
     let current_opt_accessors = subjects
@@ -8229,6 +8451,9 @@ fn finish_decide<'tcx>(
         &raw_boundary_argument_paths,
         &opt_deferred_uses,
     );
+    facts_mark("opt_uses:full", || {
+        format!("entries={}", full_opt_uses.len())
+    });
 
     let return_opt_uses = decision::emitability::collect_opt_uses_with_returns(
         tcx,
@@ -8241,6 +8466,9 @@ fn finish_decide<'tcx>(
         &facts.return_sites,
         &return_parameter_nodes,
     );
+    facts_mark("opt_uses:returns", || {
+        format!("entries={}", return_opt_uses.len())
+    });
     // After both full use maps, deliberately: R397-6(b)'s up-front decline
     // reads the candidate's own pre-selection use walls — the slice walker's
     // for a plain form, the Option walker's for a nullable one — and, for
@@ -8256,6 +8484,7 @@ fn finish_decide<'tcx>(
         &slots,
         &fat,
     );
+    facts_mark("contract_extent", String::new);
 
     // Complete the frozen A5 site's legacy drops-elaborated reads before the
     // const-MIR fn-pointer collector becomes the terminal const-body reader
@@ -8268,9 +8497,13 @@ fn finish_decide<'tcx>(
         analysis.a5_mode,
         analysis.attestation,
     );
+    facts_mark("a5_site_proofs", || {
+        format!("available={}", a5_site_proofs.is_available())
+    });
     let web_started = std::time::Instant::now();
     let fnptr_web = decision::lifetime::derive_fn_ptr_web(&program, analysis.attestation);
     let fnptr_web_wall_s = web_started.elapsed().as_secs_f64();
+    facts_mark("fnptr_web", || format!("ok={}", fnptr_web.is_ok()));
     // wave-6p (R400-4): pair-disjointness certificates ride the attested A5
     // index; an unavailable index attaches nothing. The closed-world call
     // inventory admits allocator wrappers through function pointers (R402-5).
@@ -8285,6 +8518,7 @@ fn finish_decide<'tcx>(
     } else {
         a5_site_proofs
     };
+    facts_mark("pair_disjointness", String::new);
     // wave-6b (R609-4 (a)): two byte-region formals of one call are paired on
     // the same proofs; an unproven pair keeps its read side raw.
     decision::void_region::pair_gate(
@@ -8294,6 +8528,7 @@ fn finish_decide<'tcx>(
         &a5_site_proofs,
         &mut declaration_pointees,
     );
+    facts_mark("void_region_pair_gate", String::new);
     let exposure_seed = decision::exposure::ExposureSeed::derive(
         &program,
         &run_config.configured_exposure,
@@ -8313,6 +8548,7 @@ fn finish_decide<'tcx>(
         fnptr_web.as_ref().ok(),
         &all_functions,
     );
+    facts_mark("exposure", String::new);
 
     // **S3.6-1 task 2 — the co-conversion classes.**
     //
@@ -8339,9 +8575,11 @@ fn finish_decide<'tcx>(
     };
     let flexible_tails =
         decision::flexible_tail::derive(tcx, &program.functions, &ctors, &subjects, &raw_surface);
+    facts_mark("flexible_tails", String::new);
     // era-5c relay 182 (R826-1): the retained-access check of record, once per program.
     let retained_access =
         decision::retained_access::RetainedAccessCheck::compute(&program, &slots, &model);
+    facts_mark("retained_access", String::new);
     // wave-6a W6A-C1: Box-parameter chains of consuming callees (the model is
     // read only to refuse a chain whose members are not all Owning).
     // wave-6a W6A-A1: allocation-return certificates (relay wave-6a/005 §1),
@@ -8349,12 +8587,14 @@ fn finish_decide<'tcx>(
     // admitted on the formal's shape, confirmed once the chains derive.
     let consuming_formals =
         decision::box_param::consuming_formals(tcx, &program.functions, &subjects);
+    facts_mark("consuming_formals", String::new);
     // R427-4 (relay wave-6a/017): the pointees whose exported surface is
     // closed — every function mentioning them is an exported producer or an
     // exported consumer, and no struct field holds one. The certificates and
     // the chains read it to admit a pair the crate itself never calls.
     let exported_pairs =
         decision::exported_pair::derive(tcx, &program.functions, &raw_surface, &consuming_formals);
+    facts_mark("exported_pairs", String::new);
     // R579-4 R2: formals whose re-seat a later stage withdrew; the
     // certificates re-derive without them (grows only).
     let mut excluded_reseats: rustc_hash::FxHashSet<(
@@ -8374,6 +8614,7 @@ fn finish_decide<'tcx>(
         &exported_pairs,
         &excluded_reseats,
     );
+    facts_mark("return_certificates", String::new);
     // wave-6a: allocator-contract owners (relay wave-6a/006, R409-1/3).
     let allocator_contracts = decision::allocator_contract::derive(
         tcx,
@@ -8385,6 +8626,7 @@ fn finish_decide<'tcx>(
         &box_facts,
         &ctors,
     );
+    facts_mark("allocator_contracts", String::new);
     let mut box_params = decision::box_param::derive(
         tcx,
         &program.functions,
@@ -8400,6 +8642,7 @@ fn finish_decide<'tcx>(
         &exported_pairs,
         &declaration_pointees,
     );
+    facts_mark("box_params", || format!("plans={}", box_params.plans.len()));
     // R450-8 rung 3: the chain has spoken — an owner whose release was a
     // transfer into a formal it did not plan is withdrawn.
     let mut allocator_contracts = allocator_contracts;
@@ -8430,14 +8673,17 @@ fn finish_decide<'tcx>(
             })
         },
     );
+    facts_mark("confirm_transfers", String::new);
     // R579-4 R2: the certificates' own inputs, for a re-derivation inside the
     // loop (which shadows `ctors` / `subjects` with the stage's augmented
     // copies).
     let certificate_ctors = ctors.clone();
     let certificate_subjects = subjects.clone();
+    facts_mark("certificate_clones", String::new);
     // **R857-2 / R858-4 (reading (A); fan-out 074) — the backstop's candidates**,
     // once: they read the program, not a decision.
     let released_through_indirect = decision::released_indirect::holds(&program, &subjects);
+    facts_mark("released_indirect", String::new);
     // **R864-3 (relay 299; era-5c 154 / 154a / 157c) — the retained-access check's
     // holds, the joint fixpoint's fourth predicate**, named on the settled table
     // after the field transactions (filter 3 reads them) and held for the rest of
@@ -9092,11 +9338,15 @@ fn finish_decide<'tcx>(
         // beside) key the emission's hoist; without them the premise the model
         // decided under is absent from the emitted call (quadtree's E0502 at
         // the L01¹¹ frame). An entry that records none leaves the set empty.
-        table.arg_order_hoists = model_cache::prepared_arg_order_hoists(
-            tcx,
-            &model_cache::fingerprint(&program, analysis.a5_mode, analysis.attestation),
-        )
-        .unwrap_or_default();
+        // R1520-2 (main 336 §A3): a model read from a model checkpoint brings its own receipts.
+        table.arg_order_hoists = match model_checkpoint::loaded_hoists(tcx) {
+            Some(hoists) => hoists,
+            None => model_cache::prepared_arg_order_hoists(
+                tcx,
+                &model_cache::fingerprint(&program, analysis.a5_mode, analysis.attestation),
+            )
+            .unwrap_or_default(),
+        };
         // R575-6: on the settled table, before anything is planned from it.
         apply_aliased_storage_withdrawals(tcx, &mut table, &aliased_storage_withdrawn);
         // **After the re-decide, deliberately.** `decide` returns a fresh table,
