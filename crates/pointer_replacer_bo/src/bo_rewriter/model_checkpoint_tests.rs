@@ -1,4 +1,5 @@
-//! R1520-2 (main 336 §A5): the model checkpoint's witnesses W0–W8. W3 and W5 run in this process.
+//! R1520-2 (main 336 §A5) and R1523-2: the model checkpoint's witnesses W0–W10. W3, W5 and W10 run in
+//! this process.
 //! The others run the whole rewrite in child processes of this test binary, because the switches
 //! are read once per process. The child harness is shared with `fact_marks_tests` (WB1–WB3).
 
@@ -323,7 +324,9 @@ fn r1520_2_w0_unset_changes_nothing_and_out_moves_no_decision() {
 }
 
 /// W1: `OUT` writes the accepted model after the solve and before `finish_decide` starts. The file's
-/// digest is the solve receipt's. RED at `f1dcb012b`: nothing is written.
+/// digest is the solve receipt's. RED at `f1dcb012b`: nothing is written. R1523-2 (F3): what the
+/// write needs from outside the solve is taken before the solve starts. RED at `11aeb1613`: no
+/// start mark.
 #[test]
 fn r1520_2_w1_out_writes_the_accepted_model_before_finish_decide() {
     if child() {
@@ -342,10 +345,15 @@ fn r1520_2_w1_out_writes_the_accepted_model_before_finish_decide() {
         ],
     );
     assert_eq!(w.kind, "emitted", "{w:?}");
+    let started = phase_at(&w_err, "decide:model_checkpoint", "start").expect("the start's mark");
+    let solving = phase_at(&w_err, "decide:solve", "start").expect("decide:solve start");
     let solved = phase_at(&w_err, "decide:solve", "end").expect("decide:solve end");
     let written = phase_at(&w_err, "decide:model_checkpoint", "end").expect("the write's mark");
     let finish = phase_at(&w_err, "finish_decide", "start").expect("finish_decide start");
-    assert!(solved < written && written < finish, "{w_err}");
+    assert!(
+        started < solving && solving < solved && solved < written && written < finish,
+        "{w_err}"
+    );
     let checkpoint = stored(&file);
     assert_eq!(checkpoint.schema, SCHEMA);
     assert_eq!(Some(checkpoint.model_sha256.clone()), w.model_sha256);
@@ -403,18 +411,9 @@ fn r1520_2_w3_every_difference_but_the_binary_is_refused() {
         let baseline = all(&slots, SlotKind::Ref);
         let path = scratch("w3").join("model.json");
         let rows: Result<Vec<_>, String> = Err("not recorded".into());
+        let taken = start(&program, &slots, OverlapMode::PreciseReplay, FROZEN).unwrap();
         let bytes = write(
-            &path,
-            &program,
-            &slots,
-            &model,
-            &baseline,
-            "receipt",
-            OverlapMode::PreciseReplay,
-            FROZEN,
-            rows,
-            true,
-            1.5,
+            &path, &program, &slots, &model, &baseline, "receipt", &taken, rows, true, 1.5,
         )
         .unwrap();
         assert_eq!(bytes as u64, std::fs::metadata(&path).unwrap().len());
@@ -555,8 +554,7 @@ fn r1520_2_w3_every_difference_but_the_binary_is_refused() {
             &model,
             &baseline,
             "receipt",
-            OverlapMode::PreciseReplay,
-            FROZEN,
+            &taken,
             Ok(vec![row.clone()]),
             false,
             0.0,
@@ -881,4 +879,192 @@ fn r1520_2_w8_a_failed_write_is_one_line_and_the_decide_goes_on() {
         "{b_err}"
     );
     assert!(!nowhere.exists());
+}
+
+/// W9 (R1523-2, F1): the baseline checkpoint a process resumes from is read and hashed once, at the
+/// decide's start, and the write reads no file. Here the path under `CRAT_BO_CHECKPOINT_IN` can be
+/// opened exactly twice: the first open reads the checkpoint's bytes, the second reads the same
+/// checkpoint with one trailing newline (only so that the witness can tell which read was hashed),
+/// and after the second open the path is gone. The decide's start takes the first read and the solve
+/// the second; the model checkpoint is written with the path gone and names the first read's digest.
+/// RED at `11aeb1613`: the solve takes the first read and the write hashes the second.
+#[test]
+fn r1520_2_w9_the_baseline_source_is_taken_at_the_decide_s_start() {
+    if child() {
+        return;
+    }
+    let test = "bo_rewriter::model_checkpoint::model_checkpoint_tests::r1520_2_w9_the_baseline_source_is_taken_at_the_decide_s_start";
+    let dir = scratch("w9-files");
+    let baseline = dir.join("baseline.json");
+    let model = dir.join("model.json");
+    let (p1, _) = spawn(
+        test,
+        CASCADE_TIE,
+        "w9-p1",
+        "frozen",
+        &[("CRAT_BO_CHECKPOINT_OUT", os(&baseline))],
+    );
+    assert_eq!(p1.kind, "degraded", "process 1 ends checkpointed: {p1:?}");
+    let first = std::fs::read(&baseline).unwrap();
+    let mut second = first.clone();
+    second.push(b'\n');
+
+    // The path is a symbolic link to a pipe. A pipe's `open` for writing returns when the reader has
+    // opened it, so the server below knows of each open and moves the link before it writes a byte.
+    let (pipe1, pipe2) = (dir.join("first.pipe"), dir.join("second.pipe"));
+    let made = std::process::Command::new("mkfifo")
+        .args([&pipe1, &pipe2])
+        .status()
+        .expect("mkfifo");
+    assert!(made.success());
+    let input = dir.join("baseline-in.json");
+    std::os::unix::fs::symlink(&pipe1, &input).unwrap();
+    let (served, serves) = std::sync::mpsc::channel();
+    // Not joined: when the child does not open the path, this thread stays in its `open`.
+    std::thread::spawn({
+        let (input, next) = (input.clone(), dir.join("baseline-in.next"));
+        let (first, second) = (first.clone(), second.clone());
+        move || {
+            use std::io::Write;
+            let open = |pipe: &Path| std::fs::OpenOptions::new().write(true).open(pipe);
+            let Ok(mut pipe) = open(&pipe1) else { return };
+            // The first open has happened. The next open of the path reads the second pipe.
+            let moved = std::os::unix::fs::symlink(&pipe2, &next)
+                .and_then(|()| std::fs::rename(&next, &input));
+            if moved.is_err() {
+                return;
+            }
+            let _ = pipe.write_all(&first);
+            drop(pipe);
+            let _ = served.send(1);
+            let Ok(mut pipe) = open(&pipe2) else { return };
+            // The second open has happened. No third open finds the path.
+            if std::fs::remove_file(&input).is_err() {
+                return;
+            }
+            let _ = pipe.write_all(&second);
+            drop(pipe);
+            let _ = served.send(2);
+        }
+    });
+    let (p2, p2_err) = spawn(
+        test,
+        CASCADE_TIE,
+        "w9-p2",
+        "frozen",
+        &[
+            ("CRAT_BO_CHECKPOINT_IN", os(&input)),
+            ("CRAT_BO_MODEL_CHECKPOINT_OUT", os(&model)),
+        ],
+    );
+    let wait = std::time::Duration::from_secs(10);
+    assert_eq!(serves.recv_timeout(wait), Ok(1), "{p2_err}");
+    assert_eq!(
+        serves.recv_timeout(wait),
+        Ok(2),
+        "the path was opened once only:\n{p2_err}"
+    );
+    assert_eq!(p2.kind, "emitted", "{p2:?}\n{p2_err}");
+    assert!(
+        std::fs::symlink_metadata(&input).is_err(),
+        "the path is gone"
+    );
+    let checkpoint = stored(&model);
+    let source = checkpoint
+        .provenance
+        .baseline_checkpoint
+        .clone()
+        .expect("the baseline checkpoint named");
+    assert_eq!(source.path, input.display().to_string());
+    assert_eq!(
+        source.sha256,
+        sha256_hex(&first),
+        "the write hashed a later read of the file (the second read's digest is {})",
+        sha256_hex(&second)
+    );
+    assert_eq!(Some(checkpoint.model_sha256.clone()), p2.model_sha256);
+}
+
+/// W10 (R1523-2, F3): the identity the file carries is the one taken at the decide's start, and the
+/// write computes none. Here the binary's digest (a part of the identity) reads as one value at the
+/// start and as another at the write: the file carries the start's. An identity that cannot be taken
+/// refuses `OUT`, typed, at the start (on the start's seam: no input makes the identity fail in a
+/// whole run). And F1's other half: a baseline checkpoint that cannot be read at the start is
+/// recorded as that, the write (which reads no file) still happens, and the file reads back.
+/// RED at `11aeb1613`: `write` took the mode and the attestation, computed the identity itself and
+/// read the baseline checkpoint's file (an absent one dropped the write).
+#[test]
+fn r1520_2_w10_the_identity_is_taken_at_the_decide_s_start() {
+    use crate::analyses::borrow_ownership::baseline_checkpoint::hooks::with_exe_sha256;
+    ::utils::compilation::run_compiler_on_str(CASCADE_TIE, |tcx| {
+        let program = program(tcx);
+        let slots = CrateSlots::build(&program);
+        let model = all(&slots, SlotKind::Raw);
+        let baseline = all(&slots, SlotKind::Ref);
+        let dir = scratch("w10");
+        let path = dir.join("model.json");
+        let absent = dir.join("absent-baseline.json");
+        let taken = with_exe_sha256("at-the-start", || {
+            execution_guard::checkpoint_hook::with((None, Some(absent.clone())), || {
+                start(&program, &slots, OverlapMode::PreciseReplay, FROZEN)
+            })
+        })
+        .unwrap();
+        let source = taken
+            .baseline_checkpoint
+            .clone()
+            .expect("the baseline checkpoint named");
+        assert_eq!(source.path, absent.display().to_string());
+        assert!(
+            source.sha256.starts_with("unreadable: "),
+            "{}",
+            source.sha256
+        );
+        assert_eq!(
+            taken.label(),
+            format!(
+                "baseline_checkpoint={} sha256={}",
+                source.path, source.sha256
+            )
+        );
+
+        let rows: Result<Vec<_>, String> = Err("not recorded".into());
+        with_exe_sha256("at-the-write", || {
+            write(
+                &path, &program, &slots, &model, &baseline, "receipt", &taken, rows, false, 0.0,
+            )
+        })
+        .unwrap();
+        let file = stored(&path);
+        assert_eq!(
+            file.identity.exe_sha256, "at-the-start",
+            "the write computed an identity"
+        );
+        assert_eq!(file.provenance.baseline_checkpoint, Some(source));
+        let same = with_exe_sha256("at-the-start", || {
+            read(&path, &program, &slots, OverlapMode::PreciseReplay, FROZEN)
+        })
+        .unwrap();
+        assert!(same.same_exe);
+        assert_eq!(same.cached.model, model);
+        let later = with_exe_sha256("at-the-write", || {
+            read(&path, &program, &slots, OverlapMode::PreciseReplay, FROZEN)
+        })
+        .unwrap();
+        assert!(!later.same_exe);
+
+        // No baseline checkpoint: none named, no file read.
+        let plain = start(&program, &slots, OverlapMode::PreciseReplay, FROZEN).unwrap();
+        assert_eq!(plain.baseline_checkpoint, None);
+        assert_eq!(plain.label(), "baseline_checkpoint=none");
+    })
+    .unwrap_or_else(|_| panic!("the fixture compiles"));
+
+    let error = start_with(Err("boom".into()), None)
+        .err()
+        .expect("an identity that cannot be taken is refused");
+    assert_eq!(
+        error,
+        format!("{REFUSED_HEAD}identity (computable != boom)")
+    );
 }

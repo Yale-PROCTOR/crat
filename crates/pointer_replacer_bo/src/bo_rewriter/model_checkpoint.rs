@@ -5,7 +5,9 @@
 //! - `CRAT_BO_MODEL_CHECKPOINT_OUT=<path>`: after the solve, write one JSON file
 //!   (`bo-model-checkpoint-v1`). It holds this process's identity, the accepted model, the overlap
 //!   baseline (both by slot key), the overlap receipt, the argument-order receipts the emission's
-//!   hoist reads, and the provenance.
+//!   hoist reads, and the provenance. What the file needs from outside the solve (the identity, the
+//!   baseline checkpoint's digest) is taken at the decide's start ([`start`], R1523-2), so the write
+//!   reads no file and recomputes nothing.
 //! - `CRAT_BO_MODEL_CHECKPOINT_IN=<path>`: before the memo and the disk cache, read that file,
 //!   check it, and go to `finish_decide` the way a cache hit does (`cached_rewriter_plans`: the
 //!   overlap plan is re-derived from the baseline and checked against the receipt, with no solver).
@@ -93,7 +95,7 @@ impl ArgOrder {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BaselineSource {
     pub(crate) path: String,
-    /// SHA-256 of the file's bytes.
+    /// SHA-256 of the file's bytes as the decide's start read them, or `unreadable: <error>`.
     pub(crate) sha256: String,
 }
 
@@ -110,7 +112,7 @@ pub(crate) struct Provenance {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelCheckpoint {
     pub(crate) schema: String,
-    /// `baseline_checkpoint::identity` at the write.
+    /// `baseline_checkpoint::identity` at the writing decide's start.
     pub(crate) identity: Identity,
     /// The accepted model: slot key -> kind label (`model_cache::model_map`).
     pub(crate) model: BTreeMap<String, String>,
@@ -224,8 +226,63 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// What the write needs that the solve does not give it, taken at the decide's start (R1523-2):
+/// this process's identity, and the baseline checkpoint the solve is about to resume from, read and
+/// hashed once.
+pub(crate) struct Start {
+    identity: Identity,
+    baseline_checkpoint: Option<BaselineSource>,
+}
+
+impl Start {
+    /// For the start's mark.
+    pub(crate) fn label(&self) -> String {
+        match &self.baseline_checkpoint {
+            Some(source) => format!(
+                "baseline_checkpoint={} sha256={}",
+                source.path, source.sha256
+            ),
+            None => "baseline_checkpoint=none".to_owned(),
+        }
+    }
+}
+
+/// [`Start`] for this decide. Called with `OUT` set only, before any solve.
+pub(crate) fn start(
+    program: &RustProgram<'_>,
+    slots: &CrateSlots,
+    a5_mode: OverlapMode,
+    attestation: Option<WholeProgramAttestation>,
+) -> Result<Start, String> {
+    start_with(
+        baseline_checkpoint::identity(program, slots, a5_mode, attestation),
+        crate::analyses::borrow_ownership::execution_guard::checkpoint_paths()
+            .1
+            .as_deref(),
+    )
+}
+
+/// [`start`] on its two inputs. An identity that cannot be taken refuses `OUT`, typed. A baseline
+/// checkpoint that cannot be read is recorded as that and refuses nothing here: the solve's own read
+/// of the file decides whether the process goes on.
+fn start_with(identity: Result<Identity, String>, input: Option<&Path>) -> Result<Start, String> {
+    let identity = identity.map_err(|error| refused("identity", "computable", &error))?;
+    let baseline_checkpoint = input.map(|input| BaselineSource {
+        path: input.display().to_string(),
+        sha256: match std::fs::read(input) {
+            Ok(bytes) => sha256_hex(&bytes),
+            Err(error) => format!("unreadable: {error}"),
+        },
+    });
+    Ok(Start {
+        identity,
+        baseline_checkpoint,
+    })
+}
+
 /// Write the model checkpoint to `path`, atomically (a temporary file beside it, then a rename).
-/// Returns the file's size in bytes.
+/// Returns the file's size in bytes. The identity and the baseline checkpoint's digest are
+/// `start`'s: nothing is read here, and nothing about the process is computed again.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn write(
     path: &Path,
@@ -234,14 +291,12 @@ pub(crate) fn write(
     model: &FxHashMap<SlotRef, SlotKind>,
     baseline: &FxHashMap<SlotRef, SlotKind>,
     overlap_receipt: &str,
-    a5_mode: OverlapMode,
-    attestation: Option<WholeProgramAttestation>,
+    start: &Start,
     arg_order: Result<Vec<ArgOrderRow>, String>,
     incumbent: bool,
     solve_secs: f64,
 ) -> Result<usize, String> {
     let tcx = program.tcx;
-    let identity = baseline_checkpoint::identity(program, slots, a5_mode, attestation)?;
     let rendered = |map: &FxHashMap<SlotRef, SlotKind>, what: &str| {
         model_cache::model_map(tcx, slots, map)
             .ok_or_else(|| format!("{what}: an unrenderable slot key"))
@@ -250,19 +305,9 @@ pub(crate) fn write(
         model_cache::model_bytes_sha256(tcx, slots, map)
             .ok_or_else(|| format!("{what}: an unrenderable slot key"))
     };
-    let baseline_checkpoint =
-        match crate::analyses::borrow_ownership::execution_guard::checkpoint_paths().1 {
-            Some(input) => Some(BaselineSource {
-                path: input.display().to_string(),
-                sha256: sha256_hex(
-                    &std::fs::read(&input).map_err(|e| format!("{}: {e}", input.display()))?,
-                ),
-            }),
-            None => None,
-        };
     let checkpoint = ModelCheckpoint {
         schema: SCHEMA.to_owned(),
-        identity,
+        identity: start.identity.clone(),
         model: rendered(model, "model")?,
         model_sha256: digest(model, "model")?,
         baseline: rendered(baseline, "baseline")?,
@@ -270,7 +315,7 @@ pub(crate) fn write(
         overlap_receipt: overlap_receipt.to_owned(),
         arg_order: ArgOrder::of(arg_order),
         provenance: Provenance {
-            baseline_checkpoint,
+            baseline_checkpoint: start.baseline_checkpoint.clone(),
             incumbent,
             solve_wall_s: format!("{solve_secs:.6}"),
         },

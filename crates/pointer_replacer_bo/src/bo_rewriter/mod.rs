@@ -7666,6 +7666,17 @@ fn decide_table_perturbed_config<'tcx>(
             perturb,
         );
     }
+    // R1523-2: with `OUT` set, what the write needs from outside the solve (this process's identity,
+    // the digest of the baseline checkpoint the solve resumes from) is taken here, before any solve.
+    // An identity that cannot be taken refuses `OUT` now and not after the solve.
+    let model_out = match model_out {
+        Some(path) => {
+            let start = model_checkpoint::start(&program, &slots, a5_mode, attestation)?;
+            crate::phase_log::mark("decide:model_checkpoint", "start", &start.label());
+            Some((path, start))
+        }
+        None => None,
+    };
     // The key does not name the A5 mode (S2 D5): only the frame's mode is cached.
     let cacheable = a5_mode == OverlapMode::PreciseReplay
         && attestation == Some(WholeProgramAttestation::FrozenBenchmarkGraph);
@@ -7789,8 +7800,9 @@ fn decide_table_perturbed_config<'tcx>(
     };
     // R1520-2 (main 336 §A3): the model checkpoint, written before `finish_decide` starts. The
     // switches admit `OUT` in the frame's mode only, where `cacheable` is false exactly when a round
-    // accepted an optimize incumbent. A failed write is one line; the decide goes on.
-    if let Some(path) = &model_out {
+    // accepted an optimize incumbent. A failed write is one line; the decide goes on. The write
+    // reads no file and takes the identity from `start` (R1523-2).
+    if let Some((path, start)) = &model_out {
         let arg_order = model_cache::prepared_arg_order_applied(&fp);
         let arg_order_label = match &arg_order {
             Ok(rows) => format!("ok:{}", rows.len()),
@@ -7803,8 +7815,7 @@ fn decide_table_perturbed_config<'tcx>(
             &verified.model,
             &verified.baseline_model,
             &verified.receipt,
-            a5_mode,
-            attestation,
+            start,
             arg_order,
             !cacheable,
             solve_secs,
