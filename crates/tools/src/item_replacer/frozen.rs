@@ -33,6 +33,7 @@ pub struct FrozenFunction {
 pub struct AcceptedScc {
     pub members: Vec<u64>,
     pub source: String,
+    pub stubbed_items: Vec<u64>,
 }
 
 pub fn frozen_project_from_json(input: &str) -> Result<FrozenProject, ReplacementError> {
@@ -646,6 +647,15 @@ pub fn assemble_frozen_project(
             parse_crate(&frozen.target_source, ReplacementErrorKind::RewriteFailure)?;
         let mut selected = HashMap::new();
         for scc in accepted {
+            let stubbed = scc.stubbed_items.iter().copied().collect::<HashSet<_>>();
+            if stubbed.len() != scc.stubbed_items.len()
+                || stubbed.iter().any(|id| !scc.members.contains(id))
+            {
+                return Err(global_error(
+                    ReplacementErrorKind::InvalidRequest,
+                    "stubbed items must be unique members of their retained group".to_owned(),
+                ));
+            }
             let source = parse_crate(&scc.source, ReplacementErrorKind::RewriteFailure)?;
             require_same_context(&assembled, &source)?;
             for id in &scc.members {
@@ -668,11 +678,21 @@ pub fn assemble_frozen_project(
                 })?;
                 let expected = function_at_path(&assembled.items, &path)
                     .expect("frozen template contains every function");
-                if pprust::item_to_string(item) == pprust::item_to_string(expected) {
+                let is_stub = pprust::item_to_string(item) == pprust::item_to_string(expected);
+                if is_stub && !stubbed.contains(id) {
                     return Err(global_error(
                         ReplacementErrorKind::InvalidTransformation,
                         format!(
                             "accepted function `{}` still has its frozen stub body",
+                            function.record.path
+                        ),
+                    ));
+                }
+                if !is_stub && stubbed.contains(id) {
+                    return Err(global_error(
+                        ReplacementErrorKind::InvalidRequest,
+                        format!(
+                            "stubbed function `{}` has a retained implementation",
                             function.record.path
                         ),
                     ));

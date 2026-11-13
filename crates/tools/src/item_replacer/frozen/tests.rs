@@ -230,10 +230,12 @@ fn independent_duplicate_names_assemble_in_original_order_without_stubs() {
     run_compiler_on_str(&second.replacement.source, |_| ()).unwrap();
     let accepted = [
         AcceptedScc {
+            stubbed_items: vec![],
             members: vec![2],
             source: second.replacement.source,
         },
         AcceptedScc {
+            stubbed_items: vec![],
             members: vec![0],
             source: first.replacement.source,
         },
@@ -414,6 +416,7 @@ pub unsafe fn value(p: *const i32) -> i32 {
     let assembled = assemble_frozen_project(
         &frozen,
         &[AcceptedScc {
+            stubbed_items: vec![],
             members: vec![function.record.id],
             source: candidate.clone(),
         }],
@@ -481,6 +484,7 @@ fn frozen_finalization_restores_main_and_preserves_original_api_exports() {
     );
     let output = transform(&frozen, 0);
     let accepted = [AcceptedScc {
+        stubbed_items: vec![],
         members: vec![frozen.functions[0].record.id],
         source: output.replacement.source,
     }];
@@ -705,6 +709,184 @@ fn unstructured_preparation_strips_labels_and_selects_latest_parseable_candidate
 }
 
 #[test]
+fn retention_preserves_latest_usable_body_per_function_without_type_checking() {
+    let frozen = freeze(
+        "pub unsafe fn first(x: i32) -> i32 { x } pub unsafe fn second(x: i32) -> i32 { x }",
+    );
+    let members = frozen
+        .functions
+        .iter()
+        .map(|function| function.record.id)
+        .collect::<Vec<_>>();
+    let retained = retain_frozen_functions(&frozen, &UnstructuredPreparationRequest {
+        members: members.clone(),
+        transformations: vec![
+            "unsafe fn first(mut x: i32) -> i32 { 1 } unsafe fn second(mut x: i32) -> i32 { 2 }".to_owned(),
+            "fn first(renamed: u8) -> bool { #[proctor(0)] let text = \"#[proctor(99)]\"; #[proctor(1)] missing_value } struct Unrelated;".to_owned(),
+            "unsafe fn first(mut x: i32) -> i32 { 7 } unsafe fn first(mut x: i32) -> i32 { 8 }".to_owned(),
+            "unsafe fn second(mut x: i32) -> i32 { ::core::todo!() }".to_owned(),
+            "unsafe fn first(mut x: i32) -> i32 { return todo!(); } unsafe fn second(mut x: i32) -> i32 { { std::todo!() } }".to_owned(),
+            "unsafe fn first(mut x: i32) -> i32 { let value = 1 x }".to_owned(),
+            "unsafe fn second(mut x: i32) -> i32 { let value = ; 3 }".to_owned(),
+            "unsafe fn second(".to_owned(),
+        ],
+    }).unwrap();
+    assert!(retained.stubbed_items.is_empty());
+    assert!(retained.source.contains("missing_value"));
+    assert!(retained.source.contains("\"#[proctor(99)]\""));
+    assert!(!retained.source.contains("#[proctor(0)]"));
+    assert!(!retained.source.contains("#[proctor(1)]"));
+    assert!(!retained.source.contains("Unrelated"));
+    assert!(!retained.source.contains("renamed") && !retained.source.contains("u8"));
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[AcceptedScc {
+            members,
+            source: retained.source.clone(),
+            stubbed_items: retained.stubbed_items,
+        }],
+    )
+    .unwrap();
+    assert_eq!(assembled, retained.source);
+    with_parse_session(|| {
+        let parsed = parse_crate(&assembled, ReplacementErrorKind::InvalidTransformation)?;
+        let second = function_at_path(&parsed.items, &["second".to_owned()]).unwrap();
+        let expected = one_item(&format!(
+            "{} {{ 2 }}",
+            frozen.functions[1].record.target_signature
+        ))?;
+        assert_eq!(
+            pprust::item_to_string(second),
+            pprust::item_to_string(&expected)
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn retention_keeps_frozen_stubs_only_for_members_without_usable_bodies() {
+    let frozen = freeze(
+        "pub unsafe extern \"C\" fn first(x: i32) -> i32 { x } pub unsafe fn second(x: i32) -> i32 { x } pub unsafe fn third() {}",
+    );
+    let first = &frozen.functions[0];
+    let second = &frozen.functions[1];
+    let third = &frozen.functions[2];
+    let retained = retain_frozen_functions(
+        &frozen,
+        &UnstructuredPreparationRequest {
+            members: vec![first.record.id, second.record.id],
+            transformations: vec!["fn first() { let value: i32 = todo!(); value }".to_owned()],
+        },
+    )
+    .unwrap();
+    assert_eq!(retained.stubbed_items, vec![second.record.id]);
+    assert!(retained.source.contains("extern \"C\""));
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[
+            AcceptedScc {
+                members: vec![first.record.id, second.record.id],
+                source: retained.source,
+                stubbed_items: retained.stubbed_items,
+            },
+            AcceptedScc {
+                members: vec![third.record.id],
+                source: frozen.target_source.clone(),
+                stubbed_items: vec![third.record.id],
+            },
+        ],
+    )
+    .unwrap();
+    assert!(assembled.contains("let value: i32 = todo!()"));
+    assert_eq!(assembled.matches("todo!()").count(), 3);
+    for members in [
+        vec![],
+        vec![u64::MAX],
+        vec![first.record.id, first.record.id],
+    ] {
+        assert!(
+            retain_frozen_functions(
+                &frozen,
+                &UnstructuredPreparationRequest {
+                    members,
+                    transformations: vec![],
+                }
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn assembly_requires_exact_stub_allowlists_and_complete_member_coverage() {
+    let frozen = freeze("pub unsafe fn first() {} pub unsafe fn second() {}");
+    let members = frozen
+        .functions
+        .iter()
+        .map(|function| function.record.id)
+        .collect::<Vec<_>>();
+    for stubbed_items in [
+        vec![],
+        vec![members[0]],
+        vec![members[0], members[0]],
+        vec![u64::MAX],
+    ] {
+        assert!(
+            assemble_frozen_project(
+                &frozen,
+                &[AcceptedScc {
+                    members: members.clone(),
+                    source: frozen.target_source.clone(),
+                    stubbed_items,
+                }]
+            )
+            .is_err()
+        );
+    }
+    let retained = retain_frozen_functions(
+        &frozen,
+        &UnstructuredPreparationRequest {
+            members: members.clone(),
+            transformations: vec!["unsafe fn first() { let value = 1; }".to_owned()],
+        },
+    )
+    .unwrap();
+    assert!(
+        assemble_frozen_project(
+            &frozen,
+            &[AcceptedScc {
+                members: members.clone(),
+                source: retained.source,
+                stubbed_items: members.clone(),
+            }]
+        )
+        .is_err()
+    );
+    assert!(
+        assemble_frozen_project(
+            &frozen,
+            &[AcceptedScc {
+                members: vec![members[0]],
+                source: frozen.target_source.clone(),
+                stubbed_items: vec![members[0]],
+            }]
+        )
+        .is_err()
+    );
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[AcceptedScc {
+            members: members.clone(),
+            source: frozen.target_source.clone(),
+            stubbed_items: members,
+        }],
+    )
+    .unwrap();
+    assert_eq!(assembled, frozen.target_source);
+}
+
+#[test]
 fn unstructured_stripping_handles_misplaced_labels_in_failed_function_output() {
     let stripped = strip_proctor_labels("#![proctor(0)] #[allow(dead_code)] #[proctor(1)] unsafe fn target<#[proctor(2)] 'a>(#[proctor(3)] x: &'a i32) -> i32 { match *x { #[proctor(4)] _ => 1 } }").unwrap();
     assert!(!stripped.contains("proctor"));
@@ -741,6 +923,7 @@ fn unstructured_rewrites_use_frozen_headers_and_assemble_after_free_body_changes
     let assembled = assemble_frozen_project(
         &frozen,
         &[AcceptedScc {
+            stubbed_items: vec![],
             members: vec![frozen.functions[0].record.id],
             source: replacement.source,
         }],
@@ -809,6 +992,7 @@ fn unstructured_preserves_other_scc_stubs_and_rejects_invalid_members() {
         .unwrap();
         assert_eq!(replacement.source.matches("todo!()").count(), 1);
         accepted.push(AcceptedScc {
+            stubbed_items: vec![],
             members: vec![function.record.id],
             source: replacement.source,
         });
@@ -857,6 +1041,7 @@ fn unstructured_preserves_frozen_lifetimes_and_pointer_target_types() {
     let assembled = assemble_frozen_project(
         &frozen,
         &[AcceptedScc {
+            stubbed_items: vec![],
             members: vec![frozen.functions[0].record.id],
             source: replacement.source,
         }],
@@ -910,6 +1095,7 @@ fn unstructured_rewrites_every_member_of_a_recursive_scc_together() {
     let assembled = assemble_frozen_project(
         &frozen,
         &[AcceptedScc {
+            stubbed_items: vec![],
             members,
             source: replacement.source,
         }],
@@ -944,6 +1130,7 @@ pub unsafe fn get(holder: *const Holder) -> *const i32 { (*holder).pointer }
     let assembled = assemble_frozen_project(
         &frozen,
         &[AcceptedScc {
+            stubbed_items: vec![],
             members: vec![function.record.id],
             source: output.replacement.source.clone(),
         }],
@@ -1048,6 +1235,7 @@ pub unsafe fn identity(head: *const *const i32) -> *const *const i32 { head }
     let assembled = assemble_frozen_project(
         &frozen,
         &[AcceptedScc {
+            stubbed_items: vec![],
             members: vec![function.record.id],
             source: output.replacement.source,
         }],

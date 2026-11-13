@@ -22,6 +22,11 @@ pub struct UnstructuredPreparation {
     pub candidate: Option<String>,
 }
 
+pub struct RetainedFunctions {
+    pub source: String,
+    pub stubbed_items: Vec<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnstructuredReplacementRequest {
@@ -105,6 +110,91 @@ pub fn prepare_unstructured_repair(
             .find_map(|source| strip_proctor_labels(source).ok());
         Ok(UnstructuredPreparation { targets, candidate })
     })
+}
+
+pub fn retain_frozen_functions(
+    frozen: &FrozenProject,
+    request: &UnstructuredPreparationRequest,
+) -> Result<RetainedFunctions, ReplacementError> {
+    with_parse_session(|| {
+        validate_frozen_project(frozen)?;
+        let functions = selected_functions(frozen, &request.members)?;
+        let mut retained = HashMap::new();
+        for source in request.transformations.iter().rev() {
+            let Ok(mut parsed) = utils::ast::try_parse_crate(source.clone()) else {
+                continue;
+            };
+            ProctorLabelRemover.visit_crate(&mut parsed);
+            let mut candidates = HashMap::new();
+            for item in &parsed.items {
+                let ItemKind::Fn(function) = &item.kind else { continue };
+                let name = function.ident.to_string();
+                let body = function
+                    .body
+                    .as_ref()
+                    .filter(|body| !whole_function_stub(body));
+                candidates
+                    .entry(name)
+                    .and_modify(|body| *body = None)
+                    .or_insert(body);
+            }
+            for function in &functions {
+                if let Some(Some(body)) = candidates.get(&function.record.name) {
+                    retained
+                        .entry(function.record.id)
+                        .or_insert_with(|| (*body).clone());
+                }
+            }
+        }
+        let mut candidate =
+            parse_crate(&frozen.target_source, ReplacementErrorKind::RewriteFailure)?;
+        let mut stubbed_items = Vec::new();
+        for function in functions {
+            let Some(body) = retained.remove(&function.record.id) else {
+                stubbed_items.push(function.record.id);
+                continue;
+            };
+            let path = path_segments(&function.record.path);
+            let mut implementation = function_at_path(&candidate.items, &path)
+                .expect("frozen template contains every selected member")
+                .clone();
+            let ItemKind::Fn(output) = &mut implementation.kind else { unreachable!() };
+            output.body = Some(body);
+            replace_function_at_path(&mut candidate.items, &path, implementation)?;
+        }
+        Ok(RetainedFunctions {
+            source: pprust::crate_to_string_for_macros(&candidate),
+            stubbed_items,
+        })
+    })
+}
+
+fn whole_function_stub(body: &rustc_ast::Block) -> bool {
+    let [statement] = body.stmts.as_slice() else { return false };
+    let (StmtKind::Expr(expression) | StmtKind::Semi(expression)) = &statement.kind else {
+        return false;
+    };
+    fn stub_expression(expression: &Expr) -> bool {
+        match &expression.kind {
+            ExprKind::Ret(Some(expression)) | ExprKind::Paren(expression) => {
+                stub_expression(expression)
+            }
+            ExprKind::Block(body, _) => whole_function_stub(body),
+            ExprKind::MacCall(mac) => {
+                let names = mac
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.name)
+                    .filter(|name| *name != rustc_span::kw::PathRoot)
+                    .collect::<Vec<_>>();
+                matches!(names.as_slice(), [name] if name.as_str() == "todo")
+                    || matches!(names.as_slice(), [root, name] if matches!(root.as_str(), "core" | "std") && name.as_str() == "todo")
+            }
+            _ => false,
+        }
+    }
+    stub_expression(expression)
 }
 
 pub fn replace_unstructured_scc(
