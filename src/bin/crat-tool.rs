@@ -70,6 +70,22 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    TransformInitializer {
+        #[arg(long)]
+        frozen: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
+    InstallInitializers {
+        #[arg(long)]
+        frozen: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     ReplaceUnstructuredScc {
         #[arg(long)]
         frozen: PathBuf,
@@ -679,6 +695,48 @@ fn main() {
                 tools::prepare_unstructured_repair(&read_frozen_project(&frozen), &request)
                     .unwrap_or_else(|error| replacement_failure(error));
             let json = serde_json::to_string_pretty(&prepared).unwrap();
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::TransformInitializer {
+            frozen,
+            request,
+            output,
+        } => {
+            validate_output_input_paths(&[&output], &[&frozen, &request])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            let request: tools::InitializerTransformationRequest = serde_json::from_str(
+                &std::fs::read_to_string(&request)
+                    .unwrap_or_else(|error| fail("request_io", error)),
+            )
+            .unwrap_or_else(|error| fail("invalid_request", error));
+            let response =
+                tools::transform_frozen_initializer(&read_frozen_project(&frozen), &request)
+                    .unwrap_or_else(|error| replacement_failure(error));
+            let json = serde_json::to_string_pretty(&response).unwrap();
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::InstallInitializers {
+            frozen,
+            request,
+            output,
+        } => {
+            validate_output_input_paths(&[&output], &[&frozen, &request])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            let request: tools::InitializerInstallationRequest = serde_json::from_str(
+                &std::fs::read_to_string(&request)
+                    .unwrap_or_else(|error| fail("request_io", error)),
+            )
+            .unwrap_or_else(|error| fail("invalid_request", error));
+            let updated =
+                tools::install_frozen_initializers(&read_frozen_project(&frozen), &request)
+                    .unwrap_or_else(|error| replacement_failure(error));
+            let json = serde_json::to_string_pretty(&updated).unwrap();
             prepare_publish_destinations(&[&output])
                 .unwrap_or_else(|error| fail("output_io", error));
             publish_files(&[(&output, json.as_bytes())])

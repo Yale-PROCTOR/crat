@@ -174,27 +174,28 @@ fn whole_function_stub(body: &rustc_ast::Block) -> bool {
     let (StmtKind::Expr(expression) | StmtKind::Semi(expression)) = &statement.kind else {
         return false;
     };
-    fn stub_expression(expression: &Expr) -> bool {
-        match &expression.kind {
-            ExprKind::Ret(Some(expression)) | ExprKind::Paren(expression) => {
-                stub_expression(expression)
-            }
-            ExprKind::Block(body, _) => whole_function_stub(body),
-            ExprKind::MacCall(mac) => {
-                let names = mac
-                    .path
-                    .segments
-                    .iter()
-                    .map(|segment| segment.ident.name)
-                    .filter(|name| *name != rustc_span::kw::PathRoot)
-                    .collect::<Vec<_>>();
-                matches!(names.as_slice(), [name] if name.as_str() == "todo")
-                    || matches!(names.as_slice(), [root, name] if matches!(root.as_str(), "core" | "std") && name.as_str() == "todo")
-            }
-            _ => false,
+    whole_expression_stub(expression)
+}
+
+pub(super) fn whole_expression_stub(expression: &Expr) -> bool {
+    match &expression.kind {
+        ExprKind::Ret(Some(expression)) | ExprKind::Paren(expression) => {
+            whole_expression_stub(expression)
         }
+        ExprKind::Block(body, _) => whole_function_stub(body),
+        ExprKind::MacCall(mac) => {
+            let names = mac
+                .path
+                .segments
+                .iter()
+                .map(|segment| segment.ident.name)
+                .filter(|name| *name != rustc_span::kw::PathRoot)
+                .collect::<Vec<_>>();
+            matches!(names.as_slice(), [name] if name.as_str() == "todo")
+                || matches!(names.as_slice(), [root, name] if matches!(root.as_str(), "core" | "std") && name.as_str() == "todo")
+        }
+        _ => false,
     }
-    stub_expression(expression)
 }
 
 pub fn replace_unstructured_scc(

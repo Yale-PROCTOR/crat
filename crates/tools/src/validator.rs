@@ -216,7 +216,7 @@ fn validate_inner(request: &ValidationRequest) -> ValidationResponse {
     let mut failures = vec![];
     for entry in expected {
         let result_item = by_name[&entry.metadata.name][0];
-        let errors = validate_function(&entry, result_item);
+        let errors = validate_function(&entry, result_item, false);
         if !errors.is_empty() {
             failures.push(ValidationFailure {
                 id: Some(entry.metadata.id),
@@ -721,10 +721,30 @@ pub(crate) fn validate_function_with_view(
             item: P(expected.clone()),
         },
         result,
+        false,
     )
 }
 
-fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<ValidationError> {
+pub(crate) fn validate_initializer_function_with_view(
+    expected: &Item,
+    result: &Item,
+    metadata: ExpectedFunction,
+) -> Vec<ValidationError> {
+    validate_function(
+        &ParsedExpected {
+            metadata,
+            item: P(expected.clone()),
+        },
+        result,
+        true,
+    )
+}
+
+fn validate_function(
+    expected: &ParsedExpected,
+    result: &Item,
+    allow_unsafe_blocks: bool,
+) -> Vec<ValidationError> {
     let signature_errors = validate_signature(expected, result);
     let ItemKind::Fn(box expected_fn) = &expected.item.kind else { unreachable!() };
     let ItemKind::Fn(box returned_fn) = &result.kind else { unreachable!() };
@@ -884,7 +904,11 @@ fn validate_function(expected: &ParsedExpected, result: &Item) -> Vec<Validation
     );
 
     let mut safety_errors = vec![];
-    for occurrence in &result_scan.unsafe_blocks {
+    for occurrence in result_scan
+        .unsafe_blocks
+        .iter()
+        .filter(|_| !allow_unsafe_blocks)
+    {
         safety_errors.push(error(
             "explicit_unsafe_block",
             function_message(
