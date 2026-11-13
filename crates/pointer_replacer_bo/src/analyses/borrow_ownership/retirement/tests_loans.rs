@@ -200,6 +200,10 @@ fn complete(replay: &Replay) -> &RetirementReview {
     review
 }
 
+pub(super) fn review_local(code: &str, function: &str, name: &str) -> RetirementReview {
+    complete(&replay(code, function, &[(name, 0)])).clone()
+}
+
 fn original_loan<'a>(
     replay: &'a Replay,
     conflict: &RetirementConflict,
