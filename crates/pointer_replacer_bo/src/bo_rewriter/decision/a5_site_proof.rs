@@ -477,13 +477,17 @@ mod tests {
     fn a5_proof_site_key_uses_compiler_identity_not_source_spans() {
         let caller = rustc_hir::def_id::CRATE_DEF_ID;
         let key = A5ProofSiteKey::new(caller, MirLocationKey::new(4, 7), caller.to_def_id(), 1, 0);
-        assert_eq!(key, key);
+        assert_eq!(key.caller, caller);
+        assert_eq!(key.location, MirLocationKey::new(4, 7));
+        assert_eq!(key.callee, caller.to_def_id());
+        assert_eq!(key.argument_index, 1);
+        assert_eq!(key.slot_depth, 0);
         let receipt = key.receipt_key();
-        assert!(
-            receipt.starts_with("caller=0:bb=4:stmt=7:terminator=1:callee=DefId(0:0"),
-            "{receipt}"
-        );
-        assert!(receipt.ends_with(":arg=1:depth=0"), "{receipt}");
+        let (site, callee_and_position) = receipt.split_once(":callee=").unwrap();
+        let (callee, position) = callee_and_position.rsplit_once(":arg=").unwrap();
+        assert_eq!(site, "caller=0:bb=4:stmt=7:terminator=1");
+        assert_eq!(callee, format!("{:?}", key.callee));
+        assert_eq!(position, "1:depth=0");
         let later =
             A5ProofSiteKey::new(caller, MirLocationKey::new(4, 7), caller.to_def_id(), 2, 0);
         assert_ne!(key, later);

@@ -3235,18 +3235,31 @@ fn e5c_w67_c_the_ledger_names_a_kind_equate_partner() {
     assert_ne!(partnered[2], "none", "{partnered:?}");
 }
 
-/// W67d: a pointer joined at a phi with null. The null edge excludes nothing
-/// (§29): the row names the allocation source and the ownership refusal.
+/// A conditional allocation into a null-initialized local retains ownership.
+/// The ledger names its allocation source and admission without an ownership refusal.
 #[test]
 fn e5c_w67_d_a_phi_with_null_names_its_real_cause() {
     let rows = w67_rows("w67-shapes", &[]);
     let row = w67_row(&rows, "phi_null::_2@d0");
     assert_eq!(
-        (row[2].as_str(), row[6].as_str()),
-        ("eager:allocation-source", "direct"),
+        (
+            row[1].as_str(),
+            row[2].as_str(),
+            row[6].as_str(),
+            row[7].as_str(),
+            row[12].as_str(),
+            row[13].as_str()
+        ),
+        (
+            "ref-excluded,own-admitted",
+            "eager:allocation-source",
+            "direct",
+            "-",
+            "owning",
+            "link-own"
+        ),
         "{row:?}"
     );
-    assert!(row[7].starts_with("own-assume["), "{row:?}");
     assert!(
         rows.iter()
             .all(|row| !row[6].contains("null") && !row[8].contains("null")),
