@@ -82,6 +82,8 @@ pub(crate) mod value_origins;
 mod value_origin_tests;
 
 #[cfg(test)]
+mod nullable_ownership_tests;
+#[cfg(test)]
 mod objective_tests;
 
 #[cfg(test)]

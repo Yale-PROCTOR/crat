@@ -37,6 +37,7 @@ use crate::analyses::borrow_ownership::{
 
 mod aggregate;
 mod boundary;
+mod null_overwrite;
 mod realloc_transition;
 
 pub type LocalSig = Range<Var>;
@@ -162,6 +163,9 @@ where
     /// Per (join block, local, incoming version) the window components
     /// known null on EVERY edge that carries that version into the join.
     null_joins: FxHashMap<(BasicBlock, Local, SSAIdx), Vec<bool>>,
+    null_overwrites: FxHashSet<Location>,
+    /// Only the outer old-destination component of the current write.
+    null_overwrite: Option<Var>,
     /// The proven strong-update field moves of this body.
     field_moves: super::field_moves::FieldMoves,
 }
@@ -226,6 +230,8 @@ where
             realloc_ghosts: FxHashSet::default(),
             null_paths: super::null_paths::NullPaths::compute(crate_ctxt.tcx, body),
             null_joins: FxHashMap::default(),
+            null_overwrites: null_overwrite::sites(crate_ctxt.tcx, body),
+            null_overwrite: None,
             field_moves: super::field_moves::compute(body),
         }
     }
@@ -744,6 +750,22 @@ where
         infer_cx.aggregate(body, place, kind, destination, operands);
     }
 
+    fn prepare_overwrite(
+        infer_cx: &mut Self::Ctxt,
+        destination: Option<&Consume<Self::LocalSig>>,
+        location: Location,
+    ) {
+        infer_cx.null_overwrite = destination
+            .filter(|_| infer_cx.null_overwrites.contains(&location))
+            .and_then(|destination| destination.r#use.clone().next());
+    }
+
+    fn require_empty(infer_cx: &mut Self::Ctxt, old: Self::LocalSig) {
+        for var in old {
+            null_overwrite::require_empty(infer_cx.database, var, infer_cx.null_overwrite);
+        }
+    }
+
     fn transfer<const ENSURE_MOVE: bool>(
         infer_cx: &mut InferCtxt<'infercx, 'db, 'tcx, Analysis>,
         ty: Ty<'tcx>,
@@ -767,6 +789,7 @@ where
         let reader_windows = field_reader_guard
             .as_ref()
             .map(|_| (lhs_result.clone(), rhs_result.clone()));
+        let null_old = infer_cx.null_overwrite;
         with_own_assume_site(OwnAssumeSite::SsaTransfer, || {
             // A proven strong-update field load MOVES the token —
             // the destination takes it and the source component goes vacuous —
@@ -784,12 +807,7 @@ where
                 infer_cx.database,
                 |lhs, rhs, database| {
                     let _transfer = super::ownership_occurrence::transfer(&lhs, &rhs, ensure_move);
-                    database
-                        .push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                            (),
-                            lhs.r#use,
-                            false,
-                        );
+                    null_overwrite::require_empty(database, lhs.r#use, null_old);
                     if let Some(reader) = field_reader_guard.as_ref() {
                         reader_destinations.insert(lhs.def);
                         reader_sources.insert(rhs.def);
@@ -917,7 +935,7 @@ where
 
     fn source(infer_cx: &mut Self::Ctxt, result: Consume<Self::LocalSig>) {
         infer_cx.database.record_source_sink();
-        Self::assume(infer_cx, result.r#use, false);
+        Self::require_empty(infer_cx, result.r#use);
         if let Some(sig) = result.def.clone().next() {
             // Retractable owning: hard by default, selector-gated for BO so the
             // on-UNSAT relax loop can leak a conflicting allocation.

@@ -70,6 +70,7 @@ impl Equation {
             | "guarded-original-cell-legacy"
             | "guarded-traversal-argument-legacy" => 4,
             "assume"
+            | "null-overwrite"
             | "source"
             | "sink"
             | "guarded-traversal-view-zero"
@@ -139,6 +140,11 @@ impl Equation {
         };
         if !valid_point || self.point.function.as_ref().is_some_and(String::is_empty) {
             return Err("invalid ownership emission point");
+        }
+        if self.operation == "null-overwrite"
+            && !matches!(self.point.phase.as_str(), "statement" | "terminator")
+        {
+            return Err("null overwrite outside a write");
         }
         if matches!(self.operation.as_str(), "source" | "sink") != self.endpoint.is_some() {
             return Err("ownership endpoint key mismatch");
