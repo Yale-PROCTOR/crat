@@ -181,9 +181,21 @@ fn main() {}
             .keys()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        ["analysis_source", "functions", "target_source", "types"]
+        [
+            "analysis_source",
+            "functions",
+            "initializers",
+            "target_source",
+            "types"
+        ]
     );
-    for field in ["analysis_source", "functions", "target_source", "types"] {
+    for field in [
+        "analysis_source",
+        "functions",
+        "initializers",
+        "target_source",
+        "types",
+    ] {
         let mut missing = value.clone();
         missing.as_object_mut().unwrap().remove(field);
         assert!(frozen_project_from_json(&missing.to_string()).is_err());

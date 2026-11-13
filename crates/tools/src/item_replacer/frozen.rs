@@ -2,6 +2,8 @@ use super::*;
 
 mod unstructured;
 pub use unstructured::*;
+mod initializers;
+pub use initializers::*;
 
 #[cfg(test)]
 mod tests;
@@ -15,6 +17,7 @@ pub struct FrozenProject {
     pub target_source: String,
     pub functions: Vec<FrozenFunction>,
     pub types: Vec<crate::TypeRecord>,
+    pub initializers: Vec<FrozenInitializer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +105,7 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
     let target = parse_crate(&frozen.target_source, ReplacementErrorKind::InvalidRequest)?;
     let mut expected = analysis.clone();
     install_frozen_types(&mut expected.items, &frozen.types)?;
+    validate_frozen_initializers(frozen, &analysis, &mut expected)?;
     require_same_context(&expected, &target)?;
     let mut originals = HashMap::new();
     let mut targets = HashMap::new();
@@ -303,6 +307,7 @@ pub fn freeze_project(
         })
         .collect::<Vec<_>>();
     install_frozen_types(&mut target.items, &types)?;
+    let initializers = freeze_initializers(records, &analysis)?;
     replace_pending_functions(&mut target.items);
     let mut frozen = vec![];
     let mut source_paths = FxHashMap::default();
@@ -388,6 +393,7 @@ pub fn freeze_project(
         target_source: pprust::crate_to_string_for_macros(&target),
         functions: frozen,
         types,
+        initializers,
     })
 }
 

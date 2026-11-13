@@ -86,6 +86,17 @@ pub struct ValueRecord {
     pub declaration: String,
     pub signature_dependencies: Vec<u64>,
     pub dependencies: Vec<u64>,
+    pub initializer: Option<InitializerRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitializerRecord {
+    pub annotated_source: String,
+    pub skeleton: String,
+    pub needs_transformation: bool,
+    pub block: bool,
+    pub statement_dispositions: Vec<crate::StatementDisposition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +186,10 @@ struct PreservationDecisionOverrides {
     changed_local_signatures: FxHashSet<LocalDefId>,
 }
 
+mod initializers;
+use initializers::make_initializer_record;
+pub(crate) use initializers::{initializer_expression, initializer_function, set_initializer};
+
 pub fn make_skeletons(source: &str, tcx: TyCtxt<'_>) -> Result<Vec<ItemRecord>, GenerationError> {
     make_skeletons_with_rules(source, None, tcx)
 }
@@ -263,8 +278,9 @@ fn make_skeletons_with_preservation_overrides(
         }
     }
 
-    raw_items
-        .into_iter()
+    let mut records = raw_items
+        .iter()
+        .cloned()
         .map(|item| {
             make_record(
                 item,
@@ -276,7 +292,46 @@ fn make_skeletons_with_preservation_overrides(
                 tcx,
             )
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    let changed_types = records
+        .iter()
+        .filter_map(|record| match record {
+            ItemRecord::Type(record) if record.source_definition != record.target_definition => {
+                Some(record.id)
+            }
+            _ => None,
+        })
+        .collect::<FxHashSet<_>>();
+    let dependencies = records
+        .iter()
+        .map(|record| {
+            let edges = match record {
+                ItemRecord::Function(record) => &record.signature_dependencies,
+                _ => record.dependencies(),
+            };
+            (record.id(), edges.to_vec())
+        })
+        .collect::<FxHashMap<_, _>>();
+    for (record, surface) in records.iter_mut().zip(raw_items) {
+        let ItemRecord::Value(value) = record else { continue };
+        let mut pending = value.dependencies.clone();
+        let mut seen = FxHashSet::default();
+        let mut affected = false;
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
+                continue;
+            }
+            if changed_types.contains(&id) {
+                affected = true;
+                break;
+            }
+            pending.extend(dependencies[&id].iter().copied());
+        }
+        if affected {
+            value.initializer = make_initializer_record(&surface, &ast_to_hir, &decisions, tcx)?;
+        }
+    }
+    Ok(records)
 }
 
 fn reject_unsupported_function_generics(
@@ -440,6 +495,7 @@ fn make_record(
                 declaration: pprust::item_to_string(&item),
                 signature_dependencies,
                 dependencies,
+                initializer: None,
             }))
         }
         ItemKindName::TyAlias | ItemKindName::Enum | ItemKindName::Struct | ItemKindName::Union => {

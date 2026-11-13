@@ -3775,6 +3775,7 @@ fn record_variants_serialize_only_their_defined_fields() {
             "path",
             "kind",
             "declaration",
+            "initializer",
             "signature_dependencies",
             "dependencies"
         ]
@@ -3810,12 +3811,13 @@ fn record_variants_serialize_only_their_defined_fields() {
     );
     assert!(objects[1].get("proctor_libc_function_paths").is_none());
     assert!(objects[2].get("proctor_libc_function_paths").is_none());
+    assert!(objects[1]["initializer"].is_null());
     assert!(!objects.iter().any(|value| {
         value
             .as_object()
             .unwrap()
-            .values()
-            .any(serde_json::Value::is_null)
+            .iter()
+            .any(|(key, value)| key != "initializer" && value.is_null())
     }));
 }
 
