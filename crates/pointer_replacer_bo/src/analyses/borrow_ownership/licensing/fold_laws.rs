@@ -159,7 +159,14 @@ pub(crate) fn inventory(facts: &Facts, call: &CallKey) -> Result<Inventory, Hold
                         && e.variables == [var]
                 })
             };
-            if !zero(t.destination_use) || (t.by_move && !zero(t.source_def)) {
+            let null_destination = equations.iter().any(|e| {
+                e.point == law.point
+                    && e.transfer.as_ref() == Some(t)
+                    && e.operation == "null-overwrite"
+                    && e.variables == [t.destination_use]
+            });
+            if !(zero(t.destination_use) || null_destination) || (t.by_move && !zero(t.source_def))
+            {
                 return Err(Hold::LawCoverage);
             }
         }
@@ -317,6 +324,7 @@ pub(crate) fn evaluate(
             "equal" => v(0)? == v(1)?,
             "linear" => (u8::from(v(0)?) + u8::from(v(1)?)) == u8::from(v(2)?),
             "guarded-fold-call" => true,
+            "null-overwrite" => true,
             _ => false,
         };
         if !ok {

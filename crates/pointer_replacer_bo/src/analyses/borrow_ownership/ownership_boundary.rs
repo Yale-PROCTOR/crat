@@ -828,7 +828,8 @@ pub(crate) fn validate_links(
                     Variables::UseDef { use_var, def_var },
                     Variables::Single { var: formal },
                 ) => {
-                    has(&row.point, "assume", &[*use_var], Some(false))
+                    (has(&row.point, "assume", &[*use_var], Some(false))
+                        || has(&row.point, "null-overwrite", &[*use_var], None))
                         && (has(
                             &row.point,
                             if row.licensing_role == LicensingRole::TraversalBorrow {

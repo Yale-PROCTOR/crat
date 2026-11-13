@@ -598,6 +598,7 @@ pub(crate) fn validate(
             }
         }
         let expected = match equation.operation.as_str() {
+            "null-overwrite" => equation.variables == [transfer.destination_use],
             "assume" => {
                 equation.assumption_class.as_deref() == Some("ssa-transfer")
                     && equation.value == Some(false)

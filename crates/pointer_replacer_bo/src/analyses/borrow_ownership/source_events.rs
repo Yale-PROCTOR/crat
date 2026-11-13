@@ -260,7 +260,16 @@ pub(super) fn transfer_statement(
                 state[local.as_usize()] = false;
             }
         }
-        StatementKind::StorageDead(local) => state[local.as_usize()] = false,
+        StatementKind::StorageLive(local) | StatementKind::StorageDead(local) => {
+            state[local.as_usize()] = false;
+        }
+        StatementKind::SetDiscriminant { place, .. } | StatementKind::Deinit(place) => {
+            state[place.local.as_usize()] = false;
+            for local in addressed {
+                state[local.as_usize()] = false;
+            }
+        }
+        StatementKind::Intrinsic(..) => state.fill(false),
         _ => {}
     }
 }

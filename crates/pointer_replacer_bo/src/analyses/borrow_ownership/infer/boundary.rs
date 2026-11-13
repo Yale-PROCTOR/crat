@@ -7,7 +7,7 @@ use rustc_middle::{
     ty::{Ty, TyCtxt, TyKind},
 };
 
-use super::{CallArgs, InferCtxt, matcher};
+use super::{CallArgs, InferCtxt, matcher, null_overwrite};
 use crate::analyses::{
     borrow_ownership::{
         AnalysisKind, BoOwnershipProbe, CrateCtxt,
@@ -134,6 +134,7 @@ where 'tcx: 'infercx
                 }
             }
 
+            let null_old = infer_cx.null_overwrite;
             matcher(
                 output_ty,
                 dest.transpose(),
@@ -146,12 +147,7 @@ where 'tcx: 'infercx
                         Variables::consume(&dest),
                         Variables::single(ret),
                     );
-                    database
-                        .push_assume::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                            (),
-                            dest.r#use,
-                            false,
-                        );
+                    null_overwrite::require_empty(database, dest.r#use, null_old);
                     if let Some((guard, _)) = &traversal {
                         database.pending_traversal_pair(guard, &[dest.def, ret]);
                     } else {

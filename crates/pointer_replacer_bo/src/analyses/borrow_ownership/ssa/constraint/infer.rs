@@ -94,8 +94,20 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
         location: Option<Location>,
     );
 
+    /// Bind the old-destination premise to this assignment or call only.
+    fn prepare_overwrite(
+        _infer_cx: &mut Self::Ctxt,
+        _destination: Option<&Consume<Self::LocalSig>>,
+        _location: Location,
+    ) {
+    }
+
+    fn require_empty(infer_cx: &mut Self::Ctxt, old: Self::LocalSig) {
+        Self::assume(infer_cx, old, false);
+    }
+
     fn borrow(infer_cx: &mut Self::Ctxt, consume: Consume<Self::LocalSig>) {
-        Self::assume(infer_cx, consume.r#use, false);
+        Self::require_empty(infer_cx, consume.r#use);
         Self::assume(infer_cx, consume.def, false);
     }
 
@@ -113,7 +125,7 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
     fn lend(infer_cx: &mut Self::Ctxt, consume: Consume<Self::LocalSig>);
 
     fn source(infer_cx: &mut Self::Ctxt, result: Consume<Self::LocalSig>) {
-        Self::assume(infer_cx, result.r#use, false);
+        Self::require_empty(infer_cx, result.r#use);
         Self::assume(infer_cx, result.def, true)
     }
 
@@ -125,7 +137,7 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
     /// Impose no constraint on a definition. Constraints are still emitted
     /// because the old value of lhs must be non-owning
     fn unknown_source(infer_cx: &mut Self::Ctxt, result: Consume<Self::LocalSig>) {
-        Self::assume(infer_cx, result.r#use, false)
+        Self::require_empty(infer_cx, result.r#use)
     }
 
     fn constant_source(infer_cx: &mut Self::Ctxt, result: Consume<Self::LocalSig>, is_null: bool) {
@@ -135,7 +147,7 @@ pub trait InferMode<'infercx, 'db, 'tcx> {
             crate::analyses::borrow_ownership::solver::with_own_assume_site(
                 crate::analyses::borrow_ownership::solver::OwnAssumeSite::NonOwnedConstant,
                 || {
-                    Self::assume(infer_cx, result.r#use, false);
+                    Self::require_empty(infer_cx, result.r#use);
                     Self::assume(infer_cx, result.def, false);
                 },
             );
@@ -204,6 +216,22 @@ where
         let _ = rn.state.try_consume_at(idx, location);
     }
     Infer::interpret_consume(infer_cx, body, place, consume)
+}
+
+fn consume_destination_at<'rn, 'db, 'tcx, Infer>(
+    place: &Place<'tcx>,
+    body: &Body<'tcx>,
+    location: Location,
+    rn: &mut Renamer<'rn, 'tcx>,
+    infer_cx: &mut Infer::Ctxt,
+) -> Option<Consume<Infer::LocalSig>>
+where
+    'tcx: 'rn,
+    Infer: InferMode<'rn, 'db, 'tcx>,
+{
+    let destination = consume_place_at::<Infer>(place, body, location, rn, infer_cx);
+    Infer::prepare_overwrite(infer_cx, destination.as_ref(), location);
+    destination
 }
 
 impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
@@ -498,8 +526,13 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             } => {
                 tracing::debug!("processing terminator {:?}", terminator.kind);
 
-                let destination =
-                    consume_place_at::<Infer>(destination, self.body, location, self, infer_cx);
+                let destination = consume_destination_at::<Infer>(
+                    destination,
+                    self.body,
+                    location,
+                    self,
+                    infer_cx,
+                );
                 // FIXME bad design! call args couple too much with rename
                 for arg in args {
                     if let Some(arg) = arg.node.place() {
@@ -556,7 +589,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             Rvalue::Use(operand @ Operand::Constant(_))
             | Rvalue::WrapUnsafeBinder(operand @ Operand::Constant(_), _) => {
                 if let Some(lhs_consume) =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
                     Infer::constant_source(
                         infer_cx,
@@ -575,7 +608,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 // even tho lhs is a pointer, it does not necessarily have an entry!
                 // this is because we limit the nested level of pointers
                 if let Some(lhs_consume) =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
                     if matches!(operand, Operand::Constant(_)) {
                         Infer::constant_source(
@@ -601,7 +634,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             ) => {
                 // let lhs_consume = self.state.try_consume_at(lhs.local, location);
                 let lhs_consume =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 if let Some(lhs_consume) = lhs_consume {
                     // Conservatively treat pointer-to-address casts as untrusted sources.
                     Infer::unknown_source(infer_cx, lhs_consume);
@@ -618,7 +651,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             Rvalue::Cast(_, operand @ Operand::Constant(_), _) => {
                 // let lhs_consume = self.state.try_consume_at(lhs.local, location);
                 let lhs_consume =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 if let Some(lhs_consume) = lhs_consume {
                     Infer::constant_source(
                         infer_cx,
@@ -646,7 +679,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 _,
             ) => {
                 let lhs_consume =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 let rhs_consume =
                     consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx);
 
@@ -689,7 +722,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
 
             Rvalue::Cast(_, operand @ Operand::Move(rhs) | operand @ Operand::Copy(rhs), ty) => {
                 let lhs_consume =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 let mut rhs_consume =
                     consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx);
 
@@ -741,7 +774,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             Rvalue::CopyForDeref(rhs) => {
                 // Keep fn-body signatures aligned with SSA versions produced while
                 // consuming the deref-copy destination.
-                let _ = consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                let _ = consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 let rhs_consume =
                     consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx);
                 Infer::copy_for_deref(infer_cx, rhs_consume, location);
@@ -751,7 +784,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             Rvalue::Ref(_, BorrowKind::Mut { .. }, rhs)
             | Rvalue::RawPtr(rustc_middle::mir::RawPtrKind::Mut, rhs) => {
                 let lhs_consume =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 let rhs_consume =
                     consume_place_at::<Infer>(rhs, self.body, location, self, infer_cx);
 
@@ -793,7 +826,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 }
 
                 if let Some(lhs_consume) =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
                     Infer::borrow(infer_cx, lhs_consume)
                 }
@@ -804,7 +837,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
 
             Rvalue::Aggregate(kind, rhs) => {
                 let destination =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 let operands: Vec<_> = rhs
                     .iter()
                     .map(|operand| {
@@ -825,7 +858,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
                 // of, logic in initial_definition needs to be taken care of
                 // as well
 
-                let _ = consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                let _ = consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 if let Some(rhs) = operand.place() {
                     let _ = consume_place_at::<Infer>(&rhs, self.body, location, self, infer_cx);
                 }
@@ -833,7 +866,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
 
             Rvalue::BinaryOp(_, box (left, right)) => {
                 let lhs_consume =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 // assert!(lhs_consume.is_none(), "{:?} = {:?} @ {:?}", lhs, rhs, location);
                 if let Some(lhs_consume) = lhs_consume {
                     Infer::lend(infer_cx, lhs_consume);
@@ -847,7 +880,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             }
             Rvalue::UnaryOp(_, operand) => {
                 let lhs_consume =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 if let Some(lhs_consume) = lhs_consume {
                     Infer::unknown_source(infer_cx, lhs_consume);
                 }
@@ -857,7 +890,7 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             }
             Rvalue::Discriminant(rhs) => {
                 let lhs_consume =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx);
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx);
                 if let Some(lhs_consume) = lhs_consume {
                     Infer::unknown_source(infer_cx, lhs_consume);
                 }
@@ -865,14 +898,14 @@ impl<'rn, 'tcx: 'rn> Renamer<'rn, 'tcx> {
             }
             Rvalue::NullaryOp(_, _) | Rvalue::ShallowInitBox(_, _) | Rvalue::ThreadLocalRef(_) => {
                 if let Some(lhs_consume) =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
                     Infer::unknown_source(infer_cx, lhs_consume);
                 }
             }
             Rvalue::Len(rhs) => {
                 if let Some(lhs_consume) =
-                    consume_place_at::<Infer>(lhs, self.body, location, self, infer_cx)
+                    consume_destination_at::<Infer>(lhs, self.body, location, self, infer_cx)
                 {
                     Infer::unknown_source(infer_cx, lhs_consume);
                 }
