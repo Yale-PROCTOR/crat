@@ -2,7 +2,11 @@
 use std::collections::BTreeMap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_middle::mir::{CastKind, Rvalue, StatementKind};
+use rustc_middle::{
+    mir::{CastKind, Rvalue, StatementKind},
+    ty::TyCtxt,
+};
+use rustc_span::def_id::DefId;
 
 use super::*;
 use crate::analyses::borrow_ownership::{
@@ -167,6 +171,14 @@ const COPY_METHODS: &[&str] = &[
     "offset_from",
 ];
 
+pub(super) fn is_pointer_copy_method(tcx: TyCtxt<'_>, callee: DefId) -> bool {
+    !callee.is_local()
+        && COPY_METHODS.contains(&tcx.item_name(callee).as_str())
+        && tcx
+            .impl_of_method(callee)
+            .is_some_and(|block| tcx.type_of(block).skip_binder().is_raw_ptr())
+}
+
 pub(crate) fn directed_copies<'tcx>(
     program: &RustProgram<'tcx>,
     slots: &CrateSlots,
@@ -223,13 +235,7 @@ pub(crate) fn directed_copies<'tcx>(
                 _ => continue,
             };
             let callee = func.const_fn_def().map(|(callee, _)| callee);
-            let copy_method = callee.is_some_and(|callee| {
-                !callee.is_local()
-                    && COPY_METHODS.contains(&tcx.item_name(callee).as_str())
-                    && tcx
-                        .impl_of_method(callee)
-                        .is_some_and(|block| tcx.type_of(block).skip_binder().is_raw_ptr())
-            });
+            let copy_method = callee.is_some_and(|callee| is_pointer_copy_method(tcx, callee));
             // An `extern` block's item has a local `DefId`: ask for a foreign item first.
             let kind = match callee {
                 None => LeakKind::FnPointer,

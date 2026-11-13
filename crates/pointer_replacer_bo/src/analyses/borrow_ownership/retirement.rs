@@ -23,7 +23,7 @@ use super::{
 };
 use crate::{
     analyses::{
-        borrow::{BorrowInferenceResults, Loan, ProvenanceOwner, StructFieldSlot},
+        borrow::{BorrowInferenceResults, Borrower, Loan, ProvenanceOwner, StructFieldSlot},
         borrow_ownership::borrow_fork::LoanLocation,
     },
     utils::rustc::RustProgram,
@@ -42,6 +42,7 @@ mod return_origin;
 mod routes;
 #[cfg(test)]
 mod tests_return_origin;
+mod unwind;
 
 use objects::{ObjectFacts, ObjectRoot, ObjectSet};
 use routes::{FrameEvent, RoutedEvents};
@@ -338,6 +339,7 @@ struct Context {
     unrepresented_inner: Vec<(SlotRef, Option<(LocalDefId, rustc_middle::mir::Local)>, u8)>,
     /// The BO-owned loans for those of them that have one.
     inner_loans: inner_loan::InnerLoans,
+    unwind_liveness: FxHashMap<LocalDefId, unwind::UnwindLiveness>,
     entry_consistent: bool,
     latest: FxHashMap<LocalDefId, RetirementReview>,
     discharges: discharge::Discharges,
@@ -434,6 +436,20 @@ pub(crate) fn begin(
         exact_kinds: exact.is_some(),
         unrepresented_inner: Vec::new(),
         inner_loans: inner_loan::analyze(program, slots, &is_ref),
+        unwind_liveness: program
+            .functions
+            .iter()
+            .map(|&function| {
+                let body = program
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                (
+                    function,
+                    unwind::UnwindLiveness::analyze(program.tcx, &body),
+                )
+            })
+            .collect(),
         entry_consistent: true,
         latest: FxHashMap::default(),
         discharges,
@@ -896,6 +912,14 @@ impl Context {
                 .flat_map(|live| live.iter())
             {
                 let data = &facts.borrow_set.loans[loan];
+                if event.route.is_empty()
+                    && event.source.key.role == SourceRole::UnwindStorage
+                    && event.phase == SourcePhase::Unwind
+                    && let Borrower::Assign(ProvenanceOwner::Local(local)) = data.assigned
+                    && self.unwind_liveness[&function].ends_at(local, event.location)
+                {
+                    continue;
+                }
                 let borrowed = PlaceKey::from_place(data.borrowed);
                 // Resolve the value at reservation, never through a later rebinding.
                 let target = self
@@ -1547,3 +1571,6 @@ mod tests_directed_closure;
 
 #[cfg(test)]
 mod tests_release_summaries;
+
+#[cfg(test)]
+mod tests_unwind;
