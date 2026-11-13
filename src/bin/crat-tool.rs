@@ -62,6 +62,14 @@ enum Command {
         #[arg(long)]
         output: PathBuf,
     },
+    RetainFunctions {
+        #[arg(long)]
+        frozen: PathBuf,
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     ReplaceUnstructuredScc {
         #[arg(long)]
         frozen: PathBuf,
@@ -671,6 +679,38 @@ fn main() {
                 tools::prepare_unstructured_repair(&read_frozen_project(&frozen), &request)
                     .unwrap_or_else(|error| replacement_failure(error));
             let json = serde_json::to_string_pretty(&prepared).unwrap();
+            prepare_publish_destinations(&[&output])
+                .unwrap_or_else(|error| fail("output_io", error));
+            publish_files(&[(&output, json.as_bytes())])
+                .unwrap_or_else(|error| fail("output_io", error));
+        }
+        Command::RetainFunctions {
+            frozen,
+            request,
+            output,
+        } => {
+            validate_output_input_paths(&[&output], &[&frozen, &request])
+                .unwrap_or_else(|error| fail("output_path_collision", error));
+            let request: tools::UnstructuredPreparationRequest = serde_json::from_str(
+                &std::fs::read_to_string(&request)
+                    .unwrap_or_else(|error| fail("request_io", error)),
+            )
+            .unwrap_or_else(|error| fail("invalid_request", error));
+            let frozen_bytes =
+                std::fs::read(&frozen).unwrap_or_else(|error| fail("frozen_io", error));
+            let frozen = tools::frozen_project_from_json(
+                std::str::from_utf8(&frozen_bytes).unwrap_or_else(|error| fail("frozen_io", error)),
+            )
+            .unwrap_or_else(|error| replacement_failure(error));
+            let retained = tools::retain_frozen_functions(&frozen, &request)
+                .unwrap_or_else(|error| replacement_failure(error));
+            let response = serde_json::json!({
+                "source": retained.source,
+                "stubbed_items": retained.stubbed_items,
+                "candidate_sha256": tools::sha256_hex(retained.source.as_bytes()),
+                "frozen_project_sha256": tools::sha256_hex(&frozen_bytes),
+            });
+            let json = serde_json::to_string_pretty(&response).unwrap();
             prepare_publish_destinations(&[&output])
                 .unwrap_or_else(|error| fail("output_io", error));
             publish_files(&[(&output, json.as_bytes())])
