@@ -55,6 +55,7 @@ pub(crate) struct FrameEvent {
     pub(crate) route: Vec<RouteStep>,
     pub(crate) uncertainty: Option<RouteReason>,
     pub(crate) unreachable: bool,
+    recursive: bool,
 }
 
 /// A malformed row stays here in full, rather than acquiring invented compiler
@@ -429,20 +430,22 @@ pub(crate) fn expand(
             route: Vec::new(),
             uncertainty,
             unreachable: !facts.has_location(frame, location),
+            recursive: false,
         });
     }
     let mut seen = BTreeSet::new();
     let mut recursive_seen = BTreeSet::new();
     while let Some(row) = pending.pop_front() {
-        // Once recursion makes the object Unknown, propagate that fact to
-        // every outer call context. Joining by event/frame/callsite terminates
-        // the cycle without discarding its effects on callers outside it.
-        if matches!(row.uncertainty, Some(RouteReason::Recursive(_)))
+        // Cyclic effects remain either caller/callsite-relative fresh objects or Unknown.
+        // Retain both classes, including reachable alternatives, in every outer context.
+        if row.recursive
             && !recursive_seen.insert((
                 row.source.key.clone(),
                 row.frame.local_def_index.as_u32(),
                 row.location.block.as_u32(),
                 row.location.statement_index,
+                row.objects.unknown,
+                row.unreachable,
             ))
         {
             continue;
@@ -483,6 +486,13 @@ pub(crate) fn expand(
                     .route
                     .iter()
                     .any(|edge| edge.caller == step.caller || edge.callee == step.caller);
+            // Establish birth in the callee before substituting its inputs. A caller-owned
+            // allocation passed as an argument must not acquire callee-fresh provenance.
+            let callee_fresh = !row.objects.unknown
+                && !row.objects.roots.is_empty()
+                && row.objects.roots.iter().all(
+                    |root| matches!(root, ObjectRoot::Fresh { frame, .. } if *frame == row.frame),
+                );
             let (mut objects, mut uncertainty) = substitute(program, &row, step, metadata, facts);
             if !metadata.events.contains(&row.source.key) {
                 result.problems.push(RouteProblem {
@@ -493,7 +503,7 @@ pub(crate) fn expand(
                 objects.unknown = true;
                 uncertainty = Some(RouteReason::MissingRouteEvent);
             }
-            if recursive {
+            if recursive && (!callee_fresh || objects.unknown) {
                 objects = ObjectSet::default();
                 uncertainty = Some(RouteReason::Recursive(step.caller));
             }
@@ -508,6 +518,7 @@ pub(crate) fn expand(
                 route,
                 uncertainty,
                 unreachable: row.unreachable || !facts.has_location(step.caller, step.location),
+                recursive: row.recursive || recursive,
             });
         }
     }
