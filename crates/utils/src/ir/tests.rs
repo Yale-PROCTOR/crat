@@ -1430,6 +1430,43 @@ fn test_ty_impl_trait_param() {
 }
 
 #[test]
+fn test_ty_impl_trait_in_inherent_methods() {
+    run_test(
+        r#"
+        struct Rgb<T> { red: T, green: T, blue: T }
+        impl<T> Rgb<T> {
+            fn map<U>(self, mut f: impl FnMut(T) -> U) -> Rgb<U> {
+                Rgb { red: f(self.red), green: f(self.green), blue: f(self.blue) }
+            }
+            fn visit(&self, visitor: &mut impl FnMut(&T, i32)) {
+                visitor(&self.red, 0);
+            }
+        }
+    "#,
+    );
+}
+
+#[test]
+fn test_ty_impl_trait_in_trait_methods() {
+    run_test(
+        r#"
+        trait Reader {
+            fn required<'a>(&self, value: impl AsRef<[u8]> + 'a) -> usize;
+            fn provided(&self, value: impl AsRef<[u8]>) -> usize {
+                value.as_ref().len()
+            }
+        }
+        struct Buffer;
+        impl Reader for Buffer {
+            fn required<'a>(&self, value: impl AsRef<[u8]> + 'a) -> usize {
+                value.as_ref().len()
+            }
+        }
+    "#,
+    );
+}
+
+#[test]
 fn test_generics() {
     run_test(
         "

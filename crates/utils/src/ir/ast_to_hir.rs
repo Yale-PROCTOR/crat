@@ -1729,10 +1729,7 @@ impl<'tcx> AstToHirMapper<'tcx> {
                         panic!()
                     };
                     let owner_id = self.tcx.hir_get_parent_item(hparam.hir_id);
-                    let rustc_hir::OwnerNode::Item(item) = self.tcx.hir_owner_node(owner_id) else {
-                        panic!()
-                    };
-                    let hir::ItemKind::Fn { generics, .. } = &item.kind else { panic!() };
+                    let generics = self.tcx.hir_get_generics(owner_id.def_id).unwrap();
                     for pred in generics.predicates {
                         let hir::WherePredicateKind::BoundPredicate(pred) = pred.kind else {
                             continue;
