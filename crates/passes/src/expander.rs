@@ -42,6 +42,10 @@ pub fn expand(config: Config, tcx: TyCtxt<'_>) -> String {
         Symbol::intern("rt"),
         Symbol::intern("libstd_sys_internals"),
         Symbol::intern("structural_match"),
+        Symbol::intern("thread_local_internals"),
+        Symbol::intern("never_type"),
+        Symbol::intern("fmt_helpers_for_derive"),
+        Symbol::intern("derive_eq"),
     ]);
     krate.attrs.clear();
     krate.attrs.extend([

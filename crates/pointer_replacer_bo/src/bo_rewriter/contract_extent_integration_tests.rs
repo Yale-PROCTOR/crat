@@ -2652,31 +2652,50 @@ fn w4b109_a_null_declared_local_takes_its_sole_assignment() {
     );
 }
 
-/// **W4B1-10 (control) — an ALLOCATION assigned to a null-declared local is not
-/// this walk's at all.**
-///
-/// Measured, not assumed: `let mut p = 0 as *mut u8; p = malloc(n * 1);` decides
-/// **`kind-raw`** — the model's own verdict on storing an allocation into a live
-/// binding — so it never reaches a root walk and the rule's market is the
-/// NON-allocating assignment (brotli's accessor call, a field read). The same
-/// measurement covers the sole-assignment refusal: a binding assigned twice is
-/// `kind-raw` too, which is why that refusal is belt-and-braces rather than
-/// witnessed, and why this control says so out loud.
+/// A null-initialized local later assigned an allocation belongs to ownership
+/// planning. An inactive source endpoint keeps it raw with an ownership-specific
+/// refusal, without entering borrowing extent recovery.
 #[test]
 fn w4b110_an_allocation_assignment_is_the_ownership_family() {
-    let rows = b1_rows(W4_B1_DECLARED_NULL_ALLOCATION);
-    assert!(
-        !rows
+    ::utils::compilation::run_compiler_on_str(W4_B1_DECLARED_NULL_ALLOCATION, |tcx| {
+        let (table, ctx) =
+            super::decide_table_with_ctx(tcx).expect("allocation fixture yields decisions");
+        let (subject, decision) = table
+            .entries
             .iter()
-            .any(|(subject, ..)| subject.starts_with("StoreDeclaredThenAllocated::storage")),
-        "the walk must not see it: {rows:?}"
-    );
-    let decisions = super::emit_tests::decisions_of(W4_B1_DECLARED_NULL_ALLOCATION);
-    let storage = decisions
-        .iter()
-        .find(|(name, is_param, _)| name == "storage" && !*is_param)
-        .unwrap_or_else(|| panic!("no storage subject: {decisions:#?}"));
-    assert_eq!(storage.2, "kind-raw", "{decisions:#?}");
+            .find(|(subject, _)| {
+                subject.param_name.as_deref() == Some("storage")
+                    && subject.kind == super::decision::SubjectKind::Local
+            })
+            .expect("allocation fixture has a storage local");
+        let slot = ctx.slots.fn_local_slots[&subject.fn_did]
+            .slot_for_local_depth(subject.local, 0)
+            .expect("storage has a pointer slot");
+        assert_eq!(
+            ctx.model.get(&super::SlotRef::Local(subject.fn_did, slot)),
+            Some(&super::SlotKind::Owning),
+            "{subject:?}: {decision:?}"
+        );
+        assert!(
+            matches!(decision,
+                super::decision::Decision::Degraded(record)
+                    if matches!(record.reason,
+                        super::decision::DegradeReason::BoxFailure {
+                            failure: super::decision::box_facts::BoxPlanFailure::EndpointInactive
+                        })
+            ),
+            "{subject:?}: {decision:?}"
+        );
+        assert!(
+            !table
+                .root_extents
+                .iter()
+                .any(|row| row.subject.starts_with(&subject.label)),
+            "ownership must not enter borrowing extent recovery: {:?}",
+            table.root_extents
+        );
+    })
+    .expect("allocation fixture compiles");
 }
 
 /// **W4B1-11 (control) — the element-type fallback is primitives only.**

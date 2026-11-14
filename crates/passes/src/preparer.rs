@@ -235,6 +235,16 @@ struct Discovery<'a, 'tcx> {
     error: Option<PrepareError>,
 }
 
+fn is_thread_local_key(item: &ast::Item, mapping: &utils::ir::AstToHir, tcx: TyCtxt<'_>) -> bool {
+    matches!(item.kind, ast::ItemKind::Const(_))
+        && mapping.global_map.get(&item.id).is_some_and(|definition| {
+            tcx.type_of(*definition)
+                .instantiate_identity()
+                .ty_adt_def()
+                .is_some_and(|definition| tcx.is_diagnostic_item(sym::LocalKey, definition.did()))
+        })
+}
+
 impl<'a, 'tcx> Discovery<'a, 'tcx> {
     fn new(tcx: TyCtxt<'tcx>, ast_to_hir: &'a utils::ir::AstToHir) -> Self {
         Self {
@@ -374,6 +384,9 @@ impl<'ast> visit::Visitor<'ast> for Discovery<'_, '_> {
             }
             ast::ItemKind::Static(box ast::StaticItem { ident, .. })
             | ast::ItemKind::Const(box ast::ConstItem { ident, .. }) => {
+                if is_thread_local_key(item, self.ast_to_hir, self.tcx) {
+                    return;
+                }
                 if self.function_depth == 0 || ident.name == kw::Underscore {
                     if matches!(item.kind, ast::ItemKind::Const(_)) {
                         visit::walk_item(self, item);

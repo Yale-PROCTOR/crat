@@ -16,7 +16,10 @@ use rustc_hir::{
     intravisit,
     intravisit::Visitor as _,
 };
-use rustc_middle::{hir::nested_filter, ty::TyCtxt};
+use rustc_middle::{
+    hir::nested_filter,
+    ty::{self, TyCtxt},
+};
 use rustc_span::{DUMMY_SP, Symbol, kw, sym};
 use serde::Deserialize;
 use smallvec::{SmallVec, smallvec};
@@ -50,13 +53,17 @@ pub fn unexpand(config: Config, tcx: TyCtxt<'_>) -> String {
         config,
     };
     visitor.visit_crate(&mut krate);
+    FeatureUses {
+        tcx,
+        ast_to_hir: &visitor.ast_to_hir,
+        required: &mut visitor.ctx.required_features,
+    }
+    .visit_crate(&krate);
 
     let mut unnecessary_attributes: FxHashSet<_> = [
         "derive_clone_copy",
         "hint_must_use",
-        "never_type",
         "panic_internals",
-        "thread_local_internals",
         "coverage_attribute",
         "builtin_syntax",
         "rt",
@@ -65,31 +72,48 @@ pub fn unexpand(config: Config, tcx: TyCtxt<'_>) -> String {
     ]
     .into_iter()
     .collect();
+    for feature in [
+        "never_type",
+        "thread_local_internals",
+        "fmt_helpers_for_derive",
+        "derive_eq",
+    ] {
+        if !visitor
+            .ctx
+            .required_features
+            .contains(&Symbol::intern(feature))
+        {
+            unnecessary_attributes.insert(feature);
+        }
+    }
     if !visitor.ctx.use_intrinsics {
         unnecessary_attributes.insert("core_intrinsics");
     }
     unnecessary_attributes.insert("rt");
     unnecessary_attributes.insert("libstd_sys_internals");
 
-    krate.attrs.retain(|attr| {
-        if let AttrKind::Normal(attr) = &attr.kind
-            && attr.item.path.segments.last().unwrap().ident.name == sym::feature
-            && let Some(arg) = utils::ast::get_attr_arg(&attr.item.args)
-            && let arg = arg.as_str()
-            && unnecessary_attributes.contains(arg)
-        {
-            return false;
+    let mut attributes = thin_vec![];
+    for attribute in std::mem::take(&mut krate.attrs) {
+        if attribute.has_name(sym::feature) {
+            for feature in attribute.meta_item_list().unwrap() {
+                let feature = feature.ident().unwrap().name;
+                if !unnecessary_attributes.contains(feature.as_str()) {
+                    attributes.push(utils::ast::make_inner_attribute(sym::feature, feature, tcx));
+                }
+            }
+            continue;
         }
         if !visitor.ctx.use_transmute
-            && let AttrKind::Normal(attr) = &attr.kind
+            && let AttrKind::Normal(attr) = &attribute.kind
             && attr.item.path.segments.last().unwrap().ident.name == sym::warn
             && let Some(arg) = utils::ast::get_attr_arg(&attr.item.args)
             && arg.as_str() == "mutable_transmutes"
         {
-            return false;
+            continue;
         }
-        true
-    });
+        attributes.push(attribute);
+    }
+    krate.attrs = attributes;
 
     pprust::crate_to_string_for_macros(&krate)
 }
@@ -126,6 +150,10 @@ impl MutVisitor for AstVisitor<'_> {
     }
 
     fn visit_item(&mut self, item: &mut Item) {
+        if let Some(replacement) = self.unexpanded_thread_local(item) {
+            *item = replacement;
+            return;
+        }
         if matches!(
             item.kind,
             ItemKind::Struct(..) | ItemKind::Union(..) | ItemKind::Enum(..)
@@ -177,29 +205,6 @@ impl MutVisitor for AstVisitor<'_> {
                             field.attrs.extend(attrs);
                         }
                     }
-                }
-            }
-            ItemKind::Const(const_item) => {
-                if let TyKind::Path(_, path) = &const_item.ty.kind
-                    && let Some(seg) = path.segments.last()
-                    && seg.ident.name == sym::LocalKey
-                    && let Some(box GenericArgs::AngleBracketed(args)) = &seg.args
-                    && let [AngleBracketedArg::Arg(GenericArg::Type(ty))] = &args.args[..]
-                    && let Some(init) = &const_item.expr
-                    && let ExprKind::Block(block, _) = &init.kind
-                    && let [stmt, ..] = &block.stmts[..]
-                    && let StmtKind::Item(stmt_item) = &stmt.kind
-                    && let ItemKind::Const(inner_item) = &stmt_item.kind
-                    && inner_item.ident.name.as_str() == "__INIT"
-                    && let Some(init) = &inner_item.expr
-                    && let ExprKind::Block(block, _) = &init.kind
-                    && let [stmt] = &block.stmts[..]
-                    && let StmtKind::Expr(init) = &stmt.kind
-                {
-                    let name = const_item.ident.name;
-                    let ty = pprust::ty_to_string(ty);
-                    let init = pprust::expr_to_string(init);
-                    *item = item!("thread_local! {{ static {name}: {ty} = const {{ {init} }}; }}");
                 }
             }
             ItemKind::Mod(_, _, ModKind::Loaded(items, ..)) => {
@@ -354,9 +359,290 @@ impl MutVisitor for AstVisitor<'_> {
 }
 
 impl AstVisitor<'_> {
+    fn unexpanded_thread_local(&mut self, item: &Item) -> Option<Item> {
+        let ItemKind::Const(value) = &item.kind else { return None };
+        if !value.generics.params.is_empty() {
+            return None;
+        }
+        let definition = self.ast_to_hir.global_map.get(&item.id)?;
+        let value_type = self.tcx.type_of(*definition).instantiate_identity();
+        let ty::Adt(adt, arguments) = value_type.kind() else { return None };
+        if !self.tcx.is_diagnostic_item(sym::LocalKey, adt.did()) {
+            return None;
+        }
+        let header_type = self.ast_to_hir.get_ty(value.ty.id, self.tcx)?;
+        if !matches!(header_type.kind, hir::TyKind::Path(QPath::Resolved(_, path)) if path.res.opt_def_id() == Some(adt.did()))
+        {
+            return None;
+        }
+        let TyKind::Path(_, path) = &value.ty.kind else { return None };
+        let GenericArgs::AngleBracketed(type_arguments) = path.segments.last()?.args.as_deref()?
+        else {
+            return None;
+        };
+        let [AngleBracketedArg::Arg(GenericArg::Type(ty))] = type_arguments.args.as_slice() else {
+            return None;
+        };
+        let ExprKind::Block(body, None) = &value.expr.as_ref()?.kind else { return None };
+        let [initialization, accessor] = body.stmts.as_slice() else { return None };
+        let StmtKind::Item(initialization) = &initialization.kind else { return None };
+        if !initialization
+            .attrs
+            .iter()
+            .all(|attribute| attribute.has_name(sym::inline))
+        {
+            return None;
+        }
+        let helper = self
+            .ast_to_hir
+            .global_map
+            .get(&initialization.id)?
+            .to_def_id();
+        let (mut initializer, constant) = match &initialization.kind {
+            ItemKind::Const(initialization) if initialization.ident.name.as_str() == "__INIT" => {
+                if !initialization.generics.params.is_empty()
+                    || !initialization.generics.where_clause.predicates.is_empty()
+                {
+                    return None;
+                }
+                (initialization.expr.as_ref()?.clone(), true)
+            }
+            ItemKind::Fn(initialization) if initialization.ident.name.as_str() == "__init" => {
+                if !initialization.generics.params.is_empty()
+                    || !initialization.sig.decl.inputs.is_empty()
+                    || !initialization.generics.where_clause.predicates.is_empty()
+                    || initialization.sig.header.coroutine_kind.is_some()
+                {
+                    return None;
+                }
+                let body = initialization.body.as_ref()?;
+                let initializer = if let [statement] = body.stmts.as_slice()
+                    && let StmtKind::Expr(initializer) = &statement.kind
+                {
+                    initializer.clone()
+                } else {
+                    let mut initializer = expr!("{{}}");
+                    initializer.kind = ExprKind::Block(body.clone(), None);
+                    P(initializer)
+                };
+                (initializer, false)
+            }
+            _ => return None,
+        };
+        let StmtKind::Expr(accessor) = &accessor.kind else { return None };
+        let ExprKind::Block(accessor, None) = &accessor.kind else { return None };
+        let [statement] = accessor.stmts.as_slice() else { return None };
+        let StmtKind::Expr(accessor) = &statement.kind else { return None };
+        let (constructor, values) = self.resolved_call(accessor)?;
+        let constructor_type = self.associated_adt(constructor)?;
+        if constructor.is_local()
+            || self.tcx.item_name(constructor).as_str() != "new"
+            || !self
+                .tcx
+                .is_diagnostic_item(sym::LocalKey, constructor_type.did())
+        {
+            return None;
+        }
+        let [accessor] = values else { return None };
+        let ExprKind::ConstBlock(accessor) = &accessor.kind else { return None };
+        let ExprKind::Block(accessor, None) = &accessor.value.kind else { return None };
+        let [statement] = accessor.stmts.as_slice() else { return None };
+        let StmtKind::Expr(accessor) = &statement.kind else { return None };
+        let ExprKind::If(condition, dropping, Some(non_dropping)) = &accessor.kind else {
+            return None;
+        };
+        let (needs_drop, values) = self.resolved_call(condition)?;
+        if !values.is_empty()
+            || !self
+                .tcx
+                .is_diagnostic_item(Symbol::intern("needs_drop"), needs_drop)
+        {
+            return None;
+        }
+        let ExprKind::Call(callee, _) = &condition.kind else { return None };
+        let callee = self.ast_to_hir.get_expr(callee.id, self.tcx)?;
+        if self
+            .tcx
+            .typeck(callee.hir_id.owner)
+            .node_args(callee.hir_id)
+            .type_at(0)
+            != arguments.type_at(0)
+        {
+            return None;
+        }
+        let ExprKind::Block(non_dropping, None) = &non_dropping.kind else { return None };
+        if !self.native_thread_local_branch(dropping, helper, constant, true)
+            || !self.native_thread_local_branch(non_dropping, helper, constant, false)
+        {
+            return None;
+        }
+
+        let mut uses = FeatureUses {
+            tcx: self.tcx,
+            ast_to_hir: &self.ast_to_hir,
+            required: &mut self.ctx.required_features,
+        };
+        uses.visit_ty(ty);
+        uses.visit_expr(&initializer);
+        self.visit_expr(&mut initializer);
+        let attributes = item
+            .attrs
+            .iter()
+            .map(pprust::attribute_to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let visibility = pprust::vis_to_string(&item.vis);
+        let name = value.ident;
+        let ty = pprust::ty_to_string(ty);
+        let expression = pprust::expr_to_string(&initializer);
+        let initializer = if constant {
+            if matches!(initializer.kind, ExprKind::Block(_, None)) {
+                format!("const {expression}")
+            } else {
+                format!("const {{ {expression} }}")
+            }
+        } else {
+            expression
+        };
+        Some(item!(
+            "::std::thread_local! {{ {attributes} {visibility} static {name}: {ty} = {initializer}; }}"
+        ))
+    }
+
+    fn native_thread_local_branch(
+        &self,
+        block: &Block,
+        helper: DefId,
+        constant: bool,
+        dropping: bool,
+    ) -> bool {
+        let [statement] = block.stmts.as_slice() else { return false };
+        let StmtKind::Expr(expression) = &statement.kind else { return false };
+        let ExprKind::Closure(closure) = &expression.kind else { return false };
+        let [parameter] = closure.fn_decl.inputs.as_slice() else { return false };
+        let ExprKind::Block(body, None) = &closure.body.kind else { return false };
+        let [storage, access] = body.stmts.as_slice() else { return false };
+        let StmtKind::Item(storage) = &storage.kind else { return false };
+        let ItemKind::Static(value) = &storage.kind else { return false };
+        if value.mutability.is_mut()
+            || storage.attrs.len() != 1
+            || !storage.attrs[0].has_name(sym::thread_local)
+        {
+            return false;
+        }
+        let Some(storage_id) = self.ast_to_hir.global_map.get(&storage.id).copied() else {
+            return false;
+        };
+        let StmtKind::Expr(access) = &access.kind else { return false };
+        let Some(initializer) = &value.expr else { return false };
+        let is_storage = |expression: &Expr| {
+            self.path_resolution(expression)
+                .is_some_and(|resolution| resolution.opt_def_id() == Some(storage_id.to_def_id()))
+        };
+        let is_helper = |expression: &Expr| {
+            self.path_resolution(expression)
+                .is_some_and(|resolution| resolution.opt_def_id() == Some(helper))
+        };
+        if constant && !dropping {
+            return is_helper(initializer)
+                && matches!(&access.kind, ExprKind::AddrOf(BorrowKind::Ref, Mutability::Not, value) if is_storage(value));
+        }
+        let Some((constructor, arguments)) = self.resolved_call(initializer) else { return false };
+        if constructor.is_local()
+            || self.tcx.item_name(constructor).as_str() != "new"
+            || if constant {
+                !matches!(arguments, [value] if is_helper(value))
+            } else {
+                !arguments.is_empty()
+            }
+        {
+            return false;
+        }
+        let storage_type = self.tcx.type_of(storage_id).instantiate_identity();
+        let ty::Adt(storage_adt, storage_arguments) = storage_type.kind() else { return false };
+        if storage_adt.did().krate != self.tcx.get_diagnostic_item(sym::LocalKey).unwrap().krate {
+            return false;
+        }
+        let storage_path = self.tcx.def_path_str(storage_adt.did());
+        if constant {
+            if storage_path != "std::thread::local_impl::EagerStorage" {
+                return false;
+            }
+        } else if storage_path != "std::thread::local_impl::LazyStorage"
+            || if dropping {
+                !storage_arguments.type_at(1).is_unit()
+            } else {
+                !storage_arguments.type_at(1).is_never()
+            }
+        {
+            return false;
+        }
+        if !self
+            .associated_adt(constructor)
+            .is_some_and(|adt| adt.did() == storage_adt.did())
+        {
+            return false;
+        }
+        let ExprKind::MethodCall(method) = &access.kind else { return false };
+        if !is_storage(&method.receiver) {
+            return false;
+        }
+        if constant {
+            if method.seg.ident.name.as_str() != "get" || !method.args.is_empty() {
+                return false;
+            }
+        } else {
+            let [input, initializer] = method.args.as_slice() else { return false };
+            let Some(binding) = self.binding(&parameter.pat) else { return false };
+            if method.seg.ident.name.as_str() != "get_or_init"
+                || !self.is_binding(input, binding)
+                || !is_helper(initializer)
+            {
+                return false;
+            }
+        }
+        let Some(access) = self.ast_to_hir.get_expr(access.id, self.tcx) else { return false };
+        self.tcx
+            .typeck(access.hir_id.owner)
+            .type_dependent_def_id(access.hir_id)
+            .is_some_and(|method| {
+                self.associated_adt(method)
+                    .is_some_and(|adt| adt.did() == storage_adt.did())
+            })
+    }
+
+    fn associated_adt(&self, definition: DefId) -> Option<ty::AdtDef<'_>> {
+        if self.tcx.def_kind(definition) != DefKind::AssocFn {
+            return None;
+        }
+        let implementation = self
+            .tcx
+            .associated_item(definition)
+            .impl_container(self.tcx)?;
+        let ty::Adt(adt, _) = self
+            .tcx
+            .type_of(implementation)
+            .instantiate_identity()
+            .kind()
+        else {
+            return None;
+        };
+        Some(*adt)
+    }
+
     fn path_resolution(&self, expression: &Expr) -> Option<Res> {
-        let ExprKind::Path(None, path) = &unwrap_paren(expression).kind else { return None };
-        self.ast_to_hir.path_span_to_res.get(&path.span).copied()
+        let expression = unwrap_paren(expression);
+        let ExprKind::Path(_, path) = &expression.kind else { return None };
+        if let Some(resolution) = self.ast_to_hir.path_span_to_res.get(&path.span) {
+            return Some(*resolution);
+        }
+        let expression = self.ast_to_hir.get_expr(expression.id, self.tcx)?;
+        let hir::ExprKind::Path(path) = &expression.kind else { return None };
+        Some(
+            self.tcx
+                .typeck(expression.hir_id.owner)
+                .qpath_res(path, expression.hir_id),
+        )
     }
 
     fn binding(&self, pattern: &Pat) -> Option<hir::HirId> {
@@ -504,11 +790,10 @@ impl AstVisitor<'_> {
         let ExprKind::Call(callee, arguments) = &unwrap_paren(expression).kind else {
             return None;
         };
-        let ExprKind::Path(None, path) = &callee.kind else { return None };
-        let Res::Def(_, def_id) = self.ast_to_hir.path_span_to_res.get(&path.span)? else {
+        let Res::Def(_, def_id) = self.path_resolution(callee)? else {
             return None;
         };
-        Some((*def_id, arguments))
+        Some((def_id, arguments))
     }
 
     fn core_panicking_call<'a>(&self, expression: &'a Expr) -> Option<(Symbol, &'a [P<Expr>])> {
@@ -791,6 +1076,75 @@ struct Ctx {
     bitfields: FxHashMap<LocalDefId, FxHashMap<Symbol, Vec<BitField>>>,
     use_intrinsics: bool,
     use_transmute: bool,
+    required_features: FxHashSet<Symbol>,
+}
+
+struct FeatureUses<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    ast_to_hir: &'a utils::ir::AstToHir,
+    required: &'a mut FxHashSet<Symbol>,
+}
+
+impl FeatureUses<'_, '_> {
+    fn definition(&mut self, definition: DefId) {
+        if !definition.is_local()
+            && let Some(stability) = self.tcx.lookup_stability(definition)
+            && matches!(
+                stability.feature.as_str(),
+                "thread_local_internals" | "fmt_helpers_for_derive" | "derive_eq"
+            )
+        {
+            self.required.insert(stability.feature);
+        }
+    }
+}
+
+impl<'ast> Visitor<'ast> for FeatureUses<'_, '_> {
+    fn visit_ty(&mut self, ty: &'ast Ty) {
+        if matches!(ty.kind, TyKind::Never) {
+            self.required.insert(Symbol::intern("never_type"));
+        }
+        visit::walk_ty(self, ty);
+    }
+
+    fn visit_fn_ret_ty(&mut self, return_type: &'ast FnRetTy) {
+        if !matches!(return_type, FnRetTy::Ty(ty) if matches!(ty.kind, TyKind::Never)) {
+            visit::walk_fn_ret_ty(self, return_type);
+        }
+    }
+
+    fn visit_path(&mut self, path: &'ast Path) {
+        if let Some(resolution) = self.ast_to_hir.path_span_to_res.get(&path.span)
+            && let Some(definition) = resolution.opt_def_id()
+        {
+            self.definition(definition);
+        }
+        visit::walk_path(self, path);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        if matches!(expression.kind, ExprKind::Path(..))
+            && let Some(expression) = self.ast_to_hir.get_expr(expression.id, self.tcx)
+            && let hir::ExprKind::Path(path) = &expression.kind
+            && let Some(definition) = self
+                .tcx
+                .typeck(expression.hir_id.owner)
+                .qpath_res(path, expression.hir_id)
+                .opt_def_id()
+        {
+            self.definition(definition);
+        }
+        if matches!(expression.kind, ExprKind::MethodCall(..))
+            && let Some(expression) = self.ast_to_hir.get_expr(expression.id, self.tcx)
+            && let Some(definition) = self
+                .tcx
+                .typeck(expression.hir_id.owner)
+                .type_dependent_def_id(expression.hir_id)
+        {
+            self.definition(definition);
+        }
+        visit::walk_expr(self, expression);
+    }
 }
 
 struct BitField {
@@ -937,6 +1291,213 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirBodyVisitor<'tcx> {
 
 #[cfg(test)]
 mod tests {
+    fn normalize_source(code: &str) -> String {
+        let expanded = utils::compilation::run_compiler_on_str(code, |tcx| {
+            crate::expander::expand(crate::expander::Config::default(), tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&expanded, utils::type_check).expect(&expanded);
+        let normalized = utils::compilation::run_compiler_on_str(&expanded, |tcx| {
+            super::unexpand(super::Config::default(), tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&normalized, utils::type_check).expect(&normalized);
+        normalized
+    }
+
+    #[test]
+    fn thread_local_reconstruction_uses_resolved_identity_and_keeps_raw_accessors() {
+        let source = normalize_source(
+            r#"
+#![feature(thread_local_internals)]
+struct LocalKey<T>(T);
+const LOOKALIKE: LocalKey<i32> = { const __INIT: i32 = { 3 }; LocalKey(__INIT) };
+const RAW: std::thread::LocalKey<i32> = {
+    const __INIT: i32 = 4;
+    unsafe { std::thread::LocalKey::new(|_| &__INIT) }
+};
+macro_rules! thread_local { ($($tokens:tt)*) => { compile_error!("shadowed macro") }; }
+use std::thread_local as scoped;
+scoped! { #[allow(dead_code)] pub(crate) static r#type: std::cell::Cell<u32> = std::cell::Cell::new(5); }
+fn read() -> i32 { RAW.with(|value| *value) + LOOKALIKE.0 }
+"#,
+        );
+        assert_eq!(
+            source.matches("::std::thread_local!").count(),
+            1,
+            "{source}"
+        );
+        assert!(source.contains("#[allow(dead_code)]"), "{source}");
+        assert!(source.contains("pub(crate) static r#type"), "{source}");
+        assert!(
+            source.contains("const LOOKALIKE: LocalKey<i32>"),
+            "{source}"
+        );
+        assert!(
+            source.contains("const RAW: std::thread::LocalKey<i32>"),
+            "{source}"
+        );
+        assert!(
+            source.contains("#![feature(thread_local_internals)]"),
+            "{source}"
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_never_types_inside_reconstructed_thread_local_tokens() {
+        let source = normalize_source(
+            r#"
+#![feature(never_type)]
+std::thread_local! {
+    static VALUE: std::cell::Cell<Option<!>> = const { std::cell::Cell::new(None) };
+}
+fn read() -> bool { VALUE.with(|value| value.get().is_none()) }
+"#,
+        );
+        assert!(source.contains("::std::thread_local!"), "{source}");
+        assert!(source.contains("Option<!>"), "{source}");
+        assert!(source.contains("#![feature(never_type)]"), "{source}");
+        assert!(
+            !source.contains("#![feature(thread_local_internals)]"),
+            "{source}"
+        );
+        assert_eq!(normalize_source(&source), source);
+    }
+
+    #[test]
+    fn const_thread_local_reconstruction_wraps_a_simplified_initializer() {
+        let expanded = utils::compilation::run_compiler_on_str(
+            "std::thread_local! { static VALUE: u32 = const { 7 }; }",
+            |tcx| crate::expander::expand(crate::expander::Config::default(), tcx),
+        )
+        .unwrap();
+        assert!(
+            expanded.contains("const __INIT: u32 = { 7 };"),
+            "{expanded}"
+        );
+        let expanded = expanded.replace("const __INIT: u32 = { 7 };", "const __INIT: u32 = 7;");
+        let normalized = utils::compilation::run_compiler_on_str(&expanded, |tcx| {
+            super::unexpand(super::Config::default(), tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&normalized, utils::type_check).expect(&normalized);
+        assert!(
+            normalized.contains("static VALUE: u32 = const { 7 }"),
+            "{normalized}"
+        );
+        assert!(!normalized.contains("LocalKey::new"), "{normalized}");
+        assert_eq!(normalize_source(&normalized), normalized);
+    }
+
+    #[test]
+    fn thread_local_reconstruction_declines_transformed_aliases_and_generic_helpers() {
+        let source = r#"
+type Key<T> = std::thread::LocalKey<(T, T)>;
+std::thread_local! { static ALIASED: (i32, i32) = (1, 2); static GENERIC: i32 = 3; }
+"#;
+        let expanded = utils::compilation::run_compiler_on_str(source, |tcx| {
+            crate::expander::expand(crate::expander::Config::default(), tcx)
+        })
+        .unwrap();
+        assert!(
+            expanded.contains("::std::thread::LocalKey<(i32, i32)>"),
+            "{expanded}"
+        );
+        let expanded = expanded
+            .replace("::std::thread::LocalKey<(i32, i32)>", "Key<i32>")
+            .replace("fn __init() -> i32", "fn __init<T: Default>() -> i32")
+            .replace(
+                "get_or_init(init, __init)",
+                "get_or_init(init, __init::<()>)",
+            );
+        // The tuple helper is not generic, so only specialize calls in GENERIC's item.
+        let start = expanded.find("const GENERIC:").unwrap();
+        let expanded = format!(
+            "{}{}",
+            expanded[..start].replace("__init::<()>", "__init"),
+            &expanded[start..]
+        );
+        let normalized = utils::compilation::run_compiler_on_str(&expanded, |tcx| {
+            super::unexpand(super::Config::default(), tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&normalized, utils::type_check).expect(&normalized);
+        assert!(!normalized.contains("::std::thread_local!"), "{normalized}");
+        assert!(
+            normalized.contains("const ALIASED: Key<i32>"),
+            "{normalized}"
+        );
+        assert!(normalized.contains("fn __init<T: Default>"), "{normalized}");
+        assert!(
+            normalized.contains("#![feature(thread_local_internals)]"),
+            "{normalized}"
+        );
+    }
+
+    #[test]
+    fn thread_local_reconstruction_preserves_generic_outer_constants() {
+        let expanded = utils::compilation::run_compiler_on_str(
+            "std::thread_local! { static VALUE: u32 = const { 7 }; }",
+            |tcx| crate::expander::expand(crate::expander::Config::default(), tcx),
+        )
+        .unwrap();
+        assert!(expanded.contains("const VALUE:"), "{expanded}");
+        let expanded = format!(
+            "#![feature(generic_const_items)]\n{}",
+            expanded.replace("const VALUE:", "const VALUE<const N: usize>:")
+        );
+        let normalized = utils::compilation::run_compiler_on_str(&expanded, |tcx| {
+            super::unexpand(super::Config::default(), tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&normalized, utils::type_check).expect(&normalized);
+        assert!(
+            normalized.contains("const VALUE<const N : usize>"),
+            "{normalized}"
+        );
+        assert!(!normalized.contains("::std::thread_local!"), "{normalized}");
+        assert!(
+            normalized.contains("#![feature(thread_local_internals)]"),
+            "{normalized}"
+        );
+    }
+
+    #[test]
+    fn cleanup_filters_combined_features_and_retains_exposed_library_helpers() {
+        let source = r#"
+#![feature(panic_internals, thread_local_internals, never_type, fmt_helpers_for_derive, derive_eq, allocator_api)]
+type Empty = Option<!>;
+use std::thread::LocalKey as Key;
+const RAW: Key<i32> = unsafe { Key::new(|_| &1) };
+fn format(f: &mut std::fmt::Formatter<'_>, value: &bool) -> std::fmt::Result {
+    f.debug_struct_field1_finish("Entry", "value", value)
+}
+fn eq() { let _: core::cmp::AssertParamIsEq<bool>; }
+fn allocate(value: u32) -> Result<Box<u32>, std::alloc::AllocError> { Box::try_new(value) }
+"#;
+        let normalized = utils::compilation::run_compiler_on_str(source, |tcx| {
+            super::unexpand(super::Config::default(), tcx)
+        })
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&normalized, utils::type_check).expect(&normalized);
+        for feature in [
+            "thread_local_internals",
+            "never_type",
+            "fmt_helpers_for_derive",
+            "derive_eq",
+            "allocator_api",
+        ] {
+            assert!(
+                normalized.contains(&format!("#![feature({feature})]")),
+                "{normalized}"
+            );
+        }
+        assert!(
+            !normalized.contains("#![feature(panic_internals)]"),
+            "{normalized}"
+        );
+    }
+
     fn run_test(code: &str, includes: &[&str], excludes: &[&str]) {
         let config = super::Config { use_print: true };
         let s = utils::compilation::run_compiler_on_str(code, |tcx| super::unexpand(config, tcx))

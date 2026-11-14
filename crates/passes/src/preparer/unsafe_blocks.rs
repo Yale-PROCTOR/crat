@@ -59,6 +59,9 @@ impl<'ast> Visitor<'ast> for Facts<'_, '_> {
     }
 
     fn visit_item(&mut self, item: &'ast ast::Item) {
+        if super::is_thread_local_key(item, self.mapping, self.tcx) {
+            return;
+        }
         let previous = self.function.take();
         visit::walk_item(self, item);
         self.function = previous;
@@ -234,6 +237,9 @@ impl MutVisitor for Normalizer<'_, '_> {
     }
 
     fn visit_item(&mut self, item: &mut ast::Item) {
+        if super::is_thread_local_key(item, self.mapping, self.tcx) {
+            return;
+        }
         let previous = (self.normalize_blocks, self.unsafe_context);
         self.normalize_blocks = false;
         self.unsafe_context = false;
