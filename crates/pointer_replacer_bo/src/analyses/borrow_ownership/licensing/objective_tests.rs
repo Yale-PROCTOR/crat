@@ -207,14 +207,23 @@ pub unsafe fn run(empty: bool) -> bool { let p = make(empty); p.is_null() }
 }
 
 #[test]
-fn o08_an_opaque_result_stays_raw_and_an_integer_cast_result_settles_owning() {
+fn opaque_results_stay_raw_and_integer_reconstruction_declines() {
     let fixture = inspect(
         r#"
 unsafe extern "C" { fn opaque() -> *mut i32; }
 pub unsafe fn unknown() -> *mut i32 { opaque() }
-pub fn integer(address: usize) -> *mut i32 { address as *mut i32 }
 "#,
     );
     fixture.assert_kind("unknown::_0", SlotKind::Raw);
-    fixture.assert_kind("integer::_0", SlotKind::Owning);
+    let integer = inspect("pub fn integer(address: usize) -> *mut i32 { address as *mut i32 }");
+    assert!(!integer.accepted);
+    assert!(integer.kinds.is_empty());
+    assert!(
+        integer
+            .construction_error
+            .as_deref()
+            .is_some_and(|error| error.contains("nonpointer source of type `usize`")),
+        "{:?}",
+        integer.construction_error
+    );
 }

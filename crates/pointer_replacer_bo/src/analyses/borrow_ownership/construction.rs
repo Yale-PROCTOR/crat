@@ -307,7 +307,6 @@ impl OverlapPreledgerDecline {
         self.reason
     }
 
-    #[cfg(test)]
     pub(crate) fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
     }
@@ -1015,6 +1014,7 @@ fn construct_bo_into_with_esc(
     mode: CopyLendMode,
     enable_esc_minimal: bool,
 ) -> anyhow::Result<BoConstruction> {
+    super::borrow_fork::validate_pointer_loan_sources(program)?;
     crate::phase_log::mark("bc:source_events", "start", "");
     crate::analysis_budget::check("bc:source_events")?;
     let source_events = super::source_events::for_construction(program);

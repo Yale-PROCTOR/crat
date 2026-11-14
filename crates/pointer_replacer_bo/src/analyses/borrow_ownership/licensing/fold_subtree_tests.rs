@@ -798,11 +798,6 @@ fn r336_4_the_three_prefix_and_field_puns_stay_denied() {
             N2_CODE,
             "punned-destination",
         ),
-        (
-            "N3 base made from an integer",
-            N3_CODE,
-            "punned-destination",
-        ),
     ] {
         with_facts(code, move |facts| {
             let rows = &facts.field_support_inputs.unsupported;
@@ -817,6 +812,16 @@ fn r336_4_the_three_prefix_and_field_puns_stay_denied() {
             );
         });
     }
+    let integer = super::tests::inspect(N3_CODE);
+    assert!(!integer.accepted);
+    assert!(
+        integer
+            .construction_error
+            .as_deref()
+            .is_some_and(|error| error.contains("nonpointer source of type `usize`")),
+        "{:?}",
+        integer.construction_error
+    );
 }
 
 #[test]

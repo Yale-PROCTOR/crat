@@ -10,7 +10,7 @@ use crate::{
     analyses::{
         borrow_ownership::{
             SlotKind,
-            construction::solve_bo_overlap_config,
+            construction::solve_bo_overlap_config_reporting,
             crate_slots::CrateSlots,
             mutability::mutability_analysis,
             mutability_facts::MutFacts,
@@ -74,7 +74,7 @@ pub fn analyze_pointers(tcx: TyCtxt<'_>) -> Result<AcceptedPointerAnalysis, Stri
     let mutability = mutability_analysis(&program);
     let replay_mutability = MutFacts::from_program(&program);
     let origins = compute_origins(&program);
-    let verified = solve_bo_overlap_config(
+    let verified = solve_bo_overlap_config_reporting(
         &program,
         &slots,
         &origins,
@@ -82,7 +82,12 @@ pub fn analyze_pointers(tcx: TyCtxt<'_>) -> Result<AcceptedPointerAnalysis, Stri
         OverlapMode::PreciseReplay,
         Some(WholeProgramAttestation::FrozenBenchmarkGraph),
     )
-    .ok_or_else(|| "BO analysis declined: no accepted pointer model".to_owned())?;
+    .map_err(|decline| {
+        format!(
+            "BO analysis declined: {}",
+            decline.detail().unwrap_or("no accepted pointer model")
+        )
+    })?;
     let nullable = nullability::analyze(tcx, &program.functions, &slots).slots();
     let fatness = fatness_analysis(&program);
     let mut outer_mutability = FxHashMap::default();

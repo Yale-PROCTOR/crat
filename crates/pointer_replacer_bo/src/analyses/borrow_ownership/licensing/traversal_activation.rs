@@ -236,7 +236,7 @@ fn c07_traversal_activation_all_original_endpoints_hard_sat() {
 }
 
 #[test]
-fn c07_traversal_activation_holds_open_world_retention_with_cast_premise_control() {
+fn traversal_activation_preserves_holds_and_declines_integer_reconstruction() {
     let open = super::tests::inspect(CODE);
     assert!(open.accepted);
     assert!(
@@ -261,24 +261,19 @@ fn c07_traversal_activation_holds_open_world_retention_with_cast_premise_control
             .all(|s| s.traversal_calls.is_empty()),
         "retention is not a certified reader"
     );
-    let raw = format!(
-        "{CODE}\npub unsafe fn raw_caller(address:usize)->i32{{let node=address as *mut Node;let result=minimum(node);(*result).value}}"
+    let integer = format!(
+        "{CODE}\npub unsafe fn from_address(address:usize)->i32{{let node=address as *mut Node;let result=minimum(node);(*result).value}}"
     );
-    let raw = inspect_attested_frame(&raw);
-    assert!(raw.accepted);
-    eprintln!("R284_RAW_ACTUAL_KINDS={:?}", raw.kinds);
-    // An integer cast alone settles Ref in this attested frame, so it cannot
-    // witness propagation from an actual Raw kind.
-    raw.assert_kind("raw_caller::node", SlotKind::Ref);
+    let integer = inspect_attested_frame(&integer);
+    assert!(!integer.accepted);
+    assert!(integer.export.stack_entry_final.is_none());
     assert!(
-        raw.export
-            .stack_entry_final
-            .as_ref()
-            .unwrap()
-            .traversal_guards
-            .windows(2)
-            .all(|rows| rows[0].1 == rows[1].1),
-        "Ref cast actual is not a Raw premise; shared-callee guards still agree"
+        integer
+            .construction_error
+            .as_deref()
+            .is_some_and(|error| error.contains("nonpointer source of type `usize`")),
+        "{:?}",
+        integer.construction_error
     );
 }
 #[test]

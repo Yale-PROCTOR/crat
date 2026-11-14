@@ -1436,10 +1436,14 @@ fn w6f_array_of_references_local_delivers() {
     );
     for label in [
         "kmRay2IntersectBox::p1",
+        "kmRay2IntersectBox::p2",
+        "kmRay2IntersectBox::p3",
         "kmRay2IntersectBox::p4",
         "kmRay2IntersectBox::this_point",
         "kmRay2IntersectBox::next_point",
         "kmRay2IntersectBox::other_point",
+        "kmVec2Dot::a",
+        "kmVec2Dot::b",
     ] {
         assert_eq!(
             decision_of(&observed, label),
@@ -1447,11 +1451,12 @@ fn w6f_array_of_references_local_delivers() {
             "{label}"
         );
     }
-    let outcome = emitted("points", POINTS);
-    let (source, emitted_count, reverted) = emitted_source(&outcome);
-    assert_eq!((emitted_count, reverted), (9, 0), "{source}");
+    let source = super::emit_tests::ast_emitted_source_of_attested(POINTS)
+        .expect("array reference emission");
+    assert!(super::verify::type_checks_str(&source), "{source}");
     let flat: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
     for needle in [
+        "fn kmVec2Dot(mut a: &kmVec2, mut b: &kmVec2) -> f32 {",
         "fn kmRay2IntersectBox(mut p1: &kmVec2, mut p2: &kmVec2, mut p3: &kmVec2, mut p4: &kmVec2) -> f32 {",
         "let mut points: [Option<&kmVec2>; 4] = [None; 4];",
         "points[0 as usize] = Some(p1);",
@@ -1471,13 +1476,26 @@ fn w6f_array_of_references_local_delivers() {
         );
     }
 
-    // Control: a raw-model source stored into the array.
-    let raw_source = POINTS.replace(
+    let integer_source = POINTS.replace(
         "    points[1 as usize] = p2;",
         "    let mut q = (p2 as usize + 8 as usize) as *const kmVec2;\n    points[1 as usize] = q;",
     );
-    // (`q` is model-Ref but decides `copy-source-coupled`: the store's source
-    // does not deliver, so the array holds at finalization.)
+    ::utils::compilation::run_compiler_on_str(&integer_source, |tcx| {
+        let error = crate::analyze_pointers(tcx)
+            .err()
+            .expect("integer reconstruction must decline before array decisions");
+        assert!(
+            error.contains("nonpointer source of type `usize`"),
+            "{error}"
+        );
+    })
+    .unwrap();
+
+    // Control: an opaque raw source stored into the array holds the transaction.
+    let raw_source = POINTS.replace(
+        "    points[1 as usize] = p2;",
+        "    let mut q = opaque_point(p2);\n    points[1 as usize] = q;",
+    ) + "\nunsafe extern \"C\" { fn opaque_point(point: *const kmVec2) -> *const kmVec2; }\n";
     let held = observe(&raw_source);
     let row = field_row(&held, "kmRay2IntersectBox", "points");
     assert_eq!(row.2, "held", "{row:?}");

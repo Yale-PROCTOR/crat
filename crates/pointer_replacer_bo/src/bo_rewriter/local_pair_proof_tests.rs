@@ -39,6 +39,19 @@ fn held(input: &str) -> Vec<(String, bool, bool)> {
     .expect("fixture compiles")
 }
 
+fn assert_integer_reconstruction_declines(input: &str) {
+    ::utils::compilation::run_compiler_on_str(input, |tcx| {
+        let error = crate::analyze_pointers(tcx)
+            .err()
+            .expect("integer reconstruction must decline before pair decisions");
+        assert!(
+            error.contains("nonpointer source of type `usize`"),
+            "{error}"
+        );
+    })
+    .expect("fixture compiles");
+}
+
 fn row<'a>(rows: &'a [(String, bool, bool)], label: &str) -> &'a (String, bool, bool) {
     rows.iter()
         .find(|(l, ..)| l == label)
@@ -155,16 +168,10 @@ unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
 pub unsafe fn caller(buf: *mut u8, n: usize) -> u8 { cp2(n as *mut u8, buf); *buf }
 "#;
 
-/// wave-5d 148b: an integer cast to a pointer is not a stack object, so no
-/// structural certificate reads it as one. **R936-1 (P11)**: aliasing through
-/// an integer is outside the claim; the premise arm clears the pair, receipted.
+// The pair classifier records an integer premise; full analysis declines it.
 #[test]
 fn r148b_an_integer_cast_to_a_pointer_is_not_a_stack_object() {
-    let rows = held(INTEGER_CAST);
-    assert!(
-        !is_held(&rows, "cp2::s") && !is_held(&rows, "cp2::d"),
-        "{rows:?}"
-    );
+    assert_integer_reconstruction_declines(INTEGER_CAST);
     assert_eq!(
         verdict_at(INTEGER_CAST, "caller", "cp2", 0, 1),
         Ok(
@@ -304,14 +311,13 @@ unsafe fn set_s(t: *mut u8) {{ S.buf = t; }}
     )
 }
 
-/// R936-1 (P11): the premise arm clears it, receipted; nothing is held.
+// Naming an integer-derived pointer does not make its origin modelable.
 #[test]
 fn r149g_an_integer_cast_held_in_a_local_may_point_anywhere() {
     let source = anywhere_shape(
         "pub unsafe fn b(buf: *mut u8, n: usize) -> u8 { let q = n as *mut u8; cp2(q, buf); *buf }",
     );
-    let rows = held(&source);
-    assert!(!is_held(&rows, "cp2::s"), "{rows:?}");
+    assert_integer_reconstruction_declines(&source);
     assert_eq!(
         verdict_at(&source, "b", "cp2", 0, 1),
         Ok(
@@ -442,20 +448,15 @@ fn integer_round_trip() -> String {
     )
 }
 
-/// wave-6a 157c §2: the write through an integer round trip of the sibling
-/// formal. **R936-1 (P11)**: aliasing through an integer is outside the claim,
-/// so the round trip is not chased (relay 197 drops R934-1 (iii)); the pair is
-/// not held and the three are delivered. The plain write (no integer) stays
-/// held, as R833-1 asks.
+// Ordinary raw writes retain their holds; integer reconstruction declines earlier.
 #[test]
-fn r157c_a_write_through_an_integer_round_trip_is_outside_the_claim() {
+fn integer_round_trip_write_declines_before_pair_decisions() {
     let plain = held(PLAIN_WRITE);
-    let round = held(&integer_round_trip());
     let watched = ["update::src", "caller::src", "outer::v"];
     for label in watched {
         assert!(is_raw(&plain, label), "{label}: {plain:?}");
-        assert!(!is_raw(&round, label), "{label}: {round:?}");
     }
+    assert_integer_reconstruction_declines(&integer_round_trip());
 }
 
 /// wave-5d 149f (soundness): the same pair with `dst` model-raw through a
@@ -708,8 +709,7 @@ fn r944_1_integer_made_pointers_stay_premises() {
         verdict_at(&anywhere_shape(body), "b", "cp2", 0, 1),
         Ok(premise_of(ProvenanceKind::Integer))
     );
-    let round = held(&integer_round_trip());
-    assert!(!is_raw(&round, "update::src"), "{round:?}");
+    assert_integer_reconstruction_declines(&integer_round_trip());
 }
 
 /// R944-1, the mixed case: a global beside an integer-made pointer. Under

@@ -290,8 +290,7 @@ pub unsafe fn main_0(mut key: i32) -> i32 {
 }
 "#;
 
-/// bzip2 `addFlagsFromEnvVar`'s walk, with the re-seed value left RAW (its own
-/// family does not present it): the construction takes the text as it stands.
+// A raw library result reconstructed through an integer before cursor use.
 const RE_SEEDED_RAW: &str = r#"
 #![allow(dead_code, unused_mut, unused_variables, non_snake_case)]
 unsafe extern "C" { fn getenv(name: *const i8) -> *mut i8; }
@@ -333,24 +332,25 @@ fn wave6o_a_table_rooted_walker_re_seeded_from_a_call_delivers() {
     assert!(verify::type_checks_str(&output), "{output}");
 }
 
-/// **W6O-RS-3 — a re-seed whose value is still RAW.** No bridge is needed: the
-/// text is already a pointer, and only the extent is fabricated.
 #[test]
-fn wave6o_a_raw_re_seed_value_needs_no_bridge() {
+fn integer_reconstruction_in_a_cursor_source_declines_before_emission() {
     assert!(verify::type_checks_str(RE_SEEDED_RAW));
-    let decision = decision_of(RE_SEEDED_RAW, "addFlagsFromEnvVar2", "p");
+    let error = ast_emitted_source_of(RE_SEEDED_RAW)
+        .expect_err("integer reconstruction must decline before cursor emission");
+    assert!(error.contains("BO declined"), "{error}");
+}
+
+#[test]
+fn direct_raw_cursor_source_stays_supported_without_a_reference_bridge() {
+    let input = RE_SEEDED_RAW.replace("envbase as usize as *mut i8", "envbase");
+    let decision = decision_of(&input, "addFlagsFromEnvVar2", "p");
     let Decision::Cursor { plan, .. } = &decision else {
-        panic!("the raw-sourced re-seeded walker must take the cursor: {decision:?}");
+        panic!("the direct raw source must support cursor delivery: {decision:?}");
     };
-    assert!(
-        plan.fallback,
-        "the fabricated extent is receipted: {plan:?}"
-    );
-    let output = ast_emitted_source_of(RE_SEEDED_RAW).expect("native emission");
-    assert!(
-        !output.contains("core::ptr::from_ref(q)"),
-        "a raw value is not bridged: {output}"
-    );
+    assert!(plan.fallback, "the fabricated extent is retained: {plan:?}");
+    let output =
+        ast_emitted_source_of(&input).expect("direct raw pointer source remains supported");
+    assert!(!output.contains("core::ptr::from_ref(q)"), "{output}");
     assert!(verify::type_checks_str(&output), "{output}");
 }
 

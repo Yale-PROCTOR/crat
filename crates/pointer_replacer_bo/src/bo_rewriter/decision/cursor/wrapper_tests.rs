@@ -334,14 +334,11 @@ fn slicecursor_mutable_offset_reborrow() {
 }
 
 #[test]
-fn slicecursor_integer_address_escape_is_not_a_scalar_comparison() {
-    let source = emitted(
+fn integer_address_escape_declines_before_cursor_emission() {
+    let error = crate::bo_rewriter::emit_tests::ast_emitted_source_of(
         "pub unsafe fn inspect(a: &mut [i32]) { let p: *mut i32 = a.as_mut_ptr().add(1); let address = p as usize; let q = address as *mut i32; *p.offset(-1) = 3; *q = 4; }",
-    );
-    assert!(
-        !source.contains("slice_cursor::SliceCursor"),
-        "integer address escape is not licensed by scalar comparison evidence: {source}"
-    );
+    ).expect_err("integer reconstruction must decline before cursor emission");
+    assert!(error.contains("BO declined"), "{error}");
 }
 
 #[test]
