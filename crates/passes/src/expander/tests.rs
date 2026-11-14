@@ -72,7 +72,7 @@ fn conditionally_enabled_features_survive_expansion() {
     let source = format!(
         r#"
 #![cfg_attr(all(), feature(allocator_api))]
-#![cfg_attr(any(), feature(never_type))]
+#![cfg_attr(any(), feature(try_blocks))]
 {FALLIBLE_ALLOCATION}
 "#
     );
@@ -82,7 +82,120 @@ fn conditionally_enabled_features_survive_expansion() {
         expanded.contains("#![feature(allocator_api)]"),
         "{expanded}"
     );
-    assert!(!expanded.contains("never_type"), "{expanded}");
+    assert!(!expanded.contains("try_blocks"), "{expanded}");
+}
+
+const THREAD_LOCALS: &str = r#"
+use std::cell::{Cell, RefCell};
+std::thread_local! {
+    #[allow(dead_code)]
+    pub static LAZY: RefCell<Vec<u8>> = RefCell::new(Vec::new());
+    static LAZY_CELL: Cell<u32> = Cell::new(1);
+    static LAZY_UNSAFE: Cell<u32> = Cell::new(unsafe { std::ptr::read(&5u32) });
+    pub(crate) static EAGER: RefCell<String> = const { RefCell::new(String::new()) };
+    static EAGER_CELL: Cell<u32> = const { Cell::new(2) };
+}
+pub fn update() -> u32 {
+    LAZY.with(|value| value.borrow_mut().push(3));
+    EAGER.with(|value| value.borrow_mut().push('x'));
+    LAZY_CELL.with(|left| EAGER_CELL.with(|right| LAZY_UNSAFE.with(|extra| left.get() + right.get() + extra.get())))
+}
+mod nested {
+    std::thread_local! { pub static VALUE: std::cell::Cell<usize> = std::cell::Cell::new(4); }
+    pub fn get() -> usize { VALUE.with(std::cell::Cell::get) }
+}
+"#;
+
+#[test]
+fn standard_thread_locals_recompile_after_expansion() {
+    let expanded = expand(THREAD_LOCALS);
+    check(&expanded);
+    assert_eq!(expand(&expanded), expanded);
+}
+
+#[test]
+fn standard_thread_locals_recompile_through_preparation_and_unexpansion() {
+    let expanded = expand(THREAD_LOCALS);
+    let prepared = run_compiler_on_str(&expanded, crate::preparer::prepare)
+        .unwrap()
+        .unwrap();
+    check(&prepared.code);
+    let unexpanded = run_compiler_on_str(&prepared.code, |tcx| {
+        crate::unexpander::unexpand(crate::unexpander::Config::default(), tcx)
+    })
+    .unwrap();
+    check(&unexpanded);
+    assert_eq!(
+        unexpanded.matches("::std::thread_local!").count(),
+        6,
+        "{unexpanded}"
+    );
+    for internal in [
+        "LazyStorage",
+        "EagerStorage",
+        "LocalKey::new",
+        "#![feature(thread_local_internals)]",
+    ] {
+        assert!(!unexpanded.contains(internal), "{unexpanded}");
+    }
+}
+
+#[test]
+fn derived_debug_helpers_recompile_through_preparation_and_unexpansion() {
+    let source = r#"
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Arithmetic { Integer { unsigned: bool }, Float }
+        #[derive(Debug)]
+        pub struct Location { pub line: usize, pub column: usize }
+    "#;
+    let expanded = expand(source);
+    check(&expanded);
+    let prepared = run_compiler_on_str(&expanded, crate::preparer::prepare)
+        .unwrap()
+        .unwrap();
+    check(&prepared.code);
+    let unexpanded = run_compiler_on_str(&prepared.code, |tcx| {
+        crate::unexpander::unexpand(crate::unexpander::Config::default(), tcx)
+    })
+    .unwrap();
+    check(&unexpanded);
+    assert!(unexpanded.contains("#[derive(Debug)]"), "{unexpanded}");
+    assert!(!unexpanded.contains("debug_struct_field"), "{unexpanded}");
+    assert!(
+        !unexpanded.contains("#![feature(fmt_helpers_for_derive)]"),
+        "{unexpanded}"
+    );
+    assert!(
+        !unexpanded.contains("#![feature(derive_eq)]"),
+        "{unexpanded}"
+    );
+}
+
+#[test]
+fn standard_thread_locals_recompile_through_postprocessing() {
+    let expanded = expand(THREAD_LOCALS);
+    let interfaces = run_compiler_on_str(&expanded, |tcx| {
+        crate::interface_fixer::fix_interfaces(&crate::interface_fixer::Config::default(), tcx)
+    })
+    .unwrap();
+    check(&interfaces);
+    let resolved = run_compiler_on_str(&interfaces, |tcx| {
+        crate::unsafe_resolver::resolve_unsafe(&crate::unsafe_resolver::Config::default(), tcx)
+    })
+    .unwrap();
+    check(&resolved);
+    let unexpanded = run_compiler_on_str(&resolved, |tcx| {
+        crate::unexpander::unexpand(crate::unexpander::Config::default(), tcx)
+    })
+    .unwrap();
+    check(&unexpanded);
+    assert_eq!(
+        unexpanded.matches("::std::thread_local!").count(),
+        6,
+        "{unexpanded}"
+    );
+    assert!(!unexpanded.contains("LazyStorage"), "{unexpanded}");
+    assert!(!unexpanded.contains("EagerStorage"), "{unexpanded}");
 }
 
 #[test]
