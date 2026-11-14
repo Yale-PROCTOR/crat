@@ -30,6 +30,142 @@ fn check(source: &str) {
     run_compiler_on_str(source, utils::type_check).expect(source);
 }
 
+const FALLIBLE_ALLOCATION: &str = r#"
+pub fn allocate(value: u32) -> Result<Box<u32>, std::alloc::AllocError> {
+    Box::try_new(value)
+}
+"#;
+
+#[test]
+fn existing_features_are_merged_deduplicated_and_emitted_individually() {
+    for attributes in [
+        "#![feature(c_variadic, allocator_api)]\n#![feature(extern_types, linkage)]",
+        "#![feature(allocator_api)]\n#![feature(allocator_api, c_variadic)]",
+    ] {
+        let expanded = expand(&format!("{attributes}\n{FALLIBLE_ALLOCATION}"));
+        check(&expanded);
+        for feature in ["allocator_api", "c_variadic", "extern_types", "linkage"] {
+            assert_eq!(
+                expanded.matches(&format!("#![feature({feature})]")).count(),
+                1,
+                "{expanded}"
+            );
+        }
+        let mut features = expanded
+            .lines()
+            .filter(|line| line.starts_with("#![feature("))
+            .collect::<Vec<_>>();
+        assert!(
+            features.iter().all(|attribute| !attribute.contains(',')),
+            "{expanded}"
+        );
+        let count = features.len();
+        features.sort_unstable();
+        features.dedup();
+        assert_eq!(features.len(), count, "{expanded}");
+        assert_eq!(expand(&expanded), expanded);
+    }
+}
+
+#[test]
+fn conditionally_enabled_features_survive_expansion() {
+    let source = format!(
+        r#"
+#![cfg_attr(all(), feature(allocator_api))]
+#![cfg_attr(any(), feature(never_type))]
+{FALLIBLE_ALLOCATION}
+"#
+    );
+    let expanded = expand(&source);
+    check(&expanded);
+    assert!(
+        expanded.contains("#![feature(allocator_api)]"),
+        "{expanded}"
+    );
+    assert!(!expanded.contains("never_type"), "{expanded}");
+}
+
+#[test]
+fn preserved_features_do_not_change_other_crate_attribute_handling() {
+    let source = r#"
+#![feature(register_tool)]
+#![register_tool(c2rust)]
+#![allow(dead_code, unused_assignments, unused_mut, improper_ctypes)]
+#![warn(unused_imports)]
+#![doc = "source crate documentation"]
+pub fn value() -> i32 { 1 }
+"#;
+    for keep_allows in [false, true] {
+        let expanded = run_compiler_on_str(source, |tcx| {
+            super::expand(super::Config { keep_allows }, tcx)
+        })
+        .unwrap();
+        check(&expanded);
+        assert!(
+            expanded.contains("#![feature(register_tool)]"),
+            "{expanded}"
+        );
+        assert!(
+            !expanded.contains("#![register_tool(c2rust)]"),
+            "{expanded}"
+        );
+        for attribute in [
+            "improper_ctypes",
+            "unused_imports",
+            "source crate documentation",
+        ] {
+            assert!(!expanded.contains(attribute), "{expanded}");
+        }
+        for lint in [
+            "non_camel_case_types",
+            "non_snake_case",
+            "non_upper_case_globals",
+        ] {
+            assert!(
+                expanded.contains(&format!("#![allow({lint})]")),
+                "{expanded}"
+            );
+        }
+        assert!(
+            expanded.contains("#![warn(mutable_transmutes)]"),
+            "{expanded}"
+        );
+        for lint in ["dead_code", "unused_assignments", "unused_mut"] {
+            assert_eq!(
+                expanded.contains(&format!("#![allow({lint})]")),
+                keep_allows,
+                "{expanded}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fallible_allocation_recompiles_through_preparation_and_unexpansion() {
+    let expanded = expand(&format!(
+        "#![feature(panic_internals, allocator_api)]\n{FALLIBLE_ALLOCATION}"
+    ));
+    check(&expanded);
+    let prepared = run_compiler_on_str(&expanded, crate::preparer::prepare)
+        .unwrap()
+        .unwrap();
+    check(&prepared.code);
+    let unexpanded = run_compiler_on_str(&prepared.code, |tcx| {
+        crate::unexpander::unexpand(crate::unexpander::Config::default(), tcx)
+    })
+    .unwrap();
+    check(&unexpanded);
+    assert!(
+        unexpanded.contains("#![feature(allocator_api)]"),
+        "{unexpanded}"
+    );
+    assert!(
+        !unexpanded.contains("#![feature(panic_internals)]"),
+        "{unexpanded}"
+    );
+    assert!(unexpanded.contains("Box::try_new"), "{unexpanded}");
+}
+
 #[test]
 fn standard_vectors_recompile_after_expansion() {
     let expanded = expand(VECTORS);
