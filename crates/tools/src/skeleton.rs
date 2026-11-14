@@ -1212,7 +1212,10 @@ impl<'ast> visit::Visitor<'ast> for KnownIneligibleBindingCollector<'_, '_> {
             && let hir::PatKind::Binding(_, hir_id, ..) = pattern.kind
             && !self.catalog.contains_key(&hir_id)
         {
-            self.known_ineligible.insert(hir_id);
+            let inferred = self.tcx.typeck(hir_id.owner).node_type(hir_id);
+            if !inferred.is_raw_ptr() || !type_contains_closure(inferred) {
+                self.known_ineligible.insert(hir_id);
+            }
         }
         visit::walk_pat(self, pattern);
     }
@@ -1267,7 +1270,7 @@ impl<'ast> visit::Visitor<'ast> for SourceLocalCatalogCollector<'_, '_> {
                 .tcx
                 .typeck(pattern_hir_id.owner)
                 .node_type(pattern_hir_id);
-            if inferred.is_raw_ptr() {
+            if inferred.is_raw_ptr() && !(local.ty.is_none() && type_contains_closure(inferred)) {
                 let before_type = match &local.ty {
                     Some(ty) => pprust::ty_to_string(ty),
                     None => match self.type_speller.render_semantic_type(inferred) {
@@ -4927,6 +4930,17 @@ fn nested_changes_type(nested: &[PointerLayer], source: ty::Ty<'_>) -> bool {
     })
 }
 
+pub(crate) fn type_contains_closure(ty: ty::Ty<'_>) -> bool {
+    ty.walk().any(|argument| {
+        argument.as_type().is_some_and(|ty| {
+            matches!(
+                ty.kind(),
+                ty::TyKind::Closure(..) | ty::TyKind::CoroutineClosure(..)
+            )
+        })
+    })
+}
+
 struct Skeletonizer<'a, 'tcx> {
     ast_to_hir: &'a utils::ir::AstToHir,
     decisions: &'a InitialPointerDecisions,
@@ -4965,6 +4979,7 @@ impl MutVisitor for Skeletonizer<'_, '_> {
             .then(|| self.decisions.bindings.get(&hir_id).copied())
             .flatten();
             let ty = match (decision, local.ty.as_deref()) {
+                (_, None) if type_contains_closure(inferred) => Ok(None),
                 (Some(_), Some(ty))
                     if inferred.is_ref()
                         && !nested_changes_type(

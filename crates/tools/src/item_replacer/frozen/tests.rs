@@ -11,6 +11,74 @@ fn freeze(source: &str) -> FrozenProject {
 }
 
 #[test]
+fn closure_containing_locals_survive_replacement_and_observation_extraction() {
+    for (source, body, incomplete_label) in [
+        (
+            "pub unsafe fn f(bytes: &[u8], p: *const i32) -> i32 { let chars = bytes.iter().copied().filter(|byte| *byte != b'='); let count = chars.count(); *p + count as i32 }",
+            "#[proctor(0)] let mut chars = bytes.iter().copied().filter(|byte| *byte != b'='); #[proctor(1)] let mut count: usize = chars.count(); #[proctor(2)] *p + count as i32",
+            None,
+        ),
+        (
+            "pub unsafe fn f(values: &[i32], p: *const i32) -> i32 { let nodes = values.iter().map(|value| *value); let sum = nodes.sum::<i32>(); *p + sum }",
+            "#[proctor(0)] let mut nodes = values.iter().copied(); #[proctor(1)] let mut sum: i32 = nodes.sum::<i32>(); #[proctor(2)] *p + sum",
+            None,
+        ),
+        (
+            "pub unsafe fn f(p: *const i32) -> i32 { let callback = || 1_i32; let address = &raw const callback; let value = (*address)(); *p + value }",
+            "#[proctor(0)] let mut callback = || 1_i32; #[proctor(1)] let mut address = &raw const callback; #[proctor(2)] let mut value: i32 = (*address)(); #[proctor(3)] *p + value",
+            Some(1),
+        ),
+    ] {
+        let frozen = freeze(source);
+        let function = &frozen.functions[0];
+        assert!(
+            function.record.target_signature.contains("p: &i32"),
+            "{}",
+            function.record.target_signature
+        );
+        if let Some(label) = incomplete_label {
+            let metadata = function
+                .record
+                .baseline
+                .statement_pair_metadata
+                .iter()
+                .find(|metadata| metadata.label == label)
+                .unwrap();
+            assert!(!metadata.pointer_variables_complete);
+            assert!(
+                !metadata
+                    .pointer_variables
+                    .iter()
+                    .any(|variable| variable.name == "address")
+            );
+        }
+        let returned = format!("{} {{ {body} }}", function.record.target_signature);
+        let mut validation_request = crate::ValidationRequest {
+            expected_functions: vec![crate::ExpectedFunction {
+                id: function.record.id,
+                name: function.record.name.clone(),
+                view: function.record.baseline.clone(),
+            }],
+            transformation: returned.clone(),
+        };
+        assert_eq!(
+            crate::validate(&validation_request),
+            crate::ValidationResponse::Valid
+        );
+        let (output, metadata) = metadata(&frozen, &request(function, Some(&returned)));
+        run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+        let observations = crate::observation::extract_observations_from_source(
+            &output.observation_source,
+            &metadata,
+        )
+        .unwrap();
+        assert!(!observations.observations.is_empty(), "{observations:?}");
+        validation_request.transformation = returned.replace("p: &i32", "p: *const i32");
+        assert!(!crate::validate(&validation_request).is_valid());
+    }
+}
+
+#[test]
 fn local_declarations_preserve_headers_and_keep_initializers_opaque() {
     let source = r#"
 pub unsafe fn run(p: *mut i32) -> i32 {

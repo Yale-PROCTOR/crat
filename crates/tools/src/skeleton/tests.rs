@@ -4891,6 +4891,101 @@ pub unsafe extern "C" fn arraylist_sort(arraylist: *mut ArrayList, compare_func:
 }
 
 #[test]
+fn closure_containing_locals_keep_inferred_types_recursively() {
+    let records = generate(
+        r#"
+struct Wrap<T>(T);
+pub unsafe fn filter(bytes: &[u8]) -> usize {
+    let chars = bytes.iter().copied().filter(|byte| *byte != b'=');
+    let count = chars.count();
+    count
+}
+pub unsafe fn map(values: &[*mut i32]) -> usize {
+    let nodes = values.iter().map(|node| node.is_null());
+    nodes.count()
+}
+pub unsafe fn nested() -> i32 {
+    let values = Some((Wrap(|| 1_i32), [|| 2_i32]));
+    let extracted = values.unwrap();
+    (extracted.0.0)() + (extracted.1[0])()
+}
+pub unsafe fn borrowed() -> i32 {
+    let closure = || 3_i32;
+    let borrowed = &closure;
+    borrowed()
+}
+"#,
+    );
+    for (path, names) in [
+        ("filter", &["chars"][..]),
+        ("map", &["nodes"][..]),
+        ("nested", &["values", "extracted"][..]),
+        ("borrowed", &["closure", "borrowed"][..]),
+    ] {
+        let skeleton = &function(&records, path).baseline.skeleton;
+        for name in names {
+            assert!(
+                skeleton.contains(&format!("let mut {name} =")),
+                "{skeleton}"
+            );
+            assert!(
+                !skeleton.contains(&format!("let mut {name}:")),
+                "{skeleton}"
+            );
+        }
+    }
+    assert!(
+        function(&records, "filter")
+            .baseline
+            .skeleton
+            .contains("let mut count: usize")
+    );
+}
+
+#[test]
+fn nested_async_closure_types_are_detected_without_matching_async_blocks() {
+    run_compiler_on_str(
+        "fn f() { let wrapped = Some(async || 4_i32); let future = Some(async { 5_i32 }); }",
+        |tcx| {
+            let function = local_def_path("f", tcx);
+            let wrapped = local_binding_hir_id(function, "wrapped", tcx);
+            let future = local_binding_hir_id(function, "future", tcx);
+            assert!(type_contains_closure(
+                tcx.typeck(function).node_type(wrapped)
+            ));
+            assert!(!type_contains_closure(
+                tcx.typeck(function).node_type(future)
+            ));
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn nameable_locals_and_existing_closure_type_hints_keep_annotations() {
+    let records = generate(
+        r#"
+pub unsafe fn ordinary(bytes: &[u8]) -> usize {
+    let copied = bytes.iter().copied();
+    let named = copied.map(u8::reverse_bits as fn(u8) -> u8);
+    let count = named.count();
+    count
+}
+pub unsafe fn hinted() -> u8 {
+    let values: (_, u8) = (|| 1_i32, 255);
+    values.1
+}
+"#,
+    );
+    let ordinary = &function(&records, "ordinary").baseline.skeleton;
+    for name in ["copied", "named", "count"] {
+        assert!(ordinary.contains(&format!("let mut {name}:")), "{ordinary}");
+    }
+    let hinted = &function(&records, "hinted").baseline.skeleton;
+    assert!(hinted.contains("let mut values: (_, u8)"), "{hinted}");
+}
+
+#[test]
 fn closure_bodies_are_opaque_but_outer_controls_and_dependencies_remain() {
     let source = r#"
 unsafe fn helper(value: i32) -> i32 { value + 1 }
