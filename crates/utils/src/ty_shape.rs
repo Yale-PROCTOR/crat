@@ -218,8 +218,10 @@ fn compute_ty_shape<'a, 'tcx>(
         }
         TyKind::Array(ty, len) => {
             let t = compute_ty_shape(*ty, owner, tss, tcx);
-            let len = len.try_to_target_usize(tcx).unwrap() as usize;
-            tss.arena.alloc(TyShape::Array(t, len))
+            match len.try_to_target_usize(tcx) {
+                Some(len) => tss.arena.alloc(TyShape::Array(t, len as usize)),
+                None => tss.arena.alloc(TyShape::Slice(t)),
+            }
         }
         TyKind::Slice(ty) => {
             let t = compute_ty_shape(*ty, owner, tss, tcx);
@@ -313,6 +315,22 @@ impl TyShape<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbolic_array_lengths_keep_element_shape_without_a_concrete_extent() {
+        crate::compilation::run_compiler_on_str(
+            "pub fn repeat<T: Copy, const N: usize>(value: T) -> [T; N] { [value; N] }",
+            |tcx| {
+                let arena = Arena::new();
+                let shapes = get_ty_shapes(&arena, tcx, false);
+                assert!(shapes.tys.iter().any(|(ty, shape)| {
+                    matches!(ty.kind(), TyKind::Array(..))
+                        && matches!(shape, TyShape::Slice(element) if element.len() == 1)
+                }));
+            },
+        )
+        .unwrap();
+    }
 
     fn flags_type(tcx: TyCtxt<'_>) -> Ty<'_> {
         let flags = tcx

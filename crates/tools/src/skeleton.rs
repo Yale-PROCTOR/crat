@@ -65,6 +65,7 @@ pub struct FunctionRecord {
     pub path: String,
     pub kind: ItemKindName,
     pub name: String,
+    pub unstructured: bool,
     pub annotated_source: String,
     pub baseline: SkeletonView,
     pub applied: SkeletonView,
@@ -259,7 +260,7 @@ fn make_skeletons_with_preservation_overrides(
         })?;
     for item in &raw_items {
         let ItemKind::Fn(function) = &item.item.kind else { continue };
-        if !function.sig.decl.c_variadic() {
+        if !function.sig.decl.c_variadic() && !has_type_parameters(function) {
             continue;
         }
         if let Some(signature) = decisions.signatures.data.get_mut(&item.def_id) {
@@ -349,7 +350,7 @@ fn reject_unsupported_function_generics(
             continue;
         };
         let name = item.kind.ident().unwrap().to_string();
-        if name == "main" {
+        if name == "main" || has_type_parameters(function) {
             continue;
         }
         let Some(parameter) = function
@@ -380,6 +381,32 @@ fn reject_unsupported_function_generics(
         });
     }
     Ok(())
+}
+
+pub(crate) fn has_type_parameters(function: &rustc_ast::Fn) -> bool {
+    if function
+        .generics
+        .params
+        .iter()
+        .any(|parameter| matches!(parameter.kind, GenericParamKind::Type { .. }))
+    {
+        return true;
+    }
+    struct ImplTraitFinder(bool);
+    impl<'ast> visit::Visitor<'ast> for ImplTraitFinder {
+        fn visit_ty(&mut self, ty: &'ast Ty) {
+            if matches!(ty.kind, TyKind::ImplTrait(..)) {
+                self.0 = true;
+            } else {
+                visit::walk_ty(self, ty);
+            }
+        }
+    }
+    let mut finder = ImplTraitFinder(false);
+    for parameter in &function.sig.decl.inputs {
+        finder.visit_ty(&parameter.ty);
+    }
+    finder.0
 }
 
 pub fn skeletons_to_json(records: &[ItemRecord]) -> Result<String, serde_json::Error> {
@@ -671,6 +698,37 @@ fn make_function_record<'tcx>(
     let proctor_libc_function_paths = collect_proctor_libc_function_paths(hitem, tcx);
     let mut source = surface.item.clone();
     sanitize_item(&mut source);
+    if let ItemKind::Fn(function) = &mut source.kind
+        && has_type_parameters(function)
+    {
+        function.sig.header.safety = Safety::Unsafe(DUMMY_SP);
+        let name = function.ident.to_string();
+        let signature = render_signature(&source);
+        let view = SkeletonView {
+            skeleton: format!("{signature} {{ todo!() }}"),
+            needs_transformation: false,
+            statement_dispositions: vec![],
+            statement_pair_metadata: vec![],
+        };
+        return Ok(ItemRecord::Function(Box::new(FunctionRecord {
+            id: surface.id,
+            path: surface.path,
+            kind: ItemKindName::Fn,
+            name,
+            unstructured: true,
+            annotated_source: pprust::item_to_string(&source),
+            baseline: view.clone(),
+            applied: view,
+            source_signature: signature.clone(),
+            target_signature: signature,
+            printf_format_specifiers: vec![],
+            proctor_libc_function_paths,
+            foreign_function_names,
+            foreign_static_names,
+            signature_dependencies,
+            dependencies,
+        })));
+    }
     validate_function_body(&source, &surface.path)?;
     let opaque_expressions = collect_opaque_expressions(&source, &surface.path, ast_to_hir, tcx)?;
     annotate_function(&mut source, &opaque_expressions);
@@ -886,6 +944,7 @@ fn make_function_record<'tcx>(
         path: surface.path,
         kind: ItemKindName::Fn,
         name,
+        unstructured: false,
         annotated_source: render_annotated_item(&source),
         baseline: baseline.clone(),
         applied,
@@ -1397,7 +1456,7 @@ pub(crate) fn render_statement_group(statements: &[Stmt]) -> String {
         .join("\n")
 }
 
-fn sanitize_item(item: &mut Item) {
+pub(crate) fn sanitize_item(item: &mut Item) {
     item.attrs.retain(|attr| {
         let AttrKind::Normal(normal) = &attr.kind else {
             return true;

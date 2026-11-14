@@ -10,6 +10,239 @@ fn freeze(source: &str) -> FrozenProject {
     .unwrap()
 }
 
+#[test]
+fn generic_functions_keep_signatures_and_rewrite_bodies_without_skeletons() {
+    let source = r#"
+pub unsafe fn read(p: *mut i32) -> i32 { *p }
+#[inline]
+pub unsafe fn generic<T: Copy>(p: *mut i32, value: T) -> T where T: PartialEq {
+    let values = [value].into_iter().map(|x| x);
+    if read(p) > 0 { values.into_iter().next().unwrap() } else { value }
+}
+pub fn callback(mut emit: impl FnMut(i32), p: *mut i32) {
+    emit(unsafe { read(p) });
+}
+"#;
+    let frozen = freeze(source);
+    frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).unwrap();
+    let generic = frozen
+        .functions
+        .iter()
+        .find(|f| f.record.name == "generic")
+        .unwrap();
+    let callback = frozen
+        .functions
+        .iter()
+        .find(|f| f.record.name == "callback")
+        .unwrap();
+    let read = frozen
+        .functions
+        .iter()
+        .find(|f| f.record.name == "read")
+        .unwrap();
+    assert!(
+        read.record.target_signature.contains("&i32"),
+        "{}",
+        read.record.target_signature
+    );
+    for function in [generic, callback] {
+        assert!(function.record.unstructured);
+        assert_eq!(
+            function.record.source_signature,
+            function.record.target_signature
+        );
+        assert!(function.record.target_signature.contains("p: *mut i32"));
+        assert!(!function.record.annotated_source.contains("#[proctor("));
+        assert!(!function.record.annotated_source.contains("todo!"));
+        assert!(function.record.baseline.statement_dispositions.is_empty());
+        assert!(function.record.baseline.statement_pair_metadata.is_empty());
+        assert!(function.source_copy.contains("todo!"));
+        assert!(!function.source_copy.contains("#[proctor("));
+        assert!(transform_frozen_scc(&frozen, &request(function, None)).is_err());
+    }
+    let prepared = prepare_unstructured_repair(
+        &frozen,
+        &UnstructuredPreparationRequest {
+            members: vec![generic.record.id],
+            transformations: vec![],
+        },
+    )
+    .unwrap();
+    assert!(prepared.targets[0].source.contains(".map("));
+    let returned = format!(
+        "{} {{ let copied = value; if read(&mut *p) > 0 {{ copied }} else {{ value }} }}",
+        generic.record.target_signature
+    );
+    let result = replace_unstructured_scc(
+        &frozen,
+        &UnstructuredReplacementRequest {
+            members: vec![generic.record.id],
+            transformation: returned.clone(),
+        },
+    )
+    .unwrap();
+    run_compiler_on_str(&result.source, utils::type_check).unwrap();
+    for changed in [
+        returned.replace("T: Copy", "T: Clone"),
+        returned.replace("PartialEq", "Eq"),
+        returned.replace("*mut i32", "&mut i32"),
+        returned.replace("-> T", "-> i32"),
+        returned.replace("value: T", "other: T"),
+        returned.replace("#[inline]", "#[inline(always)]"),
+    ] {
+        assert!(
+            replace_unstructured_scc(
+                &frozen,
+                &UnstructuredReplacementRequest {
+                    members: vec![generic.record.id],
+                    transformation: changed,
+                }
+            )
+            .is_err()
+        );
+    }
+    let callback_result = replace_unstructured_scc(
+        &frozen,
+        &UnstructuredReplacementRequest {
+            members: vec![callback.record.id],
+            transformation: format!(
+                "{} {{ emit(read(&mut *p)); }}",
+                callback.record.target_signature
+            ),
+        },
+    )
+    .unwrap();
+    run_compiler_on_str(&callback_result.source, utils::type_check).unwrap();
+    let read_body = read.record.baseline.skeleton.replace("todo!()", "*p");
+    let read_result = transform_frozen_scc(&frozen, &request(read, Some(&read_body)))
+        .unwrap()
+        .0;
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[
+            AcceptedScc {
+                members: vec![read.record.id],
+                source: read_result.replacement.source,
+                stubbed_items: vec![],
+            },
+            AcceptedScc {
+                members: vec![generic.record.id],
+                source: result.source,
+                stubbed_items: vec![],
+            },
+            AcceptedScc {
+                members: vec![callback.record.id],
+                source: callback_result.source,
+                stubbed_items: vec![],
+            },
+        ],
+    )
+    .unwrap();
+    run_compiler_on_str(&assembled, utils::type_check).unwrap();
+    assert!(
+        replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members: vec![callback.record.id],
+                transformation: format!(
+                    "#[inline] {} {{ emit(read(&mut *p)); }}",
+                    callback.record.target_signature
+                ),
+            }
+        )
+        .is_err()
+    );
+    let mut changed = frozen.clone();
+    changed
+        .functions
+        .iter_mut()
+        .find(|f| f.record.id == generic.record.id)
+        .unwrap()
+        .record
+        .unstructured = false;
+    assert!(frozen_project_from_json(&serde_json::to_string(&changed).unwrap()).is_err());
+}
+
+#[test]
+fn generic_dependency_source_stubs_preserve_explicit_type_arguments() {
+    let source = r#"
+pub fn size<T>() -> usize { core::mem::size_of::<T>() }
+pub fn identity<T: Copy>(value: T) -> T { value }
+pub unsafe fn read(p: *mut i32) -> i32 { identity(*p) + size::<u32>() as i32 }
+"#;
+    let frozen = freeze(source);
+    let index = frozen
+        .functions
+        .iter()
+        .position(|f| f.record.name == "read")
+        .unwrap();
+    assert!(frozen.functions[index].source_copy.contains("::<u32>"));
+    let read = &frozen.functions[index];
+    let body = read
+        .record
+        .baseline
+        .skeleton
+        .replace("todo!()", "identity(*p) + size::<u32>() as i32");
+    let (output, metadata) = metadata(&frozen, &request(read, Some(&body)));
+    crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+        .unwrap();
+    let dependency = frozen
+        .functions
+        .iter()
+        .find(|f| f.record.name == "size")
+        .unwrap();
+    assert!(output.observation_source.contains(&dependency.source_stub));
+}
+
+#[test]
+fn generic_functions_preserve_type_const_and_lifetime_parameters_together() {
+    let source = "pub fn identity<'a, T, const N: usize>(values: &'a [T; N]) -> &'a [T; N] where T: Copy { values }";
+    let frozen = freeze(source);
+    let function = &frozen.functions[0];
+    assert!(function.record.unstructured);
+    let result = replace_unstructured_scc(
+        &frozen,
+        &UnstructuredReplacementRequest {
+            members: vec![function.record.id],
+            transformation: format!("{} {{ values }}", function.record.target_signature),
+        },
+    )
+    .unwrap();
+    run_compiler_on_str(&result.source, utils::type_check).unwrap();
+}
+
+#[test]
+fn generic_headers_protect_named_types_but_generic_bodies_do_not() {
+    let source = r#"
+pub struct Fixed { p: *mut i32 }
+pub struct Changed { p: *mut i32 }
+pub unsafe fn generic<T>(value: Fixed, extra: T) -> Fixed { let _ = extra; value }
+pub unsafe fn body_only<T>(p: *mut i32, extra: T) -> i32 {
+    let local: Changed = Changed { p };
+    let _ = extra;
+    *local.p
+}
+pub unsafe fn fixed_read(value: Fixed) -> i32 { *value.p }
+pub unsafe fn changed_read(value: Changed) -> i32 { *value.p }
+"#;
+    let frozen = freeze(source);
+    let fixed = frozen.types.iter().find(|t| t.path == "Fixed").unwrap();
+    let changed = frozen.types.iter().find(|t| t.path == "Changed").unwrap();
+    assert_eq!(fixed.source_definition, fixed.target_definition);
+    assert_ne!(changed.source_definition, changed.target_definition);
+    let generic = frozen
+        .functions
+        .iter()
+        .find(|f| f.record.name == "generic")
+        .unwrap();
+    assert_eq!(
+        generic.record.source_signature,
+        generic.record.target_signature
+    );
+    run_compiler_on_str(&frozen.target_source, utils::type_check).unwrap();
+}
+
 fn request(function: &FrozenFunction, transformation: Option<&str>) -> ReplacementRequest {
     ReplacementRequest {
         items: vec![ReplacementItem {

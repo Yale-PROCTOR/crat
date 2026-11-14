@@ -693,7 +693,7 @@ fn function_named(function: &CurrentFunction, name: &str) -> bool {
 fn prepare_transformations(
     request: &ReplacementRequest,
 ) -> Result<PreparedTransformations, ReplacementError> {
-    let returned_transformations = parse_transformations(request)?;
+    let returned_transformations = parse_transformations(request, false)?;
     let mut transformations = HashMap::new();
     let mut statement_pairs = vec![];
     for requested in &request.items {
@@ -847,7 +847,7 @@ fn validate_request(request: &ReplacementRequest) -> Result<(), ReplacementError
         }
         parse_replacement_skeleton(item)?;
     }
-    parse_transformations(request)?;
+    parse_transformations(request, false)?;
     Ok(())
 }
 
@@ -988,6 +988,7 @@ fn valid_full_path(path: &str) -> Option<Vec<String>> {
 
 fn parse_transformations(
     request: &ReplacementRequest,
+    unstructured: bool,
 ) -> Result<HashMap<String, P<Item>>, ReplacementError> {
     let krate = parse_crate(
         &request.transformation,
@@ -1043,6 +1044,7 @@ fn parse_transformations(
         validate_supported_transformation(
             functions.get(&item.name).expect("function set was checked"),
             item,
+            unstructured,
         )?;
     }
     Ok(functions)
@@ -1051,6 +1053,7 @@ fn parse_transformations(
 fn validate_supported_transformation(
     item: &Item,
     requested: &ReplacementItem,
+    unstructured: bool,
 ) -> Result<(), ReplacementError> {
     let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
     if function.sig.header.coroutine_kind.is_some() {
@@ -1074,6 +1077,25 @@ fn validate_supported_transformation(
                 .to_owned(),
         ));
     }
+    let expected = if unstructured {
+        frozen::one_item(&requested.view.skeleton)?
+    } else {
+        parse_replacement_skeleton(requested)?
+    };
+    let ItemKind::Fn(expected) = &expected.kind else { unreachable!() };
+    if unstructured && crate::skeleton::has_type_parameters(expected) {
+        if crate::preservation::function_signature(function)
+            != crate::preservation::function_signature(expected)
+        {
+            return Err(item_error(
+                ReplacementErrorKind::InvalidTransformation,
+                requested,
+                "copy the complete frozen generic signature, including bounds and where clauses"
+                    .to_owned(),
+            ));
+        }
+        return Ok(());
+    }
     if function.generics.params.iter().any(|parameter| {
         !matches!(parameter.kind, GenericParamKind::Lifetime)
             || !parameter.attrs.is_empty()
@@ -1090,8 +1112,6 @@ fn validate_supported_transformation(
                 .to_owned(),
         ));
     }
-    let expected = parse_replacement_skeleton(requested)?;
-    let ItemKind::Fn(expected) = &expected.kind else { unreachable!() };
     if crate::validator::lifetime_generic_declaration(&function.generics)
         != crate::validator::lifetime_generic_declaration(&expected.generics)
     {
@@ -1637,7 +1657,17 @@ struct CallRewriter {
 impl MutVisitor for CallRewriter {
     fn visit_expr(&mut self, expression: &mut Expr) {
         if let Some(path) = self.rewrites.get(&expression.id) {
+            let arguments = match &expression.kind {
+                ExprKind::Path(_, path) => path
+                    .segments
+                    .last()
+                    .and_then(|segment| segment.args.clone()),
+                _ => None,
+            };
             *expression = utils::expr!("{path}");
+            if let ExprKind::Path(_, path) = &mut expression.kind {
+                path.segments.last_mut().unwrap().args = arguments;
+            }
             return;
         }
         mut_visit::walk_expr(self, expression);

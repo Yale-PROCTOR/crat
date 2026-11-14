@@ -1316,6 +1316,11 @@ fn test_ty_array() {
 }
 
 #[test]
+fn test_type_and_const_generic_array_paths() {
+    run_test("fn identity<T, const N: usize>(values: [T; N]) -> [T; N] { values }");
+}
+
+#[test]
 fn test_ty_ptr() {
     run_test(
         "

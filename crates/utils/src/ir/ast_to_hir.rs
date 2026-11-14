@@ -1320,7 +1320,13 @@ impl<'tcx> AstToHirMapper<'tcx> {
     ) {
         self.add_local(&mut anon_const.id, hconst_arg.hir_id);
         match hconst_arg.kind {
-            hir::ConstArgKind::Path(..) => todo!(),
+            hir::ConstArgKind::Path(path) => {
+                let ExprKind::Path(qself, source_path) = &mut anon_const.value.kind else {
+                    panic!()
+                };
+                self.add_local(&mut anon_const.value.id, hconst_arg.hir_id);
+                self.map_path_to_qpath(qself, source_path, &path);
+            }
             hir::ConstArgKind::Anon(hanon_const) => {
                 self.map_anon_const_to_anon_const(anon_const, hanon_const);
             }
@@ -2206,7 +2212,13 @@ impl<'a> Visitor<'a> for AstToHirChecker<'_> {
             .unwrap_or_else(|| panic!("{expr:?}"));
         assert!(matches!(
             node,
-            hir::Node::Expr(..) | hir::Node::PatExpr(..) | hir::Node::Pat(..)
+            hir::Node::Expr(..)
+                | hir::Node::PatExpr(..)
+                | hir::Node::Pat(..)
+                | hir::Node::ConstArg(hir::ConstArg {
+                    kind: hir::ConstArgKind::Path(..),
+                    ..
+                })
         ));
         visit::walk_expr(self, expr);
     }
