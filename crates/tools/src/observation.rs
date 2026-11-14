@@ -2026,13 +2026,17 @@ fn validate_local_annotations(
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
 ) -> Result<(), ObservationError> {
-    let target_annotation = target
-        .ty
-        .as_deref()
-        .ok_or_else(|| correspondence_error("paired target local has no type annotation"))?;
-    if !annotation_matches_binding(target_annotation, target_binding, ast_to_hir, tcx) {
+    if let Some(target_annotation) = target.ty.as_deref() {
+        if !annotation_matches_binding(target_annotation, target_binding, ast_to_hir, tcx) {
+            return Err(correspondence_error(
+                "target local annotation disagrees with its binding type",
+            ));
+        }
+    } else if source.ty.is_some()
+        || !binding_type(source_binding, tcx).is_some_and(crate::skeleton::type_contains_closure)
+    {
         return Err(correspondence_error(
-            "target local annotation disagrees with its binding type",
+            "paired target local has no type annotation",
         ));
     }
     if let Some(source_annotation) = source.ty.as_deref()
