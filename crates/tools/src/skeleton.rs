@@ -729,8 +729,8 @@ fn make_function_record<'tcx>(
             dependencies,
         })));
     }
-    validate_function_body(&source, &surface.path)?;
     let opaque_expressions = collect_opaque_expressions(&source, &surface.path, ast_to_hir, tcx)?;
+    validate_function_body(&source, &surface.path, &opaque_expressions)?;
     annotate_function(&mut source, &opaque_expressions);
     PresentationBindingNormalizer { ast_to_hir, tcx }.visit_item(&mut source);
     let statement_classification = classify_function_statements(
@@ -1540,6 +1540,8 @@ fn render_annotated_item(item: &Item) -> String {
 
 struct BodyValidator<'a> {
     function_path: &'a str,
+    opaque_expressions: &'a FxHashSet<NodeId>,
+    opaque_depth: usize,
     closure_depth: usize,
     error: Option<GenerationError>,
 }
@@ -1578,7 +1580,10 @@ impl<'ast> visit::Visitor<'ast> for BodyValidator<'_> {
         if self.error.is_some() {
             return;
         }
+        let opaque = self.opaque_expressions.contains(&expr.id);
+        self.opaque_depth += usize::from(opaque);
         if self.closure_depth == 0
+            && self.opaque_depth == 0
             && let ExprKind::Match(_, arms, _) = &expr.kind
         {
             for arm in arms {
@@ -1600,12 +1605,19 @@ impl<'ast> visit::Visitor<'ast> for BodyValidator<'_> {
         self.closure_depth += usize::from(closure);
         visit::walk_expr(self, expr);
         self.closure_depth -= usize::from(closure);
+        self.opaque_depth -= usize::from(opaque);
     }
 }
 
-fn validate_function_body(item: &Item, path: &str) -> Result<(), GenerationError> {
+fn validate_function_body(
+    item: &Item,
+    path: &str,
+    opaque_expressions: &FxHashSet<NodeId>,
+) -> Result<(), GenerationError> {
     let mut validator = BodyValidator {
         function_path: path,
+        opaque_expressions,
+        opaque_depth: 0,
         closure_depth: 0,
         error: None,
     };
@@ -5235,7 +5247,7 @@ fn raw_decision_matches_inferred_type(kind: PtrKind, ty: ty::Ty<'_>) -> bool {
 
 pub(crate) fn is_opaque_value_expression(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::If(..) => {}
+        ExprKind::If(..) | ExprKind::Match(..) => {}
         ExprKind::Block(block, _) if matches!(block.rules, rustc_ast::BlockCheckMode::Default) => {}
         _ => return false,
     }
@@ -5423,7 +5435,9 @@ impl OpaqueNestedExpressionCollector<'_> {
                     if let Some(guard) = &arm.guard {
                         self.inspect_non_control(guard);
                     }
-                    self.inspect_payload(arm.body.as_ref().unwrap());
+                    if let Some(body) = &arm.body {
+                        self.inspect_payload(body);
+                    }
                 }
             }
             _ => unreachable!(),

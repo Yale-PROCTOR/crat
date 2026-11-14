@@ -1245,10 +1245,6 @@ fn print_arguments_are_defended_without_validator() {
             "unexpected_body_attribute",
         ),
         ("{ return; }", "escaping_opaque_control"),
-        (
-            "match 1 { invented => invented }",
-            "invalid_generated_binding_name",
-        ),
         ("helper!(proctor_temp_var_0)", "temporary_in_macro"),
     ] {
         let request = ReplacementRequest {
@@ -1369,6 +1365,7 @@ unsafe fn f(token: Token, proctor_temp_var_0: i32) {}
     for argument in [
         "match token { TOKEN_EOF => 0, TOKEN_WORD => 1 }",
         "match token { Token::TOKEN_EOF => 0, Token::TOKEN_WORD => 1 }",
+        "match 1 { invented => invented }",
         "{ let local = 1; local }",
         "if true { let local = 1; local } else { 0 }",
         "(|| proctor_temp_var_0)()",
