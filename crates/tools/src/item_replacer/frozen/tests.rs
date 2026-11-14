@@ -906,6 +906,73 @@ fn cross_module_observations_use_original_and_target_signature_stubs_with_one_id
 }
 
 #[test]
+fn nested_match_conditions_survive_validation_replacement_and_observation_extraction() {
+    let frozen = freeze(
+        r#"
+pub unsafe fn value(flag: bool, p: *const i32) -> i32 {
+    let preserved = Some(match flag { value if value => 7, _ => 8 }).unwrap();
+    if match flag {
+        true => { let copy = p; *copy > 0 }
+        false => { false }
+    } {
+        *p + preserved
+    } else {
+        0
+    }
+}
+"#,
+    );
+    let function = &frozen.functions[0];
+    assert_eq!(function.record.baseline.transform_labels(), [1, 2]);
+    assert!(function.record.target_signature.contains("p: &i32"));
+    let returned = format!(
+        r#"{} {{
+    #[proctor(0)]
+    let preserved: i32 = Some(match flag {{ true => 99, false => 100 }}).unwrap();
+    #[proctor(1)]
+    if match Some(p) {{
+        Some(renamed) if flag => {{ let value: &i32 = renamed; *value > 0 }}
+        _ => false,
+    }} {{
+        #[proctor(2)] *p + preserved
+    }} else {{
+        #[proctor(3)] 0
+    }}
+}}"#,
+        function.record.target_signature,
+    );
+    assert_eq!(
+        crate::validate(&crate::ValidationRequest {
+            expected_functions: vec![crate::ExpectedFunction {
+                id: function.record.id,
+                name: function.record.name.clone(),
+                view: function.record.baseline.clone(),
+            }],
+            transformation: returned.clone(),
+        }),
+        crate::ValidationResponse::Valid,
+    );
+    let (output, metadata) = metadata(&frozen, &request(function, Some(&returned)));
+    let candidate = &output.replacement.source;
+    assert!(!candidate.contains("99") && !candidate.contains("100"));
+    assert!(candidate.contains("renamed"), "{candidate}");
+    assert_eq!(
+        output
+            .replacement
+            .statement_pairs
+            .iter()
+            .map(|pair| pair.label)
+            .collect::<Vec<_>>(),
+        [1, 2],
+    );
+    run_compiler_on_str(candidate, utils::type_check).unwrap();
+    let observations =
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .unwrap();
+    assert!(!observations.observations.is_empty(), "{observations:?}");
+}
+
+#[test]
 fn opaque_value_locals_survive_frozen_replacement_and_preservation() {
     let frozen = freeze(
         r#"

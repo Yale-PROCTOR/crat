@@ -649,7 +649,7 @@ fn validate_no_nested_control(expression: &Expr, role: &str) -> Result<(), Strin
     finder.visit_expr(expression);
     if finder.found {
         Err(format!(
-            "an unsupported control expression is nested beneath {role}; only opaque value blocks and conditionals without escaping control are allowed"
+            "an unsupported control expression is nested beneath {role}; only opaque value blocks, conditionals, and matches without escaping control are allowed"
         ))
     } else {
         Ok(())
@@ -1462,6 +1462,10 @@ impl BodyScanner {
             self.visit_expr(expression);
             return;
         }
+        self.visit_non_control_payload(expression);
+    }
+
+    fn visit_non_control_payload(&mut self, expression: &Expr) {
         let previous = std::mem::replace(&mut self.non_control_payload, true);
         self.visit_expr(expression);
         self.non_control_payload = previous;
@@ -1656,7 +1660,10 @@ impl<'ast> Visitor<'ast> for BodyScanner {
         } else if self.non_control_payload
             && self.closure_depth == 0
             && self.opaque_depth == 0
-            && matches!(expr.kind, ExprKind::If(..) | ExprKind::Block(..))
+            && matches!(
+                expr.kind,
+                ExprKind::If(..) | ExprKind::Block(..) | ExprKind::Match(..)
+            )
             && !matches!(&expr.kind, ExprKind::Block(block, _) if matches!(block.rules, BlockCheckMode::Unsafe(..)))
         {
             self.syntax_errors.push(SyntaxProblem {
@@ -1670,9 +1677,9 @@ impl<'ast> Visitor<'ast> for BodyScanner {
             ExprKind::If(condition, then_block, else_expr) => {
                 if let ExprKind::Let(pat, value, ..) = &condition.kind {
                     self.collect_pattern(pat, "if-let pattern", None);
-                    self.visit_payload(value);
+                    self.visit_non_control_payload(value);
                 } else {
-                    self.visit_payload(condition);
+                    self.visit_non_control_payload(condition);
                 }
                 self.with_path("if then branch".to_owned(), |this| {
                     this.visit_block(then_block)
@@ -1691,9 +1698,9 @@ impl<'ast> Visitor<'ast> for BodyScanner {
             ExprKind::While(condition, body, _) => {
                 if let ExprKind::Let(pat, value, ..) = &condition.kind {
                     self.collect_pattern(pat, "while-let pattern", None);
-                    self.visit_payload(value);
+                    self.visit_non_control_payload(value);
                 } else {
-                    self.visit_payload(condition);
+                    self.visit_non_control_payload(condition);
                 }
                 self.with_path("while body".to_owned(), |this| this.visit_block(body));
             }
@@ -1701,7 +1708,7 @@ impl<'ast> Visitor<'ast> for BodyScanner {
                 pat, iter, body, ..
             } => {
                 self.collect_pattern(pat, "for pattern", None);
-                self.visit_payload(iter);
+                self.visit_non_control_payload(iter);
                 self.with_path("for body".to_owned(), |this| this.visit_block(body));
             }
             ExprKind::Loop(body, ..) => {
@@ -1716,25 +1723,12 @@ impl<'ast> Visitor<'ast> for BodyScanner {
                 self.with_path("plain block".to_owned(), |this| this.visit_block(block));
             }
             ExprKind::Match(scrutinee, arms, _) => {
-                self.visit_payload(scrutinee);
+                self.visit_non_control_payload(scrutinee);
                 for (index, arm) in arms.iter().enumerate() {
-                    if self.expected
-                        && self.opaque_depth != 0
-                        && self.closure_depth == 0
-                        && !arm
-                            .body
-                            .as_ref()
-                            .is_some_and(|body| matches!(body.kind, ExprKind::Block(..)))
-                    {
-                        self.syntax_errors.push(SyntaxProblem {
-                            code: "non_block_match_arm".to_owned(),
-                            message: "source match arms must have block bodies".to_owned(),
-                        });
-                    }
                     self.with_path(format!("match arm {index}"), |this| {
                         this.collect_pattern(&arm.pat, &format!("match-arm-{index} pattern"), None);
                         if let Some(guard) = &arm.guard {
-                            this.visit_payload(guard);
+                            this.visit_non_control_payload(guard);
                         }
                         if let Some(body) = &arm.body {
                             this.visit_expr(body);
@@ -3332,6 +3326,12 @@ impl LexicalTempScanner<'_> {
         self.non_control_payload = previous;
     }
 
+    fn visit_non_control_payload(&mut self, expression: &Expr) {
+        let previous = std::mem::replace(&mut self.non_control_payload, true);
+        self.visit_expr(expression);
+        self.non_control_payload = previous;
+    }
+
     fn activate_pattern(&mut self, pat: &Pat) {
         let mut bindings = vec![];
         collect_pattern_bindings(pat, "root", &mut bindings);
@@ -3432,10 +3432,10 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
             }
             ExprKind::If(condition, then_block, else_expr) => {
                 if let ExprKind::Let(pat, value, ..) = &condition.kind {
-                    self.visit_payload(value);
+                    self.visit_non_control_payload(value);
                     self.visit_scoped_block(then_block, Some(pat));
                 } else {
-                    self.visit_payload(condition);
+                    self.visit_non_control_payload(condition);
                     self.visit_block(then_block);
                 }
                 if let Some(else_expr) = else_expr {
@@ -3444,26 +3444,26 @@ impl<'ast> Visitor<'ast> for LexicalTempScanner<'_> {
             }
             ExprKind::While(condition, body, _) => {
                 if let ExprKind::Let(pat, value, ..) = &condition.kind {
-                    self.visit_payload(value);
+                    self.visit_non_control_payload(value);
                     self.visit_scoped_block(body, Some(pat));
                 } else {
-                    self.visit_payload(condition);
+                    self.visit_non_control_payload(condition);
                     self.visit_block(body);
                 }
             }
             ExprKind::ForLoop {
                 pat, iter, body, ..
             } => {
-                self.visit_payload(iter);
+                self.visit_non_control_payload(iter);
                 self.visit_scoped_block(body, Some(pat));
             }
             ExprKind::Match(scrutinee, arms, _) => {
-                self.visit_payload(scrutinee);
+                self.visit_non_control_payload(scrutinee);
                 for arm in arms {
                     self.scopes.push(HashSet::new());
                     self.activate_pattern(&arm.pat);
                     if let Some(guard) = &arm.guard {
-                        self.visit_payload(guard);
+                        self.visit_non_control_payload(guard);
                     }
                     if let Some(body) = &arm.body {
                         self.visit_expr(body);

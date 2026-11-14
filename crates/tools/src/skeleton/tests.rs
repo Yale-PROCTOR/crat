@@ -227,7 +227,7 @@ fn required_unsafe_blocks_in_local_type_constants_are_outside_body_validation() 
     run_compiler_on_str(source, |tcx| {
         utils::type_check(tcx);
         let parsed = utils::ast::parse_crate(source.to_owned());
-        validate_function_body(&parsed.items[0], "f").unwrap();
+        validate_function_body(&parsed.items[0], "f", &FxHashSet::default()).unwrap();
     })
     .unwrap();
 }
@@ -4624,14 +4624,19 @@ fn preserves_payloadless_control_expressions_without_holes() {
 
 #[test]
 fn rejects_non_block_match_arm() {
-    let error = generate_error("pub unsafe fn f(n: i32) -> i32 { match n { 0 => 1, _ => { 2 } } }");
-    assert_eq!(error.kind, GenerationErrorKind::NonBlockMatchArm);
-    assert_eq!(error.function_path, "f");
-    assert!(
-        error
-            .message
-            .contains("match arm body must be a block expression")
-    );
+    for source in [
+        "pub unsafe fn f(n: i32) -> i32 { match n { 0 => 1, _ => { 2 } } }",
+        "#![feature(never_patterns)] enum Empty {} pub unsafe fn f(value: Result<i32, Empty>) -> i32 { match value { Ok(value) => { value }, Err(!) } }",
+    ] {
+        let error = generate_error(source);
+        assert_eq!(error.kind, GenerationErrorKind::NonBlockMatchArm);
+        assert_eq!(error.function_path, "f");
+        assert!(
+            error
+                .message
+                .contains("match arm body must be a block expression")
+        );
+    }
 }
 
 #[test]
@@ -4735,10 +4740,126 @@ fn opaque_conditional_label_suppression_does_not_skip_body_validation() {
     assert_eq!(local_item.kind, GenerationErrorKind::FunctionLocalItem);
     assert!(local_item.message.contains("type alias"));
 
-    let non_block_arm = generate_error(
-        "pub unsafe fn f(flag: bool) { let value = Some(if flag { match 0 { 0 => 1, _ => { 2 } } } else { 3 }); let _ = value; }",
+    let empty_statement = generate_error(
+        "pub unsafe fn f(flag: bool) { let value = Some(if flag { ; 1 } else { 3 }); let _ = value; }",
     );
-    assert_eq!(non_block_arm.kind, GenerationErrorKind::NonBlockMatchArm);
+    assert_eq!(empty_statement.kind, GenerationErrorKind::EmptyStatement);
+}
+
+#[test]
+fn sign_parser_match_conditions_keep_outer_branch_labels() {
+    let source = r#"
+pub fn parse_int_field(text: &std::ffi::CStr) -> Result<i32, ()> {
+    let mut digits = text.to_bytes();
+    if match digits.first() {
+        Some(b'+' | b'-') => { true }
+        _ => { false }
+    } {
+        digits = &digits[1..];
+    }
+    if digits.is_empty() { return Err(()); }
+    Ok(digits.len() as i32)
+}
+"#;
+    for source in [
+        source.to_owned(),
+        source
+            .replace("{ true }", "true,")
+            .replace("{ false }", "false,"),
+    ] {
+        let records = generate(&source);
+        let f = function(&records, "parse_int_field");
+        assert_eq!(labels(&f.annotated_source), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(labels(&f.baseline.skeleton), [0, 1, 2, 3, 4, 5]);
+        assert_eq!(f.baseline.statement_dispositions[1].children[0].label, 2);
+        assert!(f.annotated_source.contains("if match digits.first()"));
+        assert_eq!(f.baseline.transform_labels(), [1, 2]);
+        let returned = f
+            .baseline
+            .skeleton
+            .replacen(
+                "todo!()",
+                "match digits.first() { Some(b'+' | b'-') => true, _ => false }",
+                1,
+            )
+            .replacen("todo!()", "digits = &digits[1..]", 1);
+        run_compiler_on_str(
+            &crate::strip_proctor_labels(&returned).unwrap(),
+            utils::type_check,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::validate(&crate::ValidationRequest {
+                expected_functions: vec![crate::ExpectedFunction {
+                    id: f.id,
+                    name: f.name.clone(),
+                    view: f.baseline.clone(),
+                }],
+                transformation: returned,
+            }),
+            crate::ValidationResponse::Valid,
+        );
+    }
+}
+
+#[test]
+fn nested_matches_are_opaque_value_operands() {
+    for (source, expected) in [
+        (
+            "pub unsafe fn f(flag: bool) -> Option<i32> { Some(match flag { true => { let value = 1; value }, false => 2 }) }",
+            vec![0],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) -> i32 { 1 + match flag { true => 2, false => 3 } }",
+            vec![0],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) -> Option<i32> { Some(if flag { match flag { true => 1, false => 2 } } else { 3 }) }",
+            vec![0],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) { while match flag { true => { let value = flag; value }, false => false } { break; } }",
+            vec![0, 1],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) { for value in match flag { true => 0..1, false => 0..2 } { let _ = value; } }",
+            vec![0, 1],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) -> i32 { match match flag { true => 1, false => 2 } { value if match value { 1 => true, _ => false } => { value }, _ => { 0 } } }",
+            vec![0, 1, 2],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) -> i32 { if let Some(value) = match flag { true => Some(1), false => None } { value } else { 0 } }",
+            vec![0, 1, 2],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) { while let Some(value) = match flag { true => Some(1), false => None } { let _ = value; break; } }",
+            vec![0, 1, 2],
+        ),
+    ] {
+        let records = generate(source);
+        let f = function(&records, "f");
+        assert_eq!(labels(&f.annotated_source), expected, "{source}");
+        assert_eq!(labels(&f.baseline.skeleton), expected, "{source}");
+        run_compiler_on_str(
+            &crate::strip_proctor_labels(&f.annotated_source).unwrap(),
+            utils::type_check,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::validate(&crate::ValidationRequest {
+                expected_functions: vec![crate::ExpectedFunction {
+                    id: f.id,
+                    name: f.name.clone(),
+                    view: f.baseline.clone(),
+                }],
+                transformation: f.annotated_source.clone(),
+            }),
+            crate::ValidationResponse::Valid,
+            "{source}",
+        );
+    }
 }
 
 #[test]
@@ -4874,6 +4995,10 @@ fn opaque_blocks_admit_internal_loop_transfers_and_closure_returns() {
         "pub unsafe fn f() -> Option<i32> { Some('inner: { break 'inner 2; }) }",
         "pub unsafe fn f() -> Option<i32> { Some({ let mut count = 0; 'inner: loop { count += 1; if count < 2 { continue 'inner; } break 'inner count; } }) }",
         "pub unsafe fn f() -> Option<i32> { Some({ let compute = || { return 3; }; compute() }) }",
+        "pub unsafe fn f() -> Option<i32> { Some(match 0 { 0 => loop { break 1; }, _ => 2 }) }",
+        "pub unsafe fn f() -> Option<i32> { Some(match 0 { _ => 'inner: { break 'inner 2; } }) }",
+        "pub unsafe fn f() -> Option<i32> { Some(match 0 { _ => { let mut count = 0; 'inner: loop { count += 1; if count < 2 { continue 'inner; } break 'inner count; } } }) }",
+        "pub unsafe fn f() -> Option<i32> { Some(match 0 { _ => (|| { return 3; })() }) }",
     ] {
         let records = generate(source);
         let f = function(&records, "f");
@@ -4891,6 +5016,11 @@ fn rejects_unsupported_nested_control_and_escaping_opaque_values() {
         "pub unsafe fn f() { loop { let value = Some({ break; }); let _ = value; } }",
         "pub unsafe fn f() { 'outer: loop { let value = Some({ continue 'outer; }); let _ = value; } }",
         "pub unsafe fn f() { 'outer: loop { let value = Some({ loop { break 'outer; } }); let _ = value; } }",
+        "pub unsafe fn f(flag: bool) -> i32 { if match flag { true => { return 1; }, false => false } { 2 } else { 3 } }",
+        "pub unsafe fn f() -> Option<i32> { Some(match 0 { _ => return None }) }",
+        "pub unsafe fn f(flag: bool) { loop { if match flag { true => break, false => false } {} } }",
+        "pub unsafe fn f(flag: bool) { 'outer: loop { if match flag { true => continue 'outer, false => false } {} } }",
+        "pub unsafe fn f(flag: bool) { 'outer: loop { if match flag { true => loop { break 'outer; }, false => false } {} } }",
     ] {
         let error = generate_error(source);
         assert_eq!(error.kind, GenerationErrorKind::NestedControlPayload);

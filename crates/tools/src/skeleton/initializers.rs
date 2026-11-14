@@ -57,9 +57,12 @@ pub(super) fn make_initializer_record(
         }));
     }
     let mut source = initializer_function(&surface.item);
+    let opaque = collect_opaque_nested_expressions(&source, &surface.path)?;
     let ItemKind::Fn(function) = &source.kind else { unreachable!() };
     let mut validator = BodyValidator {
         function_path: &surface.path,
+        opaque_expressions: &opaque,
+        opaque_depth: 0,
         closure_depth: 0,
         error: None,
     };
@@ -67,7 +70,6 @@ pub(super) fn make_initializer_record(
     if let Some(error) = validator.error {
         return Err(error);
     }
-    let opaque = collect_opaque_nested_expressions(&source, &surface.path)?;
     annotate_function(&mut source, &opaque);
     let classification = classify_function_statements(
         &source,

@@ -224,15 +224,65 @@ fn nested_value_blocks_have_no_independent_binding_obligations() {
 
 #[test]
 fn rule_applied_views_accept_opaque_value_payloads() {
-    let skeleton = "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let result: i32 = Some({ let init = value; init }).unwrap(); #[proctor(1)] result }";
-    assert_eq!(
-        validate(&mixed_preservation_request(skeleton, &[1], &[0], skeleton)),
-        ValidationResponse::Valid,
+    for skeleton in [
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let result: i32 = Some({ let init = value; init }).unwrap(); #[proctor(1)] result }",
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let result: i32 = Some(match value { 0 => 0, _ => { let init = value; init } }).unwrap(); #[proctor(1)] result }",
+    ] {
+        assert_eq!(
+            validate(&mixed_preservation_request(skeleton, &[1], &[0], skeleton)),
+            ValidationResponse::Valid,
+        );
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                let parsed = parse_crate(skeleton).unwrap();
+                assert_eq!(validate_rule_application_shape(&parsed.items[0]), Ok(()));
+            },
+        );
+    }
+}
+
+#[test]
+fn opaque_match_conditions_have_no_inner_binding_or_arm_shape_obligations() {
+    assert_valid(
+        "unsafe fn f(flag: bool) -> i32 { #[proctor(0)] if match flag { true => { let original: i32 = 1; original > 0 }, false => false } { #[proctor(1)] 1 } else { #[proctor(2)] 0 } }",
+        "unsafe fn f(flag: bool) -> i32 { #[proctor(0)] if match Some(flag) { Some(true) => true, Some(false) => { let renamed: i64 = 0; renamed != 0 }, None => false } { #[proctor(1)] 1 } else { #[proctor(2)] 0 } }",
     );
-    rustc_span::create_session_if_not_set_then(rustc_span::edition::Edition::Edition2021, |_| {
-        let parsed = parse_crate(skeleton).unwrap();
-        assert_eq!(validate_rule_application_shape(&parsed.items[0]), Ok(()));
-    });
+    assert_valid(
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] Some(match value { 0 => 1, _ => { let original = 2; original } }).unwrap() }",
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] Some(match value { 0..=9 => { let renamed: i64 = 3; renamed as i32 }, _ => 4 }).unwrap() }",
+    );
+}
+
+#[test]
+fn opaque_match_condition_temporaries_obey_arm_scopes_and_outer_capture_checks() {
+    let skeleton = "unsafe fn f() { #[proctor(0)] todo!(); #[proctor(1)] if todo!() { #[proctor(2)] todo!(); } }";
+    assert_valid(
+        skeleton,
+        "unsafe fn f() { #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(1)] if match Some(2) { Some(proctor_temp_var_0) if proctor_temp_var_0 > 0 => proctor_temp_var_0 == 2, _ => false } { #[proctor(2)] consume(0); } }",
+    );
+    for condition in [
+        "match Some(2) { Some(value) => value > proctor_temp_var_0, _ => false }",
+        "match 2 { _ => { let proctor_temp_var_0 = proctor_temp_var_0; proctor_temp_var_0 > 0 } }",
+    ] {
+        assert_code(
+            skeleton,
+            &format!(
+                "unsafe fn f() {{ #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(1)] if {condition} {{ #[proctor(2)] consume(0); }} }}"
+            ),
+            "temporary_outside_expansion_group",
+        );
+    }
+    assert_code(
+        "unsafe fn f() { #[proctor(0)] if todo!() { #[proctor(1)] todo!(); } }",
+        "unsafe fn f() { #[proctor(0)] if match Some(1) { Some(proctor_temp_var_0) => proctor_temp_var_0 > 0, _ => proctor_temp_var_0 > 0 } { #[proctor(1)] consume(0); } }",
+        "unresolved_generated_temporary",
+    );
+    assert_code(
+        "unsafe fn f() { #[proctor(0)] if todo!() { #[proctor(1)] todo!(); } }",
+        "unsafe fn f() { #[proctor(0)] if match Some(1) { Some(proctor_temp_var_0) => proctor_temp_var_0 > 0, _ => false } { #[proctor(1)] consume(proctor_temp_var_0); } }",
+        "unresolved_generated_temporary",
+    );
 }
 
 #[test]
@@ -317,6 +367,10 @@ fn opaque_values_reject_control_transfers_to_outer_scopes() {
         "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] consume({ break; }); } }",
         "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] consume({ continue; }); } }",
         "unsafe fn f() { #[proctor(0)] 'outer: loop { #[proctor(1)] consume({ loop { break 'outer; } }); } }",
+        "unsafe fn f() { #[proctor(0)] consume(match 0 { _ => return }); }",
+        "unsafe fn f() { #[proctor(0)] if match 0 { _ => return } { #[proctor(1)] consume(0); } }",
+        "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] if match 0 { _ => break } { #[proctor(2)] consume(0); } } }",
+        "unsafe fn f() { #[proctor(0)] 'outer: loop { #[proctor(1)] if match 0 { _ => continue 'outer } { #[proctor(2)] consume(0); } } }",
     ] {
         assert_eq!(
             codes(&validate(&request(source, source))),
@@ -333,19 +387,36 @@ fn opaque_values_reject_control_transfers_to_outer_scopes() {
         "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] consume({ break; }); } }",
         "escaping_opaque_control",
     );
+    assert_code(
+        UNIT_SKELETON,
+        "unsafe fn f() { #[proctor(0)] consume(match 0 { _ => return }); }",
+        "escaping_opaque_control",
+    );
+    assert_code(
+        "unsafe fn f() { #[proctor(0)] if todo!() { #[proctor(1)] todo!(); } }",
+        "unsafe fn f() { #[proctor(0)] if match 0 { _ => return } { #[proctor(1)] consume(0); } }",
+        "escaping_opaque_control",
+    );
+    for control in ["break", "continue 'outer", "loop { break 'outer; }"] {
+        assert_code(
+            "unsafe fn f() { #[proctor(0)] 'outer: loop { #[proctor(1)] if todo!() { #[proctor(2)] todo!(); } } }",
+            &format!(
+                "unsafe fn f() {{ #[proctor(0)] 'outer: loop {{ #[proctor(1)] if match 0 {{ _ => {control} }} {{ #[proctor(2)] consume(0); }} }} }}"
+            ),
+            "escaping_opaque_control",
+        );
+    }
 }
 
 #[test]
 fn opaque_source_values_retain_body_supportedness_checks() {
-    for source in [
-        "unsafe fn f() { #[proctor(0)] consume({ ; 1 }); }",
-        "unsafe fn f() { #[proctor(0)] consume({ match 1 { _ => 1 } }); }",
-    ] {
-        assert_eq!(
-            codes(&validate(&request(source, source))),
-            ["invalid_expected_skeleton"]
-        );
-    }
+    let source = "unsafe fn f() { #[proctor(0)] consume({ ; 1 }); }";
+    assert_eq!(
+        codes(&validate(&request(source, source))),
+        ["invalid_expected_skeleton"]
+    );
+    let source = "unsafe fn f() { #[proctor(0)] consume({ match 1 { _ => 1 } }); }";
+    assert_valid(source, source);
     assert_valid(
         UNIT_SKELETON,
         "unsafe fn f() { #[proctor(0)] consume({ ; match 1 { _ => 1 } }); }",
@@ -1026,6 +1097,13 @@ fn opaque_control_operand_rejects_inner_labels() {
     let skeleton = "unsafe fn f(a: bool) -> i32 { #[proctor(0)] if 1 + (if a { #[proctor(99)] 2 } else { 3 }) > 0 { #[proctor(1)] 1 } else { #[proctor(2)] 2 } }";
     assert_eq!(
         codes(&validate(&preservation_request(skeleton, vec![], skeleton))),
+        ["invalid_expected_skeleton"]
+    );
+    let skeleton = "unsafe fn f() { #[proctor(0)] if todo!() { #[proctor(1)] todo!(); } }";
+    let transformation = "unsafe fn f() { #[proctor(0)] if match 0 { _ => { #[proctor(99)] true } } { #[proctor(1)] consume(0); } }";
+    assert_code(skeleton, transformation, "unexpected_label");
+    assert_eq!(
+        codes(&validate(&request(transformation, transformation))),
         ["invalid_expected_skeleton"]
     );
 }
