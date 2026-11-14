@@ -255,34 +255,22 @@ fn e5_n_cmp_opaque_return_keeps_its_independent_origin_cause() {
 }
 
 #[test]
-fn e5_n_cmp_integer_reconstruction_settles_owning_without_the_comparison_and_raw_with_it() {
-    let (baseline, absent) = snapshot(
-        "pub unsafe fn f(p: *mut u8) -> *mut u8 { let address = p as usize; let q = address as *mut u8; q }",
-        &["q"],
-    );
-    let (comparison, present) = snapshot(
-        "pub unsafe fn f(p: *mut u8) -> *mut u8 { let address = p as usize; let q = address as *mut u8; let _cmp = q == p; q }",
-        &["q"],
-    );
-    assert_eq!((absent, present), (0, 1));
-    // Under Ref > Owning > Raw the integer-reconstructed pointer and the return settle Owning;
-    // the comparison makes both Raw. Every other fact is the same in both twins.
-    for (snapshot, kind) in [(&baseline, SlotKind::Owning), (&comparison, SlotKind::Raw)] {
-        assert_eq!(snapshot.kinds["f::_0@d0"], kind, "{snapshot:?}");
-        assert_eq!(snapshot.kinds["f::_4@d0"], kind, "{snapshot:?}");
-        assert_eq!(snapshot.kinds["f::_1@d0"], SlotKind::Ref, "{snapshot:?}");
+fn integer_reconstruction_declines_with_or_without_comparison() {
+    for comparison in ["", "let _cmp = q == p;"] {
+        let source = format!(
+            "pub unsafe fn f(p: *mut u8) -> *mut u8 {{ let address = p as usize; let q = address as *mut u8; {comparison} q }}"
+        );
+        ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+            let error = crate::analyze_pointers(tcx)
+                .err()
+                .expect("integer reconstruction must decline before kind selection");
+            assert!(
+                error.contains("nonpointer source of type `usize`"),
+                "{error}"
+            );
+        })
+        .unwrap();
     }
-    let rest = |s: &Snapshot| {
-        (
-            s.nullable.clone(),
-            s.no_borrow_origin.clone(),
-            s.positive_opaque.clone(),
-            s.field_evidence.clone(),
-            s.locals.clone(),
-            s.returns.clone(),
-        )
-    };
-    assert_eq!(rest(&comparison), rest(&baseline));
 }
 
 #[test]

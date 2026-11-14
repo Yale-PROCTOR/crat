@@ -29,6 +29,54 @@ fn assert_stub_signatures_compile(records: &[ItemRecord], context: &str) {
 }
 
 #[test]
+fn boxed_field_updates_keep_pointer_analysis_and_skeleton_generation_working() {
+    let source = r#"
+pub struct Manager { tasks: Vec<*mut i32>, view: *mut *mut i32 }
+pub unsafe fn create() -> Box<Manager> {
+    let mut manager = Box::new(Manager { tasks: Vec::new(), view: core::ptr::null_mut() });
+    manager.view = manager.tasks.as_mut_ptr();
+    manager
+}
+pub unsafe fn read(pointer: *const i32) -> i32 { *pointer }
+"#;
+    let records = generate(source);
+    let create = function(&records, "create");
+    assert!(create.target_signature.contains("Box<Manager>"));
+    assert!(!create.baseline.transform_labels().is_empty());
+    assert!(function(&records, "read").target_signature.contains("&i32"));
+    assert_stub_signatures_compile(
+        &records,
+        "pub struct Manager { tasks: Vec<*mut i32>, view: *mut *mut i32 }",
+    );
+}
+
+#[test]
+fn unsupported_nonpointer_loan_sources_decline_analysis_with_a_diagnostic() {
+    for source in [
+        "pub unsafe fn read(address: usize) -> i32 { let pointer = address as *const i32; *pointer }",
+        "#[repr(transparent)] pub struct NonNull(*mut i32); pub unsafe fn read(value: NonNull) -> i32 { let pointer: *mut i32 = core::mem::transmute(value); *pointer }",
+        "pub unsafe fn read(value: core::ptr::NonNull<i32>) -> i32 { let pointer: *mut i32 = core::mem::transmute(value); *pointer }",
+        "pub unsafe fn read(value: core::ptr::NonNull<i32>) -> i32 { let pointer = value.as_ptr(); *pointer }",
+        "pub unsafe fn read(value: Box<core::ptr::NonNull<i32>>) -> i32 { let pointer = (*value).as_ptr(); *pointer }",
+        "pub unsafe fn read(value: *mut core::ptr::NonNull<i32>) -> i32 { let pointer = (*value).as_ptr(); *pointer }",
+        "pub struct Holder<'a> { owner: &'a mut Box<i32> } pub unsafe fn read(value: Holder<'_>) -> i32 { let pointer = &raw mut **value.owner; *pointer }",
+    ] {
+        run_compiler_on_str(source, |tcx| {
+            let error = make_skeletons(source, tcx)
+                .expect_err("unrecognized sources must decline analysis");
+            assert!(
+                error
+                    .message
+                    .contains("cannot model a pointer loan from nonpointer source"),
+                "{error:?}"
+            );
+            assert!(error.message.contains("read"), "{error:?}");
+        })
+        .unwrap();
+    }
+}
+
+#[test]
 fn nested_model_references_reach_signatures_locals_rules_and_metadata() {
     let source = r#"
 pub unsafe fn read(p: *const *const i32) -> i32 {

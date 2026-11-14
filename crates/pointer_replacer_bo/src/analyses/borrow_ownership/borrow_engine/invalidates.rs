@@ -333,7 +333,9 @@ fn build_issued_loans<'tcx>(
         let Borrower::Assign(ProvenanceOwner::Local(issuer)) = bd.assigned else {
             continue;
         };
-        if bd.borrowed.projection.last() != Some(&PlaceElem::Deref) {
+        if bd.borrowed.projection.last() != Some(&PlaceElem::Deref)
+            && !bd.borrowed.ty(body, tcx).ty.is_box()
+        {
             continue; // a direct sub-borrow, not a pointer copy/reborrow
         }
         if bd.borrowed.local == issuer {

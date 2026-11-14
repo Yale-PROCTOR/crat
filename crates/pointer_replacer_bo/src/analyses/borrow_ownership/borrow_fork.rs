@@ -13,32 +13,182 @@
 use rustc_hash::FxHashMap;
 #[cfg(test)]
 use rustc_hash::FxHashSet;
+use rustc_hir::LangItem;
 use rustc_index::{
     IndexVec,
     bit_set::{DenseBitSet, SparseBitMatrix},
 };
 use rustc_middle::{
     mir::{
-        Body, HasLocalDecls, Local, Location, Operand, Place, PlaceElem, Rvalue, Terminator,
+        Body, Local, Location, Operand, Place, PlaceElem, Rvalue, StatementKind, Terminator,
         visit::Visitor,
     },
-    ty::TyCtxt,
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_mir_dataflow::points::DenseLocationMap;
-use rustc_span::def_id::LocalDefId;
+use rustc_span::{def_id::LocalDefId, sym};
 
-use crate::analyses::{
-    borrow::{
-        BorrowData, BorrowInferenceResults, BorrowSet, Borrower, GBorrowInferCtxt, Loan,
-        ProvenanceConstraintGraph, ProvenanceOwner, ProvenanceSet, errors::compute_errors,
-        invalidates::compute_invalidates, is_borrowing_method, killed::compute_killed,
-        loan_liveness::compute_loan_liveness, provenance_liveness::compute_provenance_liveness,
-        requires::compute_requires, subset_closure::compute_subset_closure,
-    },
-    mir::{CallKind, TerminatorExt},
-};
 #[cfg(test)]
-use crate::{analyses::borrow::Provenance, utils::rustc::RustProgram};
+use crate::analyses::borrow::Provenance;
+use crate::{
+    analyses::{
+        borrow::{
+            BorrowData, BorrowInferenceResults, BorrowSet, Borrower, GBorrowInferCtxt, Loan,
+            ProvenanceConstraintGraph, ProvenanceOwner, ProvenanceSet, errors::compute_errors,
+            invalidates::compute_invalidates, is_borrowing_method, killed::compute_killed,
+            loan_liveness::compute_loan_liveness, provenance_liveness::compute_provenance_liveness,
+            requires::compute_requires, subset_closure::compute_subset_closure,
+        },
+        mir::{CallKind, TerminatorExt},
+    },
+    utils::rustc::RustProgram,
+};
+
+fn pointer_loan_place<'tcx>(
+    mut place: Place<'tcx>,
+    body: &Body<'tcx>,
+    mut location: Location,
+    tcx: TyCtxt<'tcx>,
+) -> Option<Place<'tcx>> {
+    let unique = tcx.lang_items().get(LangItem::PtrUnique);
+    let non_null = tcx.get_diagnostic_item(sym::NonNull);
+    let is_unique =
+        |ty: Ty<'tcx>| matches!(ty.kind(), TyKind::Adt(adt, _) if Some(adt.did()) == unique);
+    let is_non_null =
+        |ty: Ty<'tcx>| matches!(ty.kind(), TyKind::Adt(adt, _) if Some(adt.did()) == non_null);
+    let is_carrier = |ty| is_unique(ty) || is_non_null(ty);
+    let pointee = |ty: Ty<'tcx>| match ty.kind() {
+        TyKind::Adt(_, arguments) if is_carrier(ty) => Some(arguments.type_at(0)),
+        _ => ty.builtin_deref(true),
+    };
+    loop {
+        let ty = place.ty(body, tcx).ty;
+        let mut prefix = Place::from(place.local);
+        let mut box_owner = None;
+        for element in place.projection {
+            let parent = prefix.ty(body, tcx).ty;
+            let child = prefix.project_deeper(&[element], tcx);
+            let child_ty = child.ty(body, tcx).ty;
+            let payload_field = (parent.is_box() && is_unique(child_ty)
+                || is_unique(parent) && is_non_null(child_ty)
+                || is_non_null(parent) && child_ty.is_raw_ptr())
+                && pointee(parent) == pointee(child_ty);
+            if !matches!(element, PlaceElem::Field(..)) || !payload_field {
+                box_owner = None;
+            } else if parent.is_box() {
+                box_owner = Some(prefix);
+            }
+            prefix = child;
+        }
+        if let Some(owner) = box_owner.or_else(|| ty.is_box().then_some(place)) {
+            if !owner
+                .projection
+                .iter()
+                .all(|element| matches!(element, PlaceElem::Deref))
+            {
+                return None;
+            }
+            // Cover the owner rather than mixing abstract Box dereferences with
+            // the representation-field projections used by lowered MIR.
+            return Some(owner);
+        }
+        if let Some(pointee) = ty.builtin_deref(true) {
+            let borrowed = place.project_deeper(&[PlaceElem::Deref], tcx);
+            if pointee.is_box()
+                && !borrowed
+                    .projection
+                    .iter()
+                    .all(|element| matches!(element, PlaceElem::Deref))
+            {
+                return None;
+            }
+            return Some(borrowed);
+        }
+        if !is_carrier(ty) {
+            return None;
+        }
+        // Rustc copies Box's carrier fields into temporaries before transmuting
+        // them. Follow adjacent copies so the loan stays rooted in the owner.
+        let statement = loop {
+            location.statement_index = location.statement_index.checked_sub(1)?;
+            let statement = &body.basic_blocks[location.block].statements[location.statement_index];
+            match statement.kind {
+                StatementKind::StorageLive(local) if local != place.local => {}
+                StatementKind::Nop => {}
+                _ => break statement,
+            }
+        };
+        let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else { return None };
+        if destination.as_local() != Some(place.local) {
+            return None;
+        }
+        let (Rvalue::Use(Operand::Copy(source) | Operand::Move(source))
+        | Rvalue::CopyForDeref(source)) = rvalue
+        else {
+            return None;
+        };
+        if source.ty(body, tcx).ty != body.local_decls[place.local].ty {
+            return None;
+        }
+        place = source.project_deeper(place.projection, tcx);
+    }
+}
+
+pub(crate) fn validate_pointer_loan_sources<'tcx>(
+    program: &RustProgram<'tcx>,
+) -> anyhow::Result<()> {
+    let tcx = program.tcx;
+    for &function in &program.functions {
+        let body = tcx
+            .mir_drops_elaborated_and_const_checked(function)
+            .borrow();
+        let check = |place: Place<'tcx>, location| -> anyhow::Result<()> {
+            anyhow::ensure!(
+                pointer_loan_place(place, &body, location, tcx).is_some(),
+                "cannot model a pointer loan from nonpointer source of type `{}` in `{}`",
+                place.ty(&*body, tcx).ty,
+                tcx.def_path_str(function)
+            );
+            Ok(())
+        };
+        for (block_index, block) in body.basic_blocks.iter_enumerated() {
+            for (statement_index, statement) in block.statements.iter().enumerate() {
+                if let StatementKind::Assign(box (_, rvalue)) = &statement.kind
+                    && (rvalue.ty(&*body, tcx).is_raw_ptr() || rvalue.ty(&*body, tcx).is_ref())
+                {
+                    match rvalue {
+                        Rvalue::CopyForDeref(place)
+                        | Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
+                        | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => check(
+                            *place,
+                            Location {
+                                block: block_index,
+                                statement_index,
+                            },
+                        )?,
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(call) = block.terminator().as_call(tcx)
+                && let CallKind::RustLib(function) = call.func
+                && is_borrowing_method(function, tcx)
+                && (call.destination.ty(&*body, tcx).ty.is_raw_ptr()
+                    || call.destination.ty(&*body, tcx).ty.is_ref())
+                && let Some(source) = call.args.first().and_then(|arg| arg.node.place())
+            {
+                check(
+                    source,
+                    Location {
+                        block: block_index,
+                        statement_index: block.statements.len(),
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
 
 /// A loan's location (the legacy `BorrowData` keeps the field without an accessor).
 pub(crate) trait LoanLocation {
@@ -58,15 +208,15 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
     provenance_set: &'local ProvenanceSet,
     global_borrow_ctxt: &'global GBorrowInferCtxt,
 ) -> BorrowSet<'tcx> {
-    struct Vis<'tcx, 'this, D> {
+    struct Vis<'tcx, 'this> {
         loans: IndexVec<Loan, BorrowData<'tcx>>,
         location_map: FxHashMap<Location, Vec<Loan>>,
-        local_decl: &'this D,
+        local_decl: &'this Body<'tcx>,
         tcx: TyCtxt<'tcx>,
         provenance_set: &'this ProvenanceSet,
         global_borrow_ctxt: &'this GBorrowInferCtxt,
     }
-    impl<'tcx, 'this, D: HasLocalDecls<'tcx>> Visitor<'tcx> for Vis<'tcx, 'this, D> {
+    impl<'tcx> Visitor<'tcx> for Vis<'tcx, '_> {
         fn visit_assign(&mut self, lhs: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
             let Some(assigned_owner) = self.provenance_set.owner_for_place(self.local_decl, *lhs)
             else {
@@ -74,7 +224,7 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
             };
 
             let rvalue_ty = rvalue.ty(self.local_decl, self.tcx);
-            if !rvalue_ty.is_any_ptr() {
+            if !rvalue_ty.is_raw_ptr() && !rvalue_ty.is_ref() {
                 return self.super_assign(lhs, rvalue, location);
             }
 
@@ -111,9 +261,11 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
                 | Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
                 | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
                     let mut loans = vec![];
+                    let borrowed = pointer_loan_place(*place, self.local_decl, location, self.tcx)
+                        .expect("pointer loan sources must be validated before borrow inference");
                     let loan = self.loans.push(BorrowData {
                         location,
-                        borrowed: place.project_deeper(&[PlaceElem::Deref], self.tcx),
+                        borrowed,
                         assigned: Borrower::Assign(assigned_owner),
                     });
                     loans.push(loan);
@@ -122,9 +274,9 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
                         .provenance_set
                         .tree_borrow_local
                         .borrow_mut()
-                        .group(place.local)
+                        .group(borrowed.local)
                     {
-                        if place.local == other_local {
+                        if borrowed.local == other_local {
                             continue;
                         }
                         let loan = self.loans.push(BorrowData {
@@ -156,9 +308,16 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
                             .owner_for_place(self.local_decl, mir_call.destination)
                     {
                         let mut loans = vec![];
+                        let borrowed = pointer_loan_place(
+                            arg0_place,
+                            self.local_decl,
+                            location,
+                            self.tcx,
+                        )
+                        .expect("pointer loan sources must be validated before borrow inference");
                         let loan = self.loans.push(BorrowData {
                             location,
-                            borrowed: arg0_place.project_deeper(&[PlaceElem::Deref], self.tcx),
+                            borrowed,
                             assigned: Borrower::Assign(assigned_owner),
                         });
                         loans.push(loan);
@@ -167,9 +326,9 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
                             .provenance_set
                             .tree_borrow_local
                             .borrow_mut()
-                            .group(arg0_place.local)
+                            .group(borrowed.local)
                         {
-                            if arg0_place.local == other_local {
+                            if borrowed.local == other_local {
                                 continue;
                             }
                             let loan = self.loans.push(BorrowData {
@@ -671,6 +830,70 @@ mod tests {
     fn edge_involves(edge: &ConflictEdge, local: Local) -> bool {
         let target = ProvenanceOwner::Local(local);
         edge.issuer == Some(target) || edge.requirers.contains(&target)
+    }
+
+    #[test]
+    fn boxed_pointer_loans_preserve_owners_and_alias_conflicts() {
+        for first in [
+            "&raw mut *owner",
+            "&raw const *owner",
+            "(&raw mut *owner) as *mut u8",
+            "{ let wrapper = &mut owner; &raw mut **wrapper }",
+        ] {
+            let source = format!(
+                "unsafe fn f(mut owner: Box<i32>) -> i32 {{
+                    let first = {first};
+                    let second = &raw mut *owner;
+                    *second = 2;
+                    let value = *first as i32;
+                    *second = value + 1;
+                    *first as i32
+                }}"
+            );
+            ::utils::compilation::run_compiler_on_str(&source, |tcx| {
+                let program = build_rust_program(tcx);
+                let function = program.functions[0];
+                let first = local_by_name(tcx, function, "first");
+                let second = local_by_name(tcx, function, "second");
+                let owner = local_by_name(tcx, function, "owner");
+                validate_pointer_loan_sources(&program).unwrap();
+                let ctxt = GBorrowInferCtxt::new(&program, |_| |_| true, |_| |_| true);
+                let body = tcx.mir_drops_elaborated_and_const_checked(function).borrow();
+                let loans = borrow_set(&body, tcx, &ctxt.provenances[&function], &ctxt);
+                assert!(loans.loans.iter().any(|loan|
+                    loan.borrowed == Place::from(owner)
+                ), "compiler carrier temporaries must retain the original Box owner");
+                for local in [first, second] {
+                    let loan = loans.loans.iter().find(|loan| {
+                        matches!(loan.assigned, Borrower::Assign(ProvenanceOwner::Local(owner)) if owner == local)
+                    }).expect("pointer conversion must retain its loan");
+                    assert_eq!(loan.borrowed.ty(&*body, tcx).ty, tcx.types.i32);
+                    assert!(matches!(loan.borrowed.projection.last(), Some(PlaceElem::Deref)));
+                }
+                let (conflicts, invalidators) = super::super::borrow_engine::recording_edge_invalidators(|| {
+                    super::super::borrow_engine::borrow_conflicts_replaying(
+                        &program, |_| |_| true, |_| |_| false,
+                        |_| move |local| local != first,
+                        &[],
+                    )
+                });
+                assert!(conflicts.get(&function).is_some_and(|edges| {
+                    edges.iter().any(|edge| edge_involves(edge, first) || edge_involves(edge, second))
+                }), "overlapping pointer loans must conflict: {source}");
+                assert!(invalidators[&function].iter().flatten().any(|local| *local == second),
+                    "writes through the second pointer must reach the first loan: {source}");
+                let replay = super::super::borrow_engine::borrow_conflicts_replaying(
+                    &program,
+                    |_| move |local| local != first,
+                    |_| move |local| local == first,
+                    |_| |_| true,
+                    &[],
+                );
+                assert!(replay.get(&function).is_some_and(|edges|
+                    edges.iter().any(|edge| edge_involves(edge, second))
+                ), "raw demotion must retain the second pointer's alias obligations: {source}");
+            }).unwrap();
+        }
     }
 
     /// BB2-i (§8 CEGAR validate, union-replay): given a partial candidacy that marks `x`

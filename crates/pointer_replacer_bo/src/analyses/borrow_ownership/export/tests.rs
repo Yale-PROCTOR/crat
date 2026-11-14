@@ -5,12 +5,15 @@ use rustc_hir::{ItemKind, OwnerNode};
 use rustc_middle::ty::TyCtxt;
 
 use super::*;
+#[cfg(debug_assertions)]
+use crate::analyses::borrow_ownership::{
+    borrow_verify::verify_guarded_to_fixpoint_counting, origin_flow::analyze_program_origin_flow,
+};
 use crate::{
     analyses::borrow_ownership::{
         CrateCtxt,
         borrow_verify::{
-            RoundStats, model_accepts, verify_guarded_to_fixpoint_counting, verify_to_fixpoint,
-            verify_to_fixpoint_counting,
+            RoundStats, model_accepts, verify_to_fixpoint, verify_to_fixpoint_counting,
         },
         coherence::add_coherence,
         construction::{
@@ -21,7 +24,6 @@ use crate::{
         crate_slots::CrateSlots,
         emit_crate_ownership_constraints,
         mutability_facts::MutFacts,
-        origin_flow::analyze_program_origin_flow,
         origins::compute_origins,
         solver::{
             KindSolver, RoundModelFailure, SelectorTraceOutcome, SlotRef,

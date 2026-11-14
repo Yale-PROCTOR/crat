@@ -335,11 +335,19 @@ pub unsafe fn run(o: *mut S, h: *mut H) { f(o, h); (*o).x = 2; let _y = (*(*h).f
 
 #[test]
 fn r864_3_round5_an_integer_round_trip_to_a_keeper_is_not_covered() {
-    let d = decisions(&format!("{ALLOW}{INTEGER_ROUND_TRIP_KEPT}"));
-    assert!(
-        !d["f::s"].starts_with("Ref") && !d["f::s"].starts_with("InferredRef"),
-        "{d:#?}"
-    );
+    ::utils::compilation::run_compiler_on_str(
+        &format!("{ALLOW}{INTEGER_ROUND_TRIP_KEPT}"),
+        |tcx| {
+            let error = crate::analyze_pointers(tcx)
+                .err()
+                .expect("integer reconstruction must decline before retained-access decisions");
+            assert!(
+                error.contains("nonpointer source of type `usize`"),
+                "{error}"
+            );
+        },
+    )
+    .unwrap();
 }
 
 /// The negative controls (the stand-in review of item 1, LOW-2): a neighbour that

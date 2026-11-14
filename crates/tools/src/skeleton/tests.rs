@@ -887,7 +887,6 @@ pub unsafe fn return_use(x: i32) -> i32 { printf(b"%d\0" as *const u8 as *const 
 pub unsafe fn nested_use(x: i32) { sink(printf(b"%d\0" as *const u8 as *const i8, x)); }
 pub unsafe fn arithmetic_use(x: i32) { let _n: i32 = printf(b"%d\0" as *const u8 as *const i8, x) + 1; }
 pub unsafe fn interior_before(x: i32) { printf(b"a\0%d\0" as *const u8 as *const i8, x); }
-pub unsafe fn integer_cast(x: i32) { printf(b"%d\0".as_ptr() as usize as *const i8, x); }
 pub unsafe fn address_deref(x: i32) { printf(&*b"%d\0".as_ptr() as *const u8 as *const i8, x); }
 pub unsafe fn method(x: i32) { printf(b"%d\0".as_ptr() as *const i8, x); }
 pub unsafe fn transmute(x: i32) { printf(core::mem::transmute::<_, *const i8>(b"%d\0".as_ptr()), x); }
@@ -896,7 +895,6 @@ pub unsafe fn concatenated(x: i32) { printf(concat!("%d", "\0").as_ptr() as *con
 pub unsafe fn included(x: i32) { printf(include_bytes!("/dev/null").as_ptr() as *const i8, x); }
 pub unsafe fn block(x: i32) { printf(({ b"%d\0" }) as *const u8 as *const i8, x); }
 pub unsafe fn conditional(x: i32) { printf((if true { b"%d\0" } else { b"%i\0" }) as *const u8 as *const i8, x); }
-pub unsafe fn arithmetic(x: i32) { printf(((b"%d\0".as_ptr() as usize) + 0) as *const i8, x); }
 pub unsafe fn result(x: i32) { printf(format_result(), x); }
 pub unsafe fn count_zero() { printf(b"%d %% %s\0" as *const u8 as *const i8); }
 pub unsafe fn count_one(x: i32) { printf(b"%d %% %s\0" as *const u8 as *const i8, x); }
@@ -935,7 +933,6 @@ pub unsafe fn rust_function(x: i32) { ordinary::printf(b"%d\0".as_ptr() as *cons
         "nested_use",
         "arithmetic_use",
         "interior_before",
-        "integer_cast",
         "address_deref",
         "method",
         "transmute",
@@ -944,7 +941,6 @@ pub unsafe fn rust_function(x: i32) { ordinary::printf(b"%d\0".as_ptr() as *cons
         "included",
         "block",
         "conditional",
-        "arithmetic",
         "result",
         "count_zero",
         "count_one",
@@ -975,6 +971,43 @@ pub unsafe fn rust_function(x: i32) { ordinary::printf(b"%d\0".as_ptr() as *cons
             .iter()
             .all(|metadata| metadata.printf_template.is_none())
     );
+}
+
+#[test]
+fn printf_integer_address_formats_are_ineligible_and_decline_pointer_analysis() {
+    for format in [
+        r#"b"%d\0".as_ptr() as usize as *const i8"#,
+        r#"((b"%d\0".as_ptr() as usize) + 0) as *const i8"#,
+    ] {
+        let source = format!(
+            r#"
+unsafe extern "C" {{ fn printf(format: *const i8, ...) -> i32; }}
+pub unsafe fn print(x: i32) {{ printf({format}, x); }}
+"#
+        );
+        run_compiler_on_str(&source, |tcx| {
+            let mut surface = utils::ast::parse_crate(source.clone());
+            let mut mapper = utils::ir::AstToHirMapper::new(tcx);
+            mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
+            let ItemKind::Fn(function) = &surface.items[1].kind else { unreachable!() };
+            let statement = &function.body.as_ref().unwrap().stmts[0];
+            let StmtKind::Semi(expression) = &statement.kind else { unreachable!() };
+            assert!(crate::printf::supported_printf_call(
+                expression,
+                &mapper.ast_to_hir,
+                tcx
+            ));
+            assert!(eligible_printf_statement(statement, &mapper.ast_to_hir, tcx).is_none());
+            let error = make_skeletons(&source, tcx).unwrap_err();
+            assert_eq!(error.kind, GenerationErrorKind::PointerAnalysis);
+            assert!(
+                error
+                    .message
+                    .contains("cannot model a pointer loan from nonpointer source")
+            );
+        })
+        .unwrap();
+    }
 }
 
 #[test]
