@@ -5,6 +5,7 @@ use rustc_ast::{
     mut_visit::{self, MutVisitor},
 };
 use rustc_ast_pretty::pprust;
+use rustc_hash::FxHashSet;
 use rustc_middle::ty::TyCtxt;
 use rustc_span::{Ident, Symbol, kw, sym};
 use serde::Deserialize;
@@ -19,27 +20,44 @@ pub fn expand(config: Config, tcx: TyCtxt<'_>) -> String {
     let (_, mut krate) = tcx.resolver_for_lowering().steal();
     let krate = Arc::get_mut(&mut krate).unwrap();
     utils::ast::remove_unnecessary_items_from_ast(krate);
+    let mut features = krate
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.has_name(sym::feature))
+        .flat_map(|attribute| attribute.meta_item_list().unwrap())
+        .map(|feature| feature.ident().unwrap().name)
+        .collect::<Vec<_>>();
+    features.extend([
+        sym::c_variadic,
+        sym::extern_types,
+        sym::linkage,
+        sym::rustc_private,
+        sym::thread_local,
+        sym::builtin_syntax,
+        sym::coverage_attribute,
+        Symbol::intern("core_intrinsics"),
+        Symbol::intern("derive_clone_copy"),
+        Symbol::intern("hint_must_use"),
+        Symbol::intern("panic_internals"),
+        Symbol::intern("rt"),
+        Symbol::intern("libstd_sys_internals"),
+        Symbol::intern("structural_match"),
+    ]);
     krate.attrs.clear();
     krate.attrs.extend([
         utils::ast::make_inner_attribute(sym::warn, Symbol::intern("mutable_transmutes"), tcx),
         utils::ast::make_inner_attribute(sym::allow, Symbol::intern("non_camel_case_types"), tcx),
         utils::ast::make_inner_attribute(sym::allow, Symbol::intern("non_snake_case"), tcx),
         utils::ast::make_inner_attribute(sym::allow, Symbol::intern("non_upper_case_globals"), tcx),
-        utils::ast::make_inner_attribute(sym::feature, sym::c_variadic, tcx),
-        utils::ast::make_inner_attribute(sym::feature, sym::extern_types, tcx),
-        utils::ast::make_inner_attribute(sym::feature, sym::linkage, tcx),
-        utils::ast::make_inner_attribute(sym::feature, sym::rustc_private, tcx),
-        utils::ast::make_inner_attribute(sym::feature, sym::thread_local, tcx),
-        utils::ast::make_inner_attribute(sym::feature, sym::builtin_syntax, tcx),
-        utils::ast::make_inner_attribute(sym::feature, sym::coverage_attribute, tcx),
-        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("core_intrinsics"), tcx),
-        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("derive_clone_copy"), tcx),
-        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("hint_must_use"), tcx),
-        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("panic_internals"), tcx),
-        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("rt"), tcx),
-        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("libstd_sys_internals"), tcx),
-        utils::ast::make_inner_attribute(sym::feature, Symbol::intern("structural_match"), tcx),
     ]);
+    let mut emitted = FxHashSet::default();
+    for feature in features {
+        if emitted.insert(feature) {
+            krate
+                .attrs
+                .push(utils::ast::make_inner_attribute(sym::feature, feature, tcx));
+        }
+    }
     if config.keep_allows {
         krate.attrs.extend([
             utils::ast::make_inner_attribute(sym::allow, Symbol::intern("dead_code"), tcx),
