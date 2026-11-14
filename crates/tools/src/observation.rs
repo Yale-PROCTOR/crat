@@ -548,6 +548,7 @@ struct PreparedFunction {
     target_path: String,
     labels: Vec<PreparedLabel>,
     local_pairs: Vec<(usize, usize)>,
+    value_pairs: Vec<(usize, usize)>,
 }
 
 #[derive(Clone)]
@@ -603,6 +604,49 @@ fn prepare_observation_source(
             &current.source_copy_path,
             &current.implementation_path,
         )?;
+        let mut value_pairs = vec![];
+        for source in &source_statements {
+            let StmtKind::Item(source_item) = &source.statement.kind else { continue };
+            if !matches!(source_item.kind, ItemKind::Static(..) | ItemKind::Const(..)) {
+                continue;
+            }
+            let Some(label) = source.label else { continue };
+            if source_statements
+                .iter()
+                .filter(|statement| statement.label == Some(label))
+                .count()
+                != 1
+            {
+                return Err(ObservationError {
+                    code: "local_value_correspondence",
+                    message: format!(
+                        "local value label {label} requires exactly one source declaration"
+                    ),
+                });
+            }
+            let targets = target_statements
+                .iter()
+                .filter(|target| target.label == Some(label))
+                .collect::<Vec<_>>();
+            let [target] = targets.as_slice() else {
+                return Err(ObservationError {
+                    code: "local_value_correspondence",
+                    message: format!(
+                        "local value label {label} requires exactly one target declaration"
+                    ),
+                });
+            };
+            if !matches!(&target.statement.kind, StmtKind::Item(item) if crate::preservation::local_item_header(item) == crate::preservation::local_item_header(source_item))
+            {
+                return Err(ObservationError {
+                    code: "local_value_correspondence",
+                    message: format!(
+                        "local value label {label} has a different target declaration header"
+                    ),
+                });
+            }
+            value_pairs.push((source.ordinal, target.ordinal));
+        }
         let mut labels = vec![];
         for label in &current.transform_labels {
             let source_matches = source_statements
@@ -617,6 +661,9 @@ fn prepare_observation_source(
                         source_matches.len()
                     ),
                 });
+            }
+            if matches!(source_matches[0].statement.kind, StmtKind::Item(_)) {
+                continue;
             }
             let target_matches = target_statements
                 .iter()
@@ -691,6 +738,7 @@ fn prepare_observation_source(
             target_path: current.implementation_path.clone(),
             labels,
             local_pairs,
+            value_pairs,
         });
     }
     wrap_print_arguments(&mut krate.items, &mut vec![], &functions);
@@ -895,8 +943,7 @@ fn labeled_statements<'a>(
         }
 
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            if self.error.is_some() || matches!(statement.kind, StmtKind::Empty | StmtKind::Item(_))
-            {
+            if self.error.is_some() || matches!(statement.kind, StmtKind::Empty) {
                 return;
             }
             let (statement_list, sibling_index) = self.current_location.unwrap();
@@ -934,7 +981,9 @@ fn labeled_statements<'a>(
                 label: labels.first().copied(),
                 statement,
             });
-            visit::walk_stmt(self, statement);
+            if !matches!(statement.kind, StmtKind::Item(_)) {
+                visit::walk_stmt(self, statement);
+            }
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
@@ -1004,7 +1053,7 @@ fn extract_with_tcx(
         };
         functions.insert(path, SurfaceFunction { item, def_id });
     }
-    let callable_correspondence = callable_correspondence(metadata, &functions)?;
+    let mut callable_correspondence = callable_correspondence(metadata, &functions)?;
     let mut output = vec![];
     let mut printf_output = vec![];
     let mut ordered = prepared.functions.iter().collect::<Vec<_>>();
@@ -1035,6 +1084,22 @@ fn extract_with_tcx(
         }
         let source_statements = plain_statements(source.item);
         let target_statements = plain_statements(target.item);
+        for (source, target) in &prepared_function.value_pairs {
+            let value_id = |statements: &[&Stmt], ordinal: usize| {
+                let StmtKind::Item(item) = &statements.get(ordinal)?.kind else { return None };
+                ast_to_hir.global_map.get(&item.id).map(|id| id.to_def_id())
+            };
+            let (Some(source), Some(target)) = (
+                value_id(&source_statements, *source),
+                value_id(&target_statements, *target),
+            ) else {
+                return Err(ObservationError {
+                    code: "ast_hir_mapping",
+                    message: "local value declaration has no HIR identity".to_owned(),
+                });
+            };
+            callable_correspondence.values.insert(target, source);
+        }
         let mut labels = vec![];
         for label in &prepared_function.labels {
             let source_statement =
@@ -1236,7 +1301,7 @@ fn dump_printf_observations(
     expanded_target: &Item,
     printf: &crate::printf::EligiblePrintfCall<'_>,
     bindings: &HashMap<hir::HirId, hir::HirId>,
-    callables: &HashMap<DefId, u64>,
+    callables: &DefinitionCorrespondence,
     source_ast_to_hir: &utils::ir::AstToHir,
     target_ast_to_hir: &utils::ir::AstToHir,
     recovery_failure: PrintfRecoveryFailure,
@@ -1542,7 +1607,7 @@ fn dump_printf_observation(
     source: &Expr,
     target: &Expr,
     bindings: &HashMap<hir::HirId, hir::HirId>,
-    callables: &HashMap<DefId, u64>,
+    callables: &DefinitionCorrespondence,
     source_ast_to_hir: &utils::ir::AstToHir,
     target_ast_to_hir: &utils::ir::AstToHir,
     recovery_failure: PrintfRecoveryFailure,
@@ -1625,10 +1690,29 @@ fn type_tree_contains_local_identity(value: &TypeTree) -> bool {
     }
 }
 
+#[derive(Default)]
+struct DefinitionCorrespondence {
+    functions: HashMap<DefId, u64>,
+    values: HashMap<DefId, DefId>,
+}
+
+impl DefinitionCorrespondence {
+    fn value_id(&self, id: DefId) -> DefId {
+        self.values.get(&id).copied().unwrap_or(id)
+    }
+
+    fn resolution(&self, resolution: Res) -> Res {
+        match resolution {
+            Res::Def(kind, id) => Res::Def(kind, self.value_id(id)),
+            _ => resolution,
+        }
+    }
+}
+
 fn callable_correspondence(
     metadata: &ReplacementObservationMetadata,
     functions: &HashMap<String, SurfaceFunction<'_>>,
-) -> Result<HashMap<DefId, u64>, ObservationError> {
+) -> Result<DefinitionCorrespondence, ObservationError> {
     fn insert(
         result: &mut HashMap<DefId, u64>,
         def_id: DefId,
@@ -1737,18 +1821,23 @@ fn callable_correspondence(
             &stub.path,
         )?;
     }
-    Ok(result)
+    Ok(DefinitionCorrespondence {
+        functions: result,
+        values: HashMap::new(),
+    })
 }
 
 fn plain_statements(item: &Item) -> Vec<&Stmt> {
     struct Collector<'a>(Vec<&'a Stmt>);
     impl<'ast> Visitor<'ast> for Collector<'ast> {
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            if matches!(statement.kind, StmtKind::Empty | StmtKind::Item(_)) {
+            if matches!(statement.kind, StmtKind::Empty) {
                 return;
             }
             self.0.push(statement);
-            visit::walk_stmt(self, statement);
+            if !matches!(statement.kind, StmtKind::Item(_)) {
+                visit::walk_stmt(self, statement);
+            }
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
@@ -2404,7 +2493,7 @@ pub(crate) fn printf_rule_argument(
     let mut tree = ExpressionTree::default();
     tree.add(expression, None, ParentRole::Boundary, ast_to_hir, tcx);
     let bindings = HashMap::new();
-    let callables = HashMap::new();
+    let callables = DefinitionCorrespondence::default();
     let mut context = DumpContext::new(&bindings, &callables, ast_to_hir, tcx);
     let source_expression = context.expression(expression)?;
     let hir_expression = ast_to_hir.get_expr(expression.id, tcx)?;
@@ -2551,6 +2640,9 @@ pub(crate) fn select_rule_regions(
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
 ) -> Option<Vec<RuleRegion>> {
+    if matches!(statement.kind, StmtKind::Item(_)) {
+        return Some(vec![]);
+    }
     if statement_mentions_variadic_function(statement, ast_to_hir, tcx) {
         return None;
     }
@@ -2594,7 +2686,7 @@ pub(crate) fn select_rule_regions(
         .map(|region| {
             let root = tree.expressions[&region.root];
             let bindings = HashMap::new();
-            let callables = HashMap::new();
+            let callables = DefinitionCorrespondence::default();
             let mut context = DumpContext::new(&bindings, &callables, ast_to_hir, tcx);
             let source_expression = context.expression(root)?;
             let source_hir = ast_to_hir.get_expr(root.id, tcx)?;
@@ -3060,7 +3152,7 @@ fn align_expression<'a>(
     target: &'a Expr,
     selected: &SelectedExpressions<'_>,
     bindings: &HashMap<hir::HirId, hir::HirId>,
-    callables: &HashMap<DefId, u64>,
+    callables: &DefinitionCorrespondence,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
     mappings: &mut HashMap<NodeId, &'a Expr>,
@@ -3175,7 +3267,7 @@ fn align_expression<'a>(
                 && pair!(left_scrutinee, right_scrutinee)
                 && left_arms.len() == right_arms.len()
                 && left_arms.iter().zip(right_arms).all(|(left, right)| {
-                    patterns_correspond(&left.pat, &right.pat, bindings, ast_to_hir, tcx)
+                    patterns_correspond(&left.pat, &right.pat, bindings, callables, ast_to_hir, tcx)
                         && align_optional_expression(
                             left.guard.as_deref(),
                             right.guard.as_deref(),
@@ -3324,7 +3416,7 @@ fn align_optional_expression<'a>(
     target: Option<&'a Expr>,
     selected: &SelectedExpressions<'_>,
     bindings: &HashMap<hir::HirId, hir::HirId>,
-    callables: &HashMap<DefId, u64>,
+    callables: &DefinitionCorrespondence,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
     mappings: &mut HashMap<NodeId, &'a Expr>,
@@ -3344,7 +3436,7 @@ fn align_block<'a>(
     target: &'a rustc_ast::Block,
     selected: &SelectedExpressions<'_>,
     bindings: &HashMap<hir::HirId, hir::HirId>,
-    callables: &HashMap<DefId, u64>,
+    callables: &DefinitionCorrespondence,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
     mappings: &mut HashMap<NodeId, &'a Expr>,
@@ -3360,8 +3452,14 @@ fn align_block<'a>(
                     source, target, selected, bindings, callables, ast_to_hir, tcx, mappings,
                 ),
                 (StmtKind::Let(source), StmtKind::Let(target)) => {
-                    patterns_correspond(&source.pat, &target.pat, bindings, ast_to_hir, tcx)
-                        && local_annotations_correspond(source, target, bindings, ast_to_hir, tcx)
+                    patterns_correspond(
+                        &source.pat,
+                        &target.pat,
+                        bindings,
+                        callables,
+                        ast_to_hir,
+                        tcx,
+                    ) && local_annotations_correspond(source, target, bindings, ast_to_hir, tcx)
                         && match (&source.kind, &target.kind) {
                             (rustc_ast::LocalKind::Decl, rustc_ast::LocalKind::Decl) => true,
                             (
@@ -3426,6 +3524,7 @@ fn patterns_correspond(
     source: &rustc_ast::Pat,
     target: &rustc_ast::Pat,
     bindings: &HashMap<hir::HirId, hir::HirId>,
+    callables: &DefinitionCorrespondence,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
 ) -> bool {
@@ -3441,7 +3540,9 @@ fn patterns_correspond(
                 (Some((_, source)), Some((_, target))) => bindings.get(&source) == Some(&target),
                 (None, None) => {
                     resolved_pattern(source.id, ast_to_hir, tcx).is_some_and(|resolution| {
-                        resolved_pattern(target.id, ast_to_hir, tcx) == Some(resolution)
+                        resolved_pattern(target.id, ast_to_hir, tcx)
+                            .map(|target| callables.resolution(target))
+                            == Some(callables.resolution(resolution))
                     })
                 }
                 _ => false,
@@ -3454,23 +3555,27 @@ fn patterns_correspond(
                 ExprKind::Unary(rustc_ast::UnOp::Neg, _),
             ) => semantic_literal_expression(source, target, None, ast_to_hir, tcx),
             _ => resolved_pattern(source.id, ast_to_hir, tcx).is_some_and(|resolution| {
-                resolved_pattern(target.id, ast_to_hir, tcx) == Some(resolution)
+                resolved_pattern(target.id, ast_to_hir, tcx)
+                    .map(|target| callables.resolution(target))
+                    == Some(callables.resolution(resolution))
             }),
         },
         (PatKind::Path(..), PatKind::Path(..)) => resolved_pattern(source.id, ast_to_hir, tcx)
             .is_some_and(|resolution| {
-                resolved_pattern(target.id, ast_to_hir, tcx) == Some(resolution)
+                resolved_pattern(target.id, ast_to_hir, tcx)
+                    .map(|target| callables.resolution(target))
+                    == Some(callables.resolution(resolution))
             }),
         (PatKind::Tuple(source), PatKind::Tuple(target))
         | (PatKind::Or(source), PatKind::Or(target)) => {
             source.len() == target.len()
                 && source.iter().zip(target).all(|(source, target)| {
-                    patterns_correspond(source, target, bindings, ast_to_hir, tcx)
+                    patterns_correspond(source, target, bindings, callables, ast_to_hir, tcx)
                 })
         }
         (PatKind::Ref(source, source_mut), PatKind::Ref(target, target_mut)) => {
             source_mut == target_mut
-                && patterns_correspond(source, target, bindings, ast_to_hir, tcx)
+                && patterns_correspond(source, target, bindings, callables, ast_to_hir, tcx)
         }
         _ => false,
     }
@@ -3515,7 +3620,7 @@ fn semantic_literal_expression(
         return false;
     };
     let bindings = HashMap::new();
-    let callables = HashMap::new();
+    let callables = DefinitionCorrespondence::default();
     let mut context = DumpContext::new(&bindings, &callables, ast_to_hir, tcx);
     context.literal_with_type(source, forced_type) == context.literal_with_type(target, forced_type)
 }
@@ -3592,7 +3697,7 @@ fn resolved_struct_field(
 fn method_calls_correspond(
     source: &Expr,
     target: &Expr,
-    callables: &HashMap<DefId, u64>,
+    callables: &DefinitionCorrespondence,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
 ) -> bool {
@@ -3612,8 +3717,9 @@ fn method_calls_correspond(
     };
     source == target
         || callables
+            .functions
             .get(&source)
-            .is_some_and(|logical| callables.get(&target) == Some(logical))
+            .is_some_and(|logical| callables.functions.get(&target) == Some(logical))
 }
 
 fn semantic_types_equal(
@@ -3632,7 +3738,7 @@ fn paths_correspond(
     source: &Expr,
     target: &Expr,
     bindings: &HashMap<hir::HirId, hir::HirId>,
-    callables: &HashMap<DefId, u64>,
+    callables: &DefinitionCorrespondence,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
 ) -> bool {
@@ -3656,10 +3762,11 @@ fn paths_correspond(
     match (source_res, target_res) {
         (Res::Local(source), Res::Local(target)) => bindings.get(&source) == Some(&target),
         (Res::Def(_, source), Res::Def(_, target)) => {
-            source == target
+            callables.value_id(source) == callables.value_id(target)
                 || callables
+                    .functions
                     .get(&source)
-                    .is_some_and(|logical| callables.get(&target) == Some(logical))
+                    .is_some_and(|logical| callables.functions.get(&target) == Some(logical))
         }
         _ => source_res == target_res,
     }
@@ -3672,7 +3779,7 @@ fn dump_observation(
     anchors: &[AnchorPair],
     lhs: bool,
     bindings: &HashMap<hir::HirId, hir::HirId>,
-    callables: &HashMap<DefId, u64>,
+    callables: &DefinitionCorrespondence,
     ast_to_hir: &utils::ir::AstToHir,
     tcx: TyCtxt<'_>,
 ) -> Option<Observation> {
@@ -3718,13 +3825,13 @@ pub(crate) fn semantic_type_tree<'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> Option<TypeTree> {
     let bindings = HashMap::new();
-    let callables = HashMap::new();
+    let callables = DefinitionCorrespondence::default();
     DumpContext::new(&bindings, &callables, ast_to_hir, tcx).type_tree(value)
 }
 
 struct DumpContext<'a, 'tcx> {
     reverse_bindings: HashMap<hir::HirId, hir::HirId>,
-    callables: &'a HashMap<DefId, u64>,
+    callables: &'a DefinitionCorrespondence,
     ast_to_hir: &'a utils::ir::AstToHir,
     tcx: TyCtxt<'tcx>,
     source_side: bool,
@@ -3742,7 +3849,7 @@ struct DumpContext<'a, 'tcx> {
 impl<'a, 'tcx> DumpContext<'a, 'tcx> {
     fn new(
         bindings: &'a HashMap<hir::HirId, hir::HirId>,
-        callables: &'a HashMap<DefId, u64>,
+        callables: &'a DefinitionCorrespondence,
         ast_to_hir: &'a utils::ir::AstToHir,
         tcx: TyCtxt<'tcx>,
     ) -> Self {
@@ -4267,7 +4374,8 @@ impl<'a, 'tcx> DumpContext<'a, 'tcx> {
     }
 
     fn definition_identity(&mut self, kind: hir::def::DefKind, id: DefId) -> Option<ValueIdentity> {
-        if let Some(logical) = self.callables.get(&id) {
+        let id = self.callables.value_id(id);
+        if let Some(logical) = self.callables.functions.get(&id) {
             if !self.source_side && !self.function_ids.contains_key(logical) {
                 return None;
             }
@@ -6055,7 +6163,7 @@ unsafe fn read(a: i64, p: &[u32], c: u32, survivor: i32) {
             collect_functions(&surface.items, &mut vec![], &mut functions);
             let item = functions[function];
             let bindings = HashMap::new();
-            let callables = HashMap::new();
+            let callables = DefinitionCorrespondence::default();
             let mut context = DumpContext::new(&bindings, &callables, &ast_to_hir, tcx);
             plain_statements(item)
                 .iter()
@@ -6169,7 +6277,7 @@ unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
             collect_functions(&surface.items, &mut vec![], &mut functions);
             let ItemKind::Fn(box value) = &functions[function].kind else { unreachable!() };
             let bindings = HashMap::new();
-            let callables = HashMap::new();
+            let callables = DefinitionCorrespondence::default();
             let mut context = DumpContext::new(&bindings, &callables, &ast_to_hir, tcx);
             value
                 .sig
@@ -6198,7 +6306,7 @@ unsafe fn f(p: *const i32) { printf(b"%d\0" as *const u8 as *const i8, *p); }
             collect_functions(&surface.items, &mut vec![], &mut functions);
             let ItemKind::Fn(box value) = &functions[function].kind else { unreachable!() };
             let bindings = HashMap::new();
-            let callables = HashMap::new();
+            let callables = DefinitionCorrespondence::default();
             let mut context = DumpContext::new(&bindings, &callables, &ast_to_hir, tcx);
             context.block(value.body.as_ref().unwrap()).unwrap()
         })
@@ -7666,6 +7774,113 @@ unsafe fn __proctor_source_read(left: *const Node, offset: Offset) -> i32 {
             assert!(
                 !encoded.contains(original),
                 "leaked `{original}` in {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_local_values_keep_identity_and_skip_initializer_observations() {
+        for (before, after, target_type) in [
+            (
+                "*pointer.add(STEP + OFFSET)",
+                "pointer[STEP + OFFSET]",
+                "&[i32]",
+            ),
+            (
+                "*pointer + STEP as i32 + OFFSET as i32",
+                "*pointer + STEP as i32 + OFFSET as i32",
+                "&i32",
+            ),
+        ] {
+            let source = format!(
+                r#"
+unsafe fn source_copy(pointer: *const i32) -> i32 {{
+    #[proctor(0)] const STEP: usize = {{ let original = &0usize as *const usize; unsafe {{ *original }} }};
+    #[proctor(1)] static OFFSET: usize = {{ let original = &1usize as *const usize; unsafe {{ *original }} }};
+    #[proctor(2)] {before}
+}}
+unsafe fn target(pointer: {target_type}) -> i32 {{
+    #[proctor(0)] const STEP: usize = {{ let rewritten = 0; rewritten }};
+    #[proctor(1)] static OFFSET: usize = {{ let rewritten = 1; rewritten }};
+    #[proctor(2)] {after}
+}}
+"#
+            );
+            let document = extract_case(&source, "source_copy", "target", vec![0, 1, 2]).unwrap();
+            assert_eq!(document.observations.len(), 1, "{document:?}");
+            if before.contains(".add(") {
+                for expression in [
+                    &document.observations[0].source_expression,
+                    &document.observations[0].target_expression,
+                ] {
+                    let encoded = serde_json::to_string(expression).unwrap();
+                    assert!(encoded.contains("<const0>"), "{encoded}");
+                    assert!(encoded.contains("<static0>"), "{encoded}");
+                    assert!(!encoded.contains("<const1>"), "{encoded}");
+                    assert!(!encoded.contains("<static1>"), "{encoded}");
+                    assert!(!encoded.contains("original"));
+                    assert!(!encoded.contains("rewritten"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shadowed_local_value_names_pair_by_declaration_label() {
+        let source = r#"
+unsafe fn source_copy(pointer: *const i32) -> i32 {
+    #[proctor(0)] {
+        #[proctor(1)] const STEP: usize = 0;
+        #[proctor(2)] *pointer.add(STEP);
+    }
+    #[proctor(3)] {
+        #[proctor(4)] const STEP: usize = 1;
+        #[proctor(5)] *pointer.add(STEP)
+    }
+}
+unsafe fn target(pointer: &[i32]) -> i32 {
+    #[proctor(0)] {
+        #[proctor(1)] const STEP: usize = 0;
+        #[proctor(2)] pointer[STEP];
+    }
+    #[proctor(3)] {
+        #[proctor(4)] const STEP: usize = 1;
+        #[proctor(5)] pointer[STEP]
+    }
+}
+"#;
+        let document = extract_case(source, "source_copy", "target", vec![1, 2, 4, 5]).unwrap();
+        assert_eq!(document.observations.len(), 2, "{document:?}");
+        for observation in document.observations {
+            for expression in [observation.source_expression, observation.target_expression] {
+                let encoded = serde_json::to_string(&expression).unwrap();
+                assert!(encoded.contains("<const0>"), "{encoded}");
+                assert!(!encoded.contains("<const1>"), "{encoded}");
+            }
+        }
+    }
+
+    #[test]
+    fn function_local_value_correspondence_requires_an_unchanged_labeled_header() {
+        let source = r#"
+unsafe fn source_copy(pointer: *const i32) -> i32 {
+    #[proctor(0)] const STEP: usize = 0;
+    #[proctor(1)] *pointer.add(STEP)
+}
+unsafe fn target(pointer: &[i32]) -> i32 {
+    #[proctor(0)] const STEP: usize = 0;
+    #[proctor(1)] pointer[STEP]
+}
+"#;
+        for changed in [
+            source.replacen("#[proctor(0)] const STEP", "#[proctor(2)] const STEP", 1),
+            source.replacen("const STEP: usize", "const STEP: u32", 1),
+        ] {
+            assert_eq!(
+                extract_case(&changed, "source_copy", "target", vec![1])
+                    .unwrap_err()
+                    .code,
+                "local_value_correspondence"
             );
         }
     }

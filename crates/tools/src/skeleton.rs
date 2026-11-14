@@ -978,6 +978,9 @@ fn collect_printf_templates(
     }
     impl<'ast> visit::Visitor<'ast> for Collector<'_, '_> {
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if matches!(statement.kind, StmtKind::Item(_)) {
+                return;
+            }
             if let Some(label) = statement_numeric_label(statement)
                 && let Some(call) = eligible_printf_statement(statement, self.ast_to_hir, self.tcx)
             {
@@ -1077,8 +1080,10 @@ fn collect_statement_pair_metadata<'tcx>(
                 variables: vec![],
                 tcx,
             };
-            collector.visit_stmt(statement);
-            collector.collect_hir_root(statement);
+            if !matches!(statement.kind, StmtKind::Item(_)) {
+                collector.visit_stmt(statement);
+                collector.collect_hir_root(statement);
+            }
             StatementPairMetadata {
                 label: *label,
                 before_statement: render_statement_group(std::slice::from_ref(*statement)),
@@ -1196,6 +1201,12 @@ struct KnownIneligibleBindingCollector<'a, 'tcx> {
 }
 
 impl<'ast> visit::Visitor<'ast> for KnownIneligibleBindingCollector<'_, '_> {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if !matches!(statement.kind, StmtKind::Item(_)) {
+            visit::walk_stmt(self, statement);
+        }
+    }
+
     fn visit_pat(&mut self, pattern: &'ast Pat) {
         if let Some(pattern) = self.ast_to_hir.get_pat(pattern.id, self.tcx)
             && let hir::PatKind::Binding(_, hir_id, ..) = pattern.kind
@@ -1213,6 +1224,9 @@ struct TargetLocalTypeCollector<'a> {
 
 impl<'ast> visit::Visitor<'ast> for TargetLocalTypeCollector<'_> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if matches!(statement.kind, StmtKind::Item(_)) {
+            return;
+        }
         if let StmtKind::Let(local) = &statement.kind
             && matches!(local.pat.kind, PatKind::Ident(_, _, None))
             && let Some(ty) = &local.ty
@@ -1236,6 +1250,9 @@ struct SourceLocalCatalogCollector<'a, 'tcx> {
 
 impl<'ast> visit::Visitor<'ast> for SourceLocalCatalogCollector<'_, '_> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if matches!(statement.kind, StmtKind::Item(_)) {
+            return;
+        }
         if self.error.is_some() {
             return;
         }
@@ -1297,7 +1314,9 @@ impl<'ast> visit::Visitor<'ast> for StatementByLabelCollector<'_, 'ast> {
         if let Some(label) = statement_numeric_label(statement) {
             self.statements.insert(label, statement);
         }
-        visit::walk_stmt(self, statement);
+        if !matches!(statement.kind, StmtKind::Item(_)) {
+            visit::walk_stmt(self, statement);
+        }
     }
 }
 
@@ -1347,6 +1366,12 @@ impl PointerOccurrenceCollector<'_, '_> {
 }
 
 impl<'ast> visit::Visitor<'ast> for PointerOccurrenceCollector<'_, '_> {
+    fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        if !matches!(statement.kind, StmtKind::Item(_)) {
+            visit::walk_stmt(self, statement);
+        }
+    }
+
     fn visit_pat(&mut self, pattern: &'ast Pat) {
         if matches!(pattern.kind, PatKind::Ident(..)) {
             match self.ast_to_hir.get_pat(pattern.id, self.tcx) {
@@ -1417,6 +1442,12 @@ impl HirPointerOccurrenceCollector<'_, '_> {
 }
 
 impl<'tcx> Visitor<'tcx> for HirPointerOccurrenceCollector<'_, 'tcx> {
+    fn visit_stmt(&mut self, statement: &'tcx hir::Stmt<'tcx>) {
+        if !matches!(statement.kind, hir::StmtKind::Item(_)) {
+            intravisit::walk_stmt(self, statement);
+        }
+    }
+
     fn visit_pat(&mut self, pattern: &'tcx hir::Pat<'tcx>) {
         if let hir::PatKind::Binding(_, hir_id, ..) = pattern.kind {
             self.add(hir_id);
@@ -1516,6 +1547,9 @@ impl<'ast> visit::Visitor<'ast> for BodyValidator<'_> {
             return;
         }
         if let StmtKind::Item(item) = &stmt.kind {
+            if crate::preservation::supported_local_item(item) {
+                return;
+            }
             self.error.get_or_insert_with(|| GenerationError {
                 kind: GenerationErrorKind::FunctionLocalItem,
                 function_path: self.function_path.to_owned(),
@@ -1592,11 +1626,14 @@ struct Labeler<'a> {
 
 impl MutVisitor for Labeler<'_> {
     fn flat_map_stmt(&mut self, mut stmt: Stmt) -> SmallVec<[Stmt; 1]> {
-        if matches!(stmt.kind, StmtKind::Item(_) | StmtKind::Empty) {
+        if matches!(stmt.kind, StmtKind::Empty) {
             return smallvec![stmt];
         }
         stmt_attrs_mut(&mut stmt).extend(utils::attr!("#[proctor({})]", self.next));
         self.next += 1;
+        if matches!(stmt.kind, StmtKind::Item(_)) {
+            return smallvec![stmt];
+        }
         mut_visit::walk_flat_map_stmt(self, stmt)
     }
 
@@ -1949,6 +1986,9 @@ struct PresentationBindingNormalizer<'a, 'tcx> {
 
 impl MutVisitor for PresentationBindingNormalizer<'_, '_> {
     fn visit_item(&mut self, item: &mut Item) {
+        if !matches!(item.kind, ItemKind::Fn(_)) {
+            return;
+        }
         if let ItemKind::Fn(function) = &mut item.kind
             && function.sig.decl.c_variadic()
         {
@@ -2787,6 +2827,9 @@ fn rule_binding_catalog(
     }
     impl<'ast> visit::Visitor<'ast> for Locals<'_, '_> {
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if matches!(statement.kind, StmtKind::Item(_)) {
+                return;
+            }
             if let StmtKind::Let(local) = &statement.kind
                 && matches!(local.pat.kind, PatKind::Ident(_, _, None))
                 && let Some(hir_pattern) = self.ast_to_hir.get_pat(local.pat.id, self.tcx)
@@ -2857,6 +2900,9 @@ fn rule_target_binding_catalog(
     }
     impl<'ast> visit::Visitor<'ast> for Locals<'_> {
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if matches!(statement.kind, StmtKind::Item(_)) {
+                return;
+            }
             if let StmtKind::Let(local) = &statement.kind
                 && matches!(local.pat.kind, PatKind::Ident(_, _, None))
             {
@@ -2883,6 +2929,12 @@ fn rule_type_syntax(
         tcx: TyCtxt<'tcx>,
     }
     impl<'ast> visit::Visitor<'ast> for Types<'_, '_> {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if !matches!(statement.kind, StmtKind::Item(_)) {
+                visit::walk_stmt(self, statement);
+            }
+        }
+
         fn visit_ty(&mut self, ty: &'ast Ty) {
             if let Some(hir) = self.ast_to_hir.get_ty(ty.id, self.tcx)
                 && let Some(normalized) = semantic_type_tree(
@@ -4339,6 +4391,12 @@ impl<'ast> visit::Visitor<'ast> for StatementClassifier<'_, '_> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
         let label = statement_numeric_label(statement)
             .expect("generation assigned every statement a label");
+        if let StmtKind::Item(item) = &statement.kind {
+            if matches!(item.kind, ItemKind::Static(..) | ItemKind::Const(..)) {
+                self.transformed.insert(label);
+            }
+            return;
+        }
         if !statement_is_preservable(
             statement,
             self.ast_to_hir,
@@ -4497,7 +4555,9 @@ struct SurfacePreservationCheck<'a, 'tcx> {
 
 impl<'ast> visit::Visitor<'ast> for SurfacePreservationCheck<'_, '_> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
-        if self.excluded_statements.contains(&statement.id) {
+        if self.excluded_statements.contains(&statement.id)
+            || matches!(statement.kind, StmtKind::Item(_))
+        {
             return;
         }
         if !self.ast_to_hir.local_map.contains_key(&statement.id)
@@ -4750,7 +4810,10 @@ impl<'tcx> HirPreservationCheck<'tcx, '_> {
 
 impl<'tcx> Visitor<'tcx> for HirPreservationCheck<'tcx, '_> {
     fn visit_stmt(&mut self, statement: &'tcx hir::Stmt<'tcx>) {
-        if !self.preservable || self.excluded_roots.contains(&statement.hir_id) {
+        if !self.preservable
+            || self.excluded_roots.contains(&statement.hir_id)
+            || matches!(statement.kind, hir::StmtKind::Item(_))
+        {
             return;
         }
         intravisit::walk_stmt(self, statement);
@@ -5016,7 +5079,12 @@ impl MutVisitor for Skeletonizer<'_, '_> {
             StmtKind::Expr(expr) | StmtKind::Semi(expr) => {
                 skeletonize_statement_expr(expr, self);
             }
-            StmtKind::Item(_) | StmtKind::Empty => {}
+            StmtKind::Item(item) => {
+                if matches!(item.kind, ItemKind::Static(..) | ItemKind::Const(..)) {
+                    set_initializer(item, P(todo_expr()));
+                }
+            }
+            StmtKind::Empty => {}
             StmtKind::MacCall(mac) => {
                 debug_assert!(requires_transformation);
                 let mut expr = todo_expr();

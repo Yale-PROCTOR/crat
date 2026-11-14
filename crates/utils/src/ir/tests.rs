@@ -89,6 +89,21 @@ fn run_test(code: &str) {
 }
 
 #[test]
+fn test_function_local_grouped_imports_and_const_arguments() {
+    run_test(
+        r#"
+        fn f() -> usize {
+            use core::{mem::{self, size_of, align_of}, hint::black_box};
+            use core::mem::{};
+            const N: usize = 3;
+            let array = core::array::from_fn::<u8, N, _>(|_| 0);
+            black_box(array).len() + size_of::<u8>() + align_of::<u8>()
+        }
+    "#,
+    );
+}
+
+#[test]
 fn test_source_valid_trailing_generic_defaults() {
     let definitions = r#"
         pub struct Pair<T, U = T>(T, U);

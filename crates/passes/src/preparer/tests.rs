@@ -679,16 +679,16 @@ fn target() -> i32 {
 }
 "#,
         r#"
+const LOCAL_CONST_0: i32 = 1;
 static LOCAL_STATIC_0: i32 = 3;
 fn binders() -> i32 {
-    const LOCAL_CONST: i32 = 1;
     fn LOCAL_FN() -> i32 { 2 }
-    LOCAL_CONST + LOCAL_FN() + LOCAL_STATIC_0
+    LOCAL_CONST_0 + LOCAL_FN() + LOCAL_STATIC_0
 }
-static LOCAL_CONST_0: i32 = 4;
+static LOCAL_CONST_1: i32 = 4;
 static LOCAL_FN_0: i32 = 5;
 static LOCAL_STATIC_1: i32 = 6;
-fn target() -> i32 { LOCAL_CONST_0 + LOCAL_FN_0 + LOCAL_STATIC_1 }
+fn target() -> i32 { LOCAL_CONST_1 + LOCAL_FN_0 + LOCAL_STATIC_1 }
 "#,
     );
 }
@@ -1101,8 +1101,8 @@ fn f() -> i32 { CELL }
 }
 
 #[test]
-fn rejects_function_scoped_const_dependency() {
-    let error = transform(
+fn hoists_function_scoped_const_and_static_dependencies_together() {
+    assert_prepares_to(
         r#"
 fn f() -> usize {
     const N: usize = 4;
@@ -1110,22 +1110,90 @@ fn f() -> usize {
     DATA.len()
 }
 "#,
-    )
-    .unwrap_err();
-    let PrepareError::ScopedDependency {
-        static_name,
-        dependency_name,
-        ..
-    } = error
-    else {
-        panic!("unexpected error: {error}")
-    };
-    assert_eq!(static_name, "DATA");
-    assert_eq!(dependency_name, "N");
+        r#"
+const N: usize = 4;
+static DATA: [u8; N] = [0; N];
+fn f() -> usize { DATA.len() }
+"#,
+    );
 }
 
 #[test]
-fn rejects_scoped_type_constructor_function_and_module_dependencies() {
+fn renames_const_references_in_patterns_array_types_and_initializers() {
+    assert_prepares_to(
+        r#"
+const N: usize = 1;
+fn f(value: usize) -> usize {
+    const N: usize = 2;
+    const LIMIT: usize = N + 1;
+    let data: [u8; N] = [0; N];
+    let repeated = [0_u8; LIMIT];
+    let generated = core::array::from_fn::<u8, N, _>(|_| 0);
+    match value { N => data.len() + repeated.len() + generated.len(), _ => N }
+}
+"#,
+        r#"
+const N: usize = 1;
+const N_0: usize = 2;
+const LIMIT: usize = N_0 + 1;
+fn f(value: usize) -> usize {
+    let data: [u8; N_0] = [0; N_0];
+    let repeated = [0_u8; LIMIT];
+    let generated = core::array::from_fn::<u8, N_0, _>(|_| 0);
+    match value { N_0 => { data.len() + repeated.len() + generated.len() }, _ => { N_0 } }
+}
+"#,
+    );
+}
+
+#[test]
+fn retains_transitive_ineligible_value_dependencies_and_hoists_independent_consts() {
+    assert_prepares_to(
+        r#"
+fn f() -> u8 {
+    type Local = u8;
+    const FIRST: Local = 1;
+    const SECOND: u8 = FIRST + 1;
+    static THIRD: u8 = SECOND;
+    const INDEPENDENT: u8 = 9;
+    FIRST + SECOND + THIRD + INDEPENDENT
+}
+"#,
+        r#"
+const INDEPENDENT: u8 = 9;
+fn f() -> u8 {
+    type Local = u8;
+    const FIRST: Local = 1;
+    const SECOND: u8 = FIRST + 1;
+    static THIRD: u8 = SECOND;
+    FIRST + SECOND + THIRD + INDEPENDENT
+}
+"#,
+    );
+}
+
+#[test]
+fn const_hoisting_keeps_modules_and_inline_const_expressions() {
+    assert_prepares_to(
+        r#"
+mod inner {
+    pub fn f<T>() -> usize {
+        const COUNT: usize = 2;
+        COUNT + const { core::mem::size_of::<T>() }
+    }
+}
+"#,
+        r#"
+mod inner {
+    const COUNT: usize = 2;
+    pub fn f<T>() -> usize { COUNT + const { core::mem::size_of::<T>() } }
+}
+"#,
+    );
+}
+
+#[test]
+fn keeps_scoped_type_constructor_function_and_module_dependencies_local() {
     let cases = [
         (
             r#"fn f() { struct Local { value: i32 } static DATA: Local = Local { value: 1 }; let _ = DATA.value; }"#,
@@ -1145,22 +1213,83 @@ fn rejects_scoped_type_constructor_function_and_module_dependencies() {
         ),
     ];
     for (code, expected_dependency) in cases {
-        let error = transform(code).unwrap_err();
-        let PrepareError::ScopedDependency {
-            static_name,
-            dependency_name,
-            ..
-        } = error
-        else {
-            panic!("unexpected error: {error}")
-        };
-        assert_eq!(static_name, "DATA");
-        assert_eq!(dependency_name, expected_dependency);
+        let prepared = transform_and_compile(code);
+        assert!(prepared.find("fn f").unwrap() < prepared.find("static DATA").unwrap());
+        assert!(prepared.contains(expected_dependency));
     }
 }
 
 #[test]
-fn rejects_function_scoped_explicit_and_glob_import_dependencies() {
+fn unnamed_consts_remain_local_while_named_consts_are_hoisted() {
+    assert_prepares_to(
+        "fn f() -> usize { const _: () = (); const COUNT: usize = 2; COUNT }",
+        "const COUNT: usize = 2; fn f() -> usize { const _: () = (); COUNT }",
+    );
+}
+
+#[test]
+fn module_const_initializers_keep_existing_nested_static_hoisting() {
+    assert_prepares_to(
+        "const MAKE: fn() -> i32 = { fn helper() -> i32 { static VALUE: i32 = 1; VALUE } helper }; fn f() -> i32 { MAKE() }",
+        "static VALUE: i32 = 1; const MAKE: fn() -> i32 = { fn helper() -> i32 { VALUE } helper }; fn f() -> i32 { MAKE() }",
+    );
+}
+
+#[test]
+fn missing_const_path_and_pattern_mappings_are_errors() {
+    for missing_pattern in [false, true] {
+        let code = source(
+            "fn f(value: i32) -> i32 { const CELL: i32 = 1; match value { CELL => CELL, _ => 0 } }",
+        );
+        utils::compilation::run_compiler_on_str(&code, |tcx| {
+            let mut krate = utils::ast::expanded_ast(tcx);
+            let mut ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
+            let mut discovery = Discovery::new(tcx, &ast_to_hir);
+            discovery.discover_crate(&krate);
+            assert!(discovery.error.is_none());
+            let lifts = discovery.lifts.clone();
+            drop(discovery);
+            if missing_pattern {
+                struct PatternFinder(Option<ast::NodeId>);
+                impl<'ast> visit::Visitor<'ast> for PatternFinder {
+                    fn visit_pat(&mut self, pattern: &'ast ast::Pat) {
+                        if let ast::PatKind::Ident(_, ident, _) = &pattern.kind
+                            && ident.name.as_str() == "CELL"
+                        {
+                            self.0 = Some(pattern.id);
+                        }
+                        visit::walk_pat(self, pattern);
+                    }
+                }
+                let mut finder = PatternFinder(None);
+                finder.visit_crate(&krate);
+                ast_to_hir.local_map.remove(&finder.0.unwrap());
+            } else {
+                let span = ast_to_hir
+                    .path_span_to_res
+                    .iter()
+                    .find_map(|(span, resolution)| {
+                        matches!(resolution, Res::Def(DefKind::Const, definition)
+                        if definition.as_local() == Some(lifts[0].def_id))
+                        .then_some(*span)
+                    })
+                    .unwrap();
+                ast_to_hir.path_span_to_res.remove(&span);
+            }
+            let error = validate_use_mappings(&krate, &lifts, &ast_to_hir, tcx).unwrap_err();
+            assert_eq!(
+                error,
+                PrepareError::MissingMapping {
+                    construct: "use of local const `CELL`".to_owned(),
+                }
+            );
+        })
+        .unwrap();
+    }
+}
+
+#[test]
+fn keeps_function_scoped_explicit_and_glob_import_dependencies_local() {
     for import in ["use crate::source::N as LOCAL_N;", "use crate::source::*;"] {
         let name = if import.contains("LOCAL_N") {
             "LOCAL_N"
@@ -1177,10 +1306,63 @@ fn f() -> usize {{
 }}
 "#
         );
-        let error = transform(&code).unwrap_err();
-        assert!(matches!(error, PrepareError::ScopedDependency { .. }));
-        assert!(error.to_string().contains(name), "{error}");
+        assert_prepares_to(&code, &code);
     }
+}
+
+#[test]
+fn grouped_local_imports_keep_value_dependencies_in_scope() {
+    for import in [
+        "use crate::source::{N as LOCAL_N};",
+        "use crate::{source::{N as LOCAL_N}};",
+        "use crate::source::{self as local, N as LOCAL_N};",
+    ] {
+        let code = format!(
+            r#"
+mod source {{ pub const N: usize = 2; }}
+fn f() -> usize {{
+    {import}
+    const COUNT: usize = LOCAL_N;
+    static DATA: [u8; COUNT] = [0; COUNT];
+    DATA.len()
+}}
+"#
+        );
+        assert_prepares_to(&code, &code);
+    }
+}
+
+#[test]
+fn grouped_imports_inside_value_initializers_move_with_the_value() {
+    assert_prepares_to(
+        "fn f() -> usize { const C: usize = { use core::mem::{size_of, align_of}; size_of::<u8>() + align_of::<u8>() }; C }",
+        "const C: usize = { use core::mem::{size_of, align_of}; size_of::<u8>() + align_of::<u8>() }; fn f() -> usize { C }",
+    );
+}
+
+#[test]
+fn grouped_imports_inside_value_initializers_keep_outer_alias_dependencies_local() {
+    let code = "fn f() -> usize { use core::mem as scoped; const C: usize = { use scoped::{size_of, align_of}; size_of::<u8>() + align_of::<u8>() }; C }";
+    assert_prepares_to(code, code);
+}
+
+#[test]
+fn empty_grouped_import_prefixes_keep_the_value_in_scope() {
+    for import in [
+        "use scoped::{};",
+        "use core::mem::{};",
+        "use core::{mem::{}};",
+        "use core::{mem::{}, cmp::max};",
+    ] {
+        let code = format!(
+            "fn f() -> usize {{ use core::mem as scoped; const C: usize = {{ {import} 1 }}; C }}"
+        );
+        assert_prepares_to(&code, &code);
+    }
+    assert_prepares_to(
+        "fn f() -> usize { const C: usize = { use {}; 1 }; C }",
+        "const C: usize = { use {}; 1 }; fn f() -> usize { C }",
+    );
 }
 
 #[test]
@@ -1452,15 +1634,16 @@ fn f() -> usize {
 }
 
 #[test]
-fn one_invalid_static_rejects_the_complete_unchanged_ast() {
+fn one_ineligible_static_keeps_its_scope_while_eligible_items_are_hoisted() {
     let code = source(
         r#"
+mod source { pub const N: usize = 2; }
 fn good(x: i32) -> i32 {
     static GOOD: i32 = 1;
     match x { 0 => GOOD, _ => 2 }
 }
 fn bad() -> usize {
-    const N: usize = 2;
+    use crate::source::N;
     static BAD: [u8; N] = [0; N];
     BAD.len()
 }
@@ -1495,17 +1678,13 @@ fn bad() -> usize {
         assert_eq!(before, pprust::crate_to_string_for_macros(&krate));
     })
     .unwrap();
-    let error = utils::compilation::run_compiler_on_str(&code, prepare)
+    let prepared = utils::compilation::run_compiler_on_str(&code, prepare)
         .unwrap()
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        PrepareError::ScopedDependency {
-            static_name,
-            dependency_name,
-            ..
-        } if static_name == "BAD" && dependency_name == "N"
-    ));
+        .unwrap()
+        .code;
+    utils::compilation::run_compiler_on_str(&prepared, utils::type_check).unwrap();
+    assert!(prepared.find("static GOOD").unwrap() < prepared.find("fn good").unwrap());
+    assert!(prepared.find("fn bad").unwrap() < prepared.find("static BAD").unwrap());
 }
 
 #[test]
@@ -1607,10 +1786,7 @@ fn combined(c: i32) -> usize {
     match c { 0 => (isalpha(c) as usize) + DATA.len(), _ => DATA.len() }
 }
 "#;
-    assert!(matches!(
-        transform_result(scoped),
-        Err(PrepareError::ScopedDependency { .. })
-    ));
+    assert!(transform_result(scoped).is_ok());
 
     let direct_async = r#"
 fn isalpha(c: i32) -> i32 { c }
