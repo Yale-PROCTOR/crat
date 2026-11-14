@@ -33,6 +33,41 @@ pub(crate) fn function_signature(function: &rustc_ast::Fn) -> String {
     pprust::item_to_string(&item)
 }
 
+pub(crate) fn supported_local_item(item: &Item) -> bool {
+    matches!(
+        item.kind,
+        ItemKind::Static(..) | ItemKind::Const(..) | ItemKind::Use(..) | ItemKind::ForeignMod(..)
+    )
+}
+
+pub(crate) fn local_item_header(item: &Item) -> String {
+    let mut item = item.clone();
+    item.attrs
+        .retain(|attribute| !attribute.has_name(Symbol::intern("proctor")));
+    match &mut item.kind {
+        ItemKind::Static(value) => value.expr = None,
+        ItemKind::Const(value) => value.expr = None,
+        _ => {}
+    }
+    pprust::item_to_string(&item)
+}
+
+pub(crate) fn local_initializer_has_labels(item: &Item) -> bool {
+    struct Finder(bool);
+    impl<'ast> Visitor<'ast> for Finder {
+        fn visit_attribute(&mut self, attribute: &'ast Attribute) {
+            if !matches!(parse_label_attribute(attribute), Ok(None)) {
+                self.0 = true;
+            }
+        }
+    }
+    let mut finder = Finder(false);
+    if let Some(initializer) = crate::skeleton::initializer_expression(item) {
+        finder.visit_expr(initializer);
+    }
+    finder.0
+}
+
 pub(crate) fn has_unfilled_holes(item: &Item, view: Option<&SkeletonView>) -> bool {
     fn standard_macro(names: &[Symbol], expected: &str) -> bool {
         matches!(names, [name] if name.as_str() == expected)
@@ -874,6 +909,9 @@ impl LabelTreeCollector {
 }
 
 fn non_control_payload(statement: &Stmt) -> Option<&Expr> {
+    if let StmtKind::Item(item) = &statement.kind {
+        return crate::skeleton::initializer_expression(item);
+    }
     let (expression, role) = match &statement.kind {
         StmtKind::Let(local) => match &local.kind {
             LocalKind::Init(expression) | LocalKind::InitElse(expression, _) => {
@@ -1254,6 +1292,30 @@ fn canonicalize_transformed_group(
     preserved_shells: &HashSet<u32>,
     rule_applied: &HashSet<u32>,
 ) -> Result<(), PreservationError> {
+    if let StmtKind::Item(expected_item) = &expected.kind {
+        let [returned] = result_group else {
+            return Err(structural_error(
+                "local_item_expansion",
+                format!("local declaration at label {label} must remain exactly one item"),
+            ));
+        };
+        if !matches!(&returned.kind, StmtKind::Item(item) if local_item_header(item) == local_item_header(expected_item))
+        {
+            return Err(structural_error(
+                "local_item_header_mismatch",
+                format!("preserve the complete local declaration header at label {label}"),
+            ));
+        }
+        if let StmtKind::Item(item) = &returned.kind
+            && local_initializer_has_labels(item)
+        {
+            return Err(structural_error(
+                "opaque_initializer_labels",
+                format!("initializer at label {label} must not contain proctor labels"),
+            ));
+        }
+        return Ok(());
+    }
     if let StmtKind::Let(expected_local) = &expected.kind
         && let LocalKind::InitElse(_, expected_else) = &expected_local.kind
     {

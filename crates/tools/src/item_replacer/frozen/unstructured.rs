@@ -129,20 +129,21 @@ pub fn retain_frozen_functions(
             for item in &parsed.items {
                 let ItemKind::Fn(function) = &item.kind else { continue };
                 let name = function.ident.to_string();
-                let body = function
+                let implementation = function
                     .body
                     .as_ref()
-                    .filter(|body| !whole_function_stub(body));
+                    .filter(|body| !whole_function_stub(body))
+                    .map(|_| item);
                 candidates
                     .entry(name)
-                    .and_modify(|body| *body = None)
-                    .or_insert(body);
+                    .and_modify(|item| *item = None)
+                    .or_insert(implementation);
             }
             for function in &functions {
-                if let Some(Some(body)) = candidates.get(&function.record.name) {
+                if let Some(Some(item)) = candidates.get(&function.record.name) {
                     retained
                         .entry(function.record.id)
-                        .or_insert_with(|| (*body).clone());
+                        .or_insert_with(|| (*item).clone());
                 }
             }
         }
@@ -150,7 +151,7 @@ pub fn retain_frozen_functions(
             parse_crate(&frozen.target_source, ReplacementErrorKind::RewriteFailure)?;
         let mut stubbed_items = Vec::new();
         for function in functions {
-            let Some(body) = retained.remove(&function.record.id) else {
+            let Some(retained) = retained.remove(&function.record.id) else {
                 stubbed_items.push(function.record.id);
                 continue;
             };
@@ -158,8 +159,7 @@ pub fn retain_frozen_functions(
             let mut implementation = function_at_path(&candidate.items, &path)
                 .expect("frozen template contains every selected member")
                 .clone();
-            let ItemKind::Fn(output) = &mut implementation.kind else { unreachable!() };
-            output.body = Some(body);
+            copy_function_body(&mut implementation, &retained);
             replace_function_at_path(&mut candidate.items, &path, implementation)?;
         }
         Ok(RetainedFunctions {
@@ -167,6 +167,23 @@ pub fn retain_frozen_functions(
             stubbed_items,
         })
     })
+}
+
+fn copy_function_body(output: &mut Item, returned: &Item) {
+    output
+        .attrs
+        .retain(|attribute| attribute.style != rustc_ast::AttrStyle::Inner);
+    output.attrs.extend(
+        returned
+            .attrs
+            .iter()
+            .filter(|attribute| attribute.style == rustc_ast::AttrStyle::Inner)
+            .cloned(),
+    );
+    let (ItemKind::Fn(output), ItemKind::Fn(returned)) = (&mut output.kind, &returned.kind) else {
+        unreachable!()
+    };
+    output.body = returned.body.clone();
 }
 
 pub(super) fn whole_function_stub(body: &rustc_ast::Block) -> bool {
@@ -226,70 +243,23 @@ pub fn replace_unstructured_scc(
             parse_crate(&frozen.target_source, ReplacementErrorKind::RewriteFailure)?;
         for (function, requested) in functions.iter().zip(&items) {
             let transformed = &returned[&requested.name];
-            let expected = one_item(&function.record.baseline.skeleton)?;
-            let ItemKind::Fn(box body) = &transformed.kind else { unreachable!() };
-            let mut check = BodyCheck { problem: None };
-            if let Some(block) = &body.body {
-                check.visit_block(block);
-            }
-            if !transformed.attrs.is_empty()
-                && transformed
-                    .attrs
-                    .iter()
-                    .map(pprust::attribute_to_string)
-                    .collect::<Vec<_>>()
-                    != expected
-                        .attrs
-                        .iter()
-                        .map(pprust::attribute_to_string)
-                        .collect::<Vec<_>>()
-            {
-                check.problem = Some("do not introduce or change function attributes");
-            }
-            if let Some(problem) = check.problem {
-                return Err(item_error(
-                    ReplacementErrorKind::InvalidTransformation,
-                    requested,
-                    problem.to_owned(),
-                ));
-            }
-            let mut header = compose_implementation(&expected, transformed, requested)?;
-            let (ItemKind::Fn(expected_fn), ItemKind::Fn(transformed_fn)) =
-                (&expected.kind, &transformed.kind)
-            else {
-                unreachable!()
-            };
-            validate_transformed_header(expected_fn, transformed_fn, requested)?;
-            let mut expected_header = expected.clone();
-            for item in [&mut header, &mut expected_header] {
-                let ItemKind::Fn(box body) = &mut item.kind else { unreachable!() };
-                body.body = Some(parse_body("{ todo!() }")?);
-                TypeParenRemover.visit_item(item);
-            }
-            if pprust::item_to_string(&header) != pprust::item_to_string(&expected_header)
-                || !matches!(body.sig.header.safety, Safety::Unsafe(_))
-                || matches!(body.sig.header.constness, rustc_ast::Const::Yes(_))
-            {
-                return Err(item_error(
-                    ReplacementErrorKind::InvalidTransformation,
-                    requested,
-                    "copy the exact target signature, including parameter names, types, and lifetimes"
-                        .to_owned(),
-                ));
-            }
             let path = path_segments(&function.record.path);
             let stub = function_at_path(&candidate.items, &path)
                 .expect("frozen template contains every selected member");
             let mut implementation = stub.clone();
+            copy_function_body(&mut implementation, transformed);
             let ItemKind::Fn(box implementation_fn) = &mut implementation.kind else {
                 unreachable!()
             };
-            implementation_fn.body = body.body.clone();
-            if crate::preservation::has_unfilled_holes(&implementation, None) {
+            if implementation_fn
+                .body
+                .as_ref()
+                .is_none_or(|body| whole_function_stub(body))
+            {
                 return Err(item_error(
                     ReplacementErrorKind::InvalidTransformation,
                     requested,
-                    "complete all unfilled transformation holes".to_owned(),
+                    "replace the generated whole-function todo stub".to_owned(),
                 ));
             }
             replace_function_at_path(&mut candidate.items, &path, implementation)?;
@@ -302,26 +272,4 @@ pub fn replace_unstructured_scc(
                 .collect(),
         })
     })
-}
-
-struct BodyCheck {
-    problem: Option<&'static str>,
-}
-
-impl<'ast> Visitor<'ast> for BodyCheck {
-    fn visit_item(&mut self, _item: &'ast Item) {
-        self.problem = Some("do not define additional items inside a function body");
-    }
-
-    fn visit_attribute(&mut self, _attribute: &'ast Attribute) {
-        self.problem = Some("do not introduce proctor labels or other body attributes");
-    }
-
-    fn visit_expr(&mut self, expression: &'ast Expr) {
-        if matches!(&expression.kind, ExprKind::Block(block, _) if matches!(block.rules, BlockCheckMode::Unsafe(_)))
-        {
-            self.problem = Some("do not introduce explicit unsafe blocks");
-        }
-        visit::walk_expr(self, expression);
-    }
 }

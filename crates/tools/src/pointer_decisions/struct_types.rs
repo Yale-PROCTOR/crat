@@ -7,8 +7,8 @@ use rustc_ast::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::{
     self as hir,
-    def::Res,
-    intravisit::{self, Visitor},
+    def::{DefKind, Res},
+    intravisit::{self, Visitor, VisitorExt},
 };
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_middle::ty::{self, TyCtxt, TyKind};
@@ -116,6 +116,23 @@ pub(super) fn foreign_types(
         }
 
         fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
+            if self
+                .tcx
+                .opt_local_parent(item.owner_id.def_id)
+                .is_some_and(|parent| self.tcx.def_kind(parent) != DefKind::Mod)
+            {
+                let header_type = match item.kind {
+                    hir::ItemKind::Static(_, _, ty, _) | hir::ItemKind::Const(_, _, ty, _) => {
+                        Some(ty)
+                    }
+                    _ => None,
+                };
+                if let Some(ty) = header_type {
+                    let previous = std::mem::replace(&mut self.fixed_header, true);
+                    self.visit_ty_unambig(ty);
+                    self.fixed_header = previous;
+                }
+            }
             if let hir::ItemKind::Fn { sig, generics, .. } = item.kind
                 && self
                     .tcx
@@ -124,10 +141,10 @@ pub(super) fn foreign_types(
                     .iter()
                     .any(|parameter| matches!(parameter.kind, ty::GenericParamDefKind::Type { .. }))
             {
-                self.fixed_header = true;
+                let previous = std::mem::replace(&mut self.fixed_header, true);
                 intravisit::walk_fn_decl(self, sig.decl);
                 intravisit::walk_generics(self, generics);
-                self.fixed_header = false;
+                self.fixed_header = previous;
             }
             intravisit::walk_item(self, item);
         }

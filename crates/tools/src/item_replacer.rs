@@ -4,8 +4,8 @@ use std::{
 };
 
 use rustc_ast::{
-    AttrKind, Attribute, BindingMode, BlockCheckMode, ByRef, Crate, Expr, ExprKind, Extern,
-    FnRetTy, GenericParamKind, Item, ItemKind, NodeId, PatKind, Safety, Stmt, StmtKind, Ty, TyKind,
+    AttrKind, Attribute, BindingMode, ByRef, Crate, Expr, ExprKind, Extern, FnRetTy,
+    GenericParamKind, Item, ItemKind, NodeId, PatKind, Safety, Stmt, StmtKind, Ty, TyKind,
     mut_visit::{self, MutVisitor},
     ptr::P,
     visit::{self, Visitor},
@@ -764,6 +764,14 @@ fn prepare_transformations(
 struct SafetyNormalizer;
 
 impl MutVisitor for SafetyNormalizer {
+    fn flat_map_stmt(&mut self, statement: Stmt) -> SmallVec<[Stmt; 1]> {
+        if matches!(statement.kind, StmtKind::Item(_)) {
+            SmallVec::from_buf([statement])
+        } else {
+            mut_visit::walk_flat_map_stmt(self, statement)
+        }
+    }
+
     fn visit_item(&mut self, item: &mut Item) {
         if let ItemKind::Fn(box function) = &mut item.kind
             && function.body.is_some()
@@ -1056,6 +1064,21 @@ fn validate_supported_transformation(
     unstructured: bool,
 ) -> Result<(), ReplacementError> {
     let ItemKind::Fn(box function) = &item.kind else { unreachable!() };
+    if unstructured {
+        let expected = frozen::one_item(&requested.view.skeleton)?;
+        let ItemKind::Fn(expected) = &expected.kind else { unreachable!() };
+        if crate::preservation::function_signature(function)
+            != crate::preservation::function_signature(expected)
+        {
+            return Err(item_error(
+                ReplacementErrorKind::InvalidTransformation,
+                requested,
+                "copy the complete frozen function signature, including bounds and where clauses"
+                    .to_owned(),
+            ));
+        }
+        return Ok(());
+    }
     if function.sig.header.coroutine_kind.is_some() {
         return Err(item_error(
             ReplacementErrorKind::InvalidTransformation,
@@ -1077,25 +1100,8 @@ fn validate_supported_transformation(
                 .to_owned(),
         ));
     }
-    let expected = if unstructured {
-        frozen::one_item(&requested.view.skeleton)?
-    } else {
-        parse_replacement_skeleton(requested)?
-    };
+    let expected = parse_replacement_skeleton(requested)?;
     let ItemKind::Fn(expected) = &expected.kind else { unreachable!() };
-    if unstructured && crate::skeleton::has_type_parameters(expected) {
-        if crate::preservation::function_signature(function)
-            != crate::preservation::function_signature(expected)
-        {
-            return Err(item_error(
-                ReplacementErrorKind::InvalidTransformation,
-                requested,
-                "copy the complete frozen generic signature, including bounds and where clauses"
-                    .to_owned(),
-            ));
-        }
-        return Ok(());
-    }
     if function.generics.params.iter().any(|parameter| {
         !matches!(parameter.kind, GenericParamKind::Lifetime)
             || !parameter.attrs.is_empty()

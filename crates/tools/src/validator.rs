@@ -332,9 +332,9 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
             entry.name, entry.id
         ));
     }
-    if let Some(item) = scan.items.first() {
+    if let Some(item) = scan.items.iter().find(|item| !item.supported) {
         return Err(format!(
-            "Expected skeleton for `{}` (item {}) contains a function-local {} item{}; every function-local item is unsupported.",
+            "Expected skeleton for `{}` (item {}) contains an unsupported function-local {} item{}.",
             entry.name,
             entry.id,
             item.kind,
@@ -457,7 +457,7 @@ pub(crate) fn validate_rule_application_shape(item: &Item) -> Result<(), String>
             "an applied skeleton contains an unlabeled statement in {path}"
         ));
     }
-    if let Some(item) = scan.items.first() {
+    if let Some(item) = scan.items.iter().find(|item| !item.supported) {
         return Err(format!(
             "an applied skeleton contains a function-local {} item{}",
             item.kind,
@@ -562,6 +562,7 @@ fn validate_expected_statement(statement: &Stmt) -> Result<(), String> {
             }
             Ok(())
         }
+        StmtKind::Item(item) if crate::preservation::supported_local_item(item) => Ok(()),
         StmtKind::Item(item) => Err(format!(
             "function-local {} items are unsupported",
             local_item_kind(item)
@@ -1300,6 +1301,10 @@ struct NestedItemDecl {
     name: String,
     kind: String,
     label: Option<u32>,
+    supported: bool,
+    header: String,
+    scope: String,
+    names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1554,16 +1559,60 @@ impl<'ast> Visitor<'ast> for BodyScanner {
     }
 
     fn visit_item(&mut self, item: &'ast Item) {
+        if crate::preservation::local_initializer_has_labels(item) {
+            self.syntax_errors.push(SyntaxProblem {
+                code: "opaque_initializer_labels".to_owned(),
+                message: "opaque local initializers must not contain proctor labels".to_owned(),
+            });
+        }
+        if (self.closure_depth != 0 || self.opaque_depth != 0)
+            && crate::preservation::supported_local_item(item)
+        {
+            return;
+        }
         let kind = local_item_kind(item);
         let name = item
             .kind
             .ident()
             .map(|ident| ident.to_string())
             .unwrap_or_else(|| "<anonymous>".to_owned());
+        fn imported_names(tree: &rustc_ast::UseTree, names: &mut Vec<String>) {
+            match &tree.kind {
+                rustc_ast::UseTreeKind::Simple(alias) => {
+                    if let Some(name) = alias
+                        .as_ref()
+                        .or_else(|| tree.prefix.segments.last().map(|segment| &segment.ident))
+                    {
+                        names.push(name.to_string());
+                    }
+                }
+                rustc_ast::UseTreeKind::Nested { items, .. } => {
+                    for (tree, _) in items {
+                        imported_names(tree, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut names = vec![];
+        match &item.kind {
+            ItemKind::Use(tree) => imported_names(tree, &mut names),
+            ItemKind::ForeignMod(module) => names.extend(
+                module
+                    .items
+                    .iter()
+                    .filter_map(|item| item.kind.ident().map(|ident| ident.to_string())),
+            ),
+            _ => names.extend(item.kind.ident().map(|ident| ident.to_string())),
+        }
         self.items.push(NestedItemDecl {
             name,
             kind: kind.to_owned(),
             label: self.current_label,
+            supported: crate::preservation::supported_local_item(item),
+            header: crate::preservation::local_item_header(item),
+            scope: self.path(),
+            names,
         });
         self.next_declaration_order += 1;
     }
@@ -1986,6 +2035,12 @@ fn validate_declarations(
         .map(|binding| binding.name.as_str())
         .collect::<HashSet<_>>();
     expected_names.extend(
+        expected_scan
+            .items
+            .iter()
+            .flat_map(|item| item.names.iter().map(String::as_str)),
+    );
+    expected_names.extend(
         expected_function
             .sig
             .decl
@@ -2178,17 +2233,34 @@ fn validate_declarations(
 
     expected_errors.sort_by_key(|(order, _)| *order);
     errors.extend(expected_errors.into_iter().map(|(_, error)| error));
-    for item in &result_scan.items {
+    for (index, item) in result_scan.items.iter().enumerate() {
+        if expected_scan.items.get(index).is_some_and(|expected| {
+            item.supported
+                && item.header == expected.header
+                && item.scope == expected.scope
+                && item.label == expected.label
+        }) {
+            continue;
+        }
         errors.push(error(
             "unexpected_nested_item",
             function_message(
                 expected,
                 format!(
-                    "unexpected function-local {} item `{}`{} was introduced; every function-local item is unsupported",
+                    "unexpected or modified function-local {} item `{}`{}; preserve existing declarations and their scope",
                     item.kind,
                     item.name,
                     label_context(item.label)
                 ),
+            ),
+        ));
+    }
+    if result_scan.items.len() < expected_scan.items.len() {
+        errors.push(error(
+            "missing_nested_item",
+            function_message(
+                expected,
+                "preserve every existing local declaration in its original scope".to_owned(),
             ),
         ));
     }
@@ -3161,6 +3233,11 @@ fn expected_binding_names(expected: &ParsedExpected, scan: &BodyScanner) -> Hash
         .iter()
         .map(|binding| binding.name.clone())
         .collect::<HashSet<_>>();
+    names.extend(
+        scan.items
+            .iter()
+            .flat_map(|item| item.names.iter().cloned()),
+    );
     names.extend(
         function
             .sig

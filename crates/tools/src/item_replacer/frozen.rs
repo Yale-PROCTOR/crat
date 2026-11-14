@@ -203,7 +203,9 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
                 }
             }
             validate_supported_transformation(&skeleton, &requested, record.unstructured)?;
-            validate_transformed_header(original_fn, skeleton_fn, &requested)?;
+            if !record.unstructured {
+                validate_transformed_header(original_fn, skeleton_fn, &requested)?;
+            }
             let mut stub = compose_implementation(&original, &skeleton, &requested)?;
             let ItemKind::Fn(body) = &mut stub.kind else { unreachable!() };
             body.body = Some(parse_body("{ todo!() }")?);
@@ -730,7 +732,11 @@ pub fn assemble_frozen_project(
                 })?;
                 let expected = function_at_path(&assembled.items, &path)
                     .expect("frozen template contains every function");
-                let is_stub = pprust::item_to_string(item) == pprust::item_to_string(expected);
+                let ItemKind::Fn(function_body) = &item.kind else { unreachable!() };
+                let is_stub = function_body
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| unstructured::whole_function_stub(body));
                 if is_stub && !stubbed.contains(id) {
                     return Err(global_error(
                         ReplacementErrorKind::InvalidTransformation,
@@ -752,7 +758,12 @@ pub fn assemble_frozen_project(
                 let mut header = item.clone();
                 let ItemKind::Fn(box body) = &mut header.kind else { unreachable!() };
                 body.body = Some(parse_body("{ todo!() }")?);
-                if pprust::item_to_string(&header) != pprust::item_to_string(expected)
+                let mut expected_header = expected.clone();
+                for item in [&mut header, &mut expected_header] {
+                    item.attrs
+                        .retain(|attribute| attribute.style != rustc_ast::AttrStyle::Inner);
+                }
+                if pprust::item_to_string(&header) != pprust::item_to_string(&expected_header)
                     || selected.insert(*id, item.clone()).is_some()
                 {
                     return Err(global_error(

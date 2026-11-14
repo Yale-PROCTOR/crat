@@ -4324,31 +4324,30 @@ fn rejects_nested_empty_statement() {
 }
 
 #[test]
-fn rejects_local_const_and_static_recursively() {
-    for (source, kind) in [
-        (
-            r#"pub unsafe fn f() -> i32 {
-                const LOCAL: i32 = { let inner = 1; inner };
-                LOCAL
-            }"#,
-            "const",
-        ),
-        (
-            r#"pub unsafe fn f(flag: bool) -> i32 {
-                if flag {
-                    static mut STATE: i32 = { let inner = 1; inner };
-                    STATE
-                } else {
-                    0
-                }
-            }"#,
-            "static",
-        ),
-    ] {
-        let error = generate_error(source);
-        assert_eq!(error.kind, GenerationErrorKind::FunctionLocalItem);
-        assert_eq!(error.function_path, "f");
-        assert!(error.message.contains(kind));
+fn local_values_have_one_label_and_opaque_initializers() {
+    let records = generate(
+        r#"pub unsafe fn f(flag: bool) -> i32 {
+        const LOCAL: i32 = { const fn inner() -> i32 { 1 } inner() };
+        if flag {
+            static mut STATE: i32 = { let inner = 2; inner };
+            STATE + LOCAL
+        } else { 0 }
+    }"#,
+    );
+    let f = function(&records, "f");
+    assert_eq!(labels(&f.annotated_source), [0, 1, 2, 3, 4]);
+    assert_eq!(f.baseline.transform_labels(), [0, 2, 3]);
+    assert!(f.baseline.skeleton.contains("const LOCAL: i32 = todo!();"));
+    assert!(
+        f.baseline
+            .skeleton
+            .contains("static mut STATE: i32 = todo!();")
+    );
+    assert!(!f.baseline.skeleton.contains("inner"));
+    for metadata in &f.baseline.statement_pair_metadata {
+        if [0, 2].contains(&metadata.label) {
+            assert!(metadata.pointer_variables.is_empty());
+        }
     }
 }
 
@@ -4361,11 +4360,6 @@ fn rejects_representative_other_local_items() {
         ("pub unsafe fn f() { enum Local { Variant } }", "enum"),
         ("pub unsafe fn f() { union Local { field: i32 } }", "union"),
         ("pub unsafe fn f() { mod local {} }", "module"),
-        ("pub unsafe fn f() { use core::mem; }", "use"),
-        (
-            "pub unsafe fn f() { unsafe extern \"C\" { fn local(); } }",
-            "foreign",
-        ),
         ("pub unsafe fn f() { trait Local {} }", "trait"),
         ("struct Local; pub unsafe fn f() { impl Local {} }", "impl"),
         (
@@ -4703,10 +4697,10 @@ fn opaque_restricted_conditionals_keep_original_dependencies() {
 #[test]
 fn opaque_conditional_label_suppression_does_not_skip_body_validation() {
     let local_item = generate_error(
-        "pub unsafe fn f(flag: bool) { let value = Some(if flag { { const LOCAL: i32 = 1; LOCAL } } else { 0 }); let _ = value; }",
+        "pub unsafe fn f(flag: bool) { let value = Some(if flag { { type Local = i32; 1 as Local } } else { 0 }); let _ = value; }",
     );
     assert_eq!(local_item.kind, GenerationErrorKind::FunctionLocalItem);
-    assert!(local_item.message.contains("const"));
+    assert!(local_item.message.contains("type alias"));
 
     let non_block_arm = generate_error(
         "pub unsafe fn f(flag: bool) { let value = Some(if flag { match 0 { 0 => 1, _ => { 2 } } } else { 3 }); let _ = value; }",
@@ -4926,9 +4920,15 @@ pub unsafe fn f(values: &[i32], offset: i32) -> i32 {
 }
 
 #[test]
-fn opaque_closures_do_not_hide_function_local_items() {
+fn opaque_closures_allow_local_values_but_still_reject_other_items() {
+    let records = generate(
+        "pub unsafe fn f() -> i32 { let closure = || { use core::mem::size_of; const LOCAL: i32 = 1; static STATE: i32 = 2; LOCAL + STATE + size_of::<i32>() as i32 }; closure() }",
+    );
+    let f = function(&records, "f");
+    assert_eq!(labels(&f.annotated_source), [0, 1]);
+    assert_eq!(labels(&f.baseline.skeleton), [0, 1]);
     let error = generate_error(
-        "pub unsafe fn f() { let closure = || { const LOCAL: i32 = 1; LOCAL }; closure(); }",
+        "pub unsafe fn f() { let closure = || { fn local() {} local() }; closure(); }",
     );
     assert_eq!(error.kind, GenerationErrorKind::FunctionLocalItem);
 }

@@ -72,7 +72,7 @@ impl<'tcx> AstToHirMapper<'tcx> {
     ) {
         let mut i = 0;
         let mut remaining_nested_uses = 0;
-        for hitem in hitems {
+        for (hindex, hitem) in hitems.iter().enumerate() {
             if !expanded {
                 let hitem = self.tcx.hir_item(*hitem);
                 if hitem.span.is_dummy()
@@ -94,11 +94,11 @@ impl<'tcx> AstToHirMapper<'tcx> {
                 continue;
             }
             let item = items[i].as_mut();
-            if let ItemKind::Use(tree) = &item.kind
+            if let ItemKind::Use(tree) = &mut item.kind
                 && matches!(tree.kind, UseTreeKind::Nested { .. })
             {
                 // A grouped import lowers to a list stem and one HIR item per nested tree.
-                assert!(matches!(hitem.kind, hir::ItemKind::Use(..)));
+                self.map_use_tree(tree, &mut item.id, &mut hitems[hindex..].iter(), 0);
                 remaining_nested_uses = use_tree_node_count(tree) - 1;
                 if remaining_nested_uses == 0 {
                     i += 1;
@@ -107,6 +107,56 @@ impl<'tcx> AstToHirMapper<'tcx> {
             }
             self.map_item_to_item(item, hitem, expanded);
             i += 1;
+        }
+    }
+
+    fn map_use_tree(
+        &mut self,
+        tree: &mut UseTree,
+        id: &mut NodeId,
+        hitems: &mut std::slice::Iter<'_, hir::ItemId>,
+        prefix_len: usize,
+    ) {
+        let hitem = self.tcx.hir_item(*hitems.next().unwrap());
+        let hir::ItemKind::Use(path, kind) = hitem.kind else { panic!() };
+        self.add_global(id, hitem.owner_id.def_id);
+        let path = if matches!(kind, hir::UseKind::ListStem) {
+            hitems
+                .clone()
+                .take(use_tree_node_count(tree) - 1)
+                .find_map(|id| {
+                    let hir::ItemKind::Use(path, kind) = self.tcx.hir_item(*id).kind else {
+                        panic!()
+                    };
+                    (!matches!(kind, hir::UseKind::ListStem)).then_some(path)
+                })
+        } else {
+            Some(path)
+        };
+        if let Some(path) = path {
+            let offset = if matches!(kind, hir::UseKind::ListStem) {
+                prefix_len
+            } else {
+                path.segments.len() - tree.prefix.segments.len()
+            };
+            for (segment, hsegment) in tree
+                .prefix
+                .segments
+                .iter_mut()
+                .zip(&path.segments[offset..])
+            {
+                if segment.ident.name == rustc_span::kw::SelfLower {
+                    self.add_local(&mut segment.id, hsegment.hir_id);
+                } else {
+                    self.map_path_segment_to_path_segment(segment, hsegment);
+                }
+            }
+        }
+        let child_prefix_len = prefix_len + tree.prefix.segments.len();
+        if let UseTreeKind::Nested { items, .. } = &mut tree.kind {
+            for (tree, id) in items {
+                self.map_use_tree(tree, id, hitems, child_prefix_len);
+            }
         }
     }
 
@@ -993,6 +1043,23 @@ impl<'tcx> AstToHirMapper<'tcx> {
         self.add_local(&mut block.id, hblock.hir_id);
         let mut i = 0;
         for stmt in &mut block.stmts {
+            if let StmtKind::Item(item) = &mut stmt.kind
+                && let ItemKind::Use(tree) = &item.kind
+                && matches!(tree.kind, UseTreeKind::Nested { .. })
+            {
+                let count = use_tree_node_count(tree);
+                self.add_local(&mut stmt.id, hblock.stmts[i].hir_id);
+                let ids = hblock.stmts[i..i + count]
+                    .iter()
+                    .map(|statement| {
+                        let hir::StmtKind::Item(id) = statement.kind else { panic!() };
+                        id
+                    })
+                    .collect::<Vec<_>>();
+                self.map_items_to_items(std::slice::from_mut(item), &ids, true);
+                i += count;
+                continue;
+            }
             match stmt.kind {
                 StmtKind::Empty => {}
                 _ => match i.cmp(&hblock.stmts.len()) {
@@ -1976,6 +2043,21 @@ impl<'tcx> AstToHirMapper<'tcx> {
         arg: &mut GenericArg,
         harg: &hir::GenericArg<'tcx>,
     ) {
+        if let GenericArg::Type(ty) = arg
+            && matches!(harg, hir::GenericArg::Const(_))
+        {
+            let TyKind::Path(qself, path) = &ty.kind else { panic!() };
+            *arg = GenericArg::Const(AnonConst {
+                id: DUMMY_NODE_ID,
+                value: P(Expr {
+                    id: ty.id,
+                    kind: ExprKind::Path(qself.clone(), path.clone()),
+                    span: ty.span,
+                    attrs: AttrVec::new(),
+                    tokens: None,
+                }),
+            });
+        }
         match arg {
             GenericArg::Lifetime(lifetime) => {
                 let hir::GenericArg::Lifetime(hlifetime) = harg else { panic!() };
@@ -2120,6 +2202,16 @@ pub struct AstToHirChecker<'tcx> {
 }
 
 impl<'a> Visitor<'a> for AstToHirChecker<'_> {
+    fn visit_use_tree(&mut self, tree: &'a UseTree) {
+        if let UseTreeKind::Nested { items, .. } = &tree.kind {
+            for (tree, _) in items {
+                self.visit_use_tree(tree);
+            }
+        } else {
+            visit::walk_use_tree(self, tree);
+        }
+    }
+
     fn visit_mac_call(&mut self, _: &'a MacCall) {
         // macro calls are not mapped to HIR nodes, so we skip them
     }

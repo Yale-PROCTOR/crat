@@ -1328,7 +1328,6 @@ fn invalid_expected_skeleton_is_setup_error() {
         "unsafe fn f() { #[proctor(0)] const LOCAL: () = { #[proctor(1)] fn nested() {} }; }",
         "unsafe fn f() { #[proctor(0)] type Local = i32; }",
         "unsafe fn f() { #[proctor(0)] struct Local(i32); }",
-        "unsafe fn f() { #[proctor(0)] use core::mem; }",
         "unsafe fn f() { #[proctor(0)] macro_rules! local { () => {}; } }",
         "unsafe fn f((x, y): (i32, i32)) { #[proctor(0)] return; }",
         "unsafe fn f<T>(x: T) { #[proctor(0)] return; }",
@@ -1788,13 +1787,43 @@ unsafe fn first(input: &'a i32) -> &'a i32 {
 }
 
 #[test]
-fn rejects_every_local_item() {
-    for skeleton in [
-        "unsafe fn f() { #[proctor(0)] const LOCAL: i32 = 1; }",
-        "unsafe fn f() { #[proctor(0)] { #[proctor(1)] static mut STATE: i32 = 1; } }",
+fn local_value_initializers_are_opaque_and_headers_are_fixed() {
+    let skeleton = "unsafe fn f() { #[proctor(0)] const LOCAL: i32 = todo!(); #[proctor(1)] static mut STATE: i32 = todo!(); }";
+    let returned = "unsafe fn f() { #[proctor(0)] const LOCAL: i32 = { fn helper() -> i32 { 1 } let ordinary_name = helper(); ordinary_name }; #[proctor(1)] static mut STATE: i32 = { #[allow(unused_unsafe)] unsafe { 2 } }; }";
+    assert_valid(skeleton, returned);
+    for changed in [
+        returned.replace("const LOCAL", "static LOCAL"),
+        returned.replace("LOCAL: i32", "LOCAL: i64"),
+        returned.replace("static mut STATE", "static STATE"),
+        returned.replace("const LOCAL", "const OTHER"),
+        returned.replace("let ordinary_name", "#[proctor(2)] let ordinary_name"),
+        returned.replace("= { fn helper", "= #[proctor(2)] { fn helper"),
     ] {
-        assert_codes(skeleton, "unsafe fn f() {}", &["invalid_expected_skeleton"]);
+        assert!(
+            !matches!(
+                validate(&request(skeleton, &changed)),
+                ValidationResponse::Valid
+            ),
+            "{changed}"
+        );
     }
+    assert_valid(
+        "unsafe fn f() { #[proctor(0)] let mut closure = todo!(); }",
+        "unsafe fn f() { #[proctor(0)] let closure = || { const VALUE: i32 = 1; use core::mem::size_of; static STATE: i32 = 2; VALUE + STATE + size_of::<i32>() as i32 }; }",
+    );
+}
+
+#[test]
+fn local_import_aliases_cannot_be_reused_as_generated_bindings() {
+    assert_code(
+        "unsafe fn f() { #[proctor(0)] use core::mem::size_of as proctor_temp_var_0; #[proctor(1)] todo!(); }",
+        "unsafe fn f() { #[proctor(0)] use core::mem::size_of as proctor_temp_var_0; #[proctor(1)] let proctor_temp_var_0 = 1; }",
+        "invalid_generated_binding_name",
+    );
+}
+
+#[test]
+fn rejects_introducing_local_items_outside_opaque_expressions() {
     let skeleton = "unsafe fn f() { #[proctor(0)] return; }";
     for transformation in [
         r#"unsafe fn f() {

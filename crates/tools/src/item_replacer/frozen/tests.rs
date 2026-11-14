@@ -11,6 +11,212 @@ fn freeze(source: &str) -> FrozenProject {
 }
 
 #[test]
+fn local_declarations_preserve_headers_and_keep_initializers_opaque() {
+    let source = r#"
+pub unsafe fn run(p: *mut i32) -> i32 {
+    #[allow(dead_code)] const VALUE: i32 = { let original = 1; original };
+    static mut STATE: i32 = { let original = 2; original };
+    use core::{mem::size_of, hint::black_box};
+    unsafe extern "C" { fn abs(value: i32) -> i32; }
+    *p + VALUE + STATE
+}
+"#;
+    let frozen = freeze(source);
+    let function = &frozen.functions[0];
+    assert_eq!(function.record.baseline.transform_labels(), vec![0, 1, 4]);
+    assert_eq!(
+        function
+            .record
+            .annotated_source
+            .matches("#[proctor(")
+            .count(),
+        5
+    );
+    assert!(!function.record.baseline.skeleton.contains("original"));
+    let returned = format!(
+        r#"{} {{
+        #[proctor(0)] #[allow(dead_code)] const VALUE: i32 = {{
+            const fn helper() -> i32 {{ 1 }}
+            let freely_named = helper();
+            unsafe {{ freely_named }}
+        }};
+        #[proctor(1)] static mut STATE: i32 = {{ let freely_named: i32 = 2; freely_named }};
+        #[proctor(2)] use nonexistent::ignored;
+        #[proctor(3)] unsafe extern "C" {{ fn changed(); }}
+        #[proctor(4)] *p + VALUE + STATE
+    }}"#,
+        function.record.target_signature
+    );
+    let replacement_request = request(function, Some(&returned));
+    assert_eq!(
+        crate::validate(&crate::ValidationRequest {
+            expected_functions: vec![crate::ExpectedFunction {
+                id: function.record.id,
+                name: function.record.name.clone(),
+                view: function.record.baseline.clone()
+            }],
+            transformation: returned.clone(),
+        }),
+        crate::ValidationResponse::Valid
+    );
+    let (output, metadata) = metadata(&frozen, &replacement_request);
+    assert!(!output.replacement.source.contains("nonexistent"));
+    assert!(!output.replacement.source.contains("fn changed"));
+    run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+    let observations =
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .unwrap();
+    assert!(!observations.observations.is_empty());
+    for changed in [
+        returned.replace("const VALUE", "const OTHER"),
+        returned.replace("VALUE: i32", "VALUE: i64"),
+        returned.replace("static mut STATE", "static STATE"),
+        returned.replace("const VALUE", "static VALUE"),
+        returned.replace("#[allow(dead_code)]", "#[allow(unused)]"),
+        returned.replace(
+            "let freely_named = helper();",
+            "#[proctor(99)] let freely_named = helper();",
+        ),
+        returned.replace(
+            "#[proctor(1)] static",
+            "#[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(1)] static",
+        ),
+    ] {
+        assert!(
+            transform_frozen_scc(&frozen, &request(function, Some(&changed))).is_err(),
+            "{changed}"
+        );
+    }
+}
+
+#[test]
+fn local_value_headers_protect_named_types_in_candidates_and_observations() {
+    let source = r#"
+pub struct Holder { p: *mut i32 }
+pub unsafe fn run(p: *mut i32) -> i32 {
+    const VALUE: ([u8; { const ZERO: usize = 0; ZERO }], Holder) = ([], Holder { p: core::ptr::null_mut() });
+    static mut STATE: i32 = 2;
+    *p
+}
+pub unsafe fn read(value: Holder) -> i32 { *value.p }
+"#;
+    let frozen = freeze(source);
+    let holder = &frozen.types[0];
+    assert_eq!(holder.source_definition, holder.target_definition);
+    let function = frozen
+        .functions
+        .iter()
+        .find(|function| function.record.name == "run")
+        .unwrap();
+    let returned = function
+        .record
+        .baseline
+        .skeleton
+        .replacen("todo!()", "([], Holder { p: core::ptr::null_mut() })", 1)
+        .replacen("todo!()", "2", 1)
+        .replace("todo!()", "*p");
+    let (output, metadata) = metadata(&frozen, &request(function, Some(&returned)));
+    run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+    crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+        .unwrap();
+}
+
+#[test]
+fn unstructured_bodies_allow_local_items_attributes_unsafe_and_nested_todo() {
+    let frozen = freeze(
+        "#[inline] pub unsafe fn run(value: i32) -> i32 { #![allow(dead_code)] const UNUSED: i32 = 0; value }",
+    );
+    let function = &frozen.functions[0];
+    let returned = format!(
+        r#"{} {{
+        #![allow(unused_variables)]
+        #[allow(dead_code)] fn helper(value: i32) -> i32 {{ value }}
+        struct Local(i32);
+        const NUMBER: i32 = 1;
+        static mut STATE: i32 = 0;
+        use core::mem::size_of;
+        unsafe extern "C" {{ fn abs(value: i32) -> i32; }}
+        if value < 0 {{ todo!() }}
+        #[allow(unused_unsafe)] unsafe {{ STATE = NUMBER; }}
+        helper(Local(value).0) + size_of::<i32>() as i32
+    }}"#,
+        function.record.target_signature
+    );
+    let output = replace_unstructured_scc(
+        &frozen,
+        &UnstructuredReplacementRequest {
+            members: vec![function.record.id],
+            transformation: returned.clone(),
+        },
+    )
+    .unwrap();
+    assert!(output.source.contains("#[inline]"));
+    assert!(output.source.contains("#![allow(unused_variables)]"));
+    assert!(!output.source.contains("#![allow(dead_code)]"));
+    assert!(!output.source.contains("UNUSED"));
+    run_compiler_on_str(&output.source, utils::type_check).unwrap();
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[AcceptedScc {
+            members: vec![function.record.id],
+            source: output.source.clone(),
+            stubbed_items: vec![],
+        }],
+    )
+    .unwrap();
+    assert!(assembled.contains("#![allow(unused_variables)]"));
+    run_compiler_on_str(&assembled, utils::type_check).unwrap();
+    assert!(
+        assemble_frozen_project(
+            &frozen,
+            &[AcceptedScc {
+                members: vec![function.record.id],
+                source: frozen
+                    .target_source
+                    .replace("todo!()", "#![allow(unused_variables)] todo!()"),
+                stubbed_items: vec![],
+            }]
+        )
+        .is_err()
+    );
+    let retained = retain_frozen_functions(
+        &frozen,
+        &UnstructuredPreparationRequest {
+            members: vec![function.record.id],
+            transformations: vec![returned],
+        },
+    )
+    .unwrap();
+    assert!(retained.source.contains("#![allow(unused_variables)]"));
+    assert!(!retained.source.contains("#![allow(dead_code)]"));
+    run_compiler_on_str(&retained.source, utils::type_check).unwrap();
+    assert!(
+        replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members: vec![function.record.id],
+                transformation: function
+                    .record
+                    .baseline
+                    .skeleton
+                    .replace("value", "renamed"),
+            }
+        )
+        .is_err()
+    );
+    assert!(
+        replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members: vec![function.record.id],
+                transformation: format!("{} {{ todo!() }}", function.record.target_signature),
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
 fn generic_functions_keep_signatures_and_rewrite_bodies_without_skeletons() {
     let source = r#"
 pub unsafe fn read(p: *mut i32) -> i32 { *p }
@@ -89,7 +295,6 @@ pub fn callback(mut emit: impl FnMut(i32), p: *mut i32) {
         returned.replace("*mut i32", "&mut i32"),
         returned.replace("-> T", "-> i32"),
         returned.replace("value: T", "other: T"),
-        returned.replace("#[inline]", "#[inline(always)]"),
     ] {
         assert!(
             replace_unstructured_scc(
@@ -102,6 +307,16 @@ pub fn callback(mut emit: impl FnMut(i32), p: *mut i32) {
             .is_err()
         );
     }
+    let changed_attributes = replace_unstructured_scc(
+        &frozen,
+        &UnstructuredReplacementRequest {
+            members: vec![generic.record.id],
+            transformation: returned.replace("#[inline]", "#[inline(always)]"),
+        },
+    )
+    .unwrap();
+    assert!(changed_attributes.source.contains("#[inline]"));
+    assert!(!changed_attributes.source.contains("#[inline(always)]"));
     let callback_result = replace_unstructured_scc(
         &frozen,
         &UnstructuredReplacementRequest {
@@ -151,7 +366,7 @@ pub fn callback(mut emit: impl FnMut(i32), p: *mut i32) {
                 ),
             }
         )
-        .is_err()
+        .is_ok()
     );
     let mut changed = frozen.clone();
     changed
@@ -1150,10 +1365,7 @@ fn unstructured_stripping_handles_misplaced_labels_in_failed_function_output() {
 #[test]
 fn unstructured_rewrites_use_frozen_headers_and_assemble_after_free_body_changes() {
     let frozen = freeze("#[no_mangle] pub unsafe extern \"C\" fn target(x: i32) -> i32 { x + 1 }");
-    let signature = frozen.functions[0]
-        .record
-        .target_signature
-        .replace(": i32", ": (i32)");
+    let signature = &frozen.functions[0].record.target_signature;
     let replacement = replace_unstructured_scc(&frozen, &UnstructuredReplacementRequest {
         members: vec![frozen.functions[0].record.id],
         transformation: format!("{signature} {{ let new_name = x + 1; for value in 0..0 {{ let _ = value; }} new_name }}"),
@@ -1179,7 +1391,7 @@ fn unstructured_rewrites_use_frozen_headers_and_assemble_after_free_body_changes
 }
 
 #[test]
-fn unstructured_rejects_wrong_signatures_labels_unsafe_items_and_whole_function_stubs() {
+fn unstructured_rejects_wrong_signatures_function_sets_and_whole_function_stubs() {
     let frozen = freeze("pub unsafe fn target(x: i32) -> i32 { x + 1 }");
     for transformation in [
         "unsafe fn target(mut x: i64) -> i32 { 0 }",
@@ -1188,16 +1400,7 @@ fn unstructured_rejects_wrong_signatures_labels_unsafe_items_and_whole_function_
         "unsafe fn target(mut y: i32) -> i32 { 0 }",
         "fn target(mut x: i32) -> i32 { 0 }",
         "const unsafe fn target(mut x: i32) -> i32 { 0 }",
-        "unsafe fn target(mut x: i32) -> i32 { #[proctor(0)] x }",
-        "unsafe fn target(mut x: i32) -> i32 { #[allow(unused)] let z = x; z }",
-        "unsafe fn target(mut x: i32) -> i32 { unsafe { x } }",
-        "unsafe fn target(mut x: i32) -> i32 { (|| unsafe { x })() }",
-        "unsafe fn target(mut x: i32) -> i32 { fn extra() {} x }",
-        "unsafe fn target(mut x: i32) -> i32 { (|| { use std::mem; x })() }",
         "unsafe fn target(mut x: i32) -> i32 { todo!() }",
-        "unsafe fn target(mut x: i32) -> i32 { let value: i32 = todo!(); value }",
-        "unsafe fn target(mut x: i32) -> i32 { (|| ::core::todo!())() }",
-        "unsafe fn target(mut x: i32) -> i32 { vec![todo!()].len() as i32 }",
         "unsafe fn target(mut x: i32) -> i32;",
         "unsafe fn target(mut x: i32) -> i32 { x } fn extra() {}",
         "unsafe fn other(mut x: i32) -> i32 { x }",
@@ -1218,6 +1421,24 @@ fn unstructured_rejects_wrong_signatures_labels_unsafe_items_and_whole_function_
             error.message
         );
     }
+}
+
+#[test]
+fn unstructured_preserves_destructured_parameter_signatures() {
+    let frozen = freeze("pub unsafe fn target<T: Copy>((value,): (T,)) -> T { value }");
+    let function = &frozen.functions[0];
+    let output = replace_unstructured_scc(
+        &frozen,
+        &UnstructuredReplacementRequest {
+            members: vec![function.record.id],
+            transformation: format!(
+                "{} {{ let copied = value; copied }}",
+                function.record.target_signature
+            ),
+        },
+    )
+    .unwrap();
+    run_compiler_on_str(&output.source, utils::type_check).unwrap();
 }
 
 #[test]

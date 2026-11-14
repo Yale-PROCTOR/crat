@@ -21,7 +21,7 @@ use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{
     Span, Symbol,
     def_id::{DefId, LocalDefId},
-    sym,
+    kw, sym,
 };
 use thin_vec::thin_vec;
 
@@ -206,6 +206,7 @@ struct Lift {
     original_name: Symbol,
     anchor: ast::NodeId,
     scopes: Vec<hir::HirId>,
+    kind: &'static str,
 }
 
 #[derive(Clone, Debug)]
@@ -285,55 +286,76 @@ impl<'a, 'tcx> Discovery<'a, 'tcx> {
         let Some(scope) = self.blocks.last().copied() else {
             return;
         };
-        let Some(hir_item) = self.mapped_item(item, "local import".to_owned()) else {
-            return;
-        };
-        let import_def_id = hir_item.owner_id.def_id;
-        let hir::ItemKind::Use(path, kind) = hir_item.kind else {
-            return;
-        };
-        match kind {
-            hir::UseKind::Single(name) => {
-                for target in [path.res.value_ns, path.res.type_ns]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|resolution| resolution.opt_def_id())
-                {
-                    if self.local_imports.iter().any(|import| {
-                        import.import_def_id == import_def_id && import.target == target
-                    }) {
-                        continue;
+        fn nested_imports(tree: &ast::UseTree, ids: &mut Vec<ast::NodeId>) {
+            if let ast::UseTreeKind::Nested { items, .. } = &tree.kind {
+                for (child, id) in items {
+                    ids.push(*id);
+                    nested_imports(child, ids);
+                }
+            }
+        }
+        let mut ids = vec![item.id];
+        if let ast::ItemKind::Use(tree) = &item.kind {
+            nested_imports(tree, &mut ids);
+        }
+        for id in ids {
+            let Some(definition) = self.ast_to_hir.global_map.get(&id).copied() else {
+                self.error = Some(PrepareError::MissingMapping {
+                    construct: "local import".to_owned(),
+                });
+                return;
+            };
+            let hir_item = self.tcx.hir_expect_item(definition);
+            let import_def_id = hir_item.owner_id.def_id;
+            let hir::ItemKind::Use(path, kind) = hir_item.kind else {
+                self.error = Some(PrepareError::MissingMapping {
+                    construct: "local import".to_owned(),
+                });
+                return;
+            };
+            match kind {
+                hir::UseKind::Single(name) => {
+                    for target in [path.res.value_ns, path.res.type_ns]
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|resolution| resolution.opt_def_id())
+                    {
+                        if self.local_imports.iter().any(|import| {
+                            import.import_def_id == import_def_id && import.target == target
+                        }) {
+                            continue;
+                        }
+                        self.local_imports.push(LocalImport {
+                            scope,
+                            name: name.name,
+                            target,
+                            import_def_id,
+                        });
                     }
-                    self.local_imports.push(LocalImport {
-                        scope,
-                        name: name.name,
-                        target,
-                        import_def_id,
-                    });
                 }
-            }
-            hir::UseKind::Glob => {
-                if let Some(module) = imported_module(path) {
-                    let children = if let Some(local) = module.as_local() {
-                        self.tcx
-                            .module_children_local(local)
-                            .iter()
-                            .collect::<Vec<_>>()
-                    } else {
-                        self.tcx.module_children(module).iter().collect::<Vec<_>>()
-                    };
-                    self.local_imports
-                        .extend(children.into_iter().filter_map(|child| {
-                            child.res.opt_def_id().map(|target| LocalImport {
-                                scope,
-                                name: child.ident.name,
-                                target,
-                                import_def_id,
-                            })
-                        }));
+                hir::UseKind::Glob => {
+                    if let Some(module) = imported_module(path) {
+                        let children = if let Some(local) = module.as_local() {
+                            self.tcx
+                                .module_children_local(local)
+                                .iter()
+                                .collect::<Vec<_>>()
+                        } else {
+                            self.tcx.module_children(module).iter().collect::<Vec<_>>()
+                        };
+                        self.local_imports
+                            .extend(children.into_iter().filter_map(|child| {
+                                child.res.opt_def_id().map(|target| LocalImport {
+                                    scope,
+                                    name: child.ident.name,
+                                    target,
+                                    import_def_id,
+                                })
+                            }));
+                    }
                 }
+                hir::UseKind::ListStem => {}
             }
-            hir::UseKind::ListStem => {}
         }
     }
 }
@@ -350,17 +372,28 @@ impl<'ast> visit::Visitor<'ast> for Discovery<'_, '_> {
                 };
                 self.discover_module(items);
             }
-            ast::ItemKind::Static(box ast::StaticItem { ident, .. }) => {
-                if self.function_depth == 0 {
+            ast::ItemKind::Static(box ast::StaticItem { ident, .. })
+            | ast::ItemKind::Const(box ast::ConstItem { ident, .. }) => {
+                if self.function_depth == 0 || ident.name == kw::Underscore {
+                    if matches!(item.kind, ast::ItemKind::Const(_)) {
+                        visit::walk_item(self, item);
+                    }
                     return;
                 }
-                let Some(hir_item) = self.mapped_item(item, format!("local static `{ident}`"))
+                let kind = if matches!(item.kind, ast::ItemKind::Static(_)) {
+                    "static"
+                } else {
+                    "const"
+                };
+                let Some(hir_item) = self.mapped_item(item, format!("local {kind} `{ident}`"))
                 else {
                     return;
                 };
-                let hir::ItemKind::Static(_, hir_ident, ..) = hir_item.kind else {
+                let (hir::ItemKind::Static(_, hir_ident, ..) | hir::ItemKind::Const(hir_ident, ..)) =
+                    hir_item.kind
+                else {
                     self.error = Some(PrepareError::MissingMapping {
-                        construct: format!("local static `{ident}`"),
+                        construct: format!("local {kind} `{ident}`"),
                     });
                     return;
                 };
@@ -370,6 +403,7 @@ impl<'ast> visit::Visitor<'ast> for Discovery<'_, '_> {
                     original_name: hir_ident.name,
                     anchor: self.anchor,
                     scopes: self.blocks.clone(),
+                    kind,
                 });
             }
             ast::ItemKind::Use(_) if self.function_depth > 0 => {
@@ -662,6 +696,45 @@ impl DependencyVisitor<'_, '_> {
 }
 
 impl<'ast> visit::Visitor<'ast> for DependencyVisitor<'_, '_> {
+    fn visit_item(&mut self, item: &'ast ast::Item) {
+        if self.error.is_some() {
+            return;
+        }
+        fn has_import_leaf(tree: &ast::UseTree) -> bool {
+            match &tree.kind {
+                ast::UseTreeKind::Nested { items, .. } => {
+                    items.iter().any(|(tree, _)| has_import_leaf(tree))
+                }
+                _ => true,
+            }
+        }
+        fn empty_group_prefix(tree: &ast::UseTree) -> Option<Symbol> {
+            let ast::UseTreeKind::Nested { items, .. } = &tree.kind else {
+                return None;
+            };
+            if !has_import_leaf(tree)
+                && let Some(segment) = tree.prefix.segments.last()
+            {
+                return Some(segment.ident.name);
+            }
+            items.iter().find_map(|(tree, _)| empty_group_prefix(tree))
+        }
+        if let ast::ItemKind::Use(tree) = &item.kind
+            && let Some(name) = empty_group_prefix(tree)
+        {
+            // Empty groups have no HIR path to establish whether their prefix can move.
+            if let Some(import) = self.ast_to_hir.global_map.get(&item.id).copied() {
+                self.reject(import, name);
+            } else {
+                self.error = Some(PrepareError::MissingMapping {
+                    construct: "local import".to_owned(),
+                });
+            }
+            return;
+        }
+        visit::walk_item(self, item);
+    }
+
     fn visit_path(&mut self, path: &'ast ast::Path) {
         if self.error.is_some() {
             return;
@@ -670,9 +743,10 @@ impl<'ast> visit::Visitor<'ast> for DependencyVisitor<'_, '_> {
             let Some(hir_segment) = self.ast_to_hir.get_path_segment(segment.id, self.tcx) else {
                 self.error = Some(PrepareError::MissingMapping {
                     construct: format!(
-                        "segment `{}` of path `{}` in local static `{}`",
+                        "segment `{}` of path `{}` in local {} `{}`",
                         segment.ident,
                         pprust::path_to_string(path),
+                        self.lift.kind,
                         self.lift.original_name
                     ),
                 });
@@ -743,7 +817,9 @@ fn validate_dependencies(
                 visit::walk_item(self, item);
                 return;
             };
-            let ast::ItemKind::Static(box ast::StaticItem { ty, expr, .. }) = &item.kind else {
+            let (ast::ItemKind::Static(box ast::StaticItem { ty, expr, .. })
+            | ast::ItemKind::Const(box ast::ConstItem { ty, expr, .. })) = &item.kind
+            else {
                 unreachable!()
             };
             let mut visitor = DependencyVisitor {
@@ -799,6 +875,16 @@ fn validate_use_mappings(
             self.tcx
         }
 
+        fn visit_path(&mut self, path: &hir::Path<'tcx>, id: hir::HirId) {
+            if let Res::Def(DefKind::Const, definition) = path.res
+                && let Some(local) = definition.as_local()
+                && self.targets.contains(&local)
+            {
+                self.expressions.insert((local, id));
+            }
+            intravisit::walk_path(self, path);
+        }
+
         fn visit_expr(&mut self, expression: &'tcx hir::Expr<'tcx>) {
             if let hir::ExprKind::Path(path) = expression.kind
                 && let Res::Def(DefKind::Static { .. }, definition) = self
@@ -833,14 +919,15 @@ fn validate_use_mappings(
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut hir_uses);
 
-    struct AstUses<'a> {
+    struct AstUses<'a, 'tcx> {
+        tcx: TyCtxt<'tcx>,
         ast_to_hir: &'a utils::ir::AstToHir,
         targets: &'a FxHashSet<LocalDefId>,
         counts: FxHashMap<LocalDefId, usize>,
     }
-    impl<'ast> visit::Visitor<'ast> for AstUses<'_> {
+    impl<'ast> visit::Visitor<'ast> for AstUses<'_, '_> {
         fn visit_path(&mut self, path: &'ast ast::Path) {
-            if let Some(Res::Def(DefKind::Static { .. }, definition)) =
+            if let Some(Res::Def(DefKind::Static { .. } | DefKind::Const, definition)) =
                 self.ast_to_hir.path_span_to_res.get(&path.span)
                 && let Some(local) = definition.as_local()
                 && self.targets.contains(&local)
@@ -849,8 +936,19 @@ fn validate_use_mappings(
             }
             visit::walk_path(self, path);
         }
+
+        fn visit_pat(&mut self, pattern: &'ast ast::Pat) {
+            if matches!(pattern.kind, ast::PatKind::Ident(..))
+                && let Some(definition) = resolved_const_pattern(pattern, self.ast_to_hir, self.tcx)
+                && self.targets.contains(&definition)
+            {
+                *self.counts.entry(definition).or_default() += 1;
+            }
+            visit::walk_pat(self, pattern);
+        }
     }
     let mut ast_uses = AstUses {
+        tcx,
         ast_to_hir,
         targets: &targets,
         counts: FxHashMap::default(),
@@ -875,7 +973,7 @@ fn validate_use_mappings(
             .unwrap_or_default();
         if hir_count != ast_count {
             return Err(PrepareError::MissingMapping {
-                construct: format!("use of local static `{}`", lift.original_name),
+                construct: format!("use of local {} `{}`", lift.kind, lift.original_name),
             });
         }
     }
@@ -888,11 +986,34 @@ struct RewriteVisitor<'a, 'tcx> {
     names: &'a FxHashMap<LocalDefId, Symbol>,
 }
 
+fn resolved_const_pattern(
+    pattern: &ast::Pat,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> Option<LocalDefId> {
+    let pattern = ast_to_hir.get_pat(pattern.id, tcx)?;
+    let hir::PatKind::Expr(hir::PatExpr {
+        kind: hir::PatExprKind::Path(path),
+        ..
+    }) = pattern.kind
+    else {
+        return None;
+    };
+    let Res::Def(DefKind::Const, definition) = tcx
+        .typeck(pattern.hir_id.owner)
+        .qpath_res(path, pattern.hir_id)
+    else {
+        return None;
+    };
+    definition.as_local()
+}
+
 impl MutVisitor for RewriteVisitor<'_, '_> {
     fn visit_item(&mut self, item: &mut ast::Item) {
         if let Some(def_id) = self.ast_to_hir.global_map.get(&item.id)
             && let Some(name) = self.names.get(def_id)
-            && let ast::ItemKind::Static(box ast::StaticItem { ident, .. }) = &mut item.kind
+            && let ast::ItemKind::Static(box ast::StaticItem { ident, .. })
+            | ast::ItemKind::Const(box ast::ConstItem { ident, .. }) = &mut item.kind
         {
             let original = ident.name;
             ident.name = *name;
@@ -916,7 +1037,7 @@ impl MutVisitor for RewriteVisitor<'_, '_> {
     }
 
     fn visit_path(&mut self, path: &mut ast::Path) {
-        if let Some(Res::Def(DefKind::Static { .. }, definition)) =
+        if let Some(Res::Def(DefKind::Static { .. } | DefKind::Const, definition)) =
             self.ast_to_hir.path_span_to_res.get(&path.span)
             && let Some(local) = definition.as_local()
             && let Some(name) = self.names.get(&local)
@@ -925,6 +1046,16 @@ impl MutVisitor for RewriteVisitor<'_, '_> {
             segment.ident.name = *name;
         }
         mut_visit::walk_path(self, path);
+    }
+
+    fn visit_pat(&mut self, pattern: &mut ast::Pat) {
+        if let Some(definition) = resolved_const_pattern(pattern, self.ast_to_hir, self.tcx)
+            && let Some(name) = self.names.get(&definition)
+            && let ast::PatKind::Ident(_, ident, _) = &mut pattern.kind
+        {
+            ident.name = *name;
+        }
+        mut_visit::walk_pat(self, pattern);
     }
 
     fn visit_expr(&mut self, expression: &mut ast::Expr) {
@@ -1215,13 +1346,21 @@ pub fn prepare(tcx: TyCtxt<'_>) -> Result<PreparationResult, PrepareError> {
     if let Some(error) = discovery.error {
         return Err(error);
     }
-    validate_dependencies(
-        &krate,
-        &discovery.lifts,
-        &discovery.local_imports,
-        &ast_to_hir,
-        tcx,
-    )?;
+    loop {
+        match validate_dependencies(
+            &krate,
+            &discovery.lifts,
+            &discovery.local_imports,
+            &ast_to_hir,
+            tcx,
+        ) {
+            Ok(()) => break,
+            Err(PrepareError::ScopedDependency { static_def_id, .. }) => {
+                discovery.lifts.retain(|lift| lift.def_id != static_def_id);
+            }
+            Err(error) => return Err(error),
+        }
+    }
     validate_use_mappings(&krate, &discovery.lifts, &ast_to_hir, tcx)?;
     let names = allocated_names(&discovery.lifts, &binder_inventory(tcx), tcx);
 
