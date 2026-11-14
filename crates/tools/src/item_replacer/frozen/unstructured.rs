@@ -169,7 +169,7 @@ pub fn retain_frozen_functions(
     })
 }
 
-fn whole_function_stub(body: &rustc_ast::Block) -> bool {
+pub(super) fn whole_function_stub(body: &rustc_ast::Block) -> bool {
     let [statement] = body.stmts.as_slice() else { return false };
     let (StmtKind::Expr(expression) | StmtKind::Semi(expression)) = &statement.kind else {
         return false;
@@ -214,22 +214,37 @@ pub fn replace_unstructured_scc(
                 view: function.record.baseline.clone(),
             })
             .collect::<Vec<_>>();
-        let returned = parse_transformations(&ReplacementRequest {
-            items: items.clone(),
-            transformation: request.transformation.clone(),
-            accepted_correspondence: vec![],
-        })?;
+        let returned = parse_transformations(
+            &ReplacementRequest {
+                items: items.clone(),
+                transformation: request.transformation.clone(),
+                accepted_correspondence: vec![],
+            },
+            true,
+        )?;
         let mut candidate =
             parse_crate(&frozen.target_source, ReplacementErrorKind::RewriteFailure)?;
         for (function, requested) in functions.iter().zip(&items) {
             let transformed = &returned[&requested.name];
+            let expected = one_item(&function.record.baseline.skeleton)?;
             let ItemKind::Fn(box body) = &transformed.kind else { unreachable!() };
             let mut check = BodyCheck { problem: None };
             if let Some(block) = &body.body {
                 check.visit_block(block);
             }
-            if !transformed.attrs.is_empty() {
-                check.problem = Some("returned function attributes are not allowed");
+            if !transformed.attrs.is_empty()
+                && transformed
+                    .attrs
+                    .iter()
+                    .map(pprust::attribute_to_string)
+                    .collect::<Vec<_>>()
+                    != expected
+                        .attrs
+                        .iter()
+                        .map(pprust::attribute_to_string)
+                        .collect::<Vec<_>>()
+            {
+                check.problem = Some("do not introduce or change function attributes");
             }
             if let Some(problem) = check.problem {
                 return Err(item_error(
@@ -238,7 +253,6 @@ pub fn replace_unstructured_scc(
                     problem.to_owned(),
                 ));
             }
-            let expected = one_item(&function.record.baseline.skeleton)?;
             let mut header = compose_implementation(&expected, transformed, requested)?;
             let (ItemKind::Fn(expected_fn), ItemKind::Fn(transformed_fn)) =
                 (&expected.kind, &transformed.kind)

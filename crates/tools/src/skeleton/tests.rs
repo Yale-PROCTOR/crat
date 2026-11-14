@@ -1658,28 +1658,20 @@ pub unsafe fn third(x: i32) {{ printf(b"{specifier}\0" as *const u8 as *const i8
 }
 
 #[test]
-fn source_type_and_const_generics_reject_before_rule_application() {
-    for (source, function, kind) in [
-        ("pub unsafe fn f<T>(p: *mut T) { let _ = p; }", "f", "type"),
-        (
-            "pub unsafe fn g<const N: usize>(p: *mut [i32; N]) { let _ = p; }",
-            "g",
-            "const",
-        ),
-    ] {
-        run_compiler_on_str(source, |tcx| {
-            let without_rules = make_skeletons(source, tcx).unwrap_err();
-            let empty = crate::RuleDocument::default();
-            let with_rules = make_skeletons_with_rules(source, Some(&empty), tcx).unwrap_err();
-            for error in [&without_rules, &with_rules] {
-                assert_eq!(error.kind, GenerationErrorKind::UnsupportedGeneric);
-                assert_eq!(error.function_path, function);
-                assert!(error.message.contains(kind), "{}", error.message);
-            }
-            assert_eq!(without_rules, with_rules);
-        })
-        .unwrap();
-    }
+fn const_only_generics_reject_before_rule_application() {
+    let source = "pub unsafe fn g<const N: usize>(p: *mut [i32; N]) { let _ = p; }";
+    run_compiler_on_str(source, |tcx| {
+        let without_rules = make_skeletons(source, tcx).unwrap_err();
+        let empty = crate::RuleDocument::default();
+        let with_rules = make_skeletons_with_rules(source, Some(&empty), tcx).unwrap_err();
+        for error in [&without_rules, &with_rules] {
+            assert_eq!(error.kind, GenerationErrorKind::UnsupportedGeneric);
+            assert_eq!(error.function_path, "g");
+            assert!(error.message.contains("const"), "{}", error.message);
+        }
+        assert_eq!(without_rules, with_rules);
+    })
+    .unwrap();
 
     let lifetime_only = "pub unsafe fn h<'a>(p: *mut i32) { let _ = p; }";
     run_compiler_on_str(lifetime_only, |tcx| {
@@ -3758,6 +3750,7 @@ fn record_variants_serialize_only_their_defined_fields() {
             "applied",
             "source_signature",
             "target_signature",
+            "unstructured",
             "printf_format_specifiers",
             "proctor_libc_function_paths",
             "foreign_function_names",

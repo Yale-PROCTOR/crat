@@ -105,6 +105,7 @@ pub(super) fn foreign_types(
         tcx: TyCtxt<'tcx>,
         roots: FxHashSet<LocalDefId>,
         dependencies: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
+        fixed_header: bool,
     }
 
     impl<'tcx> Visitor<'tcx> for TypeVisitor<'tcx> {
@@ -114,11 +115,31 @@ pub(super) fn foreign_types(
             self.tcx
         }
 
+        fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
+            if let hir::ItemKind::Fn { sig, generics, .. } = item.kind
+                && self
+                    .tcx
+                    .generics_of(item.owner_id)
+                    .own_params
+                    .iter()
+                    .any(|parameter| matches!(parameter.kind, ty::GenericParamDefKind::Type { .. }))
+            {
+                self.fixed_header = true;
+                intravisit::walk_fn_decl(self, sig.decl);
+                intravisit::walk_generics(self, generics);
+                self.fixed_header = false;
+            }
+            intravisit::walk_item(self, item);
+        }
+
         fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx, hir::AmbigArg>) {
             if let hir::TyKind::Path(hir::QPath::Resolved(_, path)) = ty.kind
                 && let Res::Def(_, did) = path.res
                 && let Some(did) = did.as_local()
             {
+                if self.fixed_header {
+                    self.roots.insert(did);
+                }
                 for parent in self.tcx.hir_parent_id_iter(ty.hir_id) {
                     match self.tcx.hir_node(parent) {
                         hir::Node::ForeignItem(_) => {
@@ -155,6 +176,7 @@ pub(super) fn foreign_types(
             .filter_map(|definition| definition.as_local())
             .collect(),
         dependencies: FxHashMap::default(),
+        fixed_header: false,
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut visitor);
     let mut pending = visitor.roots.into_iter().collect::<Vec<_>>();

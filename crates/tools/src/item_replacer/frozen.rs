@@ -137,23 +137,25 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
     let mut helpers = originals.keys().cloned().collect::<HashSet<_>>();
     for function in &frozen.functions {
         let record = &function.record;
-        crate::preservation::validate_skeleton_views(&record.baseline, &record.applied).map_err(
-            |error| {
-                global_error(
-                    ReplacementErrorKind::InvalidRequest,
-                    format!(
-                        "frozen skeletons for `{}` are invalid: {}",
-                        record.path, error.message
-                    ),
-                )
-            },
-        )?;
+        if !record.unstructured {
+            crate::preservation::validate_skeleton_views(&record.baseline, &record.applied)
+                .map_err(|error| {
+                    global_error(
+                        ReplacementErrorKind::InvalidRequest,
+                        format!(
+                            "frozen skeletons for `{}` are invalid: {}",
+                            record.path, error.message
+                        ),
+                    )
+                })?;
+        }
         let original = one_item(&function.original_item)?;
         let original_fn = frozen_function(&original)?;
         if record.kind != crate::ItemKindName::Fn
             || record.name != original_fn.ident.to_string()
             || pprust::item_to_string(&original) != pprust::item_to_string(&originals[&record.path])
             || !matches!(original_fn.sig.header.safety, Safety::Unsafe(_))
+            || record.unstructured != crate::skeleton::has_type_parameters(original_fn)
         {
             return Err(global_error(
                 ReplacementErrorKind::InvalidRequest,
@@ -178,7 +180,29 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
                     "frozen skeleton function name differs from its record".to_owned(),
                 ));
             }
-            validate_supported_transformation(&skeleton, &requested)?;
+            if record.unstructured {
+                let mut expected = original.clone();
+                crate::skeleton::sanitize_item(&mut expected);
+                let ItemKind::Fn(expected_fn) = &mut expected.kind else { unreachable!() };
+                let expected_signature = crate::preservation::function_signature(expected_fn);
+                expected_fn.body = None;
+                let signature = pprust::item_to_string(&expected)
+                    .trim_end_matches(';')
+                    .to_owned();
+                if view.needs_transformation
+                    || !view.statement_dispositions.is_empty()
+                    || !view.statement_pair_metadata.is_empty()
+                    || record.baseline != record.applied
+                    || record.source_signature != signature
+                    || record.target_signature != signature
+                    || crate::preservation::function_signature(skeleton_fn) != expected_signature
+                    || !unstructured::whole_function_stub(skeleton_fn.body.as_ref().unwrap())
+                {
+                    return Err(global_error(ReplacementErrorKind::InvalidRequest,
+                        "generic functions require an unchanged signature and empty unstructured views".to_owned()));
+                }
+            }
+            validate_supported_transformation(&skeleton, &requested, record.unstructured)?;
             validate_transformed_header(original_fn, skeleton_fn, &requested)?;
             let mut stub = compose_implementation(&original, &skeleton, &requested)?;
             let ItemKind::Fn(body) = &mut stub.kind else { unreachable!() };
@@ -330,7 +354,11 @@ pub fn freeze_project(
             view: record.baseline.clone(),
         };
         validate_current_target(current, &requested)?;
-        let skeleton = parse_replacement_skeleton(&requested)?;
+        let skeleton = if record.unstructured {
+            one_item(&record.baseline.skeleton)?
+        } else {
+            parse_replacement_skeleton(&requested)?
+        };
         let mut stub = compose_implementation(&current.item, &skeleton, &requested)?;
         let ItemKind::Fn(box body) = &mut stub.kind else { unreachable!() };
         body.body = Some(parse_body("{ todo!() }")?);
@@ -346,12 +374,19 @@ pub fn freeze_project(
             .trim_start_matches("crate::")
             .to_owned();
         source_paths.insert(current.def_id, format!("crate::{source_stub_path}"));
-        let opaque = collect_opaque_expressions(&current.item, &current.path, &ast_to_hir, tcx)
-            .map_err(|error| global_error(ReplacementErrorKind::RewriteFailure, error.message))?;
         let mut copy = current.item.clone();
         copy.attrs.clear();
         copy.vis = crate_visible();
-        annotate_function(&mut copy, &opaque);
+        if record.unstructured {
+            let ItemKind::Fn(body) = &mut copy.kind else { unreachable!() };
+            body.body = Some(parse_body("{ todo!() }")?);
+        } else {
+            let opaque = collect_opaque_expressions(&current.item, &current.path, &ast_to_hir, tcx)
+                .map_err(|error| {
+                    global_error(ReplacementErrorKind::RewriteFailure, error.message)
+                })?;
+            annotate_function(&mut copy, &opaque);
+        }
         let mut source_stub = current.item.clone();
         source_stub.attrs.retain(|attr| !is_export_attribute(attr));
         source_stub.vis = crate_visible();
@@ -369,7 +404,17 @@ pub fn freeze_project(
         });
     }
     let ids = source_paths.keys().copied().collect::<FxHashSet<_>>();
-    validate_additive_macro_rewrites(&analysis, &ast_to_hir, &functions, &ids, &ids, tcx)?;
+    let callers = functions
+        .iter()
+        .filter(|function| {
+            !records.iter().any(|record| {
+                matches!(record, crate::ItemRecord::Function(record)
+            if record.unstructured && record.path == function.path)
+            })
+        })
+        .map(|function| function.def_id)
+        .collect();
+    validate_additive_macro_rewrites(&analysis, &ast_to_hir, &functions, &ids, &callers, tcx)?;
     // Rewrite before renaming so resolution is exclusively against the complete
     // original crate. Source stubs retain the original ABI and parameter types.
     let mut collector = FrozenReferenceCollector {
@@ -497,7 +542,7 @@ fn path_segments(path: &str) -> Vec<String> {
     path.split("::").map(str::to_owned).collect()
 }
 
-fn one_item(source: &str) -> Result<P<Item>, ReplacementError> {
+pub(super) fn one_item(source: &str) -> Result<P<Item>, ReplacementError> {
     let mut krate = parse_crate(source, ReplacementErrorKind::RewriteFailure)?;
     if krate.items.len() != 1 {
         return Err(global_error(
@@ -542,7 +587,8 @@ pub fn transform_frozen_scc(
                         "requested function is absent from frozen interface".to_owned(),
                     )
                 })?;
-            if requested.name != function.record.name
+            if function.record.unstructured
+                || requested.name != function.record.name
                 || (requested.view != function.record.baseline
                     && requested.view != function.record.applied)
             {

@@ -231,6 +231,14 @@ pub(super) fn initial_pointer_decisions_for_api(
     loop {
         result.type_arguments.clear();
         for (&function, universe) in &analysis.slots.fn_local_slots {
+            if tcx
+                .generics_of(function)
+                .own_params
+                .iter()
+                .any(|parameter| matches!(parameter.kind, ty::GenericParamDefKind::Type { .. }))
+            {
+                continue;
+            }
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(function)
                 .borrow();
