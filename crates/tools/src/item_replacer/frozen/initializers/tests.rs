@@ -128,7 +128,7 @@ pub unsafe fn read(holder: *const Holder) -> i32 { *(*holder).pointer.offset(1) 
     assert!(frozen.types[0].target_definition.contains("[i32]"));
     let result = transform(
         &frozen,
-        "static mut GLOBAL: [Holder; 1] = [Holder { pointer: &VALUES }];",
+        "static mut GLOBAL: [Holder; 1] = [Holder { pointer: Some(&VALUES) }];",
     );
     let InitializerTransformationResponse::Valid { source } = result else { panic!("{result:?}") };
     let installed = install(&frozen, &[&source]);
@@ -166,7 +166,7 @@ fn inferred_struct_locals_gain_required_type_lifetimes_without_promoting_raw_loc
     );
     let source = record
         .skeleton
-        .replacen("todo!()", "Holder { pointer: &VALUE }", 1)
+        .replacen("todo!()", "Holder { pointer: Some(&VALUE) }", 1)
         .replacen("todo!()", "init", 1);
     let result = transform(&frozen, &source);
     let InitializerTransformationResponse::Valid { source } = result else { panic!("{result:?}") };
@@ -184,7 +184,7 @@ fn root_unsafe_initializer_keeps_its_boundary_through_generation_and_installatio
         "{}",
         record.annotated_source
     );
-    let source = "static mut GLOBAL: Holder = unsafe { #[proctor(0)] Holder { pointer: &*(&VALUE as *const i32) } };";
+    let source = "static mut GLOBAL: Holder = unsafe { #[proctor(0)] Holder { pointer: Some(&*(&VALUE as *const i32)) } };";
     let result = transform(&frozen, source);
     let InitializerTransformationResponse::Valid { source } = result else { panic!("{result:?}") };
     let installed = install(&frozen, &[&source]);
@@ -203,7 +203,7 @@ fn nested_unsafe_blocks_keep_function_style_nested_labels() {
         "{}",
         record.annotated_source
     );
-    let source = "static mut GLOBAL: Holder = { #[proctor(0)] let pointer: *const i32 = unsafe { #[proctor(1)] &*(&VALUE as *const i32) }; #[proctor(2)] Holder { pointer: unsafe { &*pointer } } };";
+    let source = "static mut GLOBAL: Holder = { #[proctor(0)] let pointer: *const i32 = unsafe { #[proctor(1)] &*(&VALUE as *const i32) }; #[proctor(2)] Holder { pointer: unsafe { Some(&*pointer) } } };";
     let result = transform(&frozen, source);
     let InitializerTransformationResponse::Valid { source } = result else { panic!("{result:?}") };
     let installed = install(&frozen, &[&source]);
@@ -215,7 +215,7 @@ fn transforms_nonblock_initializer_without_changing_its_declaration() {
     let frozen = fixture("Holder { pointer: &VALUE }");
     let result = transform(
         &frozen,
-        "static mut GLOBAL: Holder = Holder { pointer: &VALUE };",
+        "static mut GLOBAL: Holder = Holder { pointer: Some(&VALUE) };",
     );
     let InitializerTransformationResponse::Valid { source } = result else { panic!("{result:?}") };
     assert!(source.contains("static mut GLOBAL: Holder"));
@@ -250,7 +250,7 @@ fn strict_transformation_rejects_changed_global_headers_labels_and_extra_items()
 #[test]
 fn block_validation_reuses_labels_and_permits_required_unsafe_blocks() {
     let frozen = fixture("{ let number: i32 = 7; Holder { pointer: &VALUE } }");
-    let source = "static mut GLOBAL: Holder = { #[proctor(0)] let number: i32 = 99; #[proctor(1)] Holder { pointer: unsafe { &*(&VALUE as *const i32) } } };";
+    let source = "static mut GLOBAL: Holder = { #[proctor(0)] let number: i32 = 99; #[proctor(1)] Holder { pointer: unsafe { Some(&*(&VALUE as *const i32)) } } };";
     let result = transform(&frozen, source);
     let InitializerTransformationResponse::Valid { source } = result else { panic!("{result:?}") };
     assert!(source.contains("number: i32 = 7"));

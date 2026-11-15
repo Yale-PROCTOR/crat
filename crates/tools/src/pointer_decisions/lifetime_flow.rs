@@ -1,6 +1,4 @@
-use pointer_replacer_bo::{
-    AcceptedPointerAnalysis, analyses::borrow_ownership::slots::StructFieldSlot,
-};
+use pointer_replacer_bo::analyses::borrow_ownership::slots::StructFieldSlot;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_middle::{
     mir::{
@@ -28,14 +26,19 @@ pub(super) struct LifetimeFlow {
 }
 
 impl LifetimeFlow {
-    pub fn new(analysis: &AcceptedPointerAnalysis, types: &TypeLifetimes, tcx: TyCtxt<'_>) -> Self {
+    pub fn new(
+        functions: FxHashSet<LocalDefId>,
+        field_exists: impl Fn(StructFieldSlot) -> bool,
+        types: &TypeLifetimes,
+        tcx: TyCtxt<'_>,
+    ) -> Self {
         let mut result = Self {
             edges: FxHashMap::default(),
         };
         if types.plans.is_empty() {
             return result;
         }
-        for &function in analysis.slots.fn_local_slots.keys() {
+        for &function in &functions {
             let body = tcx
                 .mir_drops_elaborated_and_const_checked(function)
                 .borrow();
@@ -69,7 +72,7 @@ impl LifetimeFlow {
                                         struct_did: owner,
                                         field_index: index.as_usize(),
                                     };
-                                    if analysis.slots.field_slots.slots_for_field(field).is_none() {
+                                    if !field_exists(field) {
                                         continue;
                                     }
                                     for &(key, source) in &sources {
@@ -105,10 +108,7 @@ impl LifetimeFlow {
                     continue;
                 };
                 let TyKind::FnDef(callee, _) = func.ty(&*body, tcx).kind() else { continue };
-                let Some(callee) = callee
-                    .as_local()
-                    .filter(|did| analysis.slots.fn_local_slots.contains_key(did))
-                else {
+                let Some(callee) = callee.as_local().filter(|did| functions.contains(did)) else {
                     continue;
                 };
                 let callee_body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();

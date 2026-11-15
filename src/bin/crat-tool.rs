@@ -30,6 +30,8 @@ enum Command {
     },
     MakeSkeleton {
         #[arg(long)]
+        use_bo_analysis: bool,
+        #[arg(long)]
         frozen_output: Option<PathBuf>,
         #[arg(long)]
         output: PathBuf,
@@ -591,6 +593,7 @@ fn main() {
                 .unwrap_or_else(|error| fail("output_io", error));
         }
         Command::MakeSkeleton {
+            use_bo_analysis,
             output,
             frozen_output,
             rules,
@@ -621,8 +624,14 @@ fn main() {
                 .unwrap_or_else(|error| fail("invalid_api_config", error));
             let (records, frozen) = run_compiler_on_path(&source_path, move |tcx| {
                 let api = api.into_iter().collect();
-                let records = tools::make_skeletons_with_api(&source, rules.as_ref(), &api, tcx)
-                    .map_err(|error| format!("{}: {}", error.function_path, error.message))?;
+                let records = tools::make_skeletons_with_analysis(
+                    &source,
+                    rules.as_ref(),
+                    &api,
+                    use_bo_analysis,
+                    tcx,
+                )
+                .map_err(|error| format!("{}: {}", error.function_path, error.message))?;
                 let frozen = if freeze {
                     Some(
                         tools::freeze_project(&source, &records, tcx)

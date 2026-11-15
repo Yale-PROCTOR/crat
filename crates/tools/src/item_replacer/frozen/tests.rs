@@ -3,8 +3,19 @@ use utils::compilation::run_compiler_on_str;
 use super::*;
 
 fn freeze(source: &str) -> FrozenProject {
+    freeze_with_analysis(source, false)
+}
+
+fn freeze_with_analysis(source: &str, use_bo_analysis: bool) -> FrozenProject {
     run_compiler_on_str(source, |tcx| {
-        let records = crate::make_skeletons(source, tcx).unwrap();
+        let records = crate::make_skeletons_with_analysis(
+            source,
+            None,
+            &FxHashSet::default(),
+            use_bo_analysis,
+            tcx,
+        )
+        .unwrap();
         freeze_project(source, &records, tcx).unwrap()
     })
     .unwrap()
@@ -1120,7 +1131,7 @@ fn cross_module_observations_use_original_and_target_signature_stubs_with_one_id
 
 #[test]
 fn nested_match_conditions_survive_validation_replacement_and_observation_extraction() {
-    let frozen = freeze(
+    let frozen = freeze_with_analysis(
         r#"
 pub unsafe fn value(flag: bool, p: *const i32) -> i32 {
     let preserved = Some(match flag { value if value => 7, _ => 8 }).unwrap();
@@ -1134,6 +1145,7 @@ pub unsafe fn value(flag: bool, p: *const i32) -> i32 {
     }
 }
 "#,
+        true,
     );
     let function = &frozen.functions[0];
     assert_eq!(function.record.baseline.transform_labels(), [1, 2]);
@@ -1931,11 +1943,10 @@ pub unsafe fn get(holder: *const Holder) -> *const i32 { (*holder).pointer }
         frozen.types[0].target_definition
     );
     let function = &frozen.functions[0];
-    let returned = function
-        .record
-        .baseline
-        .skeleton
-        .replace("todo!()", "holder.pointer");
+    let returned = function.record.baseline.skeleton.replace(
+        "todo!()",
+        "holder.pointer.map_or(core::ptr::null(), |pointer| pointer as *const i32)",
+    );
     let output = transform_frozen_scc(&frozen, &request(function, Some(&returned)))
         .unwrap()
         .0;
@@ -1982,7 +1993,7 @@ fn generated_nested_reference_bounds_survive_frozen_loading_validation_and_repla
     let source = r#"
 pub unsafe fn identity(head: *const *const i32) -> *const *const i32 { head }
 "#;
-    let frozen = freeze(source);
+    let frozen = freeze_with_analysis(source, true);
     let frozen = frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
     run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
     let function = &frozen.functions[0];

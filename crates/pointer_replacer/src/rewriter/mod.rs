@@ -16,8 +16,8 @@ use crate::{
     analyses::{
         self,
         borrow::{
-            BorrowPromotionResults, PromotedMutRefs as PromotedMutRefResult,
-            lifetime_flow::LifetimeFlowResults,
+            BorrowPromotionResults, PromotedMutRefs as PromotedMutRefResult, StructFieldSlot,
+            lifetime_flow::{LifetimeFlowResults, LifetimeFlowSummary},
         },
         fn_ptr_groups::FnPtrGroups,
         fn_ptr_rewrite_decision::FnPtrRewriteDecision,
@@ -56,6 +56,9 @@ pub struct PointerDecisionOptions {
 pub struct InitialPointerDecisions {
     pub signatures: SigDecisions,
     pub bindings: FxHashMap<HirId, PtrKind>,
+    pub fields: FxHashMap<StructFieldSlot, PtrKind>,
+    pub non_null_locals: FxHashMap<LocalDefId, rustc_index::bit_set::DenseBitSet<Local>>,
+    pub lifetime_flows: FxHashMap<LocalDefId, LifetimeFlowSummary>,
 }
 
 pub struct Analysis {
@@ -151,9 +154,17 @@ pub fn initial_pointer_decisions(
     let lifetime_plans = lifetimes::LifetimePlans::new(&input, &analysis);
     let signatures = SigDecisions::new(&input, &analysis, &lifetime_plans, &fn_ptr_groups);
     let bindings = collector::collect_diffs(&input, &analysis, &signatures, &fn_ptr_groups);
+    let fields = transform::initial_field_decisions(tcx, &analysis);
     InitialPointerDecisions {
         signatures,
         bindings,
+        fields,
+        non_null_locals: analysis.nullity_result.non_null_locals,
+        lifetime_flows: analysis
+            .borrow_lifetime_flows
+            .into_iter()
+            .map(|(function, flow)| (function, flow.summary))
+            .collect(),
     }
 }
 

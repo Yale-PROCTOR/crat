@@ -209,12 +209,23 @@ pub fn make_skeletons_with_api(
     api: &FxHashSet<String>,
     tcx: TyCtxt<'_>,
 ) -> Result<Vec<ItemRecord>, GenerationError> {
+    make_skeletons_with_analysis(source, rules, api, false, tcx)
+}
+
+pub fn make_skeletons_with_analysis(
+    source: &str,
+    rules: Option<&RuleDocument>,
+    api: &FxHashSet<String>,
+    use_bo_analysis: bool,
+    tcx: TyCtxt<'_>,
+) -> Result<Vec<ItemRecord>, GenerationError> {
     make_skeletons_with_preservation_overrides(
         source,
         rules,
         tcx,
         &PreservationDecisionOverrides::default(),
         api,
+        use_bo_analysis,
     )
 }
 
@@ -224,6 +235,7 @@ fn make_skeletons_with_preservation_overrides(
     tcx: TyCtxt<'_>,
     preservation_overrides: &PreservationDecisionOverrides,
     api: &FxHashSet<String>,
+    use_bo_analysis: bool,
 ) -> Result<Vec<ItemRecord>, GenerationError> {
     let mut surface = utils::ast::parse_crate(source.to_owned());
     reject_unsupported_function_generics(&surface.items, &mut vec![])?;
@@ -253,10 +265,12 @@ fn make_skeletons_with_preservation_overrides(
         .map(|item| (item.def_id.to_def_id(), item.id))
         .collect();
     let mut decisions =
-        initial_pointer_decisions_for_api(tcx, api).map_err(|message| GenerationError {
-            kind: GenerationErrorKind::PointerAnalysis,
-            function_path: String::new(),
-            message,
+        initial_pointer_decisions_for_api(tcx, api, use_bo_analysis).map_err(|message| {
+            GenerationError {
+                kind: GenerationErrorKind::PointerAnalysis,
+                function_path: String::new(),
+                message,
+            }
         })?;
     for item in &raw_items {
         let ItemKind::Fn(function) = &item.item.kind else { continue };
