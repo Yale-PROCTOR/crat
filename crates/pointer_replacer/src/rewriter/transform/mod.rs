@@ -14865,6 +14865,47 @@ impl OwnershipFieldDiagnostics {
     }
 }
 
+pub(super) fn initial_field_decisions(
+    tcx: TyCtxt<'_>,
+    analysis: &Analysis,
+) -> FxHashMap<StructFieldSlot, PtrKind> {
+    local_struct_fields(tcx)
+        .into_iter()
+        .filter_map(|field| {
+            let kind = if struct_field_is_exactly_owning(analysis, field) {
+                scalar_owning_raw_field_inner_ty(tcx, analysis, field)?;
+                if analysis_field_is_array_like(analysis, field) {
+                    PtrKind::OptBoxedSlice
+                } else {
+                    PtrKind::OptBox
+                }
+            } else {
+                let mutable = if analysis
+                    .borrow_promotion_result
+                    .mutable_fields
+                    .contains(&field)
+                {
+                    true
+                } else if analysis
+                    .borrow_promotion_result
+                    .shared_fields
+                    .contains(&field)
+                {
+                    false
+                } else {
+                    return None;
+                };
+                if analysis_field_is_array_like(analysis, field) {
+                    PtrKind::Slice(mutable)
+                } else {
+                    PtrKind::OptRef(mutable)
+                }
+            };
+            Some((field, kind))
+        })
+        .collect()
+}
+
 fn ownership_field_ptr_kind<'tcx>(
     tcx: TyCtxt<'tcx>,
     analysis: &Analysis,

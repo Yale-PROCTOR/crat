@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pointer_replacer_bo::{
-    AcceptedPointerAnalysis, SignatureRoot, SignatureSlot,
+    AcceptedPointerAnalysis, SignatureRoot,
     analyses::borrow_ownership::{
         SlotKind,
         crate_slots::MAX_SLOT_DEPTH,
@@ -26,6 +26,7 @@ use rustc_span::{
 };
 
 mod lifetime_flow;
+mod original;
 mod return_flow;
 mod struct_types;
 pub(super) use struct_types::{FieldRegion, TypeLifetimes};
@@ -121,13 +122,17 @@ impl InitialPointerDecisions {
 pub(super) fn initial_pointer_decisions(
     tcx: TyCtxt<'_>,
 ) -> Result<InitialPointerDecisions, String> {
-    initial_pointer_decisions_for_api(tcx, &FxHashSet::default())
+    initial_pointer_decisions_for_api(tcx, &FxHashSet::default(), false)
 }
 
 pub(super) fn initial_pointer_decisions_for_api(
     tcx: TyCtxt<'_>,
     api: &FxHashSet<String>,
+    use_bo_analysis: bool,
 ) -> Result<InitialPointerDecisions, String> {
+    if !use_bo_analysis {
+        return Ok(original::initial_pointer_decisions(tcx, api));
+    }
     let mut analysis = analyze_pointers(tcx)?;
     let representations = representation_facts(&analysis, tcx);
     let file_types = struct_types::file_types(tcx);
@@ -227,7 +232,12 @@ pub(super) fn initial_pointer_decisions_for_api(
     }
     struct_types::retain_union_compatible_fields(&mut result.fields, tcx);
     result.types = TypeLifetimes::new(&mut result.fields, tcx);
-    let lifetime_flow = lifetime_flow::LifetimeFlow::new(&analysis, &result.types, tcx);
+    let lifetime_flow = lifetime_flow::LifetimeFlow::new(
+        analysis.slots.fn_local_slots.keys().copied().collect(),
+        |field| analysis.slots.field_slots.slots_for_field(field).is_some(),
+        &result.types,
+        tcx,
+    );
     loop {
         result.type_arguments.clear();
         for (&function, universe) in &analysis.slots.fn_local_slots {
@@ -328,10 +338,14 @@ pub(super) fn initial_pointer_decisions_for_api(
                     locals.insert(local, layers);
                 }
             }
+            let origins = analysis
+                .origins
+                .get(&function)
+                .map(SignatureOrigins::from_bo);
             let bounds = signature_lifetimes(
                 function,
                 arguments,
-                &analysis,
+                origins.as_ref(),
                 &lifetime_flow,
                 &mut locals,
                 &mut result,
@@ -476,10 +490,70 @@ fn field_borrow_uses_raw_container(
     false
 }
 
+struct SignatureField {
+    deref_depth: u8,
+    field: StructFieldSlot,
+}
+
+struct SignaturePlace {
+    root: SignatureRoot,
+    parents: Vec<SignatureField>,
+    deref_depth: u8,
+    field: Option<StructFieldSlot>,
+}
+
+struct SignatureSlot {
+    place: SignaturePlace,
+    depth: u8,
+}
+
+struct SignatureOrigins {
+    flows: Vec<(SignatureSlot, SignatureSlot)>,
+    unknown: Vec<SignatureSlot>,
+}
+
+impl SignatureOrigins {
+    fn from_bo(summary: &pointer_replacer_bo::OriginSummary) -> Self {
+        let slot = |slot: &pointer_replacer_bo::SignatureSlot| SignatureSlot {
+            place: SignaturePlace {
+                root: slot.place.root,
+                parents: slot
+                    .place
+                    .parents
+                    .iter()
+                    .map(|step| SignatureField {
+                        deref_depth: step.deref_depth,
+                        field: step.field,
+                    })
+                    .collect(),
+                deref_depth: slot.place.deref_depth,
+                field: slot.place.field,
+            },
+            depth: slot.depth,
+        };
+        let mut flows = Vec::new();
+        for (source, source_slot) in summary.slots.iter_enumerated() {
+            for (target, target_slot) in summary.slots.iter_enumerated() {
+                if summary.subset.contains(source, target) {
+                    flows.push((slot(source_slot), slot(target_slot)));
+                }
+            }
+        }
+        Self {
+            flows,
+            unknown: summary
+                .unknown
+                .iter()
+                .map(|index| slot(&summary.slots[index]))
+                .collect(),
+        }
+    }
+}
+
 fn signature_lifetimes(
     function: LocalDefId,
     arguments: usize,
-    analysis: &AcceptedPointerAnalysis,
+    origins: Option<&SignatureOrigins>,
     lifetime_flow: &lifetime_flow::LifetimeFlow,
     locals: &mut FxHashMap<Local, Vec<PointerLayer>>,
     decisions: &mut InitialPointerDecisions,
@@ -555,7 +629,7 @@ fn signature_lifetimes(
             }
         }
     }
-    if let Some(summary) = analysis.origins.get(&function) {
+    if let Some(summary) = origins {
         let key_of = |slot: &SignatureSlot| {
             let local = match slot.place.root {
                 SignatureRoot::Return => 0,
@@ -632,19 +706,15 @@ fn signature_lifetimes(
                 None
             }
         };
-        for (source, source_slot) in summary.slots.iter_enumerated() {
+        for (source_slot, target_slot) in &summary.flows {
             let source_key = key_of(source_slot);
-            for (target, target_slot) in summary.slots.iter_enumerated() {
-                let Some(target_key) = key_of(target_slot) else { continue };
-                if summary.subset.contains(source, target) {
-                    if let Some(source_key) = source_key {
-                        if source_key != target_key {
-                            flows.insert((source_key, target_key));
-                        }
-                    } else if matches!(source_slot.place.root, SignatureRoot::Arg(_)) {
-                        unusable_origins.insert(target_key);
-                    }
+            let Some(target_key) = key_of(target_slot) else { continue };
+            if let Some(source_key) = source_key {
+                if source_key != target_key {
+                    flows.insert((source_key, target_key));
                 }
+            } else if matches!(source_slot.place.root, SignatureRoot::Arg(_)) {
+                unusable_origins.insert(target_key);
             }
         }
     }
@@ -702,12 +772,11 @@ fn signature_lifetimes(
             else {
                 break;
             };
-            let unknown = analysis.origins.get(&function).is_some_and(|summary| {
-                summary.slots.iter_enumerated().any(|(index, slot)| {
+            let unknown = origins.is_some_and(|summary| {
+                summary.unknown.iter().any(|slot| {
                     slot.place.root == SignatureRoot::Return
                         && slot.place.field.is_none()
                         && usize::from(slot.place.deref_depth + slot.depth) == depth
-                        && summary.unknown.contains(index)
                 })
             });
             if source.is_raw_ptr()
@@ -731,7 +800,7 @@ fn signature_lifetimes(
         return signature_lifetimes(
             function,
             arguments,
-            analysis,
+            origins,
             lifetime_flow,
             locals,
             decisions,

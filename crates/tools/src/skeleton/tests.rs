@@ -9,6 +9,9 @@ mod type_spelling_sources;
 #[path = "bo_pointer_tests.rs"]
 mod bo_pointer_tests;
 
+#[path = "original_pointer_tests.rs"]
+mod original_pointer_tests;
+
 fn type_spelling_source(name: &str) -> &'static str {
     let delimited = match name {
         "motivating" => type_spelling_sources::MOTIVATING,
@@ -68,6 +71,17 @@ fn type_spelling_source(name: &str) -> &'static str {
 
 fn generate(source: &str) -> Vec<ItemRecord> {
     run_compiler_on_str(source, |tcx| make_skeletons(source, tcx).unwrap()).unwrap()
+}
+
+fn generate_bo(source: &str) -> Vec<ItemRecord> {
+    run_compiler_on_str(source, |tcx| {
+        make_skeletons_with_analysis(source, None, &FxHashSet::default(), true, tcx).unwrap()
+    })
+    .unwrap()
+}
+
+fn bo_pointer_decisions(tcx: TyCtxt<'_>) -> InitialPointerDecisions {
+    initial_pointer_decisions_for_api(tcx, &FxHashSet::default(), true).unwrap()
 }
 
 fn synthesized_printf_rules(
@@ -1974,7 +1988,7 @@ fn resolve_emitted_type_path(
 }
 
 fn assert_constructor_failure_pointer_prerequisites(name: &str, tcx: TyCtxt<'_>) {
-    let decisions = tools_pointer_decisions(tcx);
+    let decisions = bo_pointer_decisions(tcx);
     let signature = |path: &str| &decisions.signatures.data[&local_def_path(path, tcx)];
     match name {
         "option-collision" => {
@@ -2164,6 +2178,13 @@ fn generate_error(source: &str) -> GenerationError {
             "failed generation returned records that could be serialized"
         );
         result.unwrap_err()
+    })
+    .unwrap()
+}
+
+fn generate_bo_error(source: &str) -> GenerationError {
+    run_compiler_on_str(source, |tcx| {
+        make_skeletons_with_analysis(source, None, &FxHashSet::default(), true, tcx).unwrap_err()
     })
     .unwrap()
 }
@@ -3087,7 +3108,7 @@ fn same_module_parameter_return_local_and_lifetime_types_are_short() {
         let update = local_def_path("update_and_return", tcx);
         let signature = &decisions.signatures.data[&update];
         assert_eq!(signature.input_decs[0], Some(PtrKind::Ref(true)));
-        assert_eq!(signature.output_dec, Some(PtrKind::Ref(false)));
+        assert_eq!(signature.output_dec, Some(PtrKind::Ref(true)));
         assert_eq!(signature.input_lifetimes[0], Some(Symbol::intern("a")));
         assert_eq!(signature.output_lifetime, Some(Symbol::intern("a")));
         assert_eq!(
@@ -3120,7 +3141,7 @@ fn same_module_parameter_return_local_and_lifetime_types_are_short() {
     );
     assert_eq!(
         compact(&update.target_signature),
-        "pub unsafe fn update_and_return<'a>(mut pointer: &'a mut Node) -> &'a Node"
+        "pub unsafe fn update_and_return<'a>(mut pointer: &'a mut Node) -> &'a mut Node"
     );
     assert!(!update.target_signature.contains("crate::Node"));
     assert!(!update.baseline.skeleton.contains("crate::Node"));
@@ -3237,7 +3258,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
     }
     let source = type_spelling_source("standard-constructors");
     run_compiler_on_str(source, |tcx| {
-        let decisions = tools_pointer_decisions(tcx);
+        let decisions = bo_pointer_decisions(tcx);
         let read = local_def_path("wrapped::read", tcx);
         assert_eq!(
             decisions.signatures.data[&read].input_decs[0],
@@ -3284,7 +3305,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
         ));
     })
     .unwrap();
-    let records = generate(source);
+    let records = generate_bo(source);
     assert!(
         function(&records, "wrapped::read")
             .target_signature
@@ -3318,7 +3339,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
 
     let source = type_spelling_source("standard-bare-imports");
     run_compiler_on_str(source, |tcx| {
-        let decisions = tools_pointer_decisions(tcx);
+        let decisions = bo_pointer_decisions(tcx);
         let read = local_def_path("imported::read", tcx);
         assert_eq!(
             decisions.signatures.data[&read].input_decs[0],
@@ -3343,7 +3364,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
         ));
     })
     .unwrap();
-    let records = generate(source);
+    let records = generate_bo(source);
     assert!(
         function(&records, "imported::read")
             .target_signature
@@ -3363,7 +3384,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
 
     let source = type_spelling_source("no-std-option-success");
     run_compiler_on_str(source, |tcx| {
-        let decisions = tools_pointer_decisions(tcx);
+        let decisions = bo_pointer_decisions(tcx);
         let read = local_def_path("read", tcx);
         assert_eq!(
             decisions.signatures.data[&read].input_decs[0],
@@ -3375,7 +3396,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
         ));
     })
     .unwrap();
-    let records = generate(source);
+    let records = generate_bo(source);
     assert_eq!(
         function(&records, "read").target_signature,
         "pub unsafe fn read(mut p: Option<&i32>) -> i32"
@@ -3383,7 +3404,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
 
     let source = type_spelling_source("named-optional-box");
     run_compiler_on_str(source, |tcx| {
-        let decisions = tools_pointer_decisions(tcx);
+        let decisions = bo_pointer_decisions(tcx);
         let owned_id = local_def_path("consumer::owned_id", tcx);
         assert_eq!(
             decisions.signatures.data[&owned_id].input_decs[0],
@@ -3416,7 +3437,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
         ));
     })
     .unwrap();
-    let records = generate(source);
+    let records = generate_bo(source);
     assert_eq!(
         function(&records, "consumer::owned_id").target_signature,
         "pub unsafe fn owned_id(mut p: Option<Box<P>>) -> Option<Box<ReturnP>>"
@@ -3431,7 +3452,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
 
     let source = type_spelling_source("irrelevant-collisions");
     run_compiler_on_str(source, |tcx| {
-        let decisions = tools_pointer_decisions(tcx);
+        let decisions = bo_pointer_decisions(tcx);
         let allocate = local_def_path("box_only::allocate", tcx);
         assert_eq!(
             decisions.signatures.data[&allocate].output_dec,
@@ -3456,7 +3477,7 @@ fn standard_constructors_require_exact_bare_prelude_resolution() {
         ));
     })
     .unwrap();
-    let records = generate(source);
+    let records = generate_bo(source);
     assert!(
         function(&records, "box_only::allocate")
             .target_signature
@@ -3506,7 +3527,7 @@ fn type_spelling_failures_are_structured_and_atomic() {
         );
     })
     .unwrap();
-    let error = generate_error(option_collision);
+    let error = generate_bo_error(option_collision);
     assert_eq!(error.kind, GenerationErrorKind::TypeSpelling);
     assert_eq!(error.function_path, "wrapped::read");
     assert!(error.message.contains("parameter `first`"));
@@ -3617,7 +3638,7 @@ fn type_spelling_failures_are_structured_and_atomic() {
             }
         })
         .unwrap();
-        let error = generate_error(source);
+        let error = generate_bo_error(source);
         assert_eq!(error.kind, GenerationErrorKind::TypeSpelling);
         assert_eq!(error.function_path, expected_path);
         for part in message_parts {
@@ -3635,7 +3656,7 @@ fn type_spelling_failures_are_structured_and_atomic() {
     }
 
     let unnameable = type_spelling_source("unnameable");
-    let error = generate_error(unnameable);
+    let error = generate_bo_error(unnameable);
     assert_eq!(error.kind, GenerationErrorKind::TypeSpelling);
     assert_eq!(error.function_path, "consume");
     assert!(error.message.contains("local `iterator`"));
@@ -5316,7 +5337,7 @@ fn array_pointer_fixture() -> &'static str {
 
 #[test]
 fn preserves_array_local_pointer_kinds_from_bo() {
-    let records = generate(array_pointer_fixture());
+    let records = generate_bo(array_pointer_fixture());
     assert!(
         function(&records, "read_array")
             .baseline
@@ -5334,7 +5355,7 @@ fn preserves_array_local_pointer_kinds_from_bo() {
 
 #[test]
 fn keeps_bo_raw_array_locals_explicit() {
-    let records = generate(array_pointer_fixture());
+    let records = generate_bo(array_pointer_fixture());
     assert!(
         function(&records, "read_array")
             .baseline
@@ -5393,11 +5414,11 @@ fn adds_named_lifetimes_for_returned_borrows() {
     );
     assert_eq!(
         function(&records, "id").target_signature,
-        "pub unsafe fn id<'a>(mut x: &'a i32) -> &'a i32"
+        "pub unsafe fn id<'a>(mut x: &'a mut i32) -> &'a mut i32"
     );
     assert_eq!(
         function(&records, "wrap").target_signature,
-        "pub unsafe fn wrap<'a>(mut y: &'a i32) -> &'a i32"
+        "pub unsafe fn wrap<'a>(mut y: &'a mut i32) -> &'a mut i32"
     );
 }
 
@@ -5408,7 +5429,10 @@ fn preserves_nullable_returned_borrow_relationships() {
     );
     for path in ["maybe", "maybe_local"] {
         let signature = &function(&records, path).target_signature;
-        assert!(signature.contains("mut x: &'a mut i32"), "{signature}");
+        assert!(
+            signature.contains("mut x: Option<&'a mut i32>"),
+            "{signature}"
+        );
         assert!(signature.contains("-> Option<&'a"), "{signature}");
     }
     assert!(
@@ -5425,7 +5449,7 @@ fn raw_pointer_fixture() -> &'static str {
 
 #[test]
 fn uses_bo_model_before_symbolic_rewrite_restrictions() {
-    let records = generate(raw_pointer_fixture());
+    let records = generate_bo(raw_pointer_fixture());
     assert!(
         function(&records, "void_address")
             .target_signature
@@ -5513,8 +5537,8 @@ fn all_simple_locals_receive_final_explicit_target_types() {
         (
             array_pointer_fixture(),
             &[
-                ("read_array", "p", "*const i32"),
-                ("write_array", "p", "*mut i32"),
+                ("read_array", "p", "Option<&[i32]>"),
+                ("write_array", "p", "Option<&mut [i32]>"),
             ],
         ),
         (scalar_box_fixture(), &[("alloc", "p", "Box<i32>")]),
@@ -5524,12 +5548,12 @@ fn all_simple_locals_receive_final_explicit_target_types() {
             &[
                 ("alias_caller", "x", "i32"),
                 ("alias_caller", "p", "&mut i32"),
-                ("global_escape", "p", "*mut Option<&i32>"),
+                ("global_escape", "p", "*mut *mut i32"),
             ],
         ),
         (
             optional_box_fixture(),
-            &[("foo", "p", "Box<i32>"), ("foo", "q", "Option<Box<i32>>")],
+            &[("foo", "p", "&mut i32"), ("foo", "q", "Option<&i32>")],
         ),
     ];
     for (source, expected) in fixtures {
@@ -5568,7 +5592,7 @@ fn optional_box_fixture() -> &'static str {
 
 #[test]
 fn selects_optional_boxes_at_local_call_boundaries() {
-    let records = generate(optional_box_fixture());
+    let records = generate_bo(optional_box_fixture());
     assert_eq!(
         function(&records, "owned_id").target_signature,
         "pub unsafe fn owned_id(mut p: Option<Box<i32>>) -> Option<Box<i32>>"
@@ -5620,11 +5644,11 @@ fn tools_mode_disables_conservative_slice_cursors_without_changing_crat_default(
         result.signatures.data[&did].input_decs[0].unwrap()
     })
     .unwrap();
-    assert_eq!(tools_kind, PtrKind::Slice(false));
+    assert_eq!(tools_kind, PtrKind::OptSlice(false));
     let records = generate(source);
     assert_eq!(
         function(&records, "read_at").target_signature,
-        "pub unsafe fn read_at(mut p: &[i32], mut offset: isize) -> i32"
+        "pub unsafe fn read_at(mut p: Option<&[i32]>, mut offset: isize) -> i32"
     );
     assert!(
         function(&records, "read_at")
@@ -7235,6 +7259,7 @@ pub unsafe fn move_future(mut left: FutureField, right: FutureField) -> i32 {
             tcx,
             &overrides,
             &FxHashSet::default(),
+            false,
         )
         .unwrap()
     })
@@ -7270,6 +7295,7 @@ pub unsafe fn scalar_caller(value: i32) -> i32 { scalar_callee(value) }
             tcx,
             &overrides,
             &FxHashSet::default(),
+            false,
         )
         .unwrap()
     })
@@ -8181,7 +8207,7 @@ fn main_override_aliases_and_raw_fallbacks_report_actual_skeleton_types() {
         .find(|variable| variable.name == "a")
         .unwrap();
     assert_eq!(retained.before_type, "*mut i32");
-    assert_eq!(retained.selected_target_type, "&'a mut i32");
+    assert_eq!(retained.selected_target_type, "*mut i32");
 }
 
 #[test]
@@ -8407,7 +8433,7 @@ pub unsafe fn external_generic(p: *mut i32) { core::mem::drop::<*mut i32>(p); }
         };
 
         let contexts = local_def("contexts", tcx);
-        let mut decisions = tools_pointer_decisions(tcx);
+        let mut decisions = bo_pointer_decisions(tcx);
         let signature = decisions.signatures.data.get_mut(&contexts).unwrap();
         signature.input_decs[0] = Some(PtrKind::Slice(true));
         signature.output_dec = Some(PtrKind::OptRef(false));
@@ -9793,7 +9819,7 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
             rules,
         };
         run_compiler_on_str(source, |tcx| {
-            let records = make_skeletons_with_rules(source, Some(&document), tcx).unwrap();
+            let records = make_skeletons_with_analysis(source, Some(&document), &FxHashSet::default(), true, tcx).unwrap();
             let record = function(&records, "f");
             assert_eq!(
                 record.applied,
@@ -9818,7 +9844,9 @@ pub unsafe fn f(pointer: *const i32) -> i32 { read_one(pointer) }
         rules: vec![child],
     };
     run_compiler_on_str(source, |tcx| {
-        let records = make_skeletons_with_rules(source, Some(&child_only), tcx).unwrap();
+        let records = make_skeletons_with_analysis(
+            source, Some(&child_only), &FxHashSet::default(), true, tcx,
+        ).unwrap();
         let record = function(&records, "f");
         assert_eq!(
             record.applied,

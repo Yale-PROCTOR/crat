@@ -1,5 +1,22 @@
 use super::*;
 
+fn make_bo_skeletons(source: &str, tcx: TyCtxt<'_>) -> Result<Vec<ItemRecord>, GenerationError> {
+    make_bo_skeletons_with_api(source, None, &FxHashSet::default(), tcx)
+}
+
+fn make_bo_skeletons_with_api(
+    source: &str,
+    rules: Option<&RuleDocument>,
+    api: &FxHashSet<String>,
+    tcx: TyCtxt<'_>,
+) -> Result<Vec<ItemRecord>, GenerationError> {
+    make_skeletons_with_analysis(source, rules, api, true, tcx)
+}
+
+fn generate_bo(source: &str) -> Vec<ItemRecord> {
+    run_compiler_on_str(source, |tcx| make_bo_skeletons(source, tcx).unwrap()).unwrap()
+}
+
 fn indirections(ty: &Ty) -> String {
     match &ty.kind {
         TyKind::Ref(_, inner) => format!("&{}", indirections(&inner.ty)),
@@ -39,7 +56,7 @@ pub fn bytes(values: &[u8]) -> bool {
 }
 pub unsafe fn read(pointer: *const i32) -> i32 { *pointer }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     assert!(
         function(&records, "arguments")
             .target_signature
@@ -67,7 +84,7 @@ pub fn scan(values: &(Vec<i32>, Vec<i32>)) -> i32 {
 }
 pub unsafe fn read(pointer: *const i32) -> i32 { *pointer }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     assert!(
         function(&records, "update")
             .target_signature
@@ -93,7 +110,7 @@ pub unsafe fn create() -> Box<Manager> {
 }
 pub unsafe fn read(pointer: *const i32) -> i32 { *pointer }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     let create = function(&records, "create");
     assert!(create.target_signature.contains("Box<Manager>"));
     assert!(!create.baseline.transform_labels().is_empty());
@@ -117,7 +134,7 @@ pub unsafe fn get_parent(node: *const Node) -> *mut Node {
 }
 pub unsafe fn read(pointer: *const i32) -> i32 { *pointer }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     for name in ["set_parent", "get_parent"] {
         let signature = &function(&records, name).target_signature;
         assert!(signature.contains("*"), "{signature}");
@@ -135,7 +152,7 @@ fn unsupported_nonpointer_loan_sources_decline_analysis_with_a_diagnostic() {
     let source = "#[repr(transparent)] pub struct NonNull(*mut i32); pub unsafe fn read(value: NonNull) -> i32 { let pointer: *mut i32 = core::mem::transmute(value); *pointer }";
     run_compiler_on_str(source, |tcx| {
         let error =
-            make_skeletons(source, tcx).expect_err("unrecognized sources must decline analysis");
+            make_bo_skeletons(source, tcx).expect_err("unrecognized sources must decline analysis");
         assert!(
             error
                 .message
@@ -159,7 +176,7 @@ fn recovered_smart_pointer_sources_allow_skeleton_generation() {
         "pub fn read(value: &mut Option<Box<i32>>) -> Result<(), ()> { *value.as_mut().ok_or(())?.as_mut() = 1; Ok(()) }",
         "pub struct Guard { allocation: Option<core::ptr::NonNull<i32>> } pub unsafe fn read(value: Guard) -> i32 { let pointer = value.allocation.expect(\"allocated\").as_ptr(); *pointer }",
     ] {
-        let records = generate(source);
+        let records = generate_bo(source);
         assert!(
             function(&records, "read")
                 .target_signature
@@ -259,7 +276,7 @@ pub unsafe fn read(p: *const *const i32) -> i32 {
 pub unsafe fn third(p: *const *const *const i32) -> i32 { ***p }
 "#;
     run_compiler_on_str(source, |tcx| {
-        let decisions = tools_pointer_decisions(tcx);
+        let decisions = bo_pointer_decisions(tcx);
         let read = local_def("read", tcx);
         assert_eq!(
             decisions.signatures.data[&read].input_decs[0],
@@ -281,7 +298,7 @@ pub unsafe fn third(p: *const *const *const i32) -> i32 { ***p }
         assert!(matches!(pointee.as_ref(), TypeTree::Reference { .. }));
     })
     .unwrap();
-    let records = generate(source);
+    let records = generate_bo(source);
     let read = function(&records, "read");
     assert!(
         read.baseline.skeleton.contains("let mut q: &&i32"),
@@ -308,7 +325,7 @@ pub unsafe fn third(p: *const *const *const i32) -> i32 { ***p }
 fn raw_outer_decision_does_not_hide_promoted_inner_layer() {
     let source = "pub unsafe fn read(p: *const *const i32) -> i32 { **p }";
     run_compiler_on_str(source, |tcx| {
-        let mut decisions = tools_pointer_decisions(tcx);
+        let mut decisions = bo_pointer_decisions(tcx);
         let read = local_def("read", tcx);
         decisions.signatures.data.get_mut(&read).unwrap().input_decs[0] = Some(PtrKind::Raw(false));
         let mut surface = utils::ast::parse_crate(source.to_owned());
@@ -345,7 +362,7 @@ pub unsafe fn alias(p: Pointer) -> i32 { **p }
 pub unsafe fn reference(p: &*const i32) -> i32 { **p }
 pub unsafe fn deep(p: *const *const *const *const i32) -> i32 { ****p }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     for (name, expected) in [("alias", "&&"), ("reference", "&&"), ("deep", "&&&*")] {
         let signature = &function(&records, name).target_signature;
         assert_eq!(signature_indirections(signature), expected, "{signature}");
@@ -356,7 +373,7 @@ pub unsafe fn deep(p: *const *const *const *const i32) -> i32 { ****p }
 #[test]
 fn nested_return_lifetimes_support_direct_transformed_bodies() {
     let source = "pub unsafe fn id<'a>(p: *const *const i32) -> *const *const i32 { p }";
-    let records = generate(source);
+    let records = generate_bo(source);
     let signature = &function(&records, "id").target_signature;
     assert!(signature.contains("'b"), "{signature}");
     assert!(signature.contains("'c"), "{signature}");
@@ -368,7 +385,7 @@ fn nested_return_lifetimes_support_direct_transformed_bodies() {
 fn unmodeled_reference_suffix_retains_its_original_lifetime_relationship() {
     let source =
         "pub unsafe fn id(p: *const *const *const &i32) -> *const *const *const &i32 { p }";
-    let records = generate(source);
+    let records = generate_bo(source);
     let signature = &function(&records, "id").target_signature;
     let transformed = format!("{signature} {{ p }}");
     run_compiler_on_str(&transformed, utils::type_check).expect(&transformed);
@@ -382,7 +399,7 @@ fn existing_static_and_named_return_lifetimes_remain_usable() {
         "pub unsafe fn get(p: &'static *const i32) -> i32 { **p }",
         "type P = &'static *const i32; pub unsafe fn get(p: P) -> i32 { **p }",
     ] {
-        let records = generate(source);
+        let records = generate_bo(source);
         let signature = &function(&records, "get").target_signature;
         if source.contains("'static") {
             assert!(signature.contains("'static"), "{signature}");
@@ -406,7 +423,7 @@ pub struct Holder { pub pointer: *const *const i32 }
 static mut GLOBAL: *const *const i32 = core::ptr::null();
 pub unsafe fn read(holder: *const Holder) -> i32 { **(*holder).pointer }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     assert!(
         type_record(&records, "Holder")
             .source_definition
@@ -427,7 +444,7 @@ pub unsafe fn read(holder: *const Holder) -> i32 { **(*holder).pointer }
 }
 
 fn compile_target_bodies(source: &str, bodies: &[(&str, &str)]) -> Vec<ItemRecord> {
-    let records = generate(source);
+    let records = generate_bo(source);
     let definitions = records
         .iter()
         .filter_map(|record| match record {
@@ -510,7 +527,7 @@ pub unsafe fn get(tree: *const Tree, i: isize) -> *mut Node { lookup((*tree).map
 pub unsafe fn deeper(outer: *const Outer) -> *mut Node { get((*outer).tree, 0) }
 "#;
     let frozen = run_compiler_on_str(source, |tcx| {
-        let records = make_skeletons(source, tcx).unwrap();
+        let records = make_bo_skeletons(source, tcx).unwrap();
         for name in ["get", "deeper"] {
             let signature = &function(&records, name).target_signature;
             assert!(signature.ends_with("*mut Node"), "{signature}");
@@ -538,9 +555,13 @@ pub unsafe fn get(map: *const Map, i: isize) -> *const i32 { &*(*(*map).entries.
 pub unsafe extern "C" fn api(_map: *const Map) {}
 "#;
     let frozen = run_compiler_on_str(source, |tcx| {
-        let records =
-            make_skeletons_with_api(source, None, &FxHashSet::from_iter(["api".to_owned()]), tcx)
-                .unwrap();
+        let records = make_bo_skeletons_with_api(
+            source,
+            None,
+            &FxHashSet::from_iter(["api".to_owned()]),
+            tcx,
+        )
+        .unwrap();
         let entry = &type_record(&records, "Entry").target_definition;
         assert!(entry.contains("Box<i32>"), "{entry}");
         let map = &type_record(&records, "Map").target_definition;
@@ -563,9 +584,13 @@ pub unsafe fn write(holder: *const Holder, i: isize) { *get(holder, i) = 9; }
 pub unsafe extern "C" fn api(_holder: *const Holder) {}
 "#;
     let frozen = run_compiler_on_str(source, |tcx| {
-        let records =
-            make_skeletons_with_api(source, None, &FxHashSet::from_iter(["api".to_owned()]), tcx)
-                .unwrap();
+        let records = make_bo_skeletons_with_api(
+            source,
+            None,
+            &FxHashSet::from_iter(["api".to_owned()]),
+            tcx,
+        )
+        .unwrap();
         let definition = &type_record(&records, "Holder").target_definition;
         assert!(definition.contains("cells: *const &'"), "{definition}");
         assert!(definition.contains("mut i32"), "{definition}");
@@ -587,7 +612,7 @@ pub unsafe fn walk(mut head: *mut Link) -> *mut Link {
 }
 "#;
     let frozen = run_compiler_on_str(source, |tcx| {
-        let records = make_skeletons(source, tcx).unwrap();
+        let records = make_bo_skeletons(source, tcx).unwrap();
         let signature = &function(&records, "walk").target_signature;
         assert!(signature.ends_with("*mut Link<'a>"), "{signature}");
         let definition = &type_record(&records, "Link").target_definition;
@@ -852,7 +877,7 @@ pub unsafe fn make(p: *const i32, q: *const i64) -> Pair {
 pub unsafe fn read(a: *const left::Holder, b: *const right::Holder) -> i64 { *(*a).pointer as i64 + *(*b).pointer }
 "#;
     let frozen = run_compiler_on_str(source, |tcx| {
-        let records = make_skeletons(source, tcx).unwrap();
+        let records = make_bo_skeletons(source, tcx).unwrap();
         crate::freeze_project(source, &records, tcx).unwrap()
     })
     .unwrap();
@@ -879,7 +904,7 @@ extern "C" { fn foreign(value: *const Foreign); }
 pub unsafe fn invoke(value: *const Foreign) { foreign(value); }
 "#;
     let (records, frozen) = run_compiler_on_str(source, |tcx| {
-        let records = make_skeletons_with_api(
+        let records = make_bo_skeletons_with_api(
             source,
             None,
             &FxHashSet::from_iter(["external_api".to_owned()]),
@@ -903,7 +928,7 @@ pub unsafe fn invoke(value: *const Foreign) { foreign(value); }
     assert_eq!(foreign.source_definition, foreign.target_definition);
     run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
 
-    let unprotected = generate(source);
+    let unprotected = generate_bo(source);
     assert!(
         type_record(&unprotected, "Inner")
             .target_definition
@@ -925,7 +950,7 @@ pub unsafe fn write(stream: *mut FILE) { *(*stream).buffer = 7; }
 pub unsafe fn read(stream: *const FILE) -> i32 { **(*stream).indirect }
 "#;
     let frozen = run_compiler_on_str(source, |tcx| {
-        let records = make_skeletons(source, tcx).unwrap();
+        let records = make_bo_skeletons(source, tcx).unwrap();
         for name in ["Stream", "FILE"] {
             let record = type_record(&records, name);
             assert_eq!(record.source_definition, record.target_definition, "{name}");
@@ -979,7 +1004,7 @@ pub unsafe fn ordinary(pointer: *const i32) -> i32 { *pointer }
         );
     })
     .unwrap();
-    let records = generate(source);
+    let records = generate_bo(source);
     for name in [
         "shared", "mutable", "nullable", "nested", "deep", "array", "existing",
     ] {
@@ -1097,7 +1122,7 @@ pub unsafe fn release(value: Holder) { free(value.handle as *mut core::ffi::c_vo
         })
         .unwrap();
         let frozen = run_compiler_on_str(&source, |tcx| {
-            let records = make_skeletons(&source, tcx).unwrap();
+            let records = make_bo_skeletons(&source, tcx).unwrap();
             for name in ["allocate", "nullable"] {
                 let record = function(&records, name);
                 assert_eq!(record.source_signature, record.target_signature, "{name}");
@@ -1128,7 +1153,7 @@ pub unsafe fn direct(pointer: *mut Alias) -> *mut Alias { pointer }
 pub unsafe fn nested(pointer: *const *mut Alias) -> *const *mut Alias { pointer }
 "#;
     let frozen = run_compiler_on_str(source, |tcx| {
-        let records = make_skeletons(source, tcx).unwrap();
+        let records = make_bo_skeletons(source, tcx).unwrap();
         for name in ["direct", "nested"] {
             let record = function(&records, name);
             assert_eq!(record.source_signature, record.target_signature, "{name}");
@@ -1200,7 +1225,7 @@ pub unsafe fn write(value: *mut Leaf) { *(*value).pointer = 7; }
 pub unsafe fn read_input(value: *const Input) -> i32 { *(*value).pointer }
 pub unsafe fn read_output(value: *const Output) -> i32 { *(*value).pointer }
 "#;
-    let unprotected = generate(definitions);
+    let unprotected = generate_bo(definitions);
     for name in [
         "EnumLeaf",
         "ArrayLeaf",
@@ -1218,7 +1243,7 @@ pub unsafe fn read_output(value: *const Output) -> i32 { *(*value).pointer }
     ] {
         let source = format!("{definitions}\nextern \"C\" {{ {declaration} }}");
         let frozen = run_compiler_on_str(&source, |tcx| {
-            let records = make_skeletons(&source, tcx).unwrap();
+            let records = make_bo_skeletons(&source, tcx).unwrap();
             for record in &records {
                 if let ItemRecord::Type(record) = record {
                     assert_eq!(
@@ -1247,9 +1272,13 @@ pub unsafe fn api(system: *mut system::Holder, local: *mut local::Holder) {
 }
 "#;
     let frozen = run_compiler_on_str(source, |tcx| {
-        let records =
-            make_skeletons_with_api(source, None, &FxHashSet::from_iter(["api".to_owned()]), tcx)
-                .unwrap();
+        let records = make_bo_skeletons_with_api(
+            source,
+            None,
+            &FxHashSet::from_iter(["api".to_owned()]),
+            tcx,
+        )
+        .unwrap();
         let system = type_record(&records, "system::Holder");
         assert_eq!(system.source_definition, system.target_definition);
         let local = type_record(&records, "local::Holder");
@@ -1299,7 +1328,7 @@ pub unsafe fn release(value: Data) { free(value.owned); if !value.optional_owned
     };
     let (records, original_layout) = run_compiler_on_str(source, |tcx| {
         (
-            make_skeletons_with_api(
+            make_bo_skeletons_with_api(
                 source,
                 None,
                 &FxHashSet::from_iter(["make".to_owned()]),
@@ -1347,7 +1376,7 @@ fn api_exposure_blocks_array_layers_without_blocking_nested_thin_layers() {
             "#[repr(C)] pub struct Holder {{ pub pointer: *const *const i32 }} pub unsafe fn api(value: *const Holder) -> i32 {{ {body} }}"
         );
         let (records, frozen) = run_compiler_on_str(&source, |tcx| {
-            let records = make_skeletons_with_api(
+            let records = make_bo_skeletons_with_api(
                 &source,
                 None,
                 &FxHashSet::from_iter(["api".to_owned()]),
@@ -1384,7 +1413,7 @@ pub unsafe fn read(value: *const Data) -> i32 { if (*value).optional.is_null() {
 pub unsafe fn release(value: Data) { free(value.owned); if !value.optional_owned.is_null() { free(value.optional_owned); } }
 "#;
     let records = run_compiler_on_str(source, |tcx| {
-        make_skeletons_with_api(
+        make_bo_skeletons_with_api(
             source,
             None,
             &FxHashSet::from_iter(["make".to_owned()]),
@@ -1395,7 +1424,7 @@ pub unsafe fn release(value: Data) { free(value.owned); if !value.optional_owned
     .unwrap();
     let data = type_record(&records, "Data");
     assert_eq!(data.source_definition, data.target_definition);
-    let unprotected = generate(source);
+    let unprotected = generate_bo(source);
     let target = &type_record(&unprotected, "Data").target_definition;
     assert!(target.contains("Option<&'"), "{target}");
     assert!(target.contains("[i32]"), "{target}");
@@ -1414,7 +1443,7 @@ fn api_exposure_preserves_layout_of_enums_and_rust_struct_containers() {
             "#[repr(C)] pub struct Inner {{ pub pointer: *const i32 }} {container} pub unsafe fn api(value: *const Container) {{ let _ = value; }} pub unsafe fn read(value: *const Inner) -> i32 {{ *(*value).pointer }}"
         );
         let records = run_compiler_on_str(&source, |tcx| {
-            make_skeletons_with_api(
+            make_bo_skeletons_with_api(
                 &source,
                 None,
                 &FxHashSet::from_iter(["api".to_owned()]),
@@ -1429,7 +1458,7 @@ fn api_exposure_preserves_layout_of_enums_and_rust_struct_containers() {
             "{container}"
         );
         assert!(
-            type_record(&generate(&source), "Inner")
+            type_record(&generate_bo(&source), "Inner")
                 .target_definition
                 .contains("pointer: &'")
         );
@@ -1446,7 +1475,7 @@ pub unsafe fn write(holder: *mut Holder) { *(*holder).pointer = 7; }
 pub unsafe fn read(array: *const Array) -> i32 { *(*array).pointers[0] }
 pub unsafe fn local(pointer: *const i32) -> i32 { let values: [*const i32; 1] = [pointer]; *values[0] }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     for name in ["Holder", "Storage", "Array"] {
         let record = type_record(&records, name);
         assert_eq!(record.source_definition, record.target_definition, "{name}");
@@ -1499,7 +1528,7 @@ pub struct Outer { pub pair: *const Pair, pub array: *const Array, pub pointer: 
 pub unsafe fn read(value: *const Outer) -> bool { (*value).pair.is_null() }
 pub unsafe fn read_holder(value: *const Holder) -> i32 { *(*value).pointer }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     let target = records
         .iter()
         .map(|record| match record {
@@ -1569,7 +1598,7 @@ pub union Storage { pub holder: Option<Holder>, pub bits: usize }
 pub unsafe fn allocate() -> Holder { Holder { pointer: malloc(core::mem::size_of::<i32>()) } }
 pub unsafe fn release(value: Holder) { free(value.pointer); }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     let holder = type_record(&records, "Holder");
     assert_eq!(holder.source_definition, holder.target_definition);
 }
@@ -1584,7 +1613,7 @@ pub unsafe fn none_with_statements() -> *const i32 { let _x = 1; core::ptr::null
 pub unsafe fn none_with_branches(flag: bool) -> *const i32 { if flag { core::ptr::null() } else { core::ptr::null() } }
 pub unsafe fn none_local() -> *const i32 { let p = core::ptr::null(); p }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     assert!(
         function(&records, "consume")
             .target_signature
@@ -1606,7 +1635,7 @@ pub unsafe fn none_local() -> *const i32 { let p = core::ptr::null(); p }
 
 #[test]
 fn null_comparisons_and_nullable_arrays_select_optional_forms() {
-    let records = generate(
+    let records = generate_bo(
         "pub unsafe fn maybe(p: *const i32) -> i32 { if p == 0 as *const i32 { 0 } else { *p } } pub unsafe fn array(p: *const i32) -> i32 { if p.is_null() { 0 } else { *p.offset(1) } }",
     );
     assert!(
@@ -1632,7 +1661,7 @@ fn owning_allocation_size_controls_slice_shape_without_indexing() {
         let source = format!(
             "unsafe extern \"C\" {{ fn malloc(size: usize) -> *mut core::ffi::c_void; }} pub unsafe fn allocate(count: usize) -> *mut i32 {{ let p = malloc({size}) as *mut i32; *p = 7; p }}"
         );
-        let records = generate(&source);
+        let records = generate_bo(&source);
         let signature = &function(&records, "allocate").target_signature;
         assert!(signature.ends_with(expected), "{signature}");
         assert_stub_signatures_compile(&records, "");
@@ -1663,7 +1692,7 @@ pub unsafe fn nullable(size: usize) -> *mut core::ffi::c_void {
         );
     })
     .unwrap();
-    let records = generate(source);
+    let records = generate_bo(source);
     for name in ["allocate", "nullable"] {
         let record = function(&records, name);
         assert_eq!(
@@ -1718,7 +1747,7 @@ pub unsafe fn lookalike(p: *const c_void) -> i32 { (*p).value }
         }
     })
     .unwrap();
-    let records = generate(source);
+    let records = generate_bo(source);
     for (name, raw) in [
         ("shared", "*const Void"),
         ("mutable", "*mut Void"),
@@ -1769,7 +1798,7 @@ pub unsafe fn store(p: *mut *mut Void, q: *mut Void) { *p = q; }
 pub unsafe fn deep(p: *const *const *mut Void) -> *mut Void { **p }
 "#;
     run_compiler_on_str(source, |tcx| {
-        let decisions = tools_pointer_decisions(tcx);
+        let decisions = bo_pointer_decisions(tcx);
         let read = local_def("read", tcx);
         assert_eq!(
             decisions.signatures.data[&read].input_decs[0],
@@ -1815,7 +1844,7 @@ pub unsafe fn deep(p: *const *const *mut Void) -> *mut Void { **p }
         );
     })
     .unwrap();
-    let records = generate(source);
+    let records = generate_bo(source);
     for (name, expected) in [("read", "&*"), ("store", "&*"), ("deep", "&&*")] {
         let record = function(&records, name);
         assert_eq!(signature_indirections(&record.target_signature), expected);
@@ -1877,7 +1906,7 @@ pub unsafe fn foreign() -> *mut i32 {
 pub unsafe fn read() -> i32 { *foreign().add(1) }
 "#;
     let frozen = run_compiler_on_str(source, |tcx| {
-        let records = make_skeletons(source, tcx).unwrap();
+        let records = make_bo_skeletons(source, tcx).unwrap();
         for name in ["global", "lookup", "foreign"] {
             let record = function(&records, name);
             assert!(
@@ -1908,7 +1937,7 @@ pub unsafe fn mixed(pointer: *const i32, flag: bool) -> *const i32 {
     }
 }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     let signature = &function(&records, "mixed").target_signature;
     assert!(signature.ends_with("*const i32"), "{signature}");
     assert!(
@@ -1931,7 +1960,7 @@ pub unsafe fn mixed_call(pointer: *const i32, raw: *const core::ffi::c_void, fla
     if flag { pointer } else { cast(raw) }
 }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     for name in ["cast", "mixed", "mixed_call"] {
         let signature = &function(&records, name).target_signature;
         assert!(signature.ends_with("*const i32"), "{signature}");
@@ -1950,7 +1979,7 @@ pub unsafe fn cast(pointer: *const *const core::ffi::c_void) -> *const *const i3
 }
 "#;
     run_compiler_on_str(source, |tcx| {
-        let decisions = tools_pointer_decisions(tcx);
+        let decisions = bo_pointer_decisions(tcx);
         let cast = local_def("cast", tcx);
         assert_eq!(
             decisions.signatures.data[&cast].output_dec,
@@ -2006,7 +2035,7 @@ pub unsafe fn recursive(pointer: *const i32, value: *const Holder, count: i32) -
 }
 "#;
     let frozen = run_compiler_on_str(source, |tcx| {
-        let records = make_skeletons(source, tcx).unwrap();
+        let records = make_bo_skeletons(source, tcx).unwrap();
         for name in [
             "nested",
             "mixed",
@@ -2047,7 +2076,7 @@ pub unsafe fn unknown() -> *mut *mut i32 {
     cell
 }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     let borrowed = &function(&records, "borrowed").target_signature;
     assert!(borrowed.contains("Box<&'"), "{borrowed}");
     let unknown = &function(&records, "unknown").target_signature;
@@ -2065,7 +2094,7 @@ fn nullable_owning_returns_do_not_require_borrow_origins() {
         let source = format!(
             "unsafe extern \"C\" {{ fn malloc(size: usize) -> *mut core::ffi::c_void; }} pub unsafe fn allocate() -> *mut i32 {{ let pointer = malloc({size}) as *mut i32; if pointer.is_null() {{ core::ptr::null_mut() }} else {{ *pointer = 7; pointer }} }}"
         );
-        let records = generate(&source);
+        let records = generate_bo(&source);
         let signature = &function(&records, "allocate").target_signature;
         assert!(signature.ends_with(expected), "{signature}");
         assert_stub_signatures_compile(&records, "");
@@ -2075,7 +2104,7 @@ fn nullable_owning_returns_do_not_require_borrow_origins() {
 #[test]
 fn allocation_extent_survives_preserved_struct_field_initializers() {
     let source = "unsafe extern \"C\" { fn malloc(size: usize) -> *mut i32; } pub struct Holder { p: *mut i32 } pub unsafe fn allocate() -> *mut i32 { let holder = Holder { p: malloc(4 * core::mem::size_of::<i32>()) }; let p = holder.p; *p = 7; p }";
-    let records = generate(source);
+    let records = generate_bo(source);
     let signature = &function(&records, "allocate").target_signature;
     assert!(signature.ends_with("Box<[i32]>"), "{signature}");
     assert!(
@@ -2088,7 +2117,7 @@ fn allocation_extent_survives_preserved_struct_field_initializers() {
 
 #[test]
 fn existing_shared_lifetime_parameters_do_not_create_undeclared_bounds() {
-    let records = generate("pub unsafe fn sum<'a>(x: &'a i32, y: &'a i32) -> i32 { *x + *y }");
+    let records = generate_bo("pub unsafe fn sum<'a>(x: &'a i32, y: &'a i32) -> i32 { *x + *y }");
     let signature = &function(&records, "sum").target_signature;
     assert!(!signature.contains("'b"), "{signature}");
     let transformed = format!("{signature} {{ *x + *y }}");
@@ -2097,7 +2126,7 @@ fn existing_shared_lifetime_parameters_do_not_create_undeclared_bounds() {
 
 #[test]
 fn null_tests_of_loaded_pointers_make_the_inner_layer_optional() {
-    let records = generate(
+    let records = generate_bo(
         "pub unsafe fn read(p: *const *const i32) -> i32 { let q = *p; if q.is_null() { 0 } else { *q } }",
     );
     let read = function(&records, "read");
@@ -2117,7 +2146,7 @@ fn null_tests_of_loaded_pointers_make_the_inner_layer_optional() {
 #[test]
 fn diverging_bodies_admit_reference_return_types_without_input_origins() {
     for body in ["loop {}", "std::process::abort()"] {
-        let records = generate(&format!("pub unsafe fn stop() -> *const i32 {{ {body} }}"));
+        let records = generate_bo(&format!("pub unsafe fn stop() -> *const i32 {{ {body} }}"));
         let signature = &function(&records, "stop").target_signature;
         assert!(signature.contains("-> &"), "{signature}");
         let transformed = format!("{signature} {{ {body} }}");
@@ -2234,7 +2263,7 @@ extern "C" { fn malloc(size: usize) -> *mut i32; fn free(pointer: *mut i32); }
 pub unsafe fn allocate() -> Holder { Holder { pointer: malloc(core::mem::size_of::<i32>()) } }
 pub unsafe fn release(value: Holder) { free(value.pointer); }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     let record = type_record(&records, "Holder");
     assert_eq!(record.source_definition, record.target_definition);
 }
@@ -2250,7 +2279,7 @@ pub unsafe fn make(pointer: *const i32, optional: *const i32, bytes: *const u8, 
 pub unsafe fn read(value: *const Data) -> i32 { let number = if (*value).optional.is_null() { 0 } else { *(*value).optional }; let byte = if (*value).optional_bytes.is_null() { 0 } else { *(*value).optional_bytes.offset(1) as i32 }; number + byte + *(*value).pointer + *(*value).bytes.offset(1) as i32 }
 pub unsafe fn release(value: Data) { free(value.owned); free(value.owned_array); }
 "#;
-    let records = generate(source);
+    let records = generate_bo(source);
     let target = &type_record(&records, "Data").target_definition;
     assert!(target.contains("Option<&'"), "{target}");
     assert!(target.contains("[u8]"), "{target}");
