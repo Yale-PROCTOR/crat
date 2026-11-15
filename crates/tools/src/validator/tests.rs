@@ -227,6 +227,8 @@ fn rule_applied_views_accept_opaque_value_payloads() {
     for skeleton in [
         "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let result: i32 = Some({ let init = value; init }).unwrap(); #[proctor(1)] result }",
         "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let result: i32 = Some(match value { 0 => 0, _ => { let init = value; init } }).unwrap(); #[proctor(1)] result }",
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let result: i32 = Some(loop { break value; }).unwrap(); #[proctor(1)] result }",
+        "unsafe fn f(value: i32) -> i32 { #[proctor(0)] let result: i32 = Some(match value { 0 => return 0, _ => value }).unwrap(); #[proctor(1)] result }",
     ] {
         assert_eq!(
             validate(&mixed_preservation_request(skeleton, &[1], &[0], skeleton)),
@@ -360,7 +362,7 @@ fn value_opacity_retains_item_attribute_label_and_unsafe_restrictions() {
 }
 
 #[test]
-fn opaque_values_reject_control_transfers_to_outer_scopes() {
+fn opaque_controls_allow_transfers_to_enclosing_scopes() {
     for source in [
         "unsafe fn f() { #[proctor(0)] consume({ return; }); }",
         "unsafe fn f() { #[proctor(0)] consume(if true { return; } else { () }); }",
@@ -372,38 +374,79 @@ fn opaque_values_reject_control_transfers_to_outer_scopes() {
         "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] if match 0 { _ => break } { #[proctor(2)] consume(0); } } }",
         "unsafe fn f() { #[proctor(0)] 'outer: loop { #[proctor(1)] if match 0 { _ => continue 'outer } { #[proctor(2)] consume(0); } } }",
     ] {
-        assert_eq!(
-            codes(&validate(&request(source, source))),
-            ["invalid_expected_skeleton"]
-        );
+        assert_valid(source, source);
     }
-    assert_code(
+    assert_valid(
         UNIT_SKELETON,
         "unsafe fn f() { #[proctor(0)] consume({ return; }); }",
-        "escaping_opaque_control",
     );
-    assert_code(
+    assert_valid(
         "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] todo!(); } }",
         "unsafe fn f() { #[proctor(0)] loop { #[proctor(1)] consume({ break; }); } }",
-        "escaping_opaque_control",
     );
-    assert_code(
+    assert_valid(
         UNIT_SKELETON,
         "unsafe fn f() { #[proctor(0)] consume(match 0 { _ => return }); }",
-        "escaping_opaque_control",
     );
-    assert_code(
+    assert_valid(
         "unsafe fn f() { #[proctor(0)] if todo!() { #[proctor(1)] todo!(); } }",
         "unsafe fn f() { #[proctor(0)] if match 0 { _ => return } { #[proctor(1)] consume(0); } }",
-        "escaping_opaque_control",
     );
     for control in ["break", "continue 'outer", "loop { break 'outer; }"] {
-        assert_code(
+        assert_valid(
             "unsafe fn f() { #[proctor(0)] 'outer: loop { #[proctor(1)] if todo!() { #[proctor(2)] todo!(); } } }",
             &format!(
                 "unsafe fn f() {{ #[proctor(0)] 'outer: loop {{ #[proctor(1)] if match 0 {{ _ => {control} }} {{ #[proctor(2)] consume(0); }} }} }}"
             ),
-            "escaping_opaque_control",
+        );
+    }
+}
+
+#[test]
+fn opaque_loop_bindings_retain_lexical_scope_and_capture_checks() {
+    for expression in [
+        "loop { let proctor_temp_var_0 = 1; if proctor_temp_var_0 > 0 { break proctor_temp_var_0; } }",
+        "while let Some(proctor_temp_var_0) = Some(1) { if proctor_temp_var_0 > 0 { break; } }",
+        "for proctor_temp_var_0 in [1, 2] { if proctor_temp_var_0 > 0 { continue; } }",
+    ] {
+        assert_valid(
+            UNIT_SKELETON,
+            &format!("unsafe fn f() {{ #[proctor(0)] consume({expression}); }}"),
+        );
+    }
+    let skeleton = "unsafe fn f() { #[proctor(0)] todo!(); #[proctor(1)] todo!(); }";
+    for expression in [
+        "loop { break proctor_temp_var_0; }",
+        "while proctor_temp_var_0 > 0 { break; }",
+        "for value in [proctor_temp_var_0] { consume(value); }",
+        "for proctor_temp_var_0 in [proctor_temp_var_0] { consume(proctor_temp_var_0); }",
+    ] {
+        assert_code(
+            skeleton,
+            &format!(
+                "unsafe fn f() {{ #[proctor(0)] let proctor_temp_var_0 = 1; #[proctor(1)] consume({expression}); }}"
+            ),
+            "temporary_outside_expansion_group",
+        );
+    }
+    for expression in [
+        "loop { let proctor_temp_var_0 = 1; break; }",
+        "while let Some(proctor_temp_var_0) = Some(1) { break; }",
+        "for proctor_temp_var_0 in [1] { continue; }",
+    ] {
+        assert_code(
+            skeleton,
+            &format!(
+                "unsafe fn f() {{ #[proctor(0)] consume({expression}); #[proctor(1)] consume(proctor_temp_var_0); }}"
+            ),
+            "unresolved_generated_temporary",
+        );
+        assert_code(
+            UNIT_SKELETON,
+            &format!(
+                "unsafe fn f() {{ #[proctor(0)] consume({{ #[proctor(9)] consume({expression}); }}); }}"
+            ),
+            "unexpected_label",
         );
     }
 }
@@ -556,7 +599,6 @@ fn print_arguments_receive_normal_structural_validation() {
             "{ #[allow(unused_variables)] let proctor_temp_var_0 = 1; proctor_temp_var_0 }",
             "unexpected_body_attribute",
         ),
-        ("{ return; }", "escaping_opaque_control"),
     ] {
         assert_code(
             skeleton,
@@ -1416,7 +1458,6 @@ fn invalid_expected_skeleton_is_setup_error() {
         "const unsafe fn f() { #[proctor(0)] return; }",
         "unsafe fn f() { return; }",
         "unsafe fn f() { #[proctor(0)] #[allow(unused_variables)] let x = 1; }",
-        "unsafe fn f() { #[proctor(0)] consume(loop { break 1; }); }",
         "unsafe fn f(x: i32) { #[proctor(0)] match x { _ => return } }",
     ] {
         assert_eq!(
