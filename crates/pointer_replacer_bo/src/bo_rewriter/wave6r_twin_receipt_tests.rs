@@ -122,7 +122,8 @@ pub unsafe fn copy_pointer_storage() -> u8 {
     let dst: *mut core::ffi::c_void =
         &raw mut src as *mut *const core::ffi::c_void as *mut core::ffi::c_void;
     lodepng_memcpy(dst, src, 1);
-    (src as usize & 0xff) as u8
+    let _address = src as usize;
+    *(dst as *const u8)
 }
 "#;
     let outcome = super::super::rewrite_core_injected(

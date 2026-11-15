@@ -3676,7 +3676,7 @@ const W74_SHAPES: &str = r#"
     let p: *mut i32 = &mut (*s).x;
     let q: *mut i32 = p;
     (*r).x = 5;
-    *q + n as i32
+    *q
 }
 #[no_mangle] pub unsafe extern "C" fn h(a: *mut i32) -> i32 {
     let p: *mut i32 = a;

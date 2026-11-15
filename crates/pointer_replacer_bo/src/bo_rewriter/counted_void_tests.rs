@@ -270,7 +270,7 @@ fn w6v_addressed_pointer_storage_copy_routes_to_the_raw_twin() {
     // its raw arguments and calls the pristine raw twin; the runtime check pins
     // that the input's meaning is kept exactly.
     let helper = format!(
-        "{COPY}\npub unsafe fn copy_pointer_storage() -> u8 {{ let data=[7u8;8]; let mut src: *const core::ffi::c_void=data.as_ptr().cast(); let dst: *mut core::ffi::c_void=&raw mut src as *mut *const core::ffi::c_void as *mut core::ffi::c_void; lodepng_memcpy(dst,src,1); (src as usize & 0xff) as u8 }}"
+        "{COPY}\npub unsafe fn copy_pointer_storage() -> u8 {{ let data=[7u8;8]; let mut src: *const core::ffi::c_void=data.as_ptr().cast(); let dst: *mut core::ffi::c_void=&raw mut src as *mut *const core::ffi::c_void as *mut core::ffi::c_void; lodepng_memcpy(dst,src,1); let _address = src as usize; *(dst as *const u8) }}"
     );
     let emitted = check(&helper, &["dst", "src"]);
     assert!(

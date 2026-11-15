@@ -974,7 +974,7 @@ pub unsafe fn rust_function(x: i32) { ordinary::printf(b"%d\0".as_ptr() as *cons
 }
 
 #[test]
-fn printf_integer_address_formats_are_ineligible_and_decline_pointer_analysis() {
+fn printf_integer_address_formats_remain_ineligible_with_raw_boundaries() {
     for format in [
         r#"b"%d\0".as_ptr() as usize as *const i8"#,
         r#"((b"%d\0".as_ptr() as usize) + 0) as *const i8"#,
@@ -989,8 +989,8 @@ pub unsafe fn print(x: i32) {{ printf({format}, x); }}
             let mut surface = utils::ast::parse_crate(source.clone());
             let mut mapper = utils::ir::AstToHirMapper::new(tcx);
             mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
-            let ItemKind::Fn(function) = &surface.items[1].kind else { unreachable!() };
-            let statement = &function.body.as_ref().unwrap().stmts[0];
+            let ItemKind::Fn(parsed_function) = &surface.items[1].kind else { unreachable!() };
+            let statement = &parsed_function.body.as_ref().unwrap().stmts[0];
             let StmtKind::Semi(expression) = &statement.kind else { unreachable!() };
             assert!(crate::printf::supported_printf_call(
                 expression,
@@ -998,12 +998,14 @@ pub unsafe fn print(x: i32) {{ printf({format}, x); }}
                 tcx
             ));
             assert!(eligible_printf_statement(statement, &mapper.ast_to_hir, tcx).is_none());
-            let error = make_skeletons(&source, tcx).unwrap_err();
-            assert_eq!(error.kind, GenerationErrorKind::PointerAnalysis);
+            let records =
+                make_skeletons(&source, tcx).expect("raw address format remains supported");
             assert!(
-                error
-                    .message
-                    .contains("cannot model a pointer loan from nonpointer source")
+                function(&records, "print")
+                    .baseline
+                    .statement_pair_metadata
+                    .iter()
+                    .all(|metadata| metadata.printf_template.is_none())
             );
         })
         .unwrap();

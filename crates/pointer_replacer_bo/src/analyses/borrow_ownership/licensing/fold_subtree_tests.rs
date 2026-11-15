@@ -1,5 +1,6 @@
 //! Owned-child source identities. These fixtures are never executed.
 use super::{
+    super::SlotKind,
     graph_tests::with_facts,
     matched::{MatchedTransport, TerminalTarget},
     transport::CandidateGraph,
@@ -813,15 +814,7 @@ fn r336_4_the_three_prefix_and_field_puns_stay_denied() {
         });
     }
     let integer = super::tests::inspect(N3_CODE);
-    assert!(!integer.accepted);
-    assert!(
-        integer
-            .construction_error
-            .as_deref()
-            .is_some_and(|error| error.contains("nonpointer source of type `usize`")),
-        "{:?}",
-        integer.construction_error
-    );
+    integer.assert_kind("run::p", SlotKind::Raw);
 }
 
 #[test]

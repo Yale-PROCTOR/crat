@@ -2010,8 +2010,8 @@ unsafe extern "C" fn BrotliUnalignedRead32(mut p: *const core::ffi::c_void) -> u
     return *(p as *const uint32_t);
 }
 unsafe extern "C" fn HashBytesAddr(mut data: *const uint8_t) -> size_t {
-    let mut n: size_t = data as size_t;
-    return (BrotliUnalignedRead32(data as *const core::ffi::c_void) as size_t).wrapping_add(n);
+    let _address: size_t = data as size_t;
+    return BrotliUnalignedRead32(data as *const core::ffi::c_void) as size_t;
 }
 "#;
 

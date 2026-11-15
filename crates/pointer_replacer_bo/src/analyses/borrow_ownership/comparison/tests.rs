@@ -255,22 +255,13 @@ fn e5_n_cmp_opaque_return_keeps_its_independent_origin_cause() {
 }
 
 #[test]
-fn integer_reconstruction_declines_with_or_without_comparison() {
-    for comparison in ["", "let _cmp = q == p;"] {
-        let source = format!(
-            "pub unsafe fn f(p: *mut u8) -> *mut u8 {{ let address = p as usize; let q = address as *mut u8; {comparison} q }}"
-        );
-        ::utils::compilation::run_compiler_on_str(&source, |tcx| {
-            let error = crate::analyze_pointers(tcx)
-                .err()
-                .expect("integer reconstruction must decline before kind selection");
-            assert!(
-                error.contains("nonpointer source of type `usize`"),
-                "{error}"
-            );
-        })
-        .unwrap();
-    }
+fn integer_reconstruction_stays_raw_with_or_without_comparison() {
+    let found = compare_twins(
+        "pub unsafe fn f(p: *mut u8) -> *mut u8 { let address = p as usize; let q = address as *mut u8; q }",
+        "pub unsafe fn f(p: *mut u8) -> *mut u8 { let address = p as usize; let q = address as *mut u8; let _cmp = q == p; q }",
+        &["p", "q"],
+    );
+    assert!(found.kinds.values().all(|kind| *kind == SlotKind::Raw));
 }
 
 #[test]
@@ -290,7 +281,7 @@ fn e5_n_null_local_and_field_controls_keep_null_separate_from_opacity() {
     for (name, expression, expected_field) in [
         ("null", "core::ptr::null_mut()", Some(SlotKind::Ref)),
         ("opaque", "op()", Some(SlotKind::Raw)),
-        ("nonzero", "1usize as *mut u8", None),
+        ("nonzero", "1usize as *mut u8", Some(SlotKind::Raw)),
     ] {
         let code = format!(
             "{FIELD_PREFIX} pub unsafe fn f(out: *mut Holder) {{ let local: *mut u8 = {expression}; (*out).value = local; }}"

@@ -333,11 +333,16 @@ fn wave6o_a_table_rooted_walker_re_seeded_from_a_call_delivers() {
 }
 
 #[test]
-fn integer_reconstruction_in_a_cursor_source_declines_before_emission() {
+fn integer_reconstruction_in_a_cursor_source_keeps_raw_emission() {
     assert!(verify::type_checks_str(RE_SEEDED_RAW));
-    let error = ast_emitted_source_of(RE_SEEDED_RAW)
-        .expect_err("integer reconstruction must decline before cursor emission");
-    assert!(error.contains("BO declined"), "{error}");
+    assert!(matches!(
+        decision_of(RE_SEEDED_RAW, "addFlagsFromEnvVar2", "p"),
+        Decision::Degraded(_)
+    ));
+    let output =
+        ast_emitted_source_of(RE_SEEDED_RAW).expect("raw reconstruction remains supported");
+    assert!(output.contains("as *mut i8"), "{output}");
+    assert!(verify::type_checks_str(&output), "{output}");
 }
 
 #[test]
