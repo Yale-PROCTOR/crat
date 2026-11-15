@@ -25,7 +25,7 @@ use rustc_middle::{
 use rustc_mir_dataflow::points::DenseLocationMap;
 use rustc_span::def_id::LocalDefId;
 
-use super::{integer_pointers::is_integer_reconstruction, pointer_loans::PointerLoanSources};
+use super::{pointer_loans::PointerLoanSources, raw_boundaries::is_integer_reconstruction};
 #[cfg(test)]
 use crate::analyses::borrow::Provenance;
 use crate::{

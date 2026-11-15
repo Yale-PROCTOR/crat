@@ -10,15 +10,20 @@ use rustc_middle::{
     },
     ty::{Ty, TyCtxt, TyKind},
 };
-use rustc_span::def_id::{DefId, LocalDefId};
+use rustc_span::{
+    def_id::{DefId, LocalDefId},
+    sym,
+};
 
 use super::{
     SlotKind,
     crate_slots::{CrateSlots, MAX_SLOT_DEPTH},
+    ptr::Measurable,
     resolve::{ResolvedSlot, resolve_place},
     slots::{SlotId, SlotOwner},
     solver::{KindSolver, SlotRef},
     source_events::operand_is_null,
+    struct_ctxt::StructCtxt,
 };
 use crate::{analyses::mir::TerminatorExt, utils::rustc::RustProgram};
 
@@ -64,7 +69,7 @@ struct AddressFlow<'tcx> {
     calls: FxHashMap<LocalDefId, Vec<LocalDefId>>,
     exposed: Vec<Node>,
     escapes: Vec<(LocalDefId, Node)>,
-    reconstructed: Vec<(LocalDefId, Node)>,
+    boundaries: Vec<(LocalDefId, Node)>,
     aggregates: FxHashSet<(Node, Ty<'tcx>)>,
 }
 
@@ -100,6 +105,7 @@ impl<'tcx> AddressFlow<'tcx> {
         for (prefix, element) in place.iter_projections() {
             if let PlaceElem::Field(index, _) = element
                 && let TyKind::Adt(adt, _) = prefix.ty(body, tcx).ty.kind()
+                && adt.did().is_local()
             {
                 let variant = prefix.ty(body, tcx).variant_index.unwrap_or(FIRST_VARIANT);
                 let field = Node::Field(adt.variant(variant).fields[index].did);
@@ -121,6 +127,12 @@ impl<'tcx> AddressFlow<'tcx> {
         }
         match ty.kind() {
             TyKind::Adt(adt, arguments) => {
+                if !adt.did().is_local() {
+                    for ty in arguments.types() {
+                        self.aggregate(node, ty, tcx);
+                    }
+                    return;
+                }
                 for field in adt.all_fields() {
                     let ty = field.ty(tcx, arguments);
                     if carries_address(ty) {
@@ -159,6 +171,42 @@ impl<'tcx> AddressFlow<'tcx> {
         }
     }
 
+    fn connect_payload_fields(
+        &mut self,
+        boundary: Node,
+        ty: Ty<'tcx>,
+        tcx: TyCtxt<'tcx>,
+        active: &mut FxHashSet<DefId>,
+    ) {
+        if let Some(pointee) = ty.builtin_deref(true) {
+            self.connect_payload_fields(boundary, pointee, tcx, active);
+            return;
+        }
+        match ty.kind() {
+            TyKind::Adt(adt, args) => {
+                for ty in args.types() {
+                    self.connect_payload_fields(boundary, ty, tcx, active);
+                }
+                if adt.did().is_local() && active.insert(adt.did()) {
+                    for field in adt.all_fields() {
+                        self.connect(boundary, Node::Field(field.did));
+                        self.connect_payload_fields(boundary, field.ty(tcx, args), tcx, active);
+                    }
+                    active.remove(&adt.did());
+                }
+            }
+            TyKind::Tuple(elements) => {
+                for ty in elements.iter() {
+                    self.connect_payload_fields(boundary, ty, tcx, active);
+                }
+            }
+            TyKind::Array(element, _) | TyKind::Slice(element) => {
+                self.connect_payload_fields(boundary, *element, tcx, active);
+            }
+            _ => {}
+        }
+    }
+
     fn assignment(
         &mut self,
         function: LocalDefId,
@@ -175,7 +223,7 @@ impl<'tcx> AddressFlow<'tcx> {
             && let Rvalue::Cast(_, operand, _) = rvalue
             && !(matches!(operand, Operand::Constant(_)) && operand_is_null(operand, &[], tcx))
         {
-            self.reconstructed.push((function, output));
+            self.boundaries.push((function, output));
         }
         if let Rvalue::Cast(_, operand, target) = rvalue
             && target.is_integral()
@@ -210,7 +258,9 @@ impl<'tcx> AddressFlow<'tcx> {
             }
             Rvalue::Aggregate(kind, operands) => {
                 for (index, operand) in operands.iter().enumerate() {
-                    let field = if let AggregateKind::Adt(adt, variant, _, _, active) = **kind {
+                    let field = if let AggregateKind::Adt(adt, variant, _, _, active) = **kind
+                        && adt.is_local()
+                    {
                         Some(Node::Field(
                             tcx.adt_def(adt).variant(variant).fields
                                 [active.unwrap_or_else(|| FieldIdx::from_usize(index))]
@@ -247,15 +297,86 @@ fn carries_address(ty: Ty<'_>) -> bool {
         )
 }
 
-pub(super) fn constrain_integer_boundaries(
-    program: &RustProgram<'_>,
+// Tuple elements have no kind/provenance slots yet. Follow source-visible
+// payload types; a native container's implementation fields are not raw inputs.
+fn unmodeled_payload<'tcx>(
+    ty: Ty<'tcx>,
+    tcx: TyCtxt<'tcx>,
+    layout: &StructCtxt<'tcx>,
+    unmodeled: bool,
+    active: &mut FxHashSet<(DefId, bool)>,
+) -> bool {
+    if ty.is_raw_ptr() && unmodeled {
+        return true;
+    }
+    if unmodeled
+        && matches!(ty.kind(), TyKind::Adt(adt, _)
+        if Some(adt.did()) == tcx.get_diagnostic_item(sym::NonNull))
+    {
+        return true;
+    }
+    if let Some(pointee) = ty.builtin_deref(true) {
+        return unmodeled_payload(pointee, tcx, layout, unmodeled, active);
+    }
+    match ty.kind() {
+        TyKind::Tuple(elements) => elements
+            .iter()
+            .any(|ty| unmodeled_payload(ty, tcx, layout, true, active)),
+        TyKind::Adt(adt, args) => {
+            if args
+                .types()
+                .any(|ty| unmodeled_payload(ty, tcx, layout, unmodeled, active))
+            {
+                return true;
+            }
+            if !adt.did().is_local() {
+                return false;
+            }
+            let key = (adt.did(), unmodeled);
+            if !active.insert(key) {
+                // Recursive substitutions can put a new raw argument into a
+                // tuple field. Keep that unresolved expansion conservative.
+                return args
+                    .types()
+                    .any(|ty| unmodeled_payload(ty, tcx, layout, true, active));
+            }
+            let found = adt.all_fields().enumerate().any(|(index, field)| {
+                let field_ty = field.ty(tcx, args);
+                let mismatched = adt.is_struct()
+                    && layout.is_struct_of_concerned(&adt.did())
+                    && (layout.measure_ptr(field_ty)
+                        != layout.measure_ptr(tcx.type_of(field.did).instantiate_identity())
+                        || (0..layout.max_ptr_chased() as u32).any(|chased| {
+                            layout.field_measure(ty, index, chased)
+                                != layout.measure(field_ty, chased)
+                        }));
+                if mismatched && layout.measure(field_ty, 0) > 0 {
+                    return true;
+                }
+                unmodeled_payload(field_ty, tcx, layout, unmodeled || mismatched, active)
+            });
+            active.remove(&key);
+            found
+        }
+        TyKind::Array(element, _) | TyKind::Slice(element) => {
+            unmodeled_payload(*element, tcx, layout, unmodeled, active)
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn constrain_raw_boundaries<'tcx>(
+    program: &RustProgram<'tcx>,
     slots: &CrateSlots,
     solver: &KindSolver,
+    layout: &StructCtxt<'tcx>,
 ) {
     let tcx = program.tcx;
     if !program.functions.iter().any(|&function| {
         let body = tcx.mir_drops_elaborated_and_const_checked(function).borrow();
-        body.basic_blocks.iter().any(|block| block.statements.iter().any(|statement| {
+        body.local_decls.iter().any(|decl|
+            unmodeled_payload(decl.ty, tcx, layout, false, &mut FxHashSet::default()))
+            || body.basic_blocks.iter().any(|block| block.statements.iter().any(|statement| {
             matches!(&statement.kind, StatementKind::Assign(box (_, Rvalue::Cast(_, operand, target)))
                 if (target.is_raw_ptr() && operand.ty(&*body, tcx).is_integral())
                     || (target.is_integral() && operand.ty(&*body, tcx).is_any_ptr()))
@@ -299,7 +420,22 @@ pub(super) fn constrain_integer_boundaries(
         }
         .visit_body(&body);
         for local in body.local_decls.indices() {
-            flow.place(function, Place::from(local), &body, tcx);
+            let node = flow.place(function, Place::from(local), &body, tcx);
+            if unmodeled_payload(
+                body.local_decls[local].ty,
+                tcx,
+                layout,
+                false,
+                &mut FxHashSet::default(),
+            ) {
+                flow.boundaries.push((function, node));
+                flow.connect_payload_fields(
+                    node,
+                    body.local_decls[local].ty,
+                    tcx,
+                    &mut FxHashSet::default(),
+                );
+            }
         }
         for block in body.basic_blocks.iter() {
             for statement in &block.statements {
@@ -350,9 +486,9 @@ pub(super) fn constrain_integer_boundaries(
         }
     }
     let exposed = reachable(&flow.values, flow.exposed.iter().copied());
-    let mut seeds: FxHashSet<_> = flow.reconstructed.iter().map(|&(_, node)| node).collect();
+    let mut seeds: FxHashSet<_> = flow.boundaries.iter().map(|&(_, node)| node).collect();
     let mut hazardous: FxHashSet<_> = flow
-        .reconstructed
+        .boundaries
         .iter()
         .map(|&(function, _)| function)
         .collect();
@@ -362,7 +498,7 @@ pub(super) fn constrain_integer_boundaries(
             hazardous.insert(function);
         }
     }
-    // Reconstructed addresses may alias memory without an explicit value-flow
+    // Unmodeled pointers may alias memory without an explicit value-flow
     // edge. Retain every raw layer in connected scopes and analyzed call components.
     loop {
         let previous = (seeds.len(), hazardous.len());

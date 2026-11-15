@@ -1,12 +1,15 @@
-//! I10 RED: a by-value pattern component has no annotation site of its own.
+//! Raw tuple pattern components retain their original types and guarded effects.
 
 use super::{
-    decision::DeclShape, delivery_custody::inventory_source, emit_tests::ast_emitted_source_of,
+    decision::{Decision, DeclShape, DegradeReason},
+    delivery_custody::inventory_source,
+    emit_tests::ast_emitted_source_of,
+    mechanical_receipt::{MechanicalStage, MechanicalState},
     verify,
 };
 
 #[test]
-fn decl_pattern_nullable_component_requires_a_typed_temporary_in_place() {
+fn tuple_pattern_raw_boundary_preserves_guarded_effect_order() {
     let input = "#![allow(dead_code, unused_unsafe)]\n\
         fn record_before(log: &mut u32) { *log = *log * 10 + 1; }\n\
         fn stamp(log: &mut u32) -> u8 { *log = *log * 10 + 2; 0 }\n\
@@ -25,7 +28,7 @@ fn decl_pattern_nullable_component_requires_a_typed_temporary_in_place() {
         verify::type_checks_str(input),
         "pattern witness input must type-check"
     );
-    let receipt_temporary = ::utils::compilation::run_compiler_on_str(input, |tcx| {
+    let temporary = ::utils::compilation::run_compiler_on_str(input, |tcx| {
         let (table, ctx) = super::decide_table_with_ctx(tcx).expect("pattern decisions");
         let subjects = table.entries.iter().filter(|(subject, _)| {
             tcx.def_path_str(subject.fn_did.to_def_id()) == "pattern_target"
@@ -42,21 +45,30 @@ fn decl_pattern_nullable_component_requires_a_typed_temporary_in_place() {
             .and_then(|slots| slots.slot_for_local_depth(subject.local, 0))
             .and_then(|slot| ctx.model.get(&super::SlotRef::Local(subject.fn_did, slot)))
             .copied();
-        assert_eq!(kind, Some(super::SlotKind::Ref),
-            "the original binding must have an actual model-Ref fact before presentation is tested");
+        assert_eq!(kind, Some(super::SlotKind::Raw),
+            "the tuple component must retain its raw provenance boundary");
+        assert!(matches!(&subjects[0].1, Decision::Degraded(record) if record.reason == DegradeReason::KindRaw));
         let emission = super::emit_files(tcx, &table, &Default::default(), &ctx.retained_copy_plans).unwrap();
         let none = Default::default();
         let rows = emission.plan.declaration_receipt_rows(&none);
         let events = emission.plan.mechanical_receipts(&none).0;
         super::mechanical_receipt::reconcile_declaration_shape_rows(&rows, &events).unwrap();
-        let rows = rows.iter().filter(|row| row.typed_temporary.is_some()
-            && row.terminal.stage == super::mechanical_receipt::MechanicalStage::Terminal).collect::<Vec<_>>();
-        assert_eq!(rows.len(), 1, "one canonical temporary obligation");
-        assert_eq!(rows[0].terminal.state, super::mechanical_receipt::MechanicalState::Applied);
-        rows[0].typed_temporary.clone().unwrap()
+        let temporary = &table.declaration_patterns[&(subject.fn_did, subject.hir_id)].temporary;
+        let terminal = rows.iter().find(|row| {
+            row.terminal.stage == MechanicalStage::Terminal
+                && row.typed_temporary.as_ref() == Some(temporary)
+        }).unwrap();
+        assert_eq!(terminal.terminal.state, MechanicalState::Reclassified);
+        assert_eq!(terminal.original_type_form, "*const i32");
+        assert_eq!(terminal.settled_emitted_type, terminal.original_type_form);
+        temporary.clone()
     }).expect("pattern witness compiler context");
 
     let output = ast_emitted_source_of(input).expect("pattern emission");
+    assert!(
+        !output.contains(&temporary),
+        "a rejected pattern temporary must not be emitted: {output}"
+    );
     assert!(
         verify::type_checks_str(&output),
         "pattern output must type/borrow-check: {output}"
@@ -77,16 +89,12 @@ fn decl_pattern_nullable_component_requires_a_typed_temporary_in_place() {
         .collect::<Vec<_>>();
     assert_eq!(
         temporaries.len(),
-        1,
-        "the nullable pattern needs one explicitly typed temporary, without annotating its leaf or admitting ref-mut exclusions: {output}"
+        0,
+        "the raw pattern must not acquire a safe reference temporary: {output}"
     );
     assert!(
-        output.contains("= None") || output.contains("(None,"),
-        "the typed temporary must support the null-to-None presentation: {output}"
-    );
-    assert!(
-        output.contains("p.is_none()"),
-        "the by-value pattern receives the nullable safe form: {output}"
+        output.contains("p.is_null()"),
+        "the by-value pattern keeps its original raw null test: {output}"
     );
 
     let call_positions = ["record_before(log)", "stamp(log)", "record_after(log)"].map(|call| {
@@ -107,30 +115,10 @@ fn decl_pattern_nullable_component_requires_a_typed_temporary_in_place() {
         "temporary placement must retain the guarded scalar-effect order: {output}"
     );
 
-    let temporary = temporaries[0];
-    assert_eq!(temporary.binding, receipt_temporary);
     let pattern = declarations
         .iter()
         .find(|row| row.owner == "pattern_target" && row.binding == "p")
         .unwrap();
     assert!(pattern.type_span.is_none() && !pattern.type_is_fully_explicit);
-    let carrier = pattern
-        .typed_component
-        .as_ref()
-        .expect("independent parser verifies component custody");
-    assert_eq!(carrier.temporary, receipt_temporary);
-    assert!(matches!(
-        pattern.effective_type_shape(),
-        Some(super::delivery_custody::TypeShape::Option { .. })
-    ));
-    let type_span = temporary.type_span.expect("explicit temporary type span");
-    let mut missing_type = output.clone();
-    missing_type.replace_range(
-        temporary.binding_span.hi as usize..type_span.hi as usize,
-        "",
-    );
-    assert!(
-        !verify::type_checks_str(&missing_type),
-        "omitting the temporary type must expose lost inference, not pass vacuously: {missing_type}"
-    );
+    assert!(pattern.typed_component.is_none());
 }

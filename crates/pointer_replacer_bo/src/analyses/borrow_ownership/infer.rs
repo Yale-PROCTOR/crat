@@ -7,7 +7,7 @@ use rustc_middle::{
         AggregateKind, BasicBlock, Body, ClearCrossCrate, Local, LocalInfo, Location, Operand,
         Place, PlaceElem, ProjectionElem,
     },
-    ty::{AdtDef, Ty, TyCtxt, TyKind},
+    ty::{Ty, TyCtxt, TyKind},
 };
 use rustc_span::source_map::Spanned;
 use rustc_type_ir::TyKind::FnDef;
@@ -302,9 +302,27 @@ where
             if let TyKind::Adt(adt_def, subst) = ty.kind()
                 && struct_ctxt.is_struct_of_concerned(&adt_def.did())
             {
-                for field_def in adt_def.all_fields() {
+                let chased = (struct_ctxt.max_ptr_chased() - precision) as u32;
+                for (index, field_def) in adt_def.all_fields().enumerate() {
                     let field_ty = field_def.ty(tcx, subst);
-                    dominate(field_ty, dom, vars, precision, database, struct_ctxt, tcx)
+                    let width = struct_ctxt.field_measure(ty, index, chased);
+                    let mut field_vars = vars.start..vars.start + width;
+                    vars.start += width;
+                    if struct_ctxt.measure(field_ty, chased) == width {
+                        dominate(
+                            field_ty,
+                            dom,
+                            &mut field_vars,
+                            precision,
+                            database,
+                            struct_ctxt,
+                            tcx,
+                        );
+                    }
+                }
+            } else if let TyKind::Tuple(elements) = ty.kind() {
+                for ty in elements.iter() {
+                    dominate(ty, dom, vars, precision, database, struct_ctxt, tcx);
                 }
             }
         }
@@ -367,11 +385,20 @@ where
                     ptr_chased += 1;
                 }
                 ProjectionElem::Field(field, ty) => {
-                    let TyKind::Adt(adt_def, _) = base_ty.kind() else { unreachable!() };
+                    let width =
+                        infer_cx
+                            .struct_ctxt
+                            .field_measure(base_ty, field.index(), ptr_chased);
+                    if infer_cx.struct_ctxt.measure(*ty, ptr_chased) != width {
+                        // Substituted generic fields can exceed the nominal ADT
+                        // layout. Preserve its window without using sibling slots.
+                        <Analysis as InferMode>::lend(infer_cx, base);
+                        return None;
+                    }
                     proj_start_offset +=
                         infer_cx
                             .struct_ctxt
-                            .field_offset(*adt_def, field.index(), ptr_chased);
+                            .field_offset(base_ty, field.index(), ptr_chased);
                     base_ty = *ty;
                 }
                 // [ty] is equivalent to ty
@@ -391,15 +418,7 @@ where
         }
 
         if base.r#use.start + proj_start_offset >= base.r#use.end {
-            for (pre, post) in base.r#use.zip(base.def) {
-                infer_cx
-                    .database
-                    .push_equal::<crate::analyses::borrow_ownership::ssa::constraint::Debug>(
-                        (),
-                        pre,
-                        post,
-                    );
-            }
+            <Analysis as InferMode>::lend(infer_cx, base);
             return None;
         }
 
@@ -1149,7 +1168,7 @@ where
 /// [`measure`] could be either [`FnCtxt`] or [`StructTopology`]. This is because
 /// ptr_chased is relative but precision is absolute.
 fn fit<'tcx, T, U>(
-    adt_def: AdtDef,
+    ty: Ty<'tcx>,
     mut fitter: impl Iterator<Item = T>,
     fitter_precision: Precision,
     mut fittee: impl Iterator<Item = U>,
@@ -1159,10 +1178,10 @@ fn fit<'tcx, T, U>(
 ) {
     let fitter_ptr_chased = measurable.max_ptr_chased() - fitter_precision;
 
-    let fitter_leaf_nodes = measurable.leaf_nodes(adt_def, fitter_ptr_chased as u32);
+    let fitter_leaf_nodes = measurable.extension_leaves(ty, fitter_ptr_chased as u32);
 
     let mut count = 0;
-    for &(leaf_ext_ty, offset_to_be) in fitter_leaf_nodes {
+    for (leaf_ext_ty, offset_to_be) in fitter_leaf_nodes {
         while count < offset_to_be {
             let (Some(fitter), Some(fittee)) = (fitter.next(), fittee.next()) else {
                 tracing::debug!(
@@ -1187,12 +1206,19 @@ fn fit<'tcx, T, U>(
         }
     }
 
+    for (fitter, fittee) in fitter.by_ref().zip(fittee.by_ref()) {
+        on_matched(fitter, fittee);
+    }
+
     if fitter.next().is_some() || fittee.next().is_some() {
         tracing::debug!(
             "fit: non-empty iterator tail after structural fit; ignoring trailing items"
         );
     }
 }
+
+#[cfg(test)]
+mod tuple_tests;
 
 fn matcher<'tcx, T, U, DB>(
     ty: Ty<'tcx>,
@@ -1210,7 +1236,7 @@ fn matcher<'tcx, T, U, DB>(
 
     tracing::debug!("precision: lhs = {lhs_precision}, rhs = {rhs_precision}");
 
-    let (ptr_depth, adt_def) = decompose_ty(ty);
+    let (ptr_depth, base) = decompose_ty(ty);
 
     if ptr_depth as u8 > lhs_precision
         || ptr_depth as u8 > rhs_precision
@@ -1233,10 +1259,9 @@ fn matcher<'tcx, T, U, DB>(
 
         let delta = lhs_precision.abs_diff(rhs_precision);
 
-        let adt_def = adt_def.unwrap();
         if lhs_precision < rhs_precision {
             fit(
-                adt_def,
+                base,
                 lhs_result,
                 lhs_precision,
                 rhs_result,
@@ -1246,7 +1271,7 @@ fn matcher<'tcx, T, U, DB>(
             )
         } else {
             fit(
-                adt_def,
+                base,
                 rhs_result,
                 rhs_precision,
                 lhs_result,

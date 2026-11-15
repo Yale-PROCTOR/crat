@@ -29,6 +29,34 @@ fn assert_stub_signatures_compile(records: &[ItemRecord], context: &str) {
 }
 
 #[test]
+fn native_tuple_destructuring_and_zipped_iteration_allow_skeleton_generation() {
+    let source = r#"
+pub fn update(values: &mut (usize, usize)) { values.1 += 1; }
+pub fn scan(values: &(Vec<i32>, Vec<i32>)) -> i32 {
+    let mut total = 0;
+    for (index, (first, second)) in values.0.iter().zip(&values.1).enumerate() {
+        total += index as i32 + *first + *second;
+    }
+    total
+}
+pub unsafe fn read(pointer: *const i32) -> i32 { *pointer }
+"#;
+    let records = generate(source);
+    assert!(
+        function(&records, "update")
+            .target_signature
+            .contains("&mut (usize, usize)")
+    );
+    assert!(
+        function(&records, "scan")
+            .target_signature
+            .contains("&(Vec<i32>, Vec<i32>)")
+    );
+    assert!(function(&records, "read").target_signature.contains("&i32"));
+    assert_stub_signatures_compile(&records, "");
+}
+
+#[test]
 fn boxed_field_updates_keep_pointer_analysis_and_skeleton_generation_working() {
     let source = r#"
 pub struct Manager { tasks: Vec<*mut i32>, view: *mut *mut i32 }
@@ -791,8 +819,9 @@ fn field_lifetimes_keep_multiple_structs_and_module_identities_distinct() {
     let source = r#"
 pub mod left { pub struct Holder { pub pointer: *const i32 } }
 pub mod right { pub struct Holder { pub pointer: *const i64 } }
-pub unsafe fn make(p: *const i32, q: *const i64) -> (left::Holder, right::Holder) {
-    (left::Holder { pointer: p }, right::Holder { pointer: q })
+pub struct Pair { pub left: left::Holder, pub right: right::Holder }
+pub unsafe fn make(p: *const i32, q: *const i64) -> Pair {
+    Pair { left: left::Holder { pointer: p }, right: right::Holder { pointer: q } }
 }
 pub unsafe fn read(a: *const left::Holder, b: *const right::Holder) -> i64 { *(*a).pointer as i64 + *(*b).pointer }
 "#;
@@ -1409,12 +1438,13 @@ fn field_lifetimes_follow_aggregate_values_and_nested_field_returns() {
     let source = r#"
 pub struct Holder { pub pointer: *const *const i32 }
 pub struct Container { pub holder: Holder }
+pub struct Pair { pub first: Holder, pub second: Holder }
 pub enum Choice { Value(Container), Empty }
 pub unsafe fn identity(value: Holder) -> Holder { value }
 pub unsafe fn forward(value: Holder) -> Holder { identity(value) }
 pub unsafe fn container(value: Container) -> Container { value }
 pub unsafe fn choice(value: Choice) -> Choice { value }
-pub unsafe fn pair(value: (Holder, Holder)) -> (Holder, Holder) { value }
+pub unsafe fn pair(value: Pair) -> Pair { value }
 pub unsafe fn get(value: *const Holder) -> *const *const i32 { (*value).pointer }
 pub unsafe fn read(value: *const Holder) -> i32 { **(*value).pointer }
 "#;
@@ -1433,7 +1463,7 @@ pub unsafe fn read(value: *const Holder) -> i32 { **(*value).pointer }
 }
 
 #[test]
-fn pointer_fields_preserve_lifetimes_of_aliases_to_compound_types() {
+fn raw_tuple_aliases_preserve_nested_pointer_fields() {
     let source = r#"
 pub struct Holder { pub pointer: *const i32 }
 pub type Pair = (Holder, Holder);
@@ -1454,11 +1484,26 @@ pub unsafe fn read_holder(value: *const Holder) -> i32 { *(*value).pointer }
         .collect::<Vec<_>>()
         .join("\n");
     run_compiler_on_str(&target, utils::type_check).expect(&target);
-    assert!(
-        type_record(&records, "Outer")
-            .target_definition
-            .contains("Pair<'")
-    );
+    for name in ["Holder", "Pair", "Array", "Pointer", "Outer"] {
+        let record = type_record(&records, name);
+        assert_eq!(record.source_definition, record.target_definition, "{name}");
+    }
+}
+
+#[test]
+fn raw_tuple_values_keep_field_types_and_interfaces_raw() {
+    let source = r#"
+pub struct Holder { pub pointer: *const i32 }
+pub unsafe fn pair(value: (Holder, Holder)) -> (Holder, Holder) { value }
+pub unsafe fn read(value: *const Holder) -> i32 { *(*value).pointer }
+"#;
+    let records =
+        compile_target_bodies(source, &[("pair", "value"), ("read", "*(*value).pointer")]);
+    let holder = type_record(&records, "Holder");
+    assert_eq!(holder.source_definition, holder.target_definition);
+    let signature = &function(&records, "read").target_signature;
+    assert!(signature.contains("*const Holder"), "{signature}");
+    assert!(!function(&records, "pair").target_signature.contains('&'));
 }
 
 #[test]

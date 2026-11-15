@@ -1,4 +1,6 @@
-//! Struct initialization uses the existing transfer law on disjoint slices.
+//! Struct and tuple initialization transfer disjoint component windows.
+
+use rustc_abi::FieldIdx;
 
 use super::*;
 use crate::analyses::borrow_ownership::{ownership_occurrence, source_events};
@@ -19,7 +21,7 @@ where
         destination: Option<Consume<LocalSig>>,
         operands: &[(&Operand<'tcx>, Option<Consume<LocalSig>>)],
     ) {
-        if !self.transfer_aggregate(body, place, kind, destination, operands) {
+        if !self.transfer_aggregate(body, place, kind, destination.clone(), operands) {
             // Operand visitation already advanced SSA. A declined transfer must
             // preserve every represented responsibility instead of allowing an
             // unconstrained post-value to disappear at finalization.
@@ -27,6 +29,9 @@ where
                 if let Some(source) = source {
                     <Analysis as InferMode>::lend(self, source.clone());
                 }
+            }
+            if let Some(destination) = destination {
+                <Analysis as InferMode>::borrow(self, destination);
             }
         }
     }
@@ -40,23 +45,35 @@ where
         operands: &[(&Operand<'tcx>, Option<Consume<LocalSig>>)],
     ) -> bool {
         let Some(destination) = destination else { return false };
-        let AggregateKind::Adt(did, _, args, _, active_field) = kind else { return false };
-        let adt = self.tcx.adt_def(*did);
-        if !adt.is_struct()
-            || active_field.is_some()
-            || !self.struct_ctxt.unrestricted.is_struct_of_concerned(did)
-            || adt.non_enum_variant().fields.len() != operands.len()
-            || operands.iter().any(|(operand, _)| {
-                operand
-                    .place()
-                    .is_some_and(|source| source.local == place.local)
-            })
-        {
+        if operands.iter().any(|(operand, _)| {
+            operand
+                .place()
+                .is_some_and(|source| source.local == place.local)
+        }) {
             return false;
         }
         let ty = place.ty(body, self.tcx).ty;
-        let TyKind::Adt(destination_adt, destination_args) = ty.kind() else { return false };
-        if destination_adt.did() != *did || destination_args != args {
+        let fields: Vec<_> = match (kind, ty.kind()) {
+            (AggregateKind::Adt(did, _, args, _, None), TyKind::Adt(adt, destination_args))
+                if adt.did() == *did
+                    && args == destination_args
+                    && adt.is_struct()
+                    && self.struct_ctxt.unrestricted.is_struct_of_concerned(did) =>
+            {
+                adt.non_enum_variant()
+                    .fields
+                    .iter_enumerated()
+                    .map(|(index, field)| (index, field.ty(self.tcx, args)))
+                    .collect()
+            }
+            (AggregateKind::Tuple, TyKind::Tuple(elements)) => elements
+                .iter()
+                .enumerate()
+                .map(|(index, ty)| (FieldIdx::from_usize(index), ty))
+                .collect(),
+            _ => return false,
+        };
+        if fields.len() != operands.len() {
             return false;
         }
         let width = destination.r#use.end.as_u32() - destination.r#use.start.as_u32();
@@ -75,9 +92,8 @@ where
         let mut slices = Vec::new();
         let mut source_windows: Vec<Range<Var>> = Vec::new();
         let mut covered = 0;
-        for (index, field) in adt.non_enum_variant().fields.iter_enumerated() {
-            let field_ty = field.ty(self.tcx, args);
-            let start = topology.field_offset(adt, index.as_usize(), chased);
+        for (index, field_ty) in fields {
+            let start = topology.field_offset(ty, index.as_usize(), chased);
             let field_width = topology.measure(field_ty, chased);
             if start != covered || field_width > width - covered {
                 return false;

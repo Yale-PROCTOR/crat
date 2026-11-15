@@ -481,36 +481,35 @@ pub(crate) fn vacuous_components_with<'tcx>(
                     ptr_chased += 1;
                 }
                 Proj::Field(field) => {
-                    let TyKind::Adt(adt_def, args) = base_ty.kind() else {
+                    let field_ty = match base_ty.kind() {
+                        TyKind::Adt(adt, args) if adt.is_struct() => adt
+                            .non_enum_variant()
+                            .fields
+                            .iter()
+                            .nth(*field as usize)
+                            .map(|field| field.ty(tcx, args)),
+                        TyKind::Tuple(elements) => elements.iter().nth(*field as usize),
+                        _ => None,
+                    };
+                    let Some(field_ty) = field_ty else {
                         tracked = false;
                         break;
                     };
-                    if !adt_def.is_struct() {
+                    if measurable.measure(field_ty, ptr_chased)
+                        != measurable.field_measure(base_ty, *field as usize, ptr_chased)
+                    {
                         tracked = false;
                         break;
                     }
-                    let Some(field_def) = adt_def
-                        .non_enum_variant()
-                        .fields
-                        .iter()
-                        .nth(*field as usize)
-                    else {
-                        tracked = false;
-                        break;
-                    };
-                    offset += measurable.field_offset(*adt_def, *field as usize, ptr_chased);
-                    base_ty = field_def.ty(tcx, args);
+                    offset += measurable.field_offset(base_ty, *field as usize, ptr_chased);
+                    base_ty = field_ty;
                 }
             }
         }
         if !tracked {
             continue;
         }
-        let extent = if ptr_chased >= max_ptr_chased {
-            1
-        } else {
-            measurable.measure(base_ty, ptr_chased).max(1)
-        };
+        let extent = measurable.measure(base_ty, ptr_chased);
         for index in offset..(offset + extent).min(window) {
             vacuous[index as usize] = true;
         }

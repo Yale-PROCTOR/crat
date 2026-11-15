@@ -1,4 +1,4 @@
-use rustc_middle::ty::{AdtDef, Ty};
+use rustc_middle::ty::{AdtDef, Ty, TyKind};
 
 use super::Precision;
 
@@ -13,17 +13,54 @@ pub trait Measurable<'tcx> {
 
     #[inline]
     fn measure_ptr(&self, ty: Ty) -> Measure {
-        let (ptr_measure, _) = decompose_ty(ty);
+        let (ptr_measure, base) = decompose_ty(ty);
         ptr_measure
+            + match base.kind() {
+                TyKind::Tuple(elements) => elements.iter().map(|ty| self.measure_ptr(ty)).sum(),
+                _ => 0,
+            }
     }
 
     fn measure(&self, ty: Ty, ptr_chased: u32) -> Measure;
 
     fn measure_adt(&self, adt_def: AdtDef, ptr_chased: u32) -> Measure;
 
-    fn field_offset(&self, adt_def: AdtDef, field: usize, ptr_chased: u32) -> Measure;
+    fn field_offset(&self, ty: Ty, field: usize, ptr_chased: u32) -> Measure;
+
+    fn field_measure(&self, ty: Ty, field: usize, ptr_chased: u32) -> Measure {
+        self.field_offset(ty, field + 1, ptr_chased) - self.field_offset(ty, field, ptr_chased)
+    }
 
     fn leaf_nodes(&self, adt_def: AdtDef, ptr_chased: u32) -> &[(Ty<'tcx>, u32)];
+
+    fn extension_leaves(&self, ty: Ty<'tcx>, ptr_chased: u32) -> Vec<(Ty<'tcx>, u32)> {
+        let available = (self.max_ptr_chased() as u32).saturating_sub(ptr_chased);
+        let (depth, base) = decompose_ty(ty);
+        if depth >= available {
+            return vec![(peel_pointers(ty, available), available)];
+        }
+        match base.kind() {
+            TyKind::Adt(adt, _) => self
+                .leaf_nodes(*adt, ptr_chased + depth)
+                .iter()
+                .map(|&(ty, offset)| (ty, offset + depth))
+                .collect(),
+            TyKind::Tuple(elements) => {
+                let mut leaves = Vec::new();
+                let mut offset = depth;
+                for ty in elements.iter() {
+                    leaves.extend(
+                        self.extension_leaves(ty, ptr_chased + depth)
+                            .into_iter()
+                            .map(|(ty, inner)| (ty, offset + inner)),
+                    );
+                    offset += self.measure(ty, ptr_chased + depth);
+                }
+                leaves
+            }
+            _ => Vec::new(),
+        }
+    }
 
     fn max_ptr_chased(&self) -> Precision;
 
@@ -42,8 +79,8 @@ impl<'tcx, M: Measurable<'tcx>> Measurable<'tcx> for &M {
     }
 
     #[inline]
-    fn field_offset(&self, adt_def: AdtDef, field: usize, ptr_chased: u32) -> Measure {
-        (*self).field_offset(adt_def, field, ptr_chased)
+    fn field_offset(&self, ty: Ty, field: usize, ptr_chased: u32) -> Measure {
+        (*self).field_offset(ty, field, ptr_chased)
     }
 
     #[inline]
@@ -61,7 +98,7 @@ impl<'tcx, M: Measurable<'tcx>> Measurable<'tcx> for &M {
 }
 
 #[inline]
-pub fn decompose_ty(ty: Ty) -> (Measure, Option<AdtDef>) {
+pub fn decompose_ty(ty: Ty) -> (Measure, Ty) {
     let mut ty = ty;
 
     let mut ptr_measure = 0;
@@ -80,5 +117,15 @@ pub fn decompose_ty(ty: Ty) -> (Measure, Option<AdtDef>) {
         break;
     }
 
-    (ptr_measure, ty.ty_adt_def())
+    (ptr_measure, ty)
+}
+
+pub(super) fn peel_pointers(mut ty: Ty<'_>, depth: u32) -> Ty<'_> {
+    for _ in 0..depth {
+        while let Some(element) = ty.builtin_index() {
+            ty = element;
+        }
+        ty = ty.builtin_deref(true).unwrap();
+    }
+    ty
 }

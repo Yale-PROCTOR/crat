@@ -1016,7 +1016,6 @@ fn construct_bo_into_with_esc(
 ) -> anyhow::Result<BoConstruction> {
     super::borrow_fork::validate_pointer_loan_sources(program)?;
     super::pointer_loans::constrain_carrier_boundaries(program, slots, solver);
-    super::integer_pointers::constrain_integer_boundaries(program, slots, solver);
     crate::phase_log::mark("bc:source_events", "start", "");
     crate::analysis_budget::check("bc:source_events")?;
     let source_events = super::source_events::for_construction(program);
@@ -1031,6 +1030,12 @@ fn construct_bo_into_with_esc(
     crate::phase_log::mark("bc:crate_ctxt", "start", "");
     crate::analysis_budget::check("bc:crate_ctxt")?;
     let crate_ctxt = CrateCtxt::new(program);
+    super::raw_boundaries::constrain_raw_boundaries(
+        program,
+        slots,
+        solver,
+        &crate_ctxt.struct_ctxt,
+    );
     crate::phase_log::mark(
         "bc:crate_ctxt",
         "end",
