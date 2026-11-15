@@ -55,11 +55,6 @@ fn unsupported_nonpointer_loan_sources_decline_analysis_with_a_diagnostic() {
     for source in [
         "pub unsafe fn read(address: usize) -> i32 { let pointer = address as *const i32; *pointer }",
         "#[repr(transparent)] pub struct NonNull(*mut i32); pub unsafe fn read(value: NonNull) -> i32 { let pointer: *mut i32 = core::mem::transmute(value); *pointer }",
-        "pub unsafe fn read(value: core::ptr::NonNull<i32>) -> i32 { let pointer: *mut i32 = core::mem::transmute(value); *pointer }",
-        "pub unsafe fn read(value: core::ptr::NonNull<i32>) -> i32 { let pointer = value.as_ptr(); *pointer }",
-        "pub unsafe fn read(value: Box<core::ptr::NonNull<i32>>) -> i32 { let pointer = (*value).as_ptr(); *pointer }",
-        "pub unsafe fn read(value: *mut core::ptr::NonNull<i32>) -> i32 { let pointer = (*value).as_ptr(); *pointer }",
-        "pub struct Holder<'a> { owner: &'a mut Box<i32> } pub unsafe fn read(value: Holder<'_>) -> i32 { let pointer = &raw mut **value.owner; *pointer }",
     ] {
         run_compiler_on_str(source, |tcx| {
             let error = make_skeletons(source, tcx)
@@ -74,6 +69,108 @@ fn unsupported_nonpointer_loan_sources_decline_analysis_with_a_diagnostic() {
         })
         .unwrap();
     }
+}
+
+#[test]
+fn recovered_smart_pointer_sources_allow_skeleton_generation() {
+    for source in [
+        "pub unsafe fn read(value: core::ptr::NonNull<i32>) -> i32 { let pointer: *mut i32 = core::mem::transmute(value); *pointer }",
+        "pub unsafe fn read(value: core::ptr::NonNull<i32>) -> i32 { let pointer = value.as_ptr(); *pointer }",
+        "pub unsafe fn read(value: Box<core::ptr::NonNull<i32>>) -> i32 { let pointer = (*value).as_ptr(); *pointer }",
+        "pub unsafe fn read(value: *mut core::ptr::NonNull<i32>) -> i32 { let pointer = (*value).as_ptr(); *pointer }",
+        "pub struct Holder<'a> { owner: &'a mut Box<i32> } pub unsafe fn read(value: Holder<'_>) -> i32 { let pointer = &raw mut **value.owner; *pointer }",
+        "pub fn read(value: Option<&mut Box<i32>>) -> Option<&mut i32> { Some(value?.as_mut()) }",
+        "pub fn read(value: &mut Option<Box<i32>>) -> Result<(), ()> { *value.as_mut().ok_or(())?.as_mut() = 1; Ok(()) }",
+        "pub struct Guard { allocation: Option<core::ptr::NonNull<i32>> } pub unsafe fn read(value: Guard) -> i32 { let pointer = value.allocation.expect(\"allocated\").as_ptr(); *pointer }",
+    ] {
+        let records = generate(source);
+        assert!(
+            function(&records, "read")
+                .target_signature
+                .contains("read(")
+        );
+    }
+}
+
+#[test]
+fn unknown_smart_pointer_origins_do_not_invent_references_or_ownership() {
+    use pointer_replacer_bo::analyses::borrow_ownership::{SlotKind, solver::SlotRef};
+
+    let source = r#"
+pub unsafe fn write(first: core::ptr::NonNull<i32>, second: core::ptr::NonNull<i32>) {
+    let left = first.as_ptr();
+    let right = second.as_ptr();
+    *left = 1;
+    *right = *left + 1;
+    *left = *right + 1;
+}
+pub unsafe fn copied(mut pointer: *mut i32, other: *mut i32, unrelated: *mut i32) {
+    let carrier = core::ptr::NonNull::new(pointer).unwrap();
+    let saved = pointer;
+    pointer = other;
+    let left = carrier.as_ptr();
+    let right = saved;
+    *left = 1;
+    *right = *left + 1;
+    *left = *right + 1;
+    let independent = unrelated;
+    *independent = 3;
+}
+pub unsafe fn boxed(mut owner: Box<i32>) -> i32 {
+    let pointer = &raw mut *owner;
+    *pointer = 1;
+    *pointer
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let analysis = pointer_replacer_bo::analyze_pointers(tcx).unwrap();
+        for (name, variables) in [
+            (
+                "write",
+                vec![("left", SlotKind::Raw), ("right", SlotKind::Raw)],
+            ),
+            (
+                "copied",
+                vec![
+                    ("left", SlotKind::Raw),
+                    ("right", SlotKind::Raw),
+                    ("saved", SlotKind::Raw),
+                    ("independent", SlotKind::Ref),
+                ],
+            ),
+            ("boxed", vec![("pointer", SlotKind::Ref)]),
+        ] {
+            let function = local_def(name, tcx);
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let universe = &analysis.slots.fn_local_slots[&function];
+            for (variable, expected) in variables {
+                let local = body
+                    .var_debug_info
+                    .iter()
+                    .find_map(|info| {
+                        if info.name.as_str() != variable {
+                            return None;
+                        }
+                        match info.value {
+                            rustc_middle::mir::VarDebugInfoContents::Place(place) => {
+                                place.as_local()
+                            }
+                            _ => None,
+                        }
+                    })
+                    .unwrap();
+                let slot = universe.slot_for_local_depth(local, 0).unwrap();
+                assert_eq!(
+                    analysis.kinds[&SlotRef::Local(function, slot)],
+                    expected,
+                    "{name}::{variable}"
+                );
+            }
+        }
+    })
+    .unwrap();
 }
 
 #[test]

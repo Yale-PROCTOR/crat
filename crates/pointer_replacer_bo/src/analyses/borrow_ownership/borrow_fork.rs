@@ -10,10 +10,7 @@
 //! - the conflict-edge verifiers BO added ([`borrow_conflicts`], [`borrow_conflicts_replaying`],
 //!   [`collect_invalid_loan_demotions`]) and [`LoanLocation`].
 
-use rustc_hash::FxHashMap;
-#[cfg(test)]
-use rustc_hash::FxHashSet;
-use rustc_hir::LangItem;
+use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_index::{
     IndexVec,
     bit_set::{DenseBitSet, SparseBitMatrix},
@@ -23,11 +20,12 @@ use rustc_middle::{
         Body, Local, Location, Operand, Place, PlaceElem, Rvalue, StatementKind, Terminator,
         visit::Visitor,
     },
-    ty::{Ty, TyCtxt, TyKind},
+    ty::TyCtxt,
 };
 use rustc_mir_dataflow::points::DenseLocationMap;
-use rustc_span::{def_id::LocalDefId, sym};
+use rustc_span::def_id::LocalDefId;
 
+use super::pointer_loans::PointerLoanSources;
 #[cfg(test)]
 use crate::analyses::borrow::Provenance;
 use crate::{
@@ -44,96 +42,6 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-fn pointer_loan_place<'tcx>(
-    mut place: Place<'tcx>,
-    body: &Body<'tcx>,
-    mut location: Location,
-    tcx: TyCtxt<'tcx>,
-) -> Option<Place<'tcx>> {
-    let unique = tcx.lang_items().get(LangItem::PtrUnique);
-    let non_null = tcx.get_diagnostic_item(sym::NonNull);
-    let is_unique =
-        |ty: Ty<'tcx>| matches!(ty.kind(), TyKind::Adt(adt, _) if Some(adt.did()) == unique);
-    let is_non_null =
-        |ty: Ty<'tcx>| matches!(ty.kind(), TyKind::Adt(adt, _) if Some(adt.did()) == non_null);
-    let is_carrier = |ty| is_unique(ty) || is_non_null(ty);
-    let pointee = |ty: Ty<'tcx>| match ty.kind() {
-        TyKind::Adt(_, arguments) if is_carrier(ty) => Some(arguments.type_at(0)),
-        _ => ty.builtin_deref(true),
-    };
-    loop {
-        let ty = place.ty(body, tcx).ty;
-        let mut prefix = Place::from(place.local);
-        let mut box_owner = None;
-        for element in place.projection {
-            let parent = prefix.ty(body, tcx).ty;
-            let child = prefix.project_deeper(&[element], tcx);
-            let child_ty = child.ty(body, tcx).ty;
-            let payload_field = (parent.is_box() && is_unique(child_ty)
-                || is_unique(parent) && is_non_null(child_ty)
-                || is_non_null(parent) && child_ty.is_raw_ptr())
-                && pointee(parent) == pointee(child_ty);
-            if !matches!(element, PlaceElem::Field(..)) || !payload_field {
-                box_owner = None;
-            } else if parent.is_box() {
-                box_owner = Some(prefix);
-            }
-            prefix = child;
-        }
-        if let Some(owner) = box_owner.or_else(|| ty.is_box().then_some(place)) {
-            if !owner
-                .projection
-                .iter()
-                .all(|element| matches!(element, PlaceElem::Deref))
-            {
-                return None;
-            }
-            // Cover the owner rather than mixing abstract Box dereferences with
-            // the representation-field projections used by lowered MIR.
-            return Some(owner);
-        }
-        if let Some(pointee) = ty.builtin_deref(true) {
-            let borrowed = place.project_deeper(&[PlaceElem::Deref], tcx);
-            if pointee.is_box()
-                && !borrowed
-                    .projection
-                    .iter()
-                    .all(|element| matches!(element, PlaceElem::Deref))
-            {
-                return None;
-            }
-            return Some(borrowed);
-        }
-        if !is_carrier(ty) {
-            return None;
-        }
-        // Rustc copies Box's carrier fields into temporaries before transmuting
-        // them. Follow adjacent copies so the loan stays rooted in the owner.
-        let statement = loop {
-            location.statement_index = location.statement_index.checked_sub(1)?;
-            let statement = &body.basic_blocks[location.block].statements[location.statement_index];
-            match statement.kind {
-                StatementKind::StorageLive(local) if local != place.local => {}
-                StatementKind::Nop => {}
-                _ => break statement,
-            }
-        };
-        let StatementKind::Assign(box (destination, rvalue)) = &statement.kind else { return None };
-        if destination.as_local() != Some(place.local) {
-            return None;
-        }
-        let (Rvalue::Use(Operand::Copy(source) | Operand::Move(source))
-        | Rvalue::CopyForDeref(source)) = rvalue
-        else {
-            return None;
-        };
-        if source.ty(body, tcx).ty != body.local_decls[place.local].ty {
-            return None;
-        }
-        place = source.project_deeper(place.projection, tcx);
-    }
-}
-
 pub(crate) fn validate_pointer_loan_sources<'tcx>(
     program: &RustProgram<'tcx>,
 ) -> anyhow::Result<()> {
@@ -142,30 +50,27 @@ pub(crate) fn validate_pointer_loan_sources<'tcx>(
         let body = tcx
             .mir_drops_elaborated_and_const_checked(function)
             .borrow();
-        let check = |place: Place<'tcx>, location| -> anyhow::Result<()> {
+        let sources = PointerLoanSources::new(&body, tcx);
+        let check = |place: Place<'tcx>| -> anyhow::Result<()> {
             anyhow::ensure!(
-                pointer_loan_place(place, &body, location, tcx).is_some(),
+                sources.borrowed_places(place, &body, tcx).is_some(),
                 "cannot model a pointer loan from nonpointer source of type `{}` in `{}`",
                 place.ty(&*body, tcx).ty,
                 tcx.def_path_str(function)
             );
             Ok(())
         };
-        for (block_index, block) in body.basic_blocks.iter_enumerated() {
-            for (statement_index, statement) in block.statements.iter().enumerate() {
+        for block in body.basic_blocks.iter() {
+            for statement in &block.statements {
                 if let StatementKind::Assign(box (_, rvalue)) = &statement.kind
                     && (rvalue.ty(&*body, tcx).is_raw_ptr() || rvalue.ty(&*body, tcx).is_ref())
                 {
                     match rvalue {
                         Rvalue::CopyForDeref(place)
                         | Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
-                        | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => check(
-                            *place,
-                            Location {
-                                block: block_index,
-                                statement_index,
-                            },
-                        )?,
+                        | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
+                            check(*place)?
+                        }
                         _ => {}
                     }
                 }
@@ -177,13 +82,7 @@ pub(crate) fn validate_pointer_loan_sources<'tcx>(
                     || call.destination.ty(&*body, tcx).ty.is_ref())
                 && let Some(source) = call.args.first().and_then(|arg| arg.node.place())
             {
-                check(
-                    source,
-                    Location {
-                        block: block_index,
-                        statement_index: block.statements.len(),
-                    },
-                )?;
+                check(source)?;
             }
         }
     }
@@ -215,6 +114,7 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
         tcx: TyCtxt<'tcx>,
         provenance_set: &'this ProvenanceSet,
         global_borrow_ctxt: &'this GBorrowInferCtxt,
+        sources: PointerLoanSources<'tcx>,
     }
     impl<'tcx> Visitor<'tcx> for Vis<'tcx, '_> {
         fn visit_assign(&mut self, lhs: &Place<'tcx>, rvalue: &Rvalue<'tcx>, location: Location) {
@@ -261,30 +161,40 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
                 | Rvalue::Use(Operand::Copy(place) | Operand::Move(place))
                 | Rvalue::Cast(_, Operand::Copy(place) | Operand::Move(place), _) => {
                     let mut loans = vec![];
-                    let borrowed = pointer_loan_place(*place, self.local_decl, location, self.tcx)
+                    let sources = self
+                        .sources
+                        .borrowed_places(*place, self.local_decl, self.tcx)
                         .expect("pointer loan sources must be validated before borrow inference");
-                    let loan = self.loans.push(BorrowData {
-                        location,
-                        borrowed,
-                        assigned: Borrower::Assign(assigned_owner),
-                    });
-                    loans.push(loan);
-
-                    for other_local in self
-                        .provenance_set
-                        .tree_borrow_local
-                        .borrow_mut()
-                        .group(borrowed.local)
-                    {
-                        if borrowed.local == other_local {
+                    let mut seen = FxHashSet::default();
+                    for borrowed in sources {
+                        if !seen.insert(borrowed) {
                             continue;
                         }
                         let loan = self.loans.push(BorrowData {
                             location,
-                            borrowed: Place::from(other_local),
+                            borrowed,
                             assigned: Borrower::Assign(assigned_owner),
                         });
                         loans.push(loan);
+
+                        for other_local in self
+                            .provenance_set
+                            .tree_borrow_local
+                            .borrow_mut()
+                            .group(borrowed.local)
+                        {
+                            if borrowed.local == other_local
+                                || !seen.insert(Place::from(other_local))
+                            {
+                                continue;
+                            }
+                            let loan = self.loans.push(BorrowData {
+                                location,
+                                borrowed: Place::from(other_local),
+                                assigned: Borrower::Assign(assigned_owner),
+                            });
+                            loans.push(loan);
+                        }
                     }
                     self.location_map.insert(location, loans);
                 }
@@ -308,35 +218,42 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
                             .owner_for_place(self.local_decl, mir_call.destination)
                     {
                         let mut loans = vec![];
-                        let borrowed = pointer_loan_place(
-                            arg0_place,
-                            self.local_decl,
-                            location,
-                            self.tcx,
-                        )
-                        .expect("pointer loan sources must be validated before borrow inference");
-                        let loan = self.loans.push(BorrowData {
-                            location,
-                            borrowed,
-                            assigned: Borrower::Assign(assigned_owner),
-                        });
-                        loans.push(loan);
-
-                        for other_local in self
-                            .provenance_set
-                            .tree_borrow_local
-                            .borrow_mut()
-                            .group(borrowed.local)
-                        {
-                            if borrowed.local == other_local {
+                        let sources = self
+                            .sources
+                            .borrowed_places(arg0_place, self.local_decl, self.tcx)
+                            .expect(
+                                "pointer loan sources must be validated before borrow inference",
+                            );
+                        let mut seen = FxHashSet::default();
+                        for borrowed in sources {
+                            if !seen.insert(borrowed) {
                                 continue;
                             }
                             let loan = self.loans.push(BorrowData {
                                 location,
-                                borrowed: Place::from(other_local),
+                                borrowed,
                                 assigned: Borrower::Assign(assigned_owner),
                             });
                             loans.push(loan);
+
+                            for other_local in self
+                                .provenance_set
+                                .tree_borrow_local
+                                .borrow_mut()
+                                .group(borrowed.local)
+                            {
+                                if borrowed.local == other_local
+                                    || !seen.insert(Place::from(other_local))
+                                {
+                                    continue;
+                                }
+                                let loan = self.loans.push(BorrowData {
+                                    location,
+                                    borrowed: Place::from(other_local),
+                                    assigned: Borrower::Assign(assigned_owner),
+                                });
+                                loans.push(loan);
+                            }
                         }
                         self.location_map.insert(location, loans);
                     }
@@ -387,6 +304,7 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
         tcx,
         provenance_set,
         global_borrow_ctxt,
+        sources: PointerLoanSources::new(body, tcx),
     };
     vis.visit_body(body);
 
@@ -893,6 +811,122 @@ mod tests {
                     edges.iter().any(|edge| edge_involves(edge, second))
                 ), "raw demotion must retain the second pointer's alias obligations: {source}");
             }).unwrap();
+        }
+    }
+
+    #[test]
+    fn projected_smart_pointer_loans_preserve_alias_conflicts() {
+        for source in [
+            r#"unsafe fn f(mut owner: Option<Box<i32>>) -> Result<i32, ()> {
+                let first = &raw mut **owner.as_mut().ok_or(())?;
+                let handle = owner.as_mut().ok_or(())?;
+                let second = &raw mut **handle;
+                *second = 2;
+                let value = *first;
+                *second = value + 1;
+                Ok(*first)
+            }"#,
+            r#"struct Holder<'a> { owner: &'a mut Box<i32> }
+            unsafe fn f(value: Holder<'_>) -> i32 {
+                let first = &raw mut **value.owner;
+                let second = &raw mut **value.owner;
+                *second = 2;
+                let value = *first;
+                *second = value + 1;
+                *first
+            }"#,
+            r#"unsafe fn f(value: core::ptr::NonNull<i32>) -> i32 {
+                let first = value.as_ptr();
+                let copied = value;
+                let second = copied.as_ptr();
+                *second = 2;
+                let value = *first;
+                *second = value + 1;
+                *first
+            }"#,
+            r#"unsafe fn f(pointer: *mut i32) -> i32 {
+                let carrier = core::ptr::NonNull::new(pointer).unwrap();
+                let first = carrier.as_ptr();
+                let second = pointer;
+                *second = 2;
+                let value = *first;
+                *second = value + 1;
+                *first
+            }"#,
+            r#"unsafe fn f(mut pointer: *mut i32, other: *mut i32) -> i32 {
+                let carrier = core::ptr::NonNull::new(pointer).unwrap();
+                let saved = pointer;
+                pointer = other;
+                let first = carrier.as_ptr();
+                let second = saved;
+                *second = 2;
+                let value = *first;
+                *second = value + 1;
+                *first
+            }"#,
+            r#"struct Holder<'a> { owner: Option<&'a mut Box<i32>> }
+            fn set<'a>(_unused: &i32, holder: &mut Holder<'a>, owner: &'a mut Box<i32>) {
+                holder.owner = Some(owner);
+            }
+            unsafe fn f(mut owner: Box<i32>) -> i32 {
+                let first = &raw mut *owner;
+                let mut holder = Holder { owner: None };
+                set(&0, &mut holder, &mut owner);
+                let second = &raw mut ***holder.owner.as_mut().unwrap();
+                *second = 2;
+                let value = *first;
+                *second = value + 1;
+                *first
+            }"#,
+        ] {
+            ::utils::compilation::run_compiler_on_str(source, |tcx| {
+                let program = build_rust_program(tcx);
+                let function = program
+                    .functions
+                    .iter()
+                    .copied()
+                    .find(|did| tcx.item_name(did.to_def_id()).as_str() == "f")
+                    .unwrap();
+                let first = local_by_name(tcx, function, "first");
+                let second = local_by_name(tcx, function, "second");
+                validate_pointer_loan_sources(&program).unwrap();
+                let (conflicts, invalidators) =
+                    super::super::borrow_engine::recording_edge_invalidators(|| {
+                        super::super::borrow_engine::borrow_conflicts_replaying(
+                            &program,
+                            |_| |_| true,
+                            |_| |_| false,
+                            |_| move |local| local != first,
+                            &[],
+                        )
+                    });
+                assert!(
+                    conflicts.get(&function).is_some_and(|edges| edges
+                        .iter()
+                        .any(|edge| edge_involves(edge, first) || edge_involves(edge, second))),
+                    "smart-pointer aliases must conflict: {source}"
+                );
+                assert!(
+                    invalidators
+                        .get(&function)
+                        .is_some_and(|rows| rows.iter().flatten().any(|local| *local == second)),
+                    "writes through the second pointer must reach the first loan: {source}"
+                );
+                let replay = super::super::borrow_engine::borrow_conflicts_replaying(
+                    &program,
+                    |_| move |local| local != first,
+                    |_| move |local| local == first,
+                    |_| |_| true,
+                    &[],
+                );
+                assert!(
+                    replay
+                        .get(&function)
+                        .is_some_and(|edges| edges.iter().any(|edge| edge_involves(edge, second))),
+                    "raw demotion must retain the remaining alias obligations: {source}"
+                );
+            })
+            .unwrap();
         }
     }
 
