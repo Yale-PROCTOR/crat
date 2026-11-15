@@ -398,10 +398,9 @@ fn place_vars<'tcx>(
                     _ => unreachable!(),
                 }
             }
-            ProjectionElem::Index(_) => {
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
                 base_ty = base_ty.builtin_index().unwrap();
             }
-            ProjectionElem::ConstantIndex { .. } => unreachable!("unexpected constant index"),
             ProjectionElem::Subslice { .. } => unreachable!("unexpected subslicing"),
             ProjectionElem::OpaqueCast(_) => unreachable!("unexpected opaque cast"),
             ProjectionElem::Downcast(..) => {
