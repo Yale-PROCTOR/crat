@@ -5247,66 +5247,14 @@ fn raw_decision_matches_inferred_type(kind: PtrKind, ty: ty::Ty<'_>) -> bool {
 
 pub(crate) fn is_opaque_value_expression(expr: &Expr) -> bool {
     match &expr.kind {
-        ExprKind::If(..) | ExprKind::Match(..) => {}
-        ExprKind::Block(block, _) if matches!(block.rules, rustc_ast::BlockCheckMode::Default) => {}
-        _ => return false,
+        ExprKind::If(..)
+        | ExprKind::While(..)
+        | ExprKind::ForLoop { .. }
+        | ExprKind::Loop(..)
+        | ExprKind::Match(..) => true,
+        ExprKind::Block(block, _) => matches!(block.rules, rustc_ast::BlockCheckMode::Default),
+        _ => false,
     }
-
-    struct EscapeFinder {
-        targets: Vec<(Option<Symbol>, bool)>,
-        escaping: bool,
-    }
-
-    impl<'ast> visit::Visitor<'ast> for EscapeFinder {
-        fn visit_expr(&mut self, expr: &'ast Expr) {
-            if self.escaping || matches!(expr.kind, ExprKind::Closure(..)) {
-                return;
-            }
-            match &expr.kind {
-                ExprKind::Ret(_) => self.escaping = true,
-                ExprKind::Break(label, _) | ExprKind::Continue(label) => {
-                    let needs_loop = matches!(expr.kind, ExprKind::Continue(_));
-                    self.escaping = if let Some(label) = label {
-                        !self
-                            .targets
-                            .iter()
-                            .rev()
-                            .find(|(name, _)| *name == Some(label.ident.name))
-                            .is_some_and(|(_, is_loop)| !needs_loop || *is_loop)
-                    } else {
-                        !self.targets.iter().any(|(_, is_loop)| *is_loop)
-                    };
-                }
-                _ => {}
-            }
-            if self.escaping {
-                return;
-            }
-            let target = match &expr.kind {
-                ExprKind::While(_, _, label)
-                | ExprKind::ForLoop { label, .. }
-                | ExprKind::Loop(_, label, _) => {
-                    Some((label.as_ref().map(|label| label.ident.name), true))
-                }
-                ExprKind::Block(_, Some(label)) => Some((Some(label.ident.name), false)),
-                _ => None,
-            };
-            if let Some(target) = target {
-                self.targets.push(target);
-            }
-            visit::walk_expr(self, expr);
-            if target.is_some() {
-                self.targets.pop();
-            }
-        }
-    }
-
-    let mut finder = EscapeFinder {
-        targets: vec![],
-        escaping: false,
-    };
-    finder.visit_expr(expr);
-    !finder.escaping
 }
 
 fn inspect_nested_control(expr: &Expr, mut on_opaque: impl FnMut(NodeId)) -> bool {

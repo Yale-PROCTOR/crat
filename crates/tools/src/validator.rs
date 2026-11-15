@@ -649,7 +649,7 @@ fn validate_no_nested_control(expression: &Expr, role: &str) -> Result<(), Strin
     finder.visit_expr(expression);
     if finder.found {
         Err(format!(
-            "an unsupported control expression is nested beneath {role}; only opaque value blocks, conditionals, and matches without escaping control are allowed"
+            "an unsupported control expression is nested beneath {role}; only ordinary control expressions are allowed in opaque payloads"
         ))
     } else {
         Ok(())
@@ -866,14 +866,10 @@ fn validate_function(
 
     let mut label_errors = vec![];
     for problem in &result_scan.syntax_errors {
-        let detail = if problem.code == "escaping_opaque_control" {
-            format!("{}.", problem.message)
-        } else {
-            format!(
-                "{}. Correct the attribute and preserve only canonical `#[proctor(N)]` statement labels.",
-                problem.message
-            )
-        };
+        let detail = format!(
+            "{}. Correct the attribute and preserve only canonical `#[proctor(N)]` statement labels.",
+            problem.message
+        );
         label_errors.push(error(&problem.code, function_message(expected, detail)));
     }
 
@@ -1657,21 +1653,6 @@ impl<'ast> Visitor<'ast> for BodyScanner {
         if opaque_value {
             self.suppress_unlabeled += 1;
             self.opaque_depth += 1;
-        } else if self.non_control_payload
-            && self.closure_depth == 0
-            && self.opaque_depth == 0
-            && matches!(
-                expr.kind,
-                ExprKind::If(..) | ExprKind::Block(..) | ExprKind::Match(..)
-            )
-            && !matches!(&expr.kind, ExprKind::Block(block, _) if matches!(block.rules, BlockCheckMode::Unsafe(..)))
-        {
-            self.syntax_errors.push(SyntaxProblem {
-                code: "escaping_opaque_control".to_owned(),
-                message:
-                    "a nested value expression contains control that escapes its opaque region"
-                        .to_owned(),
-            });
         }
         match &expr.kind {
             ExprKind::If(condition, then_block, else_expr) => {

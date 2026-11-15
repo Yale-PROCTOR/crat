@@ -5010,27 +5010,85 @@ fn opaque_blocks_admit_internal_loop_transfers_and_closure_returns() {
 }
 
 #[test]
-fn rejects_unsupported_nested_control_and_escaping_opaque_values() {
-    for source in [
-        "pub unsafe fn f() { let value = Some(loop { break 1; }); let _ = value; }",
-        "pub unsafe fn f(flag: bool) -> Option<i32> { Some(if flag { return None; } else { 1 }) }",
-        "pub unsafe fn f() -> Option<i32> { Some({ return None; }) }",
-        "pub unsafe fn f() { loop { let value = Some({ break; }); let _ = value; } }",
-        "pub unsafe fn f() { 'outer: loop { let value = Some({ continue 'outer; }); let _ = value; } }",
-        "pub unsafe fn f() { 'outer: loop { let value = Some({ loop { break 'outer; } }); let _ = value; } }",
-        "pub unsafe fn f(flag: bool) -> i32 { if match flag { true => { return 1; }, false => false } { 2 } else { 3 } }",
-        "pub unsafe fn f() -> Option<i32> { Some(match 0 { _ => return None }) }",
-        "pub unsafe fn f(flag: bool) { loop { if match flag { true => break, false => false } {} } }",
-        "pub unsafe fn f(flag: bool) { 'outer: loop { if match flag { true => continue 'outer, false => false } {} } }",
-        "pub unsafe fn f(flag: bool) { 'outer: loop { if match flag { true => loop { break 'outer; }, false => false } {} } }",
+fn opaque_controls_allow_loops_and_transfers_to_enclosing_scopes() {
+    for (source, expected) in [
+        (
+            "pub unsafe fn f() { let value = Some(loop { break 1; }); let _ = value; }",
+            vec![0, 1],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) -> Option<i32> { Some(if flag { return None; } else { 1 }) }",
+            vec![0],
+        ),
+        (
+            "pub unsafe fn f() -> Option<i32> { Some({ return None; }) }",
+            vec![0],
+        ),
+        (
+            "pub unsafe fn f() { loop { let value = Some({ break; }); let _ = value; } }",
+            vec![0, 1, 2],
+        ),
+        (
+            "pub unsafe fn f() { 'outer: loop { let value = Some({ continue 'outer; }); let _ = value; } }",
+            vec![0, 1, 2],
+        ),
+        (
+            "pub unsafe fn f() { 'outer: loop { let value = Some({ loop { break 'outer; } }); let _ = value; } }",
+            vec![0, 1, 2],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) -> i32 { if match flag { true => { return 1; }, false => false } { 2 } else { 3 } }",
+            vec![0, 1, 2],
+        ),
+        (
+            "pub unsafe fn f() -> Option<i32> { Some(match 0 { _ => return None }) }",
+            vec![0],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) { loop { if match flag { true => break, false => false } {} } }",
+            vec![0, 1],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) { 'outer: loop { if match flag { true => continue 'outer, false => false } {} } }",
+            vec![0, 1],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) { 'outer: loop { if match flag { true => loop { break 'outer; }, false => false } {} } }",
+            vec![0, 1],
+        ),
+        (
+            "pub unsafe fn f(flag: bool) -> Option<()> { Some(while flag { return None; }) }",
+            vec![0],
+        ),
+        (
+            "pub unsafe fn f() -> Option<()> { Some(for value in 0..2 { if value == 1 { return None; } }) }",
+            vec![0],
+        ),
+        (
+            "pub unsafe fn f(value: Option<i32>) -> Option<()> { Some(while let Some(value) = value { if value > 0 { return None; } break; }) }",
+            vec![0],
+        ),
     ] {
-        let error = generate_error(source);
-        assert_eq!(error.kind, GenerationErrorKind::NestedControlPayload);
-        assert_eq!(error.function_path, "f");
-        assert!(
-            error
-                .message
-                .contains("control expression nested beneath a non-control payload")
+        let records = generate(source);
+        let f = function(&records, "f");
+        assert_eq!(labels(&f.annotated_source), expected, "{source}");
+        assert_eq!(labels(&f.baseline.skeleton), expected, "{source}");
+        run_compiler_on_str(
+            &crate::strip_proctor_labels(&f.annotated_source).unwrap(),
+            utils::type_check,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::validate(&crate::ValidationRequest {
+                expected_functions: vec![crate::ExpectedFunction {
+                    id: f.id,
+                    name: f.name.clone(),
+                    view: f.baseline.clone()
+                }],
+                transformation: f.annotated_source.clone(),
+            }),
+            crate::ValidationResponse::Valid,
+            "{source}"
         );
     }
 }
@@ -9584,13 +9642,16 @@ pub unsafe fn f() {
         target_type: primitive.clone(),
         target_adjusted_type: primitive.clone(),
     };
-    let invalid = rule(crate::RuleExpression::Array {
-        elements: vec![crate::RuleExpression::While {
-            condition: Box::new(crate::RuleExpression::Literal {
-                value: crate::RuleLiteral::Bool { value: true },
-            }),
-            body: crate::RuleBlock { statements: vec![] },
-        }],
+    let invalid = rule(crate::RuleExpression::While {
+        condition: Box::new(crate::RuleExpression::Literal {
+            value: crate::RuleLiteral::Bool { value: true },
+        }),
+        body: crate::RuleBlock {
+            statements: vec![crate::RuleStatement::Expression {
+                expression: fixed_integer_rule("1"),
+                semicolon: true,
+            }],
+        },
     });
     let fallback = rule(fixed_integer_rule("7"));
     for rules in [

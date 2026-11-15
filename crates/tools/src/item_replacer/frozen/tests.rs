@@ -11,6 +11,155 @@ fn freeze(source: &str) -> FrozenProject {
 }
 
 #[test]
+fn opaque_policy_match_keeps_outer_labels_through_frozen_replacement() {
+    let source = r#"
+pub struct CliOptions { empty: i32, heap_type: i32 }
+pub unsafe fn parse_options(args: &[&std::ffi::CStr], start: usize,
+    options: &mut CliOptions) -> Result<(), ()> {
+    options.empty = 0;
+    options.heap_type = 1;
+    let mut args: std::iter::Skip<std::slice::Iter<'_, &std::ffi::CStr>> = args.iter().skip(start);
+    while let Some(arg) = args.next() {
+        match arg.to_bytes() {
+            b"--empty" => { options.empty = 1; }
+            b"--policy" => {
+                options.heap_type = match args.next().ok_or(())?.to_bytes() {
+                    b"min" => 0,
+                    b"max" => 1,
+                    _ => return Err(()),
+                };
+            }
+            _ => { return Err(()); }
+        }
+    }
+    Ok(())
+}
+"#;
+    let frozen = freeze(source);
+    let function = &frozen.functions[0];
+    let view = &function.record.baseline;
+    assert_eq!(
+        function
+            .record
+            .annotated_source
+            .matches("#[proctor(")
+            .count(),
+        9
+    );
+    let outer_match = &view.statement_dispositions[3].children[0];
+    assert_eq!(outer_match.label, 4);
+    assert_eq!(
+        outer_match
+            .children
+            .iter()
+            .map(|child| child.label)
+            .collect::<Vec<_>>(),
+        [5, 6, 7]
+    );
+    assert!(outer_match.children[1].children.is_empty());
+    assert!(view.transform_labels().contains(&6));
+    let body = r#"
+    #[proctor(0)] options.empty = 0;
+    #[proctor(1)] options.heap_type = 1;
+    #[proctor(2)] let mut args: std::iter::Skip<std::slice::Iter<'_, &std::ffi::CStr>> = args.iter().skip(start);
+    #[proctor(3)] while let Some(arg) = args.next() {
+        #[proctor(4)] match arg.to_bytes() {
+            b"--empty" => { #[proctor(5)] options.empty = 1; }
+            b"--policy" => {
+                #[proctor(6)] options.heap_type = match args.next().ok_or(())?.to_bytes() {
+                    b"min" => 0,
+                    b"max" => 1,
+                    _ => return Err(()),
+                };
+            }
+            _ => { #[proctor(7)] return Err(()); }
+        }
+    }
+    #[proctor(8)] Ok(())
+"#;
+    let returned = format!("{} {{ {body} }}", function.record.target_signature);
+    assert!(
+        crate::validate(&crate::ValidationRequest {
+            expected_functions: vec![crate::ExpectedFunction {
+                id: function.record.id,
+                name: function.record.name.clone(),
+                view: view.clone(),
+            }],
+            transformation: returned.clone(),
+        })
+        .is_valid()
+    );
+    let (output, metadata) = metadata(&frozen, &request(function, Some(&returned)));
+    run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+    assert!(output.replacement.source.contains("return Err(())"));
+    assert_eq!(
+        output
+            .replacement
+            .statement_pairs
+            .iter()
+            .map(|pair| pair.label)
+            .collect::<Vec<_>>(),
+        view.transform_labels()
+    );
+    crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+        .unwrap();
+}
+
+#[test]
+fn opaque_early_return_keeps_pointer_replacement_and_observations_working() {
+    let frozen = freeze(
+        r#"
+pub unsafe fn read(pointer: *const i32, enabled: bool) -> i32 {
+    if enabled {
+        return 1 + match *pointer { 0 => return -1, _ => *pointer };
+    }
+    *pointer
+}
+"#,
+    );
+    let function = &frozen.functions[0];
+    assert!(function.record.target_signature.contains("pointer: &i32"));
+    assert_eq!(
+        function
+            .record
+            .annotated_source
+            .matches("#[proctor(")
+            .count(),
+        3
+    );
+    let returned = format!(
+        "{} {{
+        #[proctor(0)] if enabled {{
+            #[proctor(1)] return 1 + match *pointer {{ 0 => return -1, _ => *pointer }};
+        }}
+        #[proctor(2)] *pointer
+    }}",
+        function.record.target_signature
+    );
+    let validation = crate::validate(&crate::ValidationRequest {
+        expected_functions: vec![crate::ExpectedFunction {
+            id: function.record.id,
+            name: function.record.name.clone(),
+            view: function.record.baseline.clone(),
+        }],
+        transformation: returned.clone(),
+    });
+    assert_eq!(validation, crate::ValidationResponse::Valid);
+    let (output, metadata) = metadata(&frozen, &request(function, Some(&returned)));
+    run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+    let observations =
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .unwrap();
+    assert!(!observations.observations.is_empty());
+    assert!(
+        observations
+            .observations
+            .iter()
+            .all(|observation| observation.pointer_anchors.len() == 1)
+    );
+}
+
+#[test]
 fn closure_containing_locals_survive_replacement_and_observation_extraction() {
     for (source, body, incomplete_label) in [
         (

@@ -1244,7 +1244,6 @@ fn print_arguments_are_defended_without_validator() {
             "{ #[allow(unused_variables)] let proctor_temp_var_0 = 1; proctor_temp_var_0 }",
             "unexpected_body_attribute",
         ),
-        ("{ return; }", "escaping_opaque_control"),
         ("helper!(proctor_temp_var_0)", "temporary_in_macro"),
     ] {
         let request = ReplacementRequest {
@@ -1288,6 +1287,10 @@ fn print_arguments_are_defended_without_validator() {
 
     for argument in [
         "{ let local = 1; local }",
+        "{ return; }",
+        "loop { break 1; }",
+        "while false { return; }",
+        "for value in [1] { if value > 0 { return; } }",
         "{ let proctor_temp_var_0 = 1; proctor_temp_var_0 }",
         "{ let proctor_temp_var_0 = 1; helper!(proctor_temp_var_0); proctor_temp_var_0 }",
     ] {
