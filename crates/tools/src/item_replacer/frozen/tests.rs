@@ -11,6 +11,70 @@ fn freeze(source: &str) -> FrozenProject {
 }
 
 #[test]
+fn thread_local_item_macros_survive_frozen_replacement_and_observation() {
+    for key in [
+        "SCOPES",
+        "__proctor_source_read",
+        "__proctor_source_stub_read",
+    ] {
+        let source = format!(
+            r#"
+pub mod context {{
+    pub struct Scope {{ value: usize }}
+    impl Scope {{ fn new() -> Self {{ Self {{ value: 1 }} }} }}
+    std::thread_local! {{
+        static {key}: std::cell::RefCell<Vec<Scope>> = std::cell::RefCell::new(<[_]>::into_vec(Box::new([Scope::new()])));
+    }}
+    std::thread_local! {{
+        static TYPE_KEYWORDS: std::cell::Cell<usize> = const {{ std::cell::Cell::new(2) }};
+    }}
+    pub unsafe fn read(pointer: *const i32) -> i32 {{
+        let count = {key}.with(|scopes| scopes.borrow().len());
+        *pointer + count as i32
+    }}
+}}
+"#
+        );
+        let frozen = freeze(&source);
+        assert_eq!(
+            frozen.functions.len(),
+            1,
+            "macro-generated definitions remain context"
+        );
+        let function = &frozen.functions[0];
+        assert_eq!(function.record.path, "context::read");
+        assert!(function.record.target_signature.contains("pointer: &i32"));
+        assert!(frozen.target_source.contains("std::thread_local!"));
+        assert_ne!(function.source_copy_path, format!("context::{key}"));
+        assert_ne!(function.source_stub_path, format!("context::{key}"));
+        let returned = format!(
+            "{} {{
+            #[proctor(0)] let mut count: usize = {key}.with(|scopes| scopes.borrow().len());
+            #[proctor(1)] *pointer + count as i32
+        }}",
+            function.record.target_signature
+        );
+        let validation = crate::validate(&crate::ValidationRequest {
+            expected_functions: vec![crate::ExpectedFunction {
+                id: function.record.id,
+                name: function.record.name.clone(),
+                view: function.record.baseline.clone(),
+            }],
+            transformation: returned.clone(),
+        });
+        assert_eq!(validation, crate::ValidationResponse::Valid);
+        let (output, metadata) = metadata(&frozen, &request(function, Some(&returned)));
+        run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+        let observations = crate::observation::extract_observations_from_source(
+            &output.observation_source,
+            &metadata,
+        )
+        .unwrap();
+        assert!(!observations.observations.is_empty());
+    }
+}
+
+#[test]
 fn opaque_policy_match_keeps_outer_labels_through_frozen_replacement() {
     let source = r#"
 pub struct CliOptions { empty: i32, heap_type: i32 }

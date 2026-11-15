@@ -267,6 +267,7 @@ pub fn add_functions_with_observations(
         &mut vec![],
         &mut functions,
         &mut occupied,
+        tcx,
     )?;
     let mut partial = parse_crate(partial_source, ReplacementErrorKind::RewriteFailure)?;
     let mut analysis_context = analysis.clone();
@@ -635,6 +636,7 @@ pub fn finalize_additive_source(
         &mut vec![],
         &mut functions,
         &mut occupied,
+        tcx,
     )?;
     let mut partial = parse_crate(partial_source, ReplacementErrorKind::RewriteFailure)?;
     let mut analysis_context = analysis.clone();
@@ -1166,6 +1168,7 @@ fn collect_current_functions(
     module_path: &mut Vec<String>,
     functions: &mut Vec<CurrentFunction>,
     occupied: &mut HashMap<Vec<String>, HashSet<String>>,
+    tcx: TyCtxt<'_>,
 ) -> Result<(), ReplacementError> {
     let module_names = occupied.entry(module_path.clone()).or_default();
     for item in items {
@@ -1175,7 +1178,14 @@ fn collect_current_functions(
         match &item.kind {
             ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(children, ..)) => {
                 module_path.push(ident.to_string());
-                collect_current_functions(children, global_map, module_path, functions, occupied)?;
+                collect_current_functions(
+                    children,
+                    global_map,
+                    module_path,
+                    functions,
+                    occupied,
+                    tcx,
+                )?;
                 module_path.pop();
             }
             ItemKind::Fn(box function) if function.body.is_some() => {
@@ -1189,6 +1199,13 @@ fn collect_current_functions(
                     ));
                 };
                 let name = function.ident.to_string();
+                // Opaque item macros can introduce names absent from the surface AST.
+                let module: LocalDefId = tcx.parent_module_from_def_id(def_id).into();
+                occupied.entry(module_path.clone()).or_default().extend(
+                    tcx.module_children_local(module)
+                        .iter()
+                        .map(|child| child.ident.to_string()),
+                );
                 functions.push(CurrentFunction {
                     path: module_path
                         .iter()
