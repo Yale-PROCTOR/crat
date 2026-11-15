@@ -100,6 +100,225 @@ mod b {
 }
 
 #[test]
+fn grouped_imports_keep_used_types_and_constants_and_prune_unused_leaves() {
+    let code = r#"
+mod data {
+    pub struct Value;
+    pub type Id = usize;
+    pub const CAPACITY: Id = 4;
+    pub fn obsolete() {}
+}
+mod app {
+    use crate::data::{Value, Id, CAPACITY, obsolete};
+    pub fn run() -> (Value, Id) { (Value, CAPACITY) }
+}
+mod unused {
+    use crate::data::{obsolete};
+    fn unused() { obsolete(); }
+}
+fn main() { app::run(); }
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["use crate::data::{Value, Id, CAPACITY};"],
+        &["obsolete", "mod unused"],
+    );
+}
+
+#[test]
+fn function_local_grouped_io_imports_keep_types_and_traits() {
+    let code = r#"
+fn main() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut stream = std::io::Cursor::new([0u8]);
+    stream.write_all(b"a").unwrap();
+    stream.seek(SeekFrom::Start(0)).unwrap();
+    let mut buffer = [0u8];
+    stream.read_exact(&mut buffer).unwrap();
+}
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["use std::io::{Read, Seek, SeekFrom, Write};"],
+        &[],
+    );
+}
+
+#[test]
+fn grouped_imports_used_by_methods_and_closures_remain_in_scope() {
+    let code = r#"
+mod data {
+    pub const VALUE: i32 = 7;
+    pub type ResultValue = i32;
+}
+mod app {
+    use crate::data::{VALUE, ResultValue};
+    pub struct Receiver;
+    impl Receiver {
+        pub fn run() -> ResultValue { VALUE + (|| VALUE)() }
+    }
+}
+fn main() { app::Receiver::run(); }
+"#;
+    run_transformation_test(code, true, &["use crate::data::{VALUE, ResultValue};"], &[]);
+}
+
+#[test]
+fn nested_import_groups_preserve_self_and_renamed_leaves() {
+    let code = r#"
+mod data {
+    pub const CAPACITY: usize = 4;
+    pub mod nested {
+        pub struct Value;
+        pub fn run() -> usize { 1 }
+        pub fn obsolete() {}
+    }
+}
+mod app {
+    use crate::data::{self as imported, nested::{Value as Renamed, obsolete}, CAPACITY};
+    pub fn run() -> (Renamed, usize) { (Renamed, imported::nested::run() + CAPACITY) }
+}
+fn main() { app::run(); }
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["self as imported", "Value as Renamed", "CAPACITY"],
+        &["obsolete"],
+    );
+}
+
+#[test]
+fn grouped_trait_imports_follow_reachable_method_calls() {
+    let code = r#"
+mod traits {
+    pub trait Required { fn value(&self) -> i32 { 7 } }
+    pub trait Unused { fn unused(&self) {} }
+    pub struct Receiver;
+    pub struct UnusedReceiver;
+    impl Required for Receiver {}
+    impl Unused for UnusedReceiver {}
+}
+mod app {
+    use crate::traits::{Receiver, Required as _, Unused};
+    pub fn run() -> i32 { Receiver.value() }
+}
+fn removed() {
+    use crate::traits::{Unused, UnusedReceiver};
+    UnusedReceiver.unused();
+}
+fn main() { app::run(); }
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["Required as _", "trait Required", "fn value("],
+        &["Unused", "fn removed("],
+    );
+}
+
+#[test]
+fn grouped_reexports_keep_live_types_across_modules() {
+    for visibility in ["pub", "pub(crate)"] {
+        let code = format!(
+            r#"
+mod data {{
+    pub struct Value {{ pub number: i32 }}
+    pub type Alias = Value;
+    pub fn obsolete() {{}}
+}}
+mod facade {{
+    {visibility} use crate::data::{{Alias, Value, obsolete}};
+}}
+fn main() {{
+    let value: facade::Value = facade::Alias {{ number: 7 }};
+    let _number = value.number;
+}}
+"#
+        );
+        run_transformation_test(
+            &code,
+            true,
+            &["use crate::data::{Alias, Value};"],
+            &["obsolete"],
+        );
+    }
+}
+
+#[test]
+fn private_grouped_imports_remain_visible_to_descendant_modules() {
+    for code in [
+        r#"
+mod data { pub struct Value { pub number: i32 } }
+mod facade {
+    use crate::data::{Value as Alias};
+    mod child {
+        pub fn make() -> super::Alias { super::Alias { number: 1 } }
+    }
+    pub fn run() -> i32 { child::make().number }
+}
+fn main() { facade::run(); }
+"#,
+        r#"
+mod data { pub struct Value { pub number: i32 } }
+use crate::data::{Value as Alias};
+mod child {
+    pub fn make() -> crate::Alias { crate::Alias { number: 1 } }
+}
+fn main() { let value = child::make(); let _number = value.number; }
+"#,
+    ] {
+        run_transformation_test(code, true, &["Value as Alias"], &[]);
+    }
+}
+
+#[test]
+fn grouped_globs_keep_live_reexports_and_remove_dead_import_scopes() {
+    let code = r#"
+mod data { pub fn entry() -> i32 { 1 } }
+mod facade { pub use crate::data::*; }
+mod app {
+    use crate::facade::{self as alias, *};
+    pub fn run() -> i32 { entry() + alias::entry() }
+}
+mod dead { pub fn obsolete() {} }
+mod unused { use crate::dead::{*}; }
+fn main() { app::run(); }
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["self as alias", "pub use crate::data::*;", "fn entry()"],
+        &["mod dead", "mod unused", "obsolete"],
+    );
+}
+
+#[test]
+fn nested_enum_globs_preserve_used_variants() {
+    let code = r#"
+mod data { pub enum Mode { First, Second } }
+mod app {
+    use crate::data::{Mode::{*}};
+    pub fn run() -> crate::data::Mode { First }
+}
+fn main() { app::run(); }
+"#;
+    run_transformation_test(code, true, &["use crate::data::Mode::*;"], &[]);
+}
+
+#[test]
+fn empty_glob_scopes_do_not_leave_dangling_imports() {
+    let code = r#"
+mod empty {}
+use crate::empty::{*};
+fn main() {}
+"#;
+    run_transformation_test(code, true, &["fn main()"], &["empty", "use crate"]);
+}
+
+#[test]
 fn test_transformation_variant_reexport_used_from_other_module() {
     let code = r#"
 mod a {
