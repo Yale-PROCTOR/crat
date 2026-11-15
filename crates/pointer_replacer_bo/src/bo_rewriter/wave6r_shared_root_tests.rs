@@ -6,10 +6,12 @@ pub struct H6 { num: i32 }
 pub struct HROLLING { tag: i32 }
 pub struct H65 { ha: H6, hb: HROLLING }
 pub unsafe fn prepare_h6(s: *mut H6, cache: *mut i32) {
-    *cache = (*s).num + (s as usize) as i32;
+    let _address = s as usize;
+    *cache = (*s).num;
 }
 pub unsafe fn prepare_hrolling(s: *mut HROLLING, cache: *mut i32) {
-    *cache += (s as usize) as i32;
+    let _address = s as usize;
+    *cache += 1;
 }
 pub unsafe fn prepare_h65(s: *mut H65, cache: *mut i32) {
     prepare_h6(&mut (*s).ha, cache);
@@ -127,10 +129,8 @@ fn wave6r_h65_reverted_caller_keeps_original_address() {
 /// `&mut H65` and `cache` `&mut i32`; the mutable address still stands.
 #[test]
 fn wave6r_h65_written_formal_keeps_mutable_root() {
-    let source = super::emitted(&INPUT.replace(
-        "*cache = (*s).num + (s as usize) as i32;",
-        "(*s).num += 1; *cache = (s as usize) as i32;",
-    ));
+    let source =
+        super::emitted(&INPUT.replace("*cache = (*s).num;", "(*s).num += 1; *cache = (*s).num;"));
     assert!(
         source.contains("prepare_h65(s: &mut H65, cache: &mut i32)"),
         "{source}"

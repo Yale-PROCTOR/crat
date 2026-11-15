@@ -136,6 +136,8 @@ mod exit_tests;
 mod transport_tests;
 
 #[cfg(test)]
+mod integer_pointer_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod witnesses;

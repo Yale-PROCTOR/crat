@@ -216,7 +216,7 @@ fn raw_receiver_keeps_the_borrowed_callee_and_views_its_result_once() {
 }
 
 #[test]
-fn raw_receiver_returned_address_keeps_the_positive_retention_hold() {
+fn raw_receiver_returned_address_keeps_producer_and_receiver_raw() {
     let source = INPUT.replace("let _address = q as usize;\n        0", "q as usize");
     let emitted = ::utils::compilation::run_compiler_on_str(&source, |tcx| {
         let capture = super::ast_transform::capture_ast(tcx).unwrap();
@@ -232,22 +232,32 @@ fn raw_receiver_returned_address_keeps_the_positive_retention_hold() {
             "RAW-RECEIVER positive-retention contrast solve={:#?}",
             super::model_cache::solve_receipt()
         );
-        let (p, _) = table
+        let (p, decision) = table
             .entries
             .iter()
             .find(|(s, _)| s.label == "target::p")
             .unwrap();
-        assert!(
-            ctx.raw_boundary_artifacts
-                .additive_family_receipts
-                .iter()
-                .any(
-                    |receipt| receipt.owner_local_def_id == p.fn_did.local_def_index.as_u32()
-                        && receipt
-                            .cause
-                            .contains("raw-receiver-result:View(PositiveRetention)")
-                ),
-            "the observed returned-address retention hold remains attributed"
+        assert!(matches!(decision, Decision::Degraded(_)));
+        let locals = &ctx.slots.fn_local_slots[&p.fn_did];
+        for local in [p.local, RETURN_PLACE] {
+            let slot = locals.slot_for_local_depth(local, 0).unwrap();
+            assert_eq!(
+                ctx.model[&super::SlotRef::Local(p.fn_did, slot)],
+                super::SlotKind::Raw
+            );
+        }
+        let (q, decision) = table
+            .entries
+            .iter()
+            .find(|(s, _)| s.label == "entry::q")
+            .unwrap();
+        assert!(matches!(decision, Decision::Degraded(_)));
+        let slot = ctx.slots.fn_local_slots[&q.fn_did]
+            .slot_for_local_depth(q.local, 0)
+            .unwrap();
+        assert_eq!(
+            ctx.model[&super::SlotRef::Local(q.fn_did, slot)],
+            super::SlotKind::Raw
         );
         let emission = super::emit_files(
             tcx,

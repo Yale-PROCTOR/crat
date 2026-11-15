@@ -27,6 +27,7 @@ pub(crate) mod esc_minimal;
 pub(crate) mod execution_guard;
 pub(crate) mod export;
 mod infer;
+mod integer_pointers;
 pub(crate) mod overlap_producer;
 pub(crate) mod overlap_snapshot_effects;
 pub(crate) mod param_overlap;

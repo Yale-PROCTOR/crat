@@ -25,7 +25,7 @@ use rustc_middle::{
 use rustc_mir_dataflow::points::DenseLocationMap;
 use rustc_span::def_id::LocalDefId;
 
-use super::pointer_loans::PointerLoanSources;
+use super::{integer_pointers::is_integer_reconstruction, pointer_loans::PointerLoanSources};
 #[cfg(test)]
 use crate::analyses::borrow::Provenance;
 use crate::{
@@ -64,6 +64,7 @@ pub(crate) fn validate_pointer_loan_sources<'tcx>(
             for statement in &block.statements {
                 if let StatementKind::Assign(box (_, rvalue)) = &statement.kind
                     && (rvalue.ty(&*body, tcx).is_raw_ptr() || rvalue.ty(&*body, tcx).is_ref())
+                    && !is_integer_reconstruction(rvalue, &body, tcx)
                 {
                     match rvalue {
                         Rvalue::CopyForDeref(place)
@@ -125,6 +126,9 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
 
             let rvalue_ty = rvalue.ty(self.local_decl, self.tcx);
             if !rvalue_ty.is_raw_ptr() && !rvalue_ty.is_ref() {
+                return self.super_assign(lhs, rvalue, location);
+            }
+            if is_integer_reconstruction(rvalue, self.local_decl, self.tcx) {
                 return self.super_assign(lhs, rvalue, location);
             }
 
@@ -748,6 +752,33 @@ mod tests {
     fn edge_involves(edge: &ConflictEdge, local: Local) -> bool {
         let target = ProvenanceOwner::Local(local);
         edge.issuer == Some(target) || edge.requirers.contains(&target)
+    }
+
+    #[test]
+    fn integer_reconstruction_creates_no_fabricated_pointer_loan() {
+        ::utils::compilation::run_compiler_on_str(
+            "pub unsafe fn read(bits: usize) -> i32 { let p = (bits & !3) as *mut i32; *p }",
+            |tcx| {
+                let program = build_rust_program(tcx);
+                validate_pointer_loan_sources(&program).unwrap();
+                let function = program.functions[0];
+                let pointer = local_by_name(tcx, function, "p");
+                let ctxt = GBorrowInferCtxt::new(&program, |_| |_| true, |_| |_| true);
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                let loans = borrow_set(&body, tcx, &ctxt.provenances[&function], &ctxt);
+                assert!(!loans.loans.iter().any(|loan| matches!(loan.assigned,
+                    Borrower::Assign(ProvenanceOwner::Local(local)) if local == pointer)));
+                assert!(
+                    loans
+                        .loans
+                        .iter()
+                        .all(|loan| !body.local_decls[loan.borrowed.local].ty.is_integral())
+                );
+            },
+        )
+        .unwrap();
     }
 
     #[test]

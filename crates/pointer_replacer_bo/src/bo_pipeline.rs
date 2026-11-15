@@ -720,7 +720,7 @@ pub unsafe fn addr(mut p: *mut i32) -> usize { p as usize }
 pub unsafe fn caller() -> i32 {
     let mut x = [1, 2, 3];
     let mut y = 5;
-    get(&mut y) + sum(x.as_ptr(), 3) + addr(&mut y) as i32
+    get(&mut y) + sum(x.as_ptr(), 3)
 }
 ";
 

@@ -236,7 +236,7 @@ fn c07_traversal_activation_all_original_endpoints_hard_sat() {
 }
 
 #[test]
-fn traversal_activation_preserves_holds_and_declines_integer_reconstruction() {
+fn traversal_activation_preserves_holds_and_keeps_integer_reconstruction_raw() {
     let open = super::tests::inspect(CODE);
     assert!(open.accepted);
     assert!(
@@ -265,16 +265,9 @@ fn traversal_activation_preserves_holds_and_declines_integer_reconstruction() {
         "{CODE}\npub unsafe fn from_address(address:usize)->i32{{let node=address as *mut Node;let result=minimum(node);(*result).value}}"
     );
     let integer = inspect_attested_frame(&integer);
-    assert!(!integer.accepted);
-    assert!(integer.export.stack_entry_final.is_none());
-    assert!(
-        integer
-            .construction_error
-            .as_deref()
-            .is_some_and(|error| error.contains("nonpointer source of type `usize`")),
-        "{:?}",
-        integer.construction_error
-    );
+    integer.assert_kind("from_address::node", SlotKind::Raw);
+    integer.assert_kind("from_address::result", SlotKind::Raw);
+    integer.assert_kind("minimum::node", SlotKind::Raw);
 }
 #[test]
 fn c07_traversal_activation_raw_write_before_borrow_use_remains_held() {

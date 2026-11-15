@@ -190,14 +190,14 @@ fn wave6s2_pass_on_beside_a_certified_caller_pair_bridges() {
     );
 }
 
-/// **Pins 1–3.** A callee parameter the analysis itself keeps raw (a
-/// pointer-to-integer observation: `kind-raw`), a thin callee, and a
+/// **Pins 1–3.** A callee parameter kept raw by a local address observation,
+/// a thin callee, and a
 /// positively-retaining callee. The first two deliver the caller; the third
 /// must stay held — the site's own disposition blocks it and nothing raises a
 /// tier.
-const PASS_ON_TO_RAW_MODEL: &str = r#"
+const PASS_ON_TO_RAW: &str = r#"
  #![allow(dead_code, unused_mut, unused_variables)]
- unsafe fn back(mut p: *const u8, n: usize) -> u8 { let a = p as usize; return *p.offset((a % 2 + n) as isize); }
+ unsafe fn back(mut p: *const u8, n: usize) -> u8 { let _address = p as usize; return *p.offset(n as isize); }
  pub unsafe fn caller(mut buf: *const u8, n: usize) -> u8 {
     let a = *buf.offset(1);
     let b = back(buf, n);
@@ -206,8 +206,8 @@ const PASS_ON_TO_RAW_MODEL: &str = r#"
 "#;
 
 #[test]
-fn wave6s2_pin_pass_on_into_a_model_raw_callee_bridges() {
-    let (source, receipts) = emit_with_receipts(PASS_ON_TO_RAW_MODEL);
+fn slice_pass_on_to_a_raw_callee_uses_its_raw_bridge() {
+    let (source, receipts) = emit_with_receipts(PASS_ON_TO_RAW);
     assert!(super::verify::type_checks_str(&source), "{source}");
     assert!(source.contains("mut buf: &[u8]"), "{source}");
     assert!(

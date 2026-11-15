@@ -39,17 +39,11 @@ fn held(input: &str) -> Vec<(String, bool, bool)> {
     .expect("fixture compiles")
 }
 
-fn assert_integer_reconstruction_declines(input: &str) {
-    ::utils::compilation::run_compiler_on_str(input, |tcx| {
-        let error = crate::analyze_pointers(tcx)
-            .err()
-            .expect("integer reconstruction must decline before pair decisions");
-        assert!(
-            error.contains("nonpointer source of type `usize`"),
-            "{error}"
-        );
-    })
-    .expect("fixture compiles");
+fn assert_integer_reconstruction_stays_raw(input: &str, watched: &[&str]) {
+    let rows = held(input);
+    for label in watched {
+        assert!(is_raw(&rows, label), "{label}: {rows:?}");
+    }
 }
 
 fn row<'a>(rows: &'a [(String, bool, bool)], label: &str) -> &'a (String, bool, bool) {
@@ -168,10 +162,10 @@ unsafe fn cp2(d: *mut u8, s: *const u8) { *d = *s; }
 pub unsafe fn caller(buf: *mut u8, n: usize) -> u8 { cp2(n as *mut u8, buf); *buf }
 "#;
 
-// The pair classifier records an integer premise; full analysis declines it.
+// An integer premise cannot justify promoting the connected raw pointers.
 #[test]
 fn r148b_an_integer_cast_to_a_pointer_is_not_a_stack_object() {
-    assert_integer_reconstruction_declines(INTEGER_CAST);
+    assert_integer_reconstruction_stays_raw(INTEGER_CAST, &["caller::buf", "cp2::d", "cp2::s"]);
     assert_eq!(
         verdict_at(INTEGER_CAST, "caller", "cp2", 0, 1),
         Ok(
@@ -317,7 +311,7 @@ fn r149g_an_integer_cast_held_in_a_local_may_point_anywhere() {
     let source = anywhere_shape(
         "pub unsafe fn b(buf: *mut u8, n: usize) -> u8 { let q = n as *mut u8; cp2(q, buf); *buf }",
     );
-    assert_integer_reconstruction_declines(&source);
+    assert_integer_reconstruction_stays_raw(&source, &["b::buf", "b::q", "cp2::d", "cp2::s"]);
     assert_eq!(
         verdict_at(&source, "b", "cp2", 0, 1),
         Ok(
@@ -448,15 +442,15 @@ fn integer_round_trip() -> String {
     )
 }
 
-// Ordinary raw writes retain their holds; integer reconstruction declines earlier.
+// Writes through reconstructed aliases also retain raw pointer interfaces.
 #[test]
-fn integer_round_trip_write_declines_before_pair_decisions() {
+fn integer_round_trip_write_keeps_connected_pointer_interfaces_raw() {
     let plain = held(PLAIN_WRITE);
     let watched = ["update::src", "caller::src", "outer::v"];
     for label in watched {
         assert!(is_raw(&plain, label), "{label}: {plain:?}");
     }
-    assert_integer_reconstruction_declines(&integer_round_trip());
+    assert_integer_reconstruction_stays_raw(&integer_round_trip(), &watched);
 }
 
 /// wave-5d 149f (soundness): the same pair with `dst` model-raw through a
@@ -709,7 +703,10 @@ fn r944_1_integer_made_pointers_stay_premises() {
         verdict_at(&anywhere_shape(body), "b", "cp2", 0, 1),
         Ok(premise_of(ProvenanceKind::Integer))
     );
-    assert_integer_reconstruction_declines(&integer_round_trip());
+    assert_integer_reconstruction_stays_raw(
+        &integer_round_trip(),
+        &["update::dst", "update::src", "caller::src", "outer::v"],
+    );
 }
 
 /// R944-1, the mixed case: a global beside an integer-made pointer. Under

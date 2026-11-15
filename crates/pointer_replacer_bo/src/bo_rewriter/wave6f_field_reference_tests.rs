@@ -1480,16 +1480,12 @@ fn w6f_array_of_references_local_delivers() {
         "    points[1 as usize] = p2;",
         "    let mut q = (p2 as usize + 8 as usize) as *const kmVec2;\n    points[1 as usize] = q;",
     );
-    ::utils::compilation::run_compiler_on_str(&integer_source, |tcx| {
-        let error = crate::analyze_pointers(tcx)
-            .err()
-            .expect("integer reconstruction must decline before array decisions");
-        assert!(
-            error.contains("nonpointer source of type `usize`"),
-            "{error}"
-        );
-    })
-    .unwrap();
+    let integer = observe(&integer_source);
+    assert!(decision_of(&integer, "kmRay2IntersectBox::q").starts_with("Degraded"));
+    assert_eq!(
+        field_row(&integer, "kmRay2IntersectBox", "points").2,
+        "held"
+    );
 
     // Control: an opaque raw source stored into the array holds the transaction.
     let raw_source = POINTS.replace(

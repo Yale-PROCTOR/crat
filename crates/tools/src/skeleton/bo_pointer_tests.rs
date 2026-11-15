@@ -51,24 +51,46 @@ pub unsafe fn read(pointer: *const i32) -> i32 { *pointer }
 }
 
 #[test]
-fn unsupported_nonpointer_loan_sources_decline_analysis_with_a_diagnostic() {
-    for source in [
-        "pub unsafe fn read(address: usize) -> i32 { let pointer = address as *const i32; *pointer }",
-        "#[repr(transparent)] pub struct NonNull(*mut i32); pub unsafe fn read(value: NonNull) -> i32 { let pointer: *mut i32 = core::mem::transmute(value); *pointer }",
-    ] {
-        run_compiler_on_str(source, |tcx| {
-            let error = make_skeletons(source, tcx)
-                .expect_err("unrecognized sources must decline analysis");
-            assert!(
-                error
-                    .message
-                    .contains("cannot model a pointer loan from nonpointer source"),
-                "{error:?}"
-            );
-            assert!(error.message.contains("read"), "{error:?}");
-        })
-        .unwrap();
+fn tagged_parent_addresses_allow_skeleton_generation_and_keep_raw_interfaces() {
+    let source = r#"
+#[repr(C)] pub struct Node { parent: usize, left: *mut Node }
+pub unsafe fn set_parent(node: *mut Node, parent: *mut Node) {
+    (*node).parent = parent as usize | ((*node).parent & 3);
+    (*node).left = parent;
+}
+pub unsafe fn get_parent(node: *const Node) -> *mut Node {
+    ((*node).parent & !3usize) as *mut Node
+}
+pub unsafe fn read(pointer: *const i32) -> i32 { *pointer }
+"#;
+    let records = generate(source);
+    for name in ["set_parent", "get_parent"] {
+        let signature = &function(&records, name).target_signature;
+        assert!(signature.contains("*"), "{signature}");
+        assert!(!signature.contains('&'), "{signature}");
     }
+    assert!(function(&records, "read").target_signature.contains("&i32"));
+    assert_stub_signatures_compile(
+        &records,
+        "#[repr(C)] pub struct Node { parent: usize, left: *mut Node }",
+    );
+}
+
+#[test]
+fn unsupported_nonpointer_loan_sources_decline_analysis_with_a_diagnostic() {
+    let source = "#[repr(transparent)] pub struct NonNull(*mut i32); pub unsafe fn read(value: NonNull) -> i32 { let pointer: *mut i32 = core::mem::transmute(value); *pointer }";
+    run_compiler_on_str(source, |tcx| {
+        let error =
+            make_skeletons(source, tcx).expect_err("unrecognized sources must decline analysis");
+        assert!(
+            error
+                .message
+                .contains("cannot model a pointer loan from nonpointer source"),
+            "{error:?}"
+        );
+        assert!(error.message.contains("read"), "{error:?}");
+    })
+    .unwrap();
 }
 
 #[test]
