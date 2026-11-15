@@ -30,6 +30,7 @@ mod infer;
 pub(crate) mod overlap_producer;
 pub(crate) mod overlap_snapshot_effects;
 pub(crate) mod param_overlap;
+mod pointer_loans;
 // The call-result reseat destinations (`x = f(x)`) the exit finalization spares, for a
 // MIR-walk count.
 #[cfg(test)]
