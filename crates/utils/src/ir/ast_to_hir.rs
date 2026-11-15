@@ -4,7 +4,11 @@ use rustc_ast::{node_id::NodeMap, ptr::P, visit::Visitor, *};
 use rustc_hash::FxHashMap;
 use rustc_hir::{self as hir, HirId, def::Res};
 use rustc_middle::ty::TyCtxt;
-use rustc_span::{Ident, Span, def_id::LocalDefId};
+use rustc_span::{
+    Ident, Span,
+    def_id::LocalDefId,
+    hygiene::{ExpnId, ExpnKind, MacroKind},
+};
 
 fn use_tree_node_count(tree: &UseTree) -> usize {
     match &tree.kind {
@@ -75,11 +79,22 @@ impl<'tcx> AstToHirMapper<'tcx> {
         for (hindex, hitem) in hitems.iter().enumerate() {
             if !expanded {
                 let hitem = self.tcx.hir_item(*hitem);
+                let mut expansion = self.tcx.expn_that_defined(hitem.owner_id.to_def_id());
+                let mut generated_by_item_macro = false;
+                while expansion != ExpnId::root() {
+                    let data = expansion.expn_data();
+                    if matches!(data.kind, ExpnKind::Macro(MacroKind::Bang, _)) {
+                        generated_by_item_macro = true;
+                        break;
+                    }
+                    expansion = data.parent;
+                }
                 if hitem.span.is_dummy()
                     || hitem.span.in_derive_expansion()
                     || self
                         .tcx
                         .is_automatically_derived(hitem.owner_id.to_def_id())
+                    || generated_by_item_macro
                 {
                     continue;
                 }
@@ -92,6 +107,16 @@ impl<'tcx> AstToHirMapper<'tcx> {
                     i += 1;
                 }
                 continue;
+            }
+            // An item macro has no single HIR owner. Its generated owners are
+            // skipped above; leave the source invocation opaque and unmapped.
+            if !expanded {
+                while items
+                    .get_mut(i)
+                    .is_some_and(|item| matches!(item.as_mut().kind, ItemKind::MacCall(..)))
+                {
+                    i += 1;
+                }
             }
             let item = items[i].as_mut();
             if let ItemKind::Use(tree) = &mut item.kind
@@ -2225,6 +2250,9 @@ impl<'a> Visitor<'a> for AstToHirChecker<'_> {
     }
 
     fn visit_item(&mut self, item: &'a Item) {
+        if matches!(item.kind, ItemKind::MacCall(..)) {
+            return;
+        }
         self.ast_to_hir
             .get_item(item.id, self.tcx)
             .unwrap_or_else(|| panic!("{item:?}"));

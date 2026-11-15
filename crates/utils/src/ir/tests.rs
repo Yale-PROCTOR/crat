@@ -244,6 +244,58 @@ fn test_item_fn_variadic() {
 }
 
 #[test]
+fn test_item_thread_local_macro_expansions() {
+    run_test(
+        r#"
+        static BEFORE: usize = 1;
+        std::thread_local! {
+            static SCOPES: std::cell::RefCell<Vec<usize>> = std::cell::RefCell::new(vec![1]);
+            static COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(2) };
+        }
+        std::thread_local! {
+            static OTHER: std::cell::Cell<usize> = std::cell::Cell::new(3);
+        }
+        static AFTER: usize = 4;
+        fn read() -> usize {
+            BEFORE + AFTER + SCOPES.with(|scopes| scopes.borrow().len())
+                + COUNT.with(|count| count.get()) + OTHER.with(|other| other.get())
+        }
+    "#,
+    )
+}
+
+#[test]
+fn test_item_macro_expansion_cardinality_and_forwarded_items() {
+    run_test(
+        r#"
+        macro_rules! empty { () => {} }
+        macro_rules! one { ($name:ident) => { const $name: usize = 1; } }
+        macro_rules! many { () => { const FIRST: usize = 2; const SECOND: usize = 3; } }
+        macro_rules! forward { ($item:item) => { $item } }
+        macro_rules! nested { () => { one!(NESTED); } }
+        empty!();
+        const BEFORE: usize = 0;
+        #[derive(Clone, Copy)]
+        struct Source(usize);
+        one!(SINGLE);
+        many!();
+        empty!();
+        forward! { fn generated() -> usize { FIRST + SECOND } }
+        forward! { #[derive(Clone, Copy)] struct Generated(usize); }
+        nested!();
+        use core::{mem::{size_of, align_of}, hint::black_box};
+        fn after() -> usize { black_box(BEFORE + SINGLE + NESTED + generated() + size_of::<u8>() + align_of::<u8>()) }
+        mod inner {
+            empty!();
+            one!(VALUE);
+            pub fn after() -> usize { VALUE }
+        }
+        empty!();
+    "#,
+    )
+}
+
+#[test]
 fn test_item_foreign_mod_static() {
     run_test("extern \"C\" { static mut X: i32; }")
 }

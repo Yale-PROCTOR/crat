@@ -323,6 +323,7 @@ pub fn freeze_project(
         &mut vec![],
         &mut functions,
         &mut occupied,
+        tcx,
     )?;
     let mut target = analysis.clone();
     let types = records
