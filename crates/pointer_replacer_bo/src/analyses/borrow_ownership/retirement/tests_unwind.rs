@@ -33,6 +33,14 @@ pub unsafe fn aggregate() -> i32 {
     may_unwind();
     *holder.0
 }
+pub struct LocalHolder { pointer: *const i32 }
+pub unsafe fn named_aggregate() -> i32 {
+    let value = 1;
+    let p = &raw const value;
+    let holder = LocalHolder { pointer: p };
+    may_unwind();
+    *holder.pointer
+}
 #[derive(Clone, Copy)]
 pub struct Point { x: i32, y: i32 }
 pub unsafe fn pointee_data() -> i32 {
@@ -66,7 +74,7 @@ fn local_borrows_remain_references_across_possible_unwind() {
         "shared::q",
         "mutable::p",
         "mutable::q",
-        "aggregate::p",
+        "named_aggregate::p",
         "pointee_data::p",
         "pointee_data::q",
     ] {
@@ -76,6 +84,7 @@ fn local_borrows_remain_references_across_possible_unwind() {
             "{name}: {kinds:?}"
         );
     }
+    assert_eq!(kinds.get("aggregate::p").map(String::as_str), Some("raw"));
     with_program(LOCAL_BORROWS, |program| {
         let inventory = source_events::collect(program);
         assert!(

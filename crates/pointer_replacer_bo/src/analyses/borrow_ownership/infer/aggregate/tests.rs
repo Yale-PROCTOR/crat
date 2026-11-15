@@ -19,15 +19,24 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
-fn check_held_source_frames(destination_present: bool) {
+fn check_held_source_frames(destination_present: bool, overlapping: bool) {
     ::utils::compilation::run_compiler_on_str(
-        r#"
+        if overlapping {
+            r#"
+pub struct Inner { payload: *mut i32 }
+pub unsafe fn initialize(out: *mut (*mut Inner, *mut Inner), inner: *mut Inner) {
+    *out = (inner, inner);
+}
+"#
+        } else {
+            r#"
 pub struct Inner { payload: *mut i32 }
 pub struct Outer { inner: *mut Inner }
 pub unsafe fn initialize(out: *mut Outer, inner: *mut Inner) {
     *out = Outer { inner };
 }
-"#,
+"#
+        },
         move |tcx| {
             let mut functions = Vec::new();
             let mut structs = Vec::new();
@@ -50,7 +59,7 @@ pub unsafe fn initialize(out: *mut Outer, inner: *mut Inner) {
                 .mir_drops_elaborated_and_const_checked(function)
                 .borrow();
             let body = &*body_ref;
-            let (block, statement, kind, operand) = body
+            let (block, statement, kind, operands) = body
                 .basic_blocks
                 .iter_enumerated()
                 .find_map(|(block, data)| {
@@ -63,13 +72,24 @@ pub unsafe fn initialize(out: *mut Outer, inner: *mut Inner) {
                             else {
                                 return None;
                             };
-                            let AggregateKind::Adt(did, ..) = kind.as_ref() else { return None };
-                            (tcx.item_name(*did).as_str() == "Outer").then(|| {
-                                (block, index, kind.as_ref(), operands.iter().next().unwrap())
+                            let selected = match kind.as_ref() {
+                                AggregateKind::Tuple => overlapping,
+                                AggregateKind::Adt(did, ..) => {
+                                    !overlapping && tcx.item_name(*did).as_str() == "Outer"
+                                }
+                                _ => false,
+                            };
+                            selected.then(|| {
+                                (
+                                    block,
+                                    index,
+                                    kind.as_ref(),
+                                    operands.iter().collect::<Vec<_>>(),
+                                )
                             })
                         })
                 })
-                .expect("real compiler Outer aggregate");
+                .expect("real compiler aggregate");
             let out = body.args_iter().next().expect("out parameter");
             let destination_place = Place::from(out).project_deeper(&[PlaceElem::Deref], tcx);
             let slots = CrateSlots::build(&program);
@@ -88,10 +108,14 @@ pub unsafe fn initialize(out: *mut Outer, inner: *mut Inner) {
                 r#use: database.new_vars(&mut var_gen, 2),
                 def: database.new_vars(&mut var_gen, 2),
             };
+            let width = if overlapping { 4 } else { 1 };
             let destination = destination_present.then(|| Consume {
-                r#use: database.new_vars(&mut var_gen, 1),
-                def: database.new_vars(&mut var_gen, 1),
+                r#use: database.new_vars(&mut var_gen, width),
+                def: database.new_vars(&mut var_gen, width),
             });
+            let destination_defs = destination
+                .as_ref()
+                .map(|destination| destination.def.clone());
             let copy_lend_guards = FxHashMap::default();
             let _function_scope = ownership_evidence::function(|| tcx.def_path_str(function));
             let mut inference = InferCtxt::<BoOwnershipProbe>::new(
@@ -113,10 +137,23 @@ pub unsafe fn initialize(out: *mut Outer, inner: *mut Inner) {
                 destination_place,
                 kind,
                 destination,
-                &[(operand, Some(source.clone()))],
+                &operands
+                    .into_iter()
+                    .map(|operand| (operand, Some(source.clone())))
+                    .collect::<Vec<_>>(),
             );
             let equations =
                 facts::read(|facts| facts.equations[first_equation..].to_vec()).unwrap();
+            for definition in destination_defs.into_iter().flatten() {
+                assert!(
+                    equations
+                        .iter()
+                        .any(|equation| equation.operation == "assume"
+                            && equation.variables == [definition.as_u32()]
+                            && equation.value == Some(false)),
+                    "unproven aggregate transfer cannot create destination ownership"
+                );
+            }
             for (before, after) in source.r#use.zip(source.def) {
                 assert!(
                     equations
@@ -150,10 +187,15 @@ pub unsafe fn initialize(out: *mut Outer, inner: *mut Inner) {
 
 #[test]
 fn t07_constructed_width_hold_frames_every_consumed_source_depth() {
-    check_held_source_frames(true);
+    check_held_source_frames(true, false);
 }
 
 #[test]
 fn t07_constructed_missing_destination_frames_every_consumed_source_depth() {
-    check_held_source_frames(false);
+    check_held_source_frames(false, false);
+}
+
+#[test]
+fn tuple_held_overlapping_sources_are_framed_and_cannot_create_owners() {
+    check_held_source_frames(true, true);
 }

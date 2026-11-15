@@ -315,10 +315,15 @@ pub fn initial_definitions<'tcx>(body: &Body<'tcx>, crate_ctxt: &CrateCtxt<'tcx>
                     return;
                 }
                 Rvalue::Aggregate(kind, _)
-                    if !matches!(kind.as_ref(),
-                    AggregateKind::Adt(did,_,_,_,active_field)
-                        if active_field.is_none() && self.tcx.adt_def(*did).is_struct()
-                            && self.crate_ctxt.struct_ctxt.is_struct_of_concerned(did)) =>
+                    if !match kind.as_ref() {
+                        AggregateKind::Tuple => true,
+                        AggregateKind::Adt(did, _, _, _, active_field) => {
+                            active_field.is_none()
+                                && self.tcx.adt_def(*did).is_struct()
+                                && self.crate_ctxt.struct_ctxt.is_struct_of_concerned(did)
+                        }
+                        _ => false,
+                    } =>
                 {
                     return;
                 }

@@ -26,6 +26,8 @@ use crate::analyses::{
 
 mod libc;
 mod library;
+#[cfg(test)]
+mod tuple_tests;
 
 pub trait Boundary<'infercx, 'db, 'tcx>: AnalysisKind<'infercx, 'db, 'tcx> + Sized
 where 'tcx: 'infercx
@@ -572,7 +574,7 @@ impl<'ga, 'sc, 'db, 'tcx, DB: Database> GlobalAssumptionApplier<'ga, 'sc, 'db, '
         ty: Ty<'tcx>,
         mut dom: Option<Var>,
         field_ctxt: &mut dyn Iterator<Item = Var>,
-        input: &mut impl Iterator<Item = Var>,
+        input: &mut dyn Iterator<Item = Var>,
         mut precision: u8,
     ) {
         if precision == 0 {
@@ -607,7 +609,15 @@ impl<'ga, 'sc, 'db, 'tcx, DB: Database> GlobalAssumptionApplier<'ga, 'sc, 'db, '
             break;
         }
 
-        if let TyKind::Adt(adt_def, subst) = ty.kind() {
+        if let TyKind::Tuple(elements) = ty.kind() {
+            for ty in elements.iter() {
+                let mut child_fields = field_ctxt.take(self.struct_ctxt.measure_ptr(ty) as usize);
+                self.apply(ty, None, &mut child_fields, input, precision);
+                // A shallower input still advances past this child's full global
+                // field context before matching the next tuple element.
+                child_fields.for_each(drop);
+            }
+        } else if let TyKind::Adt(adt_def, subst) = ty.kind() {
             assert!(field_ctxt.next().is_none());
             if self.struct_ctxt.is_struct_of_concerned(&adt_def.did())
                 && self.struct_ctxt.measure_adt(*adt_def, 0) > 0
@@ -615,8 +625,13 @@ impl<'ga, 'sc, 'db, 'tcx, DB: Database> GlobalAssumptionApplier<'ga, 'sc, 'db, '
                 let fields = self
                     .global_assumptions
                     .fields(self.struct_ctxt, &adt_def.did());
-                for (mut field_ctxt, field_def) in itertools::izip!(fields, adt_def.all_fields()) {
+                let chased = (self.struct_ctxt.max_ptr_chased() - precision) as u32;
+                for (index, (mut field_ctxt, field_def)) in
+                    itertools::izip!(fields, adt_def.all_fields()).enumerate()
+                {
                     let field_ty = field_def.ty(self.tcx, subst);
+                    let width = self.struct_ctxt.field_measure(ty, index, chased);
+                    let mut field_input = input.take(width as usize);
                     // Recurse with `None`, NOT `dom`. Inheriting the enclosing
                     // struct-pointer's `dom` is the `field ⟹ parent` coupling
                     // (`push_eq_min` asserts `input ⟹ dom`) that over-claims a
@@ -627,7 +642,13 @@ impl<'ga, 'sc, 'db, 'tcx, DB: Database> GlobalAssumptionApplier<'ga, 'sc, 'db, '
                     // is a no-op for by-value structs (already `None`), and the
                     // caller-side escape's depth-1 var is on the pointer-chain path
                     // (empty `field_ctxt`), untouched. Required at precision ≥ 2.
-                    self.apply(field_ty, None, &mut field_ctxt, input, precision)
+                    let context_width = field_ctxt.end.as_u32() - field_ctxt.start.as_u32();
+                    if self.struct_ctxt.measure(field_ty, chased) == width
+                        && self.struct_ctxt.measure_ptr(field_ty) == context_width
+                    {
+                        self.apply(field_ty, None, &mut field_ctxt, &mut field_input, precision);
+                    }
+                    field_input.for_each(drop);
                 }
             }
         }

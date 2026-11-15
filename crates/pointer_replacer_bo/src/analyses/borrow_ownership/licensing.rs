@@ -140,6 +140,8 @@ mod integer_pointer_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tuple_tests;
+#[cfg(test)]
 mod witnesses;
 
 #[cfg(test)]

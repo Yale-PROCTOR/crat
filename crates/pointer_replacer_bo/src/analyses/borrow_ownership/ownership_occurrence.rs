@@ -26,6 +26,9 @@ pub(crate) enum Availability<T> {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub(crate) enum PathStep {
     Deref,
+    TupleElement {
+        index: u32,
+    },
     Field {
         structure: String,
         index: u32,
@@ -152,6 +155,14 @@ fn paths<'tcx>(
         path.push(PathStep::Deref);
         paths(pointee, tcx, remaining - 1, path, out);
         path.pop();
+    } else if let TyKind::Tuple(elements) = ty.kind() {
+        for (index, ty) in elements.iter().enumerate() {
+            path.push(PathStep::TupleElement {
+                index: index as u32,
+            });
+            paths(ty, tcx, remaining, path, out);
+            path.pop();
+        }
     } else if let TyKind::Adt(adt, args) = ty.kind() {
         if !adt.is_struct() {
             return;

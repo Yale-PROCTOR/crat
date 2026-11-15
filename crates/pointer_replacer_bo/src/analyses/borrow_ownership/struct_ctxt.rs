@@ -6,9 +6,9 @@ use rustc_type_ir::TyKind::Adt;
 
 use super::{
     Precision,
-    ptr::{Measurable, Measure, decompose_ty},
+    ptr::{Measurable, Measure, decompose_ty, peel_pointers},
 };
-use crate::analyses::borrow_ownership::vec_vec::VecVec;
+use crate::analyses::borrow_ownership::vec_vec::{VecVec, VecVecConstruction};
 
 impl<'tcx> Measurable<'tcx> for StructCtxt<'tcx> {
     #[inline]
@@ -16,14 +16,20 @@ impl<'tcx> Measurable<'tcx> for StructCtxt<'tcx> {
         // let max_ptr_depth = self.offset_of.len() as u32;
         let max_ptr_depth = self.max_ptr_chased() as u32;
 
-        let (ptr_depth, maybe_adt) = decompose_ty(ty);
+        let (ptr_depth, base) = decompose_ty(ty);
 
         if ptr_depth + ptr_chased >= max_ptr_depth {
-            max_ptr_depth - ptr_chased
-        } else if let Some(adt) = maybe_adt {
-            ptr_depth + self.measure_adt(adt, ptr_depth + ptr_chased)
+            max_ptr_depth.saturating_sub(ptr_chased)
         } else {
             ptr_depth
+                + match base.kind() {
+                    TyKind::Adt(adt, _) => self.measure_adt(*adt, ptr_depth + ptr_chased),
+                    TyKind::Tuple(elements) => elements
+                        .iter()
+                        .map(|ty| self.measure(ty, ptr_depth + ptr_chased))
+                        .sum(),
+                    _ => 0,
+                }
         }
     }
 
@@ -33,15 +39,25 @@ impl<'tcx> Measurable<'tcx> for StructCtxt<'tcx> {
     }
 
     #[inline]
-    fn field_offset(
-        &self,
-        adt_def: rustc_middle::ty::AdtDef,
-        field: usize,
-        ptr_chased: u32,
-    ) -> Measure {
-        assert!(adt_def.is_struct());
-        let Some(field_offsets) = self.field_offsets(&adt_def.did(), ptr_chased) else { return 0 };
-        field_offsets[field]
+    fn field_offset(&self, ty: Ty, field: usize, ptr_chased: u32) -> Measure {
+        if ptr_chased >= self.max_ptr_chased() as u32 {
+            return 0;
+        }
+        match ty.kind() {
+            TyKind::Adt(adt_def, _) => {
+                assert!(adt_def.is_struct());
+                let Some(offsets) = self.field_offsets(&adt_def.did(), ptr_chased) else {
+                    return 0;
+                };
+                offsets[field]
+            }
+            TyKind::Tuple(elements) => elements
+                .iter()
+                .take(field)
+                .map(|ty| self.measure(ty, ptr_chased))
+                .sum(),
+            _ => unreachable!("unexpected field projection on {ty}"),
+        }
     }
 
     fn max_ptr_chased(&self) -> Precision {
@@ -118,16 +134,20 @@ impl<'tcx> StructCtxt<'tcx> {
                 unreachable!("impossible")
             };
             assert!(adt_def.is_struct());
-            for field_def in adt_def.all_fields() {
-                let mut ty = field_def.ty(tcx, subst_ref);
-                while let TyKind::Array(inner_ty, _) = ty.kind() {
-                    ty = *inner_ty;
-                }
-                if let TyKind::Adt(sub_adt_def, _) = ty.kind()
-                    && let Some(&to_idx) = node_idx.get(&sub_adt_def.did())
-                {
-                    let from_idx = node_idx[did];
-                    graph.add_edge(from_idx, to_idx, ());
+            let mut fields: Vec<_> = adt_def
+                .all_fields()
+                .map(|field| field.ty(tcx, subst_ref))
+                .collect();
+            while let Some(ty) = fields.pop() {
+                match ty.kind() {
+                    TyKind::Array(element, _) => fields.push(*element),
+                    TyKind::Tuple(elements) => fields.extend(elements.iter()),
+                    TyKind::Adt(sub_adt_def, _) => {
+                        if let Some(&to_idx) = node_idx.get(&sub_adt_def.did()) {
+                            graph.add_edge(node_idx[did], to_idx, ());
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -220,43 +240,13 @@ impl<'tcx> StructCtxt<'tcx> {
 
             for field_def in adt_def.all_fields() {
                 let field_ty = field_def.ty(tcx, subst_ref);
-                let (ptr_depth, maybe_adt) = decompose_ty(field_ty);
-                if ptr_depth >= max_ptr_depth {
-                    let mut leaf_ext_ty = field_ty;
-                    for _ in 0..max_ptr_depth {
-                        while let Some(ty) = leaf_ext_ty.builtin_index() {
-                            leaf_ext_ty = ty;
-                        }
-                        leaf_ext_ty = leaf_ext_ty.builtin_deref(true).unwrap();
-                    }
-                    leaf_nodes.push_inner((leaf_ext_ty, offset + max_ptr_depth));
-                    offset += max_ptr_depth;
-                } else if let Some(&idx) = maybe_adt.and_then(|adt| self.did_idx.get(&adt.did())) {
-                    if ptr_depth == 0 {
-                        for (leaf_ext_ty, inner_offset) in leaf_nodes
-                            .get_constructed(idx)
-                            .iter()
-                            .copied()
-                            .collect::<smallvec::SmallVec<[_; 4]>>()
-                        {
-                            leaf_nodes.push_inner((leaf_ext_ty, offset + inner_offset));
-                        }
-
-                        offset += offset_of.get_constructed(idx).last().unwrap();
-                    } else {
-                        let leaves = &self.leaf_nodes[(max_ptr_depth - ptr_depth) as usize][idx];
-                        for &(leaf_ext_ty, inner_offset) in leaves {
-                            leaf_nodes.push_inner((leaf_ext_ty, offset + ptr_depth + inner_offset));
-                        }
-
-                        offset += ptr_depth
-                            + self.offset_of[(max_ptr_depth - ptr_depth) as usize][idx]
-                                .last()
-                                .unwrap();
-                    }
-                } else {
-                    offset += ptr_depth
-                }
+                self.extend_layout(
+                    field_ty,
+                    max_ptr_depth,
+                    &mut offset,
+                    &offset_of,
+                    &mut leaf_nodes,
+                );
                 offset_of.push_inner(offset);
             }
             offset_of.push();
@@ -269,6 +259,52 @@ impl<'tcx> StructCtxt<'tcx> {
         self.leaf_nodes.push(leaf_nodes);
 
         self.offset_of.push(offset_of);
+    }
+
+    fn extend_layout(
+        &self,
+        ty: Ty<'tcx>,
+        available: u32,
+        offset: &mut u32,
+        offsets: &VecVecConstruction<u32>,
+        leaves: &mut VecVecConstruction<(Ty<'tcx>, u32)>,
+    ) {
+        let (depth, base) = decompose_ty(ty);
+        if depth >= available {
+            *offset += available;
+            leaves.push_inner((peel_pointers(ty, available), *offset));
+            return;
+        }
+        *offset += depth;
+        let available = available - depth;
+        match base.kind() {
+            TyKind::Tuple(elements) => {
+                for ty in elements.iter() {
+                    self.extend_layout(ty, available, offset, offsets, leaves);
+                }
+            }
+            TyKind::Adt(adt, _) => {
+                let Some(&index) = self.did_idx.get(&adt.did()) else { return };
+                let (field_offsets, field_leaves) = if available == self.offset_of.len() as u32 {
+                    (
+                        offsets.get_constructed(index),
+                        leaves.get_constructed(index),
+                    )
+                } else {
+                    (
+                        &self.offset_of[available as usize][index],
+                        &self.leaf_nodes[available as usize][index],
+                    )
+                };
+                let field_leaves: smallvec::SmallVec<[_; 4]> =
+                    field_leaves.iter().copied().collect();
+                for (ty, inner) in field_leaves {
+                    leaves.push_inner((ty, *offset + inner));
+                }
+                *offset += field_offsets.last().unwrap();
+            }
+            _ => {}
+        }
     }
 }
 
@@ -515,19 +551,14 @@ impl<'intra, 'tcx> Measurable<'tcx> for RestrictedStructCtxt<'intra, 'tcx> {
         }
     }
 
-    fn field_offset(
-        &self,
-        adt_def: rustc_middle::ty::AdtDef,
-        field: usize,
-        ptr_chased: u32,
-    ) -> Measure {
+    fn field_offset(&self, ty: Ty, field: usize, ptr_chased: u32) -> Measure {
         let allowed = self.allowed_ptr_depth as u32;
         let maximum = self.unrestricted.max_ptr_chased() as u32;
         if allowed >= maximum {
-            self.unrestricted.field_offset(adt_def, field, ptr_chased)
+            self.unrestricted.field_offset(ty, field, ptr_chased)
         } else {
             self.unrestricted
-                .field_offset(adt_def, field, maximum - allowed + ptr_chased)
+                .field_offset(ty, field, maximum - allowed + ptr_chased)
         }
     }
 
