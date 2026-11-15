@@ -51,6 +51,13 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
 
     // trait method calls are not resolved in HIR, so we visit THIR
     for def_id in tcx.hir_body_owners() {
+        let trait_imports = tcx.used_trait_imports(def_id);
+        used.entry(def_id).or_default().extend(
+            visitor
+                .uses
+                .iter()
+                .filter_map(|(import, _)| trait_imports.contains(import).then_some(*import)),
+        );
         let (thir, expr_id) = tcx.thir_body(def_id).unwrap();
         let thir = thir.borrow();
         let mut visitor = ThirVisitor {
@@ -93,16 +100,47 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
         .uses
         .iter()
         .filter_map(|(use_def_id, def_ids)| {
-            let use_mod = visitor.item_mods.get(use_def_id);
-            // for each def_id imported by the use, check if all def_id is local and each item
-            // using this def_id is unused or in a different module
+            if def_ids.is_empty() || used_items.contains(use_def_id) {
+                return None;
+            }
+            let hir::ItemKind::Use(_, kind) = tcx.hir_expect_item(*use_def_id).kind else {
+                unreachable!()
+            };
+            if matches!(kind, hir::UseKind::ListStem) {
+                return None;
+            }
+            let glob_targets;
+            let def_ids = if matches!(kind, hir::UseKind::Glob) {
+                glob_targets = def_ids.iter().try_fold(Vec::new(), |mut targets, scope| {
+                    for child in tcx.module_children_local(scope.as_local()?) {
+                        targets.push(child.res.opt_def_id()?);
+                    }
+                    Some(targets)
+                })?;
+                &glob_targets
+            } else {
+                def_ids
+            };
+            let visibility = tcx.visibility(use_def_id.to_def_id());
+            let is_reexport = visibility
+                != rustc_middle::ty::Visibility::Restricted(
+                    visitor.item_mods[use_def_id].to_local_def_id().to_def_id(),
+                );
+            // Every imported definition must be local and have no reachable
+            // user in the import's visibility scope before the leaf is removed.
             def_ids
                 .iter()
                 .all(|def_id| {
                     def_id.as_local().is_some_and(|def_id| {
-                        let used_same_module = used_inv.get(&def_id).is_some_and(|using_items| {
+                        let used_in_scope = used_inv.get(&def_id).is_some_and(|using_items| {
                             using_items.iter().any(|item| {
-                                used_items.contains(item) && use_mod == visitor.item_mods.get(item)
+                                used_items.contains(item)
+                                    && visibility.is_accessible_from(
+                                        tcx.parent_module_from_def_id(*item)
+                                            .to_local_def_id()
+                                            .to_def_id(),
+                                        tcx,
+                                    )
                             })
                         });
                         let used_variant_reexport =
@@ -110,7 +148,9 @@ pub fn resolve_unsafe(config: &Config, tcx: TyCtxt<'_>) -> String {
                                 && used_inv.get(&def_id).is_some_and(|using_items| {
                                     using_items.iter().any(|item| used_items.contains(item))
                                 });
-                        !used_same_module && !used_variant_reexport
+                        !(used_in_scope
+                            || used_variant_reexport
+                            || is_reexport && used_items.contains(&def_id))
                     })
                 })
                 .then_some(*use_def_id)
@@ -145,6 +185,20 @@ struct AstVisitor<'tcx, 'a> {
     config: &'a Config,
 }
 
+impl AstVisitor<'_, '_> {
+    fn retain_use_tree(&self, tree: &mut ast::UseTree, id: ast::NodeId) -> bool {
+        if let ast::UseTreeKind::Nested { items, .. } = &mut tree.kind {
+            items.retain_mut(|(tree, id)| self.retain_use_tree(tree, *id));
+            !items.is_empty()
+        } else {
+            self.ast_to_hir
+                .global_map
+                .get(&id)
+                .is_none_or(|def_id| !self.removable_uses.contains(def_id))
+        }
+    }
+}
+
 impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
     fn flat_map_foreign_item(
         &mut self,
@@ -173,7 +227,15 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
         mut_visit::walk_flat_map_assoc_item(self, item, ctxt)
     }
 
-    fn flat_map_item(&mut self, item: P<ast::Item>) -> smallvec::SmallVec<[P<ast::Item>; 1]> {
+    fn flat_map_item(&mut self, mut item: P<ast::Item>) -> smallvec::SmallVec<[P<ast::Item>; 1]> {
+        if self.config.remove_unused {
+            let id = item.id;
+            if let ast::ItemKind::Use(tree) = &mut item.kind
+                && !self.retain_use_tree(tree, id)
+            {
+                return smallvec![];
+            }
+        }
         if self.config.remove_unused
             && let Some(def_id) = self.ast_to_hir.global_map.get(&item.id)
         {
@@ -186,9 +248,8 @@ impl mut_visit::MutVisitor for AstVisitor<'_, '_> {
                 | ast::ItemKind::Delegation(..)
                 | ast::ItemKind::DelegationMac(..) => {}
                 ast::ItemKind::Use(tree) => {
-                    if self.removable_uses.contains(def_id)
-                        || matches!(tree.kind, ast::UseTreeKind::Simple(None))
-                            && tree.prefix.segments.last().unwrap().ident.name == sym::libc
+                    if matches!(tree.kind, ast::UseTreeKind::Simple(None))
+                        && tree.prefix.segments.last().unwrap().ident.name == sym::libc
                     {
                         return smallvec![];
                     }
@@ -486,6 +547,16 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
     }
 
     fn visit_path(&mut self, path: &hir::Path<'tcx>, hir_id: HirId) {
+        for segment in path.segments {
+            if let Res::Def(DefKind::Mod, def_id) = segment.res
+                && let Some(def_id) = def_id.as_local()
+            {
+                self.used
+                    .entry(hir_id.owner.def_id)
+                    .or_default()
+                    .insert(def_id);
+            }
+        }
         match path.res {
             Res::Def(_, def_id) => {
                 if let Some(def_id) = def_id.as_local() {
