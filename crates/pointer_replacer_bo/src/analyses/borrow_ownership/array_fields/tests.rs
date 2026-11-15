@@ -13,6 +13,72 @@ use crate::analyses::borrow_ownership::{
     solver::SlotRef,
 };
 
+#[test]
+fn constant_index_patterns_keep_array_elements_and_loads_raw() {
+    inspect(
+        r#"
+pub struct Holder { pointers: [*mut i32; 2] }
+pub unsafe fn array(holder: *mut Holder) -> i32 {
+    let [first, last] = (*holder).pointers;
+    *first + *last
+}
+pub unsafe fn slice(holder: *mut Holder) -> i32 {
+    let values: &[*mut i32] = &(*holder).pointers;
+    if let [first, .., last] = *values { *first + *last } else { 0 }
+}
+pub unsafe fn reader(pointer: *const i32) -> i32 { *pointer }
+"#,
+        |program, _| {
+            let accepted =
+                crate::analyze_pointers(program.tcx).expect("constant-index BO analysis");
+            assert_eq!(
+                accepted.slots.field_slots.len(),
+                1,
+                "indices share one declaration summary"
+            );
+            assert_eq!(
+                accepted.kinds[&SlotRef::Field(SlotId::from_usize(0))],
+                SlotKind::Raw
+            );
+            let mut loaded = 0;
+            let mut reader = false;
+            for &function in &program.functions {
+                let body = program
+                    .tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                for info in &body.var_debug_info {
+                    let VarDebugInfoContents::Place(place) = info.value else { continue };
+                    let Some(local) = place.as_local() else { continue };
+                    let expected = match info.name.as_str() {
+                        "first" | "last" => {
+                            loaded += 1;
+                            SlotKind::Raw
+                        }
+                        "pointer" => {
+                            reader = true;
+                            SlotKind::Ref
+                        }
+                        _ => continue,
+                    };
+                    let id = accepted.slots.fn_local_slots[&function]
+                        .slot_for_local_depth(local, 0)
+                        .unwrap();
+                    assert_eq!(
+                        accepted.kinds[&SlotRef::Local(function, id)],
+                        expected,
+                        "{}::{}",
+                        program.tcx.def_path_str(function),
+                        info.name
+                    );
+                }
+            }
+            assert_eq!(loaded, 4);
+            assert!(reader);
+        },
+    );
+}
+
 fn inspect(code: &str, check: impl FnOnce(&RustProgram<'_>, &CrateSlots) + Send + Sync) {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let mut functions = Vec::new();

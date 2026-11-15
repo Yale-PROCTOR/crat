@@ -29,6 +29,32 @@ fn assert_stub_signatures_compile(records: &[ItemRecord], context: &str) {
 }
 
 #[test]
+fn constant_index_cli_patterns_allow_skeleton_generation() {
+    let source = r#"
+pub fn arguments(values: &[String]) -> usize {
+    match values { [_, command, key, ..] => { command.len() + key.len() }, _ => { 0 } }
+}
+pub fn bytes(values: &[u8]) -> bool {
+    match values { [b'a', .., b'z'] => { true }, _ => { false } }
+}
+pub unsafe fn read(pointer: *const i32) -> i32 { *pointer }
+"#;
+    let records = generate(source);
+    assert!(
+        function(&records, "arguments")
+            .target_signature
+            .contains("&[String]")
+    );
+    assert!(
+        function(&records, "bytes")
+            .target_signature
+            .contains("&[u8]")
+    );
+    assert!(function(&records, "read").target_signature.contains("&i32"));
+    assert_stub_signatures_compile(&records, "");
+}
+
+#[test]
 fn native_tuple_destructuring_and_zipped_iteration_allow_skeleton_generation() {
     let source = r#"
 pub fn update(values: &mut (usize, usize)) { values.1 += 1; }

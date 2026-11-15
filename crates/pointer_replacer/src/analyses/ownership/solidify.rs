@@ -23,6 +23,86 @@ use crate::{
     utils::rustc::RustProgram,
 };
 
+#[cfg(test)]
+mod tests {
+    use rustc_middle::mir::{ProjectionElem, Rvalue, StatementKind};
+
+    use crate::analyses::{
+        output_params::compute_output_params,
+        ownership::{AnalysisKind, CrateCtxt, whole_program::WholeProgramAnalysis},
+        type_qualifier::foster::mutability::mutability_analysis,
+    };
+
+    #[test]
+    fn constant_index_patterns_share_ownership_with_dynamic_indices() {
+        utils::compilation::run_compiler_on_str(
+            r#"
+pub fn select(values: &[*mut i32; 2], index: usize, choose: bool) -> *mut i32 {
+    let [first, last] = *values;
+    if choose { first } else if first.is_null() { last } else { values[index] }
+}
+pub fn suffix(values: &[*mut i32]) -> *mut i32 {
+    if let [.., last] = *values { last } else { core::ptr::null_mut() }
+}
+"#,
+            |tcx| {
+                let program = crate::rewriter::collect_input(tcx);
+                let mutable = mutability_analysis(&program);
+                let output = compute_output_params(&program, &mutable, &Default::default());
+                let ownership = WholeProgramAnalysis::analyze(CrateCtxt::new(&program), &output)
+                    .expect("constant-index ownership inference");
+                let solid = ownership.solidify(&program);
+                let mut constant = Vec::new();
+                let mut dynamic = None;
+                let mut suffix = false;
+                for &function in &program.functions {
+                    let body = tcx
+                        .mir_drops_elaborated_and_const_checked(function)
+                        .borrow();
+                    for statement in body.basic_blocks.iter().flat_map(|block| &block.statements) {
+                        let StatementKind::Assign(box (_, Rvalue::Use(operand))) = &statement.kind
+                        else {
+                            continue;
+                        };
+                        let Some(place) = operand.place() else { continue };
+                        if place
+                            .projection
+                            .iter()
+                            .any(|element| matches!(element, ProjectionElem::ConstantIndex { .. }))
+                        {
+                            let result = solid.place_result(&body, &place);
+                            assert_eq!(result.len(), 1);
+                            suffix |= place.projection.iter().any(|element| {
+                                matches!(
+                                    element,
+                                    ProjectionElem::ConstantIndex { from_end: true, .. }
+                                )
+                            });
+                            if tcx.item_name(function.to_def_id()).as_str() == "select" {
+                                constant.push(result.to_vec());
+                            }
+                        } else if place
+                            .projection
+                            .iter()
+                            .any(|element| matches!(element, ProjectionElem::Index(_)))
+                        {
+                            dynamic = Some(solid.place_result(&body, &place).to_vec());
+                        }
+                    }
+                }
+                assert_eq!(constant.len(), 2);
+                assert!(suffix, "suffix pattern must exercise from-end indexing");
+                let dynamic = dynamic.expect("dynamic-index control");
+                assert!(
+                    constant.iter().all(|result| result == &dynamic),
+                    "indices must not invent distinct ownership summaries"
+                );
+            },
+        )
+        .unwrap();
+    }
+}
+
 rustc_index::newtype_index! {
     #[debug_format = "{}"]
     pub struct Var {}
@@ -88,7 +168,8 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
                     ptr_kinds_index = 0;
                     ty = field_ty;
                 }
-                rustc_middle::mir::ProjectionElem::Index(_) => {
+                rustc_middle::mir::ProjectionElem::Index(_)
+                | rustc_middle::mir::ProjectionElem::ConstantIndex { .. } => {
                     ty = ty.builtin_index().unwrap();
                 }
                 _ => unreachable!(),
@@ -281,7 +362,8 @@ impl<'tcx> WholeProgramResults<'tcx> {
                                     index = 0;
                                     ty = field_ty;
                                 }
-                                rustc_middle::mir::ProjectionElem::Index(_) => {
+                                rustc_middle::mir::ProjectionElem::Index(_)
+                                | rustc_middle::mir::ProjectionElem::ConstantIndex { .. } => {
                                     ty = ty.builtin_index().unwrap();
                                 }
                                 _ => unreachable!(),

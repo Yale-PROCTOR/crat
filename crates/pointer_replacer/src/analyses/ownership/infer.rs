@@ -316,9 +316,8 @@ where
                     base_ty = *ty;
                 }
                 // [ty] is equivalent to ty
-                ProjectionElem::Index(_) => base_ty = base_ty.builtin_index().unwrap(),
-                ProjectionElem::ConstantIndex { .. } => {
-                    unreachable!("unexpected constant index");
+                ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
+                    base_ty = base_ty.builtin_index().unwrap();
                 }
                 ProjectionElem::Subslice { .. } => {
                     unreachable!("unexpected subslicing")

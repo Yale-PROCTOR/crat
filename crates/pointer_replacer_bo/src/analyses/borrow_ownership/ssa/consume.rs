@@ -440,10 +440,9 @@ fn place_not_reachable_to_union<'tcx>(place: &Place<'tcx>, body: &Body<'tcx>) ->
                 };
                 base_ty = ty
             }
-            ProjectionElem::Index(_) => {
+            ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
                 base_ty = base_ty.builtin_index().unwrap();
             }
-            ProjectionElem::ConstantIndex { .. } => unreachable!(),
             ProjectionElem::Subslice { .. } => unreachable!(),
             ProjectionElem::OpaqueCast(_) => unreachable!("unexpected opaque cast"),
             ProjectionElem::UnwrapUnsafeBinder(ty) | ProjectionElem::Subtype(ty) => {
@@ -453,4 +452,68 @@ fn place_not_reachable_to_union<'tcx>(place: &Place<'tcx>, body: &Body<'tcx>) ->
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_hir::{ItemKind, OwnerNode};
+    use rustc_middle::mir::{Rvalue, StatementKind};
+
+    use super::*;
+
+    #[test]
+    fn constant_index_patterns_still_detect_union_fields() {
+        utils::compilation::run_compiler_on_str(
+            r#"
+pub union Element { pointer: *mut i32, bits: usize }
+pub struct Record { pointer: *mut i32 }
+pub unsafe fn union_pattern(values: &[Element; 2]) -> *mut i32 {
+    let [Element { pointer }, _] = *values;
+    pointer
+}
+pub fn struct_pattern(values: &[Record; 2]) -> *mut i32 {
+    let [Record { pointer }, _] = *values;
+    pointer
+}
+"#,
+            |tcx| {
+                let mut checked = 0;
+                for owner in tcx
+                    .hir_crate(())
+                    .owners
+                    .iter()
+                    .filter_map(|owner| owner.as_owner())
+                {
+                    let OwnerNode::Item(item) = owner.node() else { continue };
+                    if !matches!(item.kind, ItemKind::Fn { .. }) {
+                        continue;
+                    }
+                    let function = item.owner_id.def_id;
+                    let body = tcx
+                        .mir_drops_elaborated_and_const_checked(function)
+                        .borrow();
+                    for statement in body.basic_blocks.iter().flat_map(|block| &block.statements) {
+                        let StatementKind::Assign(box (_, Rvalue::Use(operand))) = &statement.kind
+                        else {
+                            continue;
+                        };
+                        let Some(place) = operand.place() else { continue };
+                        if place
+                            .projection
+                            .iter()
+                            .any(|element| matches!(element, ProjectionElem::ConstantIndex { .. }))
+                        {
+                            assert_eq!(
+                                place_not_reachable_to_union(&place, &body),
+                                tcx.item_name(function.to_def_id()).as_str() == "struct_pattern"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+                assert_eq!(checked, 2);
+            },
+        )
+        .unwrap();
+    }
 }

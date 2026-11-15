@@ -1,6 +1,72 @@
 use super::{fatness::fatness_analysis, mutability::mutability_analysis};
 
 #[test]
+fn constant_index_patterns_preserve_pointer_qualifiers() {
+    use rustc_middle::mir::{ProjectionElem, Rvalue, StatementKind};
+
+    let source = r#"
+pub unsafe fn prefix(values: &mut [*mut i32; 2], offset: isize) {
+    let [first, _] = *values;
+    *first.offset(offset) = 1;
+}
+pub unsafe fn suffix(values: &mut [*mut i32], offset: isize) {
+    if let [.., last] = *values { *last.offset(offset) = 1; }
+}
+pub unsafe fn dynamic(values: &mut [*mut i32], index: usize, offset: isize) {
+    *values[index].offset(offset) = 1;
+}
+pub struct Entry { pointer: *mut i32 }
+pub unsafe fn nested(values: &mut [[Entry; 2]; 2], offset: isize) {
+    let [_, [_, Entry { pointer }]] = *values;
+    *pointer.offset(offset) = 1;
+}
+"#;
+    utils::compilation::run_compiler_on_str(source, |tcx| {
+        let program = crate::rewriter::collect_input(tcx);
+        let mutable = mutability_analysis(&program);
+        let fatness = fatness_analysis(&program);
+        let mut start = false;
+        let mut end = false;
+        let mut nested = false;
+        for &function in &program.functions {
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            for statement in body.basic_blocks.iter().flat_map(|block| &block.statements) {
+                let StatementKind::Assign(box (_, Rvalue::Use(operand))) = &statement.kind else {
+                    continue;
+                };
+                let Some(place) = operand.place() else { continue };
+                let mut indices = 0;
+                for element in place.projection {
+                    if let ProjectionElem::ConstantIndex { from_end, .. } = element {
+                        start |= !from_end;
+                        end |= from_end;
+                        indices += 1;
+                    }
+                }
+                nested |= indices == 2;
+            }
+            if tcx.item_name(function.to_def_id()).as_str() != "nested" {
+                let pointer_shape = fatness.function_facts(function, tcx).nth(1).unwrap();
+                assert_eq!(pointer_shape.len(), 2);
+                assert!(pointer_shape[0].is_ptr());
+                assert!(pointer_shape[1].is_arr());
+                assert!(mutable.function_facts(function, tcx).nth(1).unwrap()[1].is_mutable());
+            }
+        }
+        assert!(
+            start && end && nested,
+            "fixtures must exercise real constant-index projections"
+        );
+        let entry = program.structs[0];
+        assert!(fatness.struct_field_fact(entry, 0, 0).unwrap().is_arr());
+        assert!(mutable.struct_field_fact(entry, 0, 0).unwrap().is_mutable());
+    })
+    .unwrap();
+}
+
+#[test]
 fn memchr_tracks_buffer_shape_and_read_or_write_uses_through_void_casts() {
     use crate::analyses::mir::{CallKind, TerminatorExt};
 
