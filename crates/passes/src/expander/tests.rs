@@ -343,3 +343,84 @@ pub fn literal() -> &'static str { "::alloc::vec::from_elem" }
         "{expanded}"
     );
 }
+
+#[test]
+fn local_macro_definitions_are_removed_after_expanding_captured_uses() {
+    let source = r#"
+pub const fn calculate(value: usize) -> usize {
+    let bias = 3;
+    macro_rules! add_bias { ($value:expr) => { $value + bias }; }
+    let first = add_bias!(value);
+    let second = {
+        let bias = 5;
+        macro_rules! add_bias { ($value:expr) => { $value + bias }; }
+        add_bias!(value)
+    };
+    first + second
+}
+pub fn captured_closure(value: usize) -> usize {
+    let bias = 7;
+    (|| {
+        macro_rules! add_bias { ($value:expr) => { $value + bias }; }
+        add_bias!(value)
+    })()
+}
+"#;
+    let expanded = expand(source);
+    check(&format!(
+        "{expanded}\nconst _: [(); 12] = [(); calculate(2)];"
+    ));
+    assert!(!expanded.contains("macro_rules!"), "{expanded}");
+    assert_eq!(expand(&expanded), expanded);
+
+    let prepared = run_compiler_on_str(&expanded, crate::preparer::prepare)
+        .unwrap()
+        .unwrap();
+    check(&prepared.code);
+    let unexpanded = run_compiler_on_str(&prepared.code, |tcx| {
+        crate::unexpander::unexpand(crate::unexpander::Config::default(), tcx)
+    })
+    .unwrap();
+    check(&format!(
+        "{unexpanded}\nconst _: [(); 12] = [(); calculate(2)];"
+    ));
+    assert!(!unexpanded.contains("macro_rules!"), "{unexpanded}");
+}
+
+#[test]
+fn module_and_exported_local_macro_definitions_are_preserved() {
+    let source = r#"
+macro_rules! root_value { () => { 1usize }; }
+mod nested {
+    macro_rules! module_value { () => { 2usize }; }
+    pub fn value() -> usize { module_value!() }
+}
+pub fn define_exported_macros() {
+    #[macro_export]
+    macro_rules! exported_value { () => { 3usize }; }
+    #[cfg_attr(all(), macro_export)]
+    macro_rules! conditional_exported_value { () => { 4usize }; }
+}
+pub fn value() -> usize {
+    root_value!() + nested::value() + crate::exported_value!()
+        + crate::conditional_exported_value!()
+}
+"#;
+    let expanded = expand(source);
+    check(&expanded);
+    for name in [
+        "root_value",
+        "module_value",
+        "exported_value",
+        "conditional_exported_value",
+    ] {
+        assert!(
+            expanded.contains(&format!("macro_rules! {name}")),
+            "{expanded}"
+        );
+    }
+    check(&format!(
+        "{expanded}\npub fn reuse_exports() -> usize {{ crate::exported_value!() + crate::conditional_exported_value!() }}"
+    ));
+    assert_eq!(expand(&expanded), expanded);
+}
