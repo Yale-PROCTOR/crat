@@ -127,6 +127,107 @@ fn main() { app::run(); }
 }
 
 #[test]
+fn enum_prefix_imports_survive_construction_and_pattern_matching() {
+    let code = r#"
+mod data {
+    pub enum JobStatus { Waiting, Finished(i32) }
+    pub struct Job { pub status: JobStatus }
+    pub struct Unused;
+}
+mod app {
+    use crate::data::{Job, JobStatus, Unused};
+    pub fn reset(job: &mut Job) { job.status = JobStatus::Waiting; }
+    pub fn finish(job: &mut Job) { job.status = JobStatus::Finished(7); }
+}
+mod reports {
+    use crate::data::{Job, JobStatus, Unused};
+    pub fn result(job: &Job) -> i32 {
+        match job.status {
+            JobStatus::Waiting => 0,
+            JobStatus::Finished(value) => value,
+        }
+    }
+}
+fn main() {
+    let mut job = data::Job { status: data::JobStatus::Waiting };
+    app::reset(&mut job);
+    app::finish(&mut job);
+    reports::result(&job);
+}
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["use crate::data::{Job, JobStatus};"],
+        &["Unused"],
+    );
+}
+
+#[test]
+fn renamed_enum_and_type_alias_prefix_imports_are_retained() {
+    let code = r#"
+mod data {
+    pub enum State { Ready, Done(i32) }
+    pub type Alias = State;
+    pub struct Unused;
+}
+mod app {
+    use crate::data::{State as Mode, Alias as StateAlias, Unused};
+    pub fn run() -> i32 {
+        let ready = Mode::Ready;
+        let done = StateAlias::Done(3);
+        match (ready, done) {
+            (Mode::Ready, StateAlias::Done(value)) => value,
+            _ => 0,
+        }
+    }
+}
+fn main() { app::run(); }
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &[
+            "State as Mode",
+            "Alias as StateAlias",
+            "pub type Alias = State;",
+        ],
+        &["Unused"],
+    );
+}
+
+#[test]
+fn direct_variant_imports_retain_the_enclosing_enum() {
+    for (variant, expression, pattern) in [
+        ("Ready", "Ready", "Ready"),
+        ("Done", "Done(1)", "Done(_)"),
+        ("Named", "Named { value: 1 }", "Named { value: _ }"),
+    ] {
+        let code = format!(
+            r#"
+mod data {{
+    pub enum State {{ Ready, Done(i32), Named {{ value: i32 }} }}
+}}
+use crate::data::State::{variant};
+fn main() {{
+    let value = {expression};
+    match value {{ {pattern} => {{}}, _ => {{}} }}
+}}
+"#
+        );
+        run_transformation_test(
+            &code,
+            true,
+            &[
+                "pub enum State",
+                &format!("use crate::data::State::{variant};"),
+            ],
+            &[],
+        );
+    }
+}
+
+#[test]
 fn function_local_grouped_io_imports_keep_types_and_traits() {
     let code = r#"
 fn main() {
