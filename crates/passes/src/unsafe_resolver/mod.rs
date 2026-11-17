@@ -597,12 +597,13 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         // (e.g., functions placed in static arrays of fn pointers).
         if let hir::ExprKind::Path(ref qpath) = expr.kind
             && let hir::QPath::Resolved(_, path) = qpath
-            && let Res::Def(_, def_id) = path.res
+            && let Res::Def(DefKind::Fn | DefKind::AssocFn, def_id) = path.res
             && let Some(def_id) = def_id.as_local()
         {
-            let typeck = self.tcx.typeck(expr.hir_id.owner.def_id);
-            let adjusted_ty = typeck.expr_ty_adjusted(expr);
-            if let rustc_middle::ty::TyKind::FnPtr(_, hdr) = adjusted_ty.kind()
+            let owner = self.tcx.hir_enclosing_body_owner(expr.hir_id);
+            let typeck = self.tcx.typeck(owner);
+            if let Some(adjusted_ty) = typeck.expr_ty_adjusted_opt(expr)
+                && let rustc_middle::ty::TyKind::FnPtr(_, hdr) = adjusted_ty.kind()
                 && !hdr.abi.is_rustic_abi()
             {
                 self.extern_c_fn_ptrs.insert(def_id);
