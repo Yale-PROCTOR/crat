@@ -535,6 +535,14 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
         intravisit::walk_item(self, item)
     }
 
+    fn visit_variant(&mut self, variant: &'tcx hir::Variant<'tcx>) {
+        self.used
+            .entry(variant.def_id)
+            .or_default()
+            .insert(variant.hir_id.owner.def_id);
+        intravisit::walk_variant(self, variant);
+    }
+
     fn visit_variant_data(&mut self, vd: &'tcx hir::VariantData<'tcx>) {
         if let Some((_, hir_id, def_id)) = vd.ctor() {
             // if a constructor is used, then the struct is considered used
@@ -548,7 +556,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'tcx> {
 
     fn visit_path(&mut self, path: &hir::Path<'tcx>, hir_id: HirId) {
         for segment in path.segments {
-            if let Res::Def(DefKind::Mod, def_id) = segment.res
+            if let Res::Def(_, def_id) = segment.res
                 && let Some(def_id) = def_id.as_local()
             {
                 self.used
