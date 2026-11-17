@@ -802,6 +802,58 @@ fn run_extern_c_test(code: &str, includes: &[&str], excludes: &[&str]) {
 }
 
 #[test]
+fn constant_array_lengths_survive_unsafe_cleanup() {
+    let code = r#"
+mod dimensions {
+    pub const COUNT: u32 = 2;
+    pub const fn width() -> usize { COUNT as usize }
+}
+fn main() {
+    const LOCAL: usize = 2;
+    let direct = [false; dimensions::COUNT as usize];
+    let called = [false; dimensions::width()];
+    let closure = || [0u8; LOCAL];
+    let inline = [0u8; const { LOCAL + 1 }];
+    let _length = direct.len() + called.len() + closure().len() + inline.len();
+}
+"#;
+    run_transformation_test(
+        code,
+        true,
+        &["const COUNT", "const fn width", "const LOCAL"],
+        &[],
+    );
+}
+
+#[test]
+fn extern_c_callbacks_in_nested_bodies_keep_their_abi() {
+    let code = r#"
+const fn count(_: extern "C" fn()) -> usize { 1 }
+extern "C" fn in_length() {}
+extern "C" fn in_closure() {}
+extern "C" fn in_const() {}
+extern "C" fn direct() {}
+fn main() {
+    let values = [false; count(in_length)];
+    let callback = || -> extern "C" fn() { in_closure };
+    let inline: extern "C" fn() = const { in_const };
+    if values[0] { callback()(); }
+    inline();
+    direct();
+}
+"#;
+    run_extern_c_test(
+        code,
+        &[
+            "extern \"C\" fn in_length",
+            "extern \"C\" fn in_closure",
+            "extern \"C\" fn in_const",
+        ],
+        &["extern \"C\" fn direct"],
+    );
+}
+
+#[test]
 fn test_extern_c_fn_ptr_preserved() {
     let code = r#"
 extern "C" fn f(x: i32) -> i32 {
@@ -823,8 +875,9 @@ fn test_extern_c_fn_in_static_array_preserved() {
     let code = r#"
 extern "C" fn f() {}
 extern "C" fn g() {}
+const COUNT: usize = 1;
 #[used]
-static INIT_ARRAY: [extern "C" fn(); 1] = [f];
+static INIT_ARRAY: [extern "C" fn(); COUNT] = [f; COUNT];
 fn main() {
     g();
 }
