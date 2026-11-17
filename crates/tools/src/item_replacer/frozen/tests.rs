@@ -22,6 +22,166 @@ fn freeze_with_analysis(source: &str, use_bo_analysis: bool) -> FrozenProject {
 }
 
 #[test]
+fn macro_statements_skip_only_their_own_observations() {
+    let frozen = freeze(
+        r#"
+pub unsafe fn leaf(p: *const i32) -> i32 { *p }
+pub unsafe fn caller(p: *const i32) -> i32 {
+    let before = *p;
+    assert_eq!(leaf(p), before);
+    before + *p
+}
+"#,
+    );
+    let function = &frozen.functions[1];
+    let returned = format!(
+        "{} {{
+        #[proctor(0)] let mut before: i32 = *p;
+        #[proctor(1)] assert_eq!(leaf(p), before);
+        #[proctor(2)] before + *p
+    }}",
+        function.record.target_signature
+    );
+    let (output, metadata) = metadata(&frozen, &request(function, Some(&returned)));
+    run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+    assert!(
+        output
+            .replacement
+            .source
+            .contains("assert_eq!(leaf(p), before)")
+    );
+    assert!(!function.source_copy.contains("assert_eq!"));
+    let observations =
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .unwrap();
+    assert!(!observations.observations.is_empty());
+    let mut macro_only = metadata;
+    macro_only.current_items[0].transform_labels = vec![1];
+    let observations = crate::observation::extract_observations_from_source(
+        &output.observation_source,
+        &macro_only,
+    )
+    .unwrap();
+    assert!(observations.observations.is_empty());
+    assert!(observations.printf_observations.is_empty());
+}
+
+#[test]
+fn macro_results_keep_inferred_types_and_nested_statements_observable() {
+    for (source, body, label) in [
+        (
+            "let value = payload!(p); *p + value.value",
+            "#[proctor(0)] let mut value: Payload = payload!(&*p); #[proctor(1)] *p + value.value",
+            0,
+        ),
+        (
+            "if matches!(leaf(p), 0) { *p } else { *p + 1 }",
+            "#[proctor(0)] if matches!(leaf(p), 0) { #[proctor(1)] *p } else { #[proctor(2)] *p + 1 }",
+            0,
+        ),
+        (
+            "const TEXT: &str = concat!(\"a\", \"b\"); assert_eq!(leaf(p), 2); *p + TEXT.len() as i32",
+            "#[proctor(0)] const TEXT: &str = concat!(\"a\", \"b\"); #[proctor(1)] assert_eq!(leaf(p), 2); #[proctor(2)] *p + TEXT.len() as i32",
+            1,
+        ),
+    ] {
+        let source = format!(
+            "pub struct Payload {{ pub value: i32 }} macro_rules! payload {{ ($p:expr) => {{ Payload {{ value: leaf($p) }} }}; }} pub unsafe fn leaf(p: *const i32) -> i32 {{ *p }} pub unsafe fn caller(p: *const i32) -> i32 {{ {source} }}"
+        );
+        let frozen = freeze(&source);
+        let function = &frozen.functions[1];
+        let body = body.replace("leaf(p)", "leaf(&*p)");
+        let returned = format!("{} {{ {body} }}", function.record.target_signature);
+        let (output, mut metadata) = metadata(&frozen, &request(function, Some(&returned)));
+        run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+        let observations = crate::observation::extract_observations_from_source(
+            &output.observation_source,
+            &metadata,
+        )
+        .unwrap();
+        assert!(!observations.observations.is_empty(), "{source}");
+        metadata.current_items[0].transform_labels = vec![label];
+        let observations = crate::observation::extract_observations_from_source(
+            &output.observation_source,
+            &metadata,
+        )
+        .unwrap();
+        assert!(observations.observations.is_empty());
+        assert!(observations.printf_observations.is_empty());
+    }
+}
+
+#[test]
+fn skipped_macro_statements_preserve_trusted_printf_observations() {
+    let frozen = freeze(
+        r#"
+extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn leaf(p: *const i32) -> i32 { *p }
+pub unsafe fn caller(p: *const i32) -> i32 {
+    assert_eq!(leaf(p), 1);
+    printf(b"%d\0" as *const u8 as *const i8, *p);
+    *p
+}
+"#,
+    );
+    let function = &frozen.functions[1];
+    let returned = format!(
+        "{} {{
+        #[proctor(0)] assert_eq!(leaf(p), 1);
+        #[proctor(1)] ::std::print!(\"{{}}\", *p);
+        #[proctor(2)] *p
+    }}",
+        function.record.target_signature
+    );
+    let (output, mut metadata) = metadata(&frozen, &request(function, Some(&returned)));
+    run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+    let observations =
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .unwrap();
+    assert!(!observations.observations.is_empty());
+    assert_eq!(observations.printf_observations.len(), 1);
+    metadata.current_items[0].transform_labels = vec![0];
+    let observations =
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .unwrap();
+    assert!(observations.observations.is_empty());
+    assert!(observations.printf_observations.is_empty());
+}
+
+#[test]
+fn a_child_macro_does_not_disable_the_parent_condition_observation() {
+    let frozen = freeze(
+        r#"
+pub unsafe fn leaf(p: *const i32) -> i32 { *p }
+pub unsafe fn caller(p: *const i32) -> i32 {
+    if *p > 0 { assert_eq!(leaf(p), 1); }
+    *p
+}
+"#,
+    );
+    let function = &frozen.functions[1];
+    let returned = format!(
+        "{} {{
+        #[proctor(0)] if *p > 0 {{ #[proctor(1)] assert_eq!(leaf(p), 1); }}
+        #[proctor(2)] *p
+    }}",
+        function.record.target_signature
+    );
+    let (output, mut metadata) = metadata(&frozen, &request(function, Some(&returned)));
+    run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+    metadata.current_items[0].transform_labels = vec![0];
+    let observations =
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .unwrap();
+    assert!(!observations.observations.is_empty());
+    metadata.current_items[0].transform_labels = vec![1];
+    let observations =
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .unwrap();
+    assert!(observations.observations.is_empty());
+}
+
+#[test]
 fn thread_local_item_macros_survive_frozen_replacement_and_observation() {
     for key in [
         "SCOPES",
