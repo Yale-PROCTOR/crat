@@ -250,6 +250,37 @@ impl MutVisitor for AstVisitor<'_> {
         stmts
     }
 
+    fn visit_arm(&mut self, arm: &mut Arm) {
+        let had_block_body = arm
+            .body
+            .as_ref()
+            .is_some_and(|body| matches!(body.kind, ExprKind::Block(..)));
+        mut_visit::walk_arm(self, arm);
+        if had_block_body
+            && let Some(body) = &mut arm.body
+            && !matches!(body.kind, ExprKind::Block(..))
+        {
+            let span = body.span;
+            let mut tail = body.clone();
+            tail.attrs.clear();
+            body.kind = ExprKind::Block(
+                P(Block {
+                    stmts: thin_vec![Stmt {
+                        id: DUMMY_NODE_ID,
+                        kind: StmtKind::Expr(tail),
+                        span,
+                    }],
+                    id: DUMMY_NODE_ID,
+                    rules: BlockCheckMode::Default,
+                    span,
+                    tokens: None,
+                }),
+                None,
+            );
+            body.tokens = None;
+        }
+    }
+
     fn visit_expr(&mut self, expr: &mut Expr) {
         if let Some(mut unexpanded) = self
             .unexpanded_comparison_assert(expr)
@@ -1668,6 +1699,65 @@ pub unsafe extern "C" fn compare(left: Kind, right: Kind) -> bool { left == righ
         assert!(!second.contains("panic_cold_"), "{second}");
         assert!(!second.contains("panicking::"), "{second}");
         second
+    }
+
+    #[test]
+    fn match_arm_blocks_survive_macro_reconstruction() {
+        use rustc_ast::visit::Visitor;
+
+        let source = normalize_panic_source(
+            r#"
+pub fn f(value: i32, flag: bool) {
+    match value {
+        #[allow(unreachable_code)]
+        0 if flag => { panic!("literal panic") }
+        1 => { panic!() },
+        2 => { panic!("value: {}", value) }
+        3 => { ::std::print!("printed {}", value); }
+        4 => { ::std::eprint!("stderr"); }
+        5 => { match flag {
+            true => { panic!("nested panic") }
+            false => { () }
+        } }
+        6 => 'kept: { ::std::print!("labeled"); break 'kept; },
+        7 => unsafe { ::std::eprint!("unsafe"); },
+        _ => { () }
+    }
+}
+"#,
+        );
+        struct Arms(usize);
+        impl<'ast> Visitor<'ast> for Arms {
+            fn visit_arm(&mut self, arm: &'ast rustc_ast::Arm) {
+                let body = arm.body.as_ref().unwrap();
+                assert!(matches!(body.kind, rustc_ast::ExprKind::Block(..)));
+                self.0 += 1;
+                rustc_ast::visit::walk_arm(self, arm);
+            }
+        }
+        utils::compilation::run_compiler_on_str(&source, |_| {
+            let mut arms = Arms(0);
+            arms.visit_crate(&utils::ast::parse_crate(source.clone()));
+            assert_eq!(arms.0, 11, "{source}");
+        })
+        .unwrap();
+        assert!(source.contains("#[allow(unreachable_code)]"), "{source}");
+        assert!(source.contains("0 if flag =>"), "{source}");
+        assert!(source.contains("'kept:"), "{source}");
+        assert!(source.contains("unsafe {"), "{source}");
+        assert!(!source.contains("panic_cold_"), "{source}");
+        assert!(!source.contains("panicking::"), "{source}");
+        assert!(!source.contains("::_print"), "{source}");
+        assert!(!source.contains("::_eprint"), "{source}");
+    }
+
+    #[test]
+    fn match_arms_without_blocks_are_not_normalized() {
+        run_test(
+            "pub fn f(value: i32) -> i32 { match value { 0 => 1, _ => 2 } }",
+            &["0 => 1", "_ => 2"],
+            &["=> {"],
+        );
     }
 
     #[test]

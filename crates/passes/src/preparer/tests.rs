@@ -1973,9 +1973,10 @@ unsafe fn classify(x: Kind) -> i32 {
 fn prepare_then_unexpand_preserves_the_structural_postconditions() {
     let prepared = transform_and_compile(
         r#"
+#![feature(panic_internals)]
 fn f(x: i32) -> i32 {
     static CELL: i32 = 1;
-    match x { 0 => CELL, _ => x }
+    match x { 0 => CELL, 1 => panic!("invalid value"), _ => x }
 }
 "#,
     );
@@ -1986,7 +1987,9 @@ fn f(x: i32) -> i32 {
     utils::compilation::run_compiler_on_str(&unexpanded, utils::type_check).unwrap();
     let unexpanded = compact(&unexpanded);
     assert!(unexpanded.find("static CELL").unwrap() < unexpanded.find("fn f").unwrap());
-    assert!(unexpanded.contains("match x { 0 => { CELL } _ => { x } }"));
+    assert!(unexpanded.contains(
+        "match x { 0 => { CELL } 1 => { ::core::panic!(\"invalid value\") } _ => { x } }"
+    ));
 }
 
 #[test]
