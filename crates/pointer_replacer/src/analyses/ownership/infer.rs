@@ -699,7 +699,7 @@ where
                 match infer_cx.tcx.hir_node_by_def_id(local_did) {
                     // this crate
                     rustc_hir::Node::Item(_) => {
-                        <Analysis as Boundary>::call(infer_cx, destination, &args, callee)
+                        <Analysis as Boundary>::call(infer_cx, destination, &args, callee, substs)
                     }
                     // extern
                     rustc_hir::Node::ForeignItem(_) => infer_cx.unknown_call(destination, &args),
