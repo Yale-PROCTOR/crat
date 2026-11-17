@@ -301,6 +301,62 @@ pub unsafe extern "C" fn searchAndReplace(orig: *const i8, search: *const i8, va
 }
 
 #[test]
+fn prepared_panic_and_print_match_arms_generate_and_freeze_skeletons() {
+    let source = r#"
+#![feature(print_internals)]
+enum ShapeKind { Circle, Polygon }
+enum Shape { Circle(f32) }
+pub fn shape_from_parts(kind: ShapeKind, value: f32) -> Shape {
+    match kind {
+        ShapeKind::Circle => Shape::Circle(value),
+        ShapeKind::Polygon => panic!("Reached end of non-void function without returning"),
+    }
+}
+pub fn notify(kind: u32) {
+    match kind {
+        0 => print!("ok"),
+        1 => eprint!("error"),
+        _ => panic!(),
+    }
+}
+"#;
+    let expanded = run_compiler_on_str(source, |tcx| {
+        passes::expander::expand(passes::expander::Config::default(), tcx)
+    })
+    .unwrap();
+    let prepared = run_compiler_on_str(&expanded, passes::preparer::prepare)
+        .unwrap()
+        .unwrap()
+        .code;
+    run_compiler_on_str(&prepared, utils::type_check).expect(&prepared);
+    let unexpanded = run_compiler_on_str(&prepared, |tcx| {
+        passes::unexpander::unexpand(passes::unexpander::Config { use_print: true }, tcx)
+    })
+    .unwrap();
+    run_compiler_on_str(&unexpanded, utils::type_check).expect(&unexpanded);
+    run_compiler_on_str(&unexpanded, |tcx| {
+        let records = make_skeletons(&unexpanded, tcx).unwrap();
+        for name in ["shape_from_parts", "notify"] {
+            let record = function(&records, name);
+            assert!(!labels(&record.annotated_source).is_empty());
+            for view in [&record.baseline, &record.applied] {
+                let response = crate::validate(&crate::ValidationRequest {
+                    expected_functions: vec![crate::ExpectedFunction {
+                        id: record.id,
+                        name: record.name.clone(),
+                        view: view.clone(),
+                    }],
+                    transformation: view.skeleton.clone(),
+                });
+                assert!(response.is_valid(), "{response:?}");
+            }
+        }
+        crate::freeze_project(&unexpanded, &records, tcx).unwrap();
+    })
+    .unwrap();
+}
+
+#[test]
 fn hash_map_assertions_generate_skeleton() {
     let source = r#"
 pub mod src {
