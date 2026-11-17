@@ -4,7 +4,7 @@ use itertools::izip;
 use rustc_hir::def_id::DefId;
 use rustc_middle::{
     mir::Body,
-    ty::{Ty, TyCtxt, TyKind},
+    ty::{GenericArgsRef, Ty, TyCtxt, TyKind},
 };
 
 use super::{CallArgs, InferCtxt, matcher};
@@ -34,6 +34,7 @@ where 'tcx: 'infercx
         destination: Option<Consume<Range<Var>>>,
         args: &CallArgs,
         callee: DefId,
+        substs: GenericArgsRef<'tcx>,
     );
 
     fn entry(
@@ -66,6 +67,7 @@ where
         _: Option<Consume<Range<Var>>>,
         _: &CallArgs,
         _: DefId,
+        _: GenericArgsRef<'tcx>,
     ) {
     }
 
@@ -99,28 +101,35 @@ where 'tcx: 'infercx
         destination: Option<Consume<Range<Var>>>,
         args: &CallArgs,
         callee: DefId,
+        substs: GenericArgsRef<'tcx>,
     ) {
         let fn_sig = infer_cx.tcx.fn_sig(callee).skip_binder();
+        let instantiated_sig = infer_cx
+            .tcx
+            .fn_sig(callee)
+            .instantiate(infer_cx.tcx, substs);
 
         let mut params = infer_cx.inter_ctxt[&callee].iter();
 
         let ret = params.next().unwrap();
 
         // dest = ret ~> rho(dest) = 0, rho(dest') = rho(ret)
-        if let Some(ret) = ret.clone()
-            && let Some(dest) = destination
-        {
+        if let Some(dest) = destination {
             let output_ty = fn_sig.output().skip_binder();
 
-            let ret = ret.expect_normal();
+            let ret = ret
+                .clone()
+                .map(|ret| ret.expect_normal())
+                .unwrap_or(Var::MIN..Var::MIN);
 
-            matcher(
+            match_call(
                 output_ty,
-                dest.transpose(),
+                instantiated_sig.output().skip_binder(),
                 ret,
+                dest.transpose(),
                 infer_cx.struct_ctxt.unrestricted,
                 infer_cx.database,
-                |dest, ret, database| {
+                |ret, dest, database| {
                     database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
                         (),
                         dest.r#use,
@@ -135,13 +144,21 @@ where 'tcx: 'infercx
             );
         }
 
-        let params_args = izip!(params, args, fn_sig.inputs().skip_binder()); // params.zip(args.iter());
+        let params_args = izip!(
+            params,
+            args,
+            fn_sig.inputs().skip_binder(),
+            instantiated_sig.inputs().skip_binder()
+        );
 
         // para = arg ~> rho(para') + rho(arg') = rho(arg)
-        for (param, arg, &ty) in params_args {
-            if let Some(param) = param.clone()
-                && let Some((arg, is_ref)) = arg.clone()
-            {
+        for (param, arg, &ty, &instantiated_ty) in params_args {
+            if let Some((arg, is_ref)) = arg.clone() {
+                let param = param
+                    .clone()
+                    .unwrap_or(crate::analyses::ownership::Param::Normal(
+                        Var::MIN..Var::MIN,
+                    ));
                 match param {
                     crate::analyses::ownership::Param::Output(output_param) => {
                         let mut output_param = output_param.transpose();
@@ -152,10 +169,16 @@ where 'tcx: 'infercx
                         } else {
                             ty
                         };
+                        let instantiated_ty = if is_ref {
+                            instantiated_ty.builtin_deref(true).unwrap()
+                        } else {
+                            instantiated_ty
+                        };
                         let arg = arg.transpose();
 
-                        matcher(
+                        match_call(
                             ty,
+                            instantiated_ty,
                             output_param,
                             arg,
                             infer_cx.struct_ctxt.unrestricted,
@@ -181,10 +204,15 @@ where 'tcx: 'infercx
                                 "bad output parameter analysis for {}!",
                                 infer_cx.tcx.def_path_str(callee)
                             );
-                            let _ = param.next().unwrap();
-                            ty.builtin_deref(true).unwrap()
+                            let _ = param.next();
+                            ty.builtin_deref(true).unwrap_or(ty)
                         } else {
                             ty
+                        };
+                        let instantiated_ty = if is_ref {
+                            instantiated_ty.builtin_deref(true).unwrap()
+                        } else {
+                            instantiated_ty
                         };
 
                         // FIXME working around type cast
@@ -198,8 +226,9 @@ where 'tcx: 'infercx
 
                         let arg = arg.transpose();
 
-                        matcher(
+                        match_call(
                             ty,
+                            instantiated_ty,
                             param,
                             arg,
                             infer_cx.struct_ctxt.unrestricted,
@@ -402,6 +431,58 @@ where
     }
 }
 
+fn match_call<'tcx, T, DB: Database>(
+    ty: Ty<'tcx>,
+    instantiated_ty: Ty<'tcx>,
+    mut params: impl Iterator<Item = T>,
+    args: impl Iterator<Item = Consume<Var>>,
+    measurable: impl Measurable<'tcx>,
+    database: &mut DB,
+    mut on_matched: impl FnMut(T, Consume<Var>, &mut DB),
+) {
+    let mut tail = ty;
+    let mut pointer_depth = 0;
+    loop {
+        if let Some(inner) = tail.builtin_index() {
+            tail = inner;
+        } else if let Some(inner) = tail.builtin_deref(true) {
+            pointer_depth += 1;
+            tail = inner;
+        } else {
+            break;
+        }
+    }
+
+    if matches!(tail.kind(), TyKind::Param(_)) {
+        // Generic MIR has no summary slots for pointers inside T. Match the
+        // explicit prefix and keep the remaining concrete slots nonowning.
+        for (index, arg) in args.enumerate() {
+            if index < pointer_depth
+                && let Some(param) = params.next()
+            {
+                on_matched(param, arg, database);
+            } else {
+                for var in [arg.r#use, arg.def] {
+                    database.push_assume::<crate::analyses::ownership::ssa::constraint::Debug>(
+                        (),
+                        var,
+                        false,
+                    );
+                }
+            }
+        }
+    } else {
+        matcher(
+            instantiated_ty,
+            params,
+            args,
+            measurable,
+            database,
+            on_matched,
+        );
+    }
+}
+
 struct GlobalAssumptionApplier<'ga, 'sc, 'db, 'tcx, DB> {
     global_assumptions: &'ga GlobalAssumptions,
     struct_ctxt: &'sc StructCtxt<'tcx>,
@@ -466,3 +547,6 @@ impl<'ga, 'sc, 'db, 'tcx, DB: Database> GlobalAssumptionApplier<'ga, 'sc, 'db, '
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
