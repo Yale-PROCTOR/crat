@@ -2119,7 +2119,7 @@ struct ScopeCandidate {
     own_definition: bool,
 }
 
-struct TypeSpeller<'a, 'tcx> {
+pub(crate) struct TypeSpeller<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: &'a utils::ir::AstToHir,
     containing_module: LocalDefId,
@@ -2132,7 +2132,7 @@ struct TypeSpeller<'a, 'tcx> {
 }
 
 impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
-    fn new(
+    pub(crate) fn new(
         function_def_id: LocalDefId,
         ast_to_hir: &'a utils::ir::AstToHir,
         tcx: TyCtxt<'tcx>,
@@ -2300,7 +2300,7 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
         SourceTypeShortener { speller: self }.visit_ty(ty);
     }
 
-    fn render_semantic_type(&self, ty: ty::Ty<'tcx>) -> Result<Ty, String> {
+    pub(crate) fn render_semantic_type(&self, ty: ty::Ty<'tcx>) -> Result<Ty, String> {
         let mut rendered = String::new();
         let mut nominal_path = |def_id| {
             self.nominal_path(def_id)

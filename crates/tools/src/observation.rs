@@ -1241,6 +1241,12 @@ fn extract_with_tcx(
             let selected_expressions = SelectedExpressions {
                 all: &selected_ids,
                 promoted_fields: &promoted_field_ids,
+                opaque_statements: label
+                    .source_opaque_ordinals
+                    .iter()
+                    .filter_map(|ordinal| source_statements.get(*ordinal))
+                    .map(|statement| statement.id)
+                    .collect(),
             };
             let mut mappings = HashMap::new();
             if !align_expression(
@@ -2786,6 +2792,7 @@ pub(crate) fn select_rule_regions(
 }
 
 struct SelectedExpressions<'a> {
+    opaque_statements: HashSet<NodeId>,
     all: &'a HashSet<NodeId>,
     promoted_fields: &'a HashSet<NodeId>,
 }
@@ -3450,33 +3457,38 @@ fn align_block<'a>(
             .stmts
             .iter()
             .zip(&target.stmts)
-            .all(|(source, target)| match (&source.kind, &target.kind) {
-                (StmtKind::Expr(source), StmtKind::Expr(target))
-                | (StmtKind::Semi(source), StmtKind::Semi(target)) => align_expression(
-                    source, target, selected, bindings, callables, ast_to_hir, tcx, mappings,
-                ),
-                (StmtKind::Let(source), StmtKind::Let(target)) => {
-                    patterns_correspond(
-                        &source.pat,
-                        &target.pat,
-                        bindings,
-                        callables,
-                        ast_to_hir,
-                        tcx,
-                    ) && local_annotations_correspond(source, target, bindings, ast_to_hir, tcx)
-                        && match (&source.kind, &target.kind) {
-                            (rustc_ast::LocalKind::Decl, rustc_ast::LocalKind::Decl) => true,
-                            (
-                                rustc_ast::LocalKind::Init(source),
-                                rustc_ast::LocalKind::Init(target),
-                            ) => align_expression(
-                                source, target, selected, bindings, callables, ast_to_hir, tcx,
-                                mappings,
-                            ),
-                            _ => false,
-                        }
+            .all(|(source, target)| {
+                if selected.opaque_statements.contains(&source.id) {
+                    return true;
                 }
-                _ => false,
+                match (&source.kind, &target.kind) {
+                    (StmtKind::Expr(source), StmtKind::Expr(target))
+                    | (StmtKind::Semi(source), StmtKind::Semi(target)) => align_expression(
+                        source, target, selected, bindings, callables, ast_to_hir, tcx, mappings,
+                    ),
+                    (StmtKind::Let(source), StmtKind::Let(target)) => {
+                        patterns_correspond(
+                            &source.pat,
+                            &target.pat,
+                            bindings,
+                            callables,
+                            ast_to_hir,
+                            tcx,
+                        ) && local_annotations_correspond(source, target, bindings, ast_to_hir, tcx)
+                            && match (&source.kind, &target.kind) {
+                                (rustc_ast::LocalKind::Decl, rustc_ast::LocalKind::Decl) => true,
+                                (
+                                    rustc_ast::LocalKind::Init(source),
+                                    rustc_ast::LocalKind::Init(target),
+                                ) => align_expression(
+                                    source, target, selected, bindings, callables, ast_to_hir, tcx,
+                                    mappings,
+                                ),
+                                _ => false,
+                            }
+                    }
+                    _ => false,
+                }
             })
 }
 
@@ -4668,27 +4680,42 @@ impl MutVisitor for ProctorAttributeRemover {
 }
 
 fn statement_contains_macro(statement: &Stmt) -> bool {
-    struct Finder(bool);
+    struct Finder {
+        label: Option<u32>,
+        found: bool,
+    }
     impl<'ast> Visitor<'ast> for Finder {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             if matches!(expression.kind, ExprKind::MacCall(..)) {
-                self.0 = true;
+                self.found = true;
                 return;
             }
             visit::walk_expr(self, expression);
         }
 
         fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if let Some(label) = statement_attributes(statement)
+                .iter()
+                .find_map(numeric_proctor_label)
+                && Some(label) != self.label
+            {
+                return;
+            }
             if matches!(statement.kind, StmtKind::MacCall(..)) {
-                self.0 = true;
+                self.found = true;
                 return;
             }
             visit::walk_stmt(self, statement);
         }
     }
-    let mut finder = Finder(false);
+    let mut finder = Finder {
+        label: statement_attributes(statement)
+            .iter()
+            .find_map(numeric_proctor_label),
+        found: false,
+    };
     finder.visit_stmt(statement);
-    finder.0
+    finder.found
 }
 
 fn expression_contains_macro(expression: &Expr) -> bool {

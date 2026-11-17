@@ -4,6 +4,7 @@ mod unstructured;
 pub use unstructured::*;
 mod initializers;
 pub use initializers::*;
+mod macros;
 
 #[cfg(test)]
 mod tests;
@@ -406,20 +407,9 @@ pub fn freeze_project(
             source_stub_path,
         });
     }
-    let ids = source_paths.keys().copied().collect::<FxHashSet<_>>();
-    let callers = functions
-        .iter()
-        .filter(|function| {
-            !records.iter().any(|record| {
-                matches!(record, crate::ItemRecord::Function(record)
-            if record.unstructured && record.path == function.path)
-            })
-        })
-        .map(|function| function.def_id)
-        .collect();
-    validate_additive_macro_rewrites(&analysis, &ast_to_hir, &functions, &ids, &callers, tcx)?;
     // Rewrite before renaming so resolution is exclusively against the complete
     // original crate. Source stubs retain the original ABI and parameter types.
+    let targets = source_paths.keys().copied().collect();
     let mut collector = FrozenReferenceCollector {
         ast_to_hir: &ast_to_hir,
         tcx,
@@ -430,7 +420,16 @@ pub fn freeze_project(
     let mut rewriter = CallRewriter {
         rewrites: collector.rewrites,
     };
-    for (function, (_, mut copy, name)) in frozen.iter_mut().zip(originals) {
+    for (function, (definition, mut copy, name)) in frozen.iter_mut().zip(originals) {
+        if !function.record.unstructured {
+            macros::normalize_observation_macros(
+                &mut copy,
+                definition,
+                &targets,
+                &ast_to_hir,
+                tcx,
+            )?;
+        }
         rewriter.visit_item(&mut copy);
         let ItemKind::Fn(box body) = &mut copy.kind else { unreachable!() };
         body.ident = parsed_ident(&name);
