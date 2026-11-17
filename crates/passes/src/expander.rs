@@ -79,6 +79,19 @@ struct AstVisitor<'tcx> {
 }
 
 impl MutVisitor for AstVisitor<'_> {
+    fn flat_map_stmt(&mut self, statement: ast::Stmt) -> smallvec::SmallVec<[ast::Stmt; 1]> {
+        if let ast::StmtKind::Item(item) = &statement.kind
+            && matches!(item.kind, ast::ItemKind::MacroDef(..))
+            && !item
+                .attrs
+                .iter()
+                .any(|attr| attr.has_name(sym::macro_export))
+        {
+            return smallvec::smallvec![];
+        }
+        mut_visit::walk_flat_map_stmt(self, statement)
+    }
+
     fn visit_item(&mut self, item: &mut ast::Item) {
         if let ast::ItemKind::Mod(_, ident, _) = &mut item.kind
             && ident.name == kw::Mod
