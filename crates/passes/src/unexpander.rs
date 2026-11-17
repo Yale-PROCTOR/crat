@@ -288,19 +288,15 @@ impl MutVisitor for AstVisitor<'_> {
                 } else {
                     panic!("{func}");
                 }
-            } else if md == sym::fmt {
-                if func == sym::format {
-                    let [arg] = &args[..] else { panic!() };
-                    let arg = pprust::expr_to_string(arg);
-                    let arg = arg
-                        .strip_prefix("format_args!(")
-                        .unwrap()
-                        .strip_suffix(')')
-                        .unwrap();
-                    *expr = expr!("format!({arg})");
-                } else {
-                    panic!("{func}");
-                }
+            } else if md == sym::fmt && func == sym::format {
+                let [arg] = &args[..] else { panic!() };
+                let arg = pprust::expr_to_string(arg);
+                let arg = arg
+                    .strip_prefix("format_args!(")
+                    .unwrap()
+                    .strip_suffix(')')
+                    .unwrap();
+                *expr = expr!("format!({arg})");
             }
         } else if let ExprKind::Match(scrutinee, arms, _) = &mut expr.kind
             && let scrutinee = unwrap_paren_mut(scrutinee)
@@ -1512,6 +1508,90 @@ fn allocate(value: u32) -> Result<Box<u32>, std::alloc::AllocError> { Box::try_n
                 "Expected not to find `{exclude}` in:\n{s}"
             );
         }
+    }
+
+    #[test]
+    fn fmt_format_calls_still_reconstruct_macros() {
+        let source = normalize_source(
+            r#"
+pub fn direct(value: i32) -> String {
+    std::fmt::format(format_args!("{value:02}"))
+}
+pub fn generated(value: i32) -> String {
+    format!("value: {value}")
+}
+"#,
+        );
+        assert_eq!(source.matches("format!(").count(), 2, "{source}");
+        assert!(source.contains("format!(\"{0:02}\", value)"), "{source}");
+        assert!(
+            source.contains("format!(\"value: {0}\", value)"),
+            "{source}"
+        );
+        assert!(!source.contains("fmt::format("), "{source}");
+        assert!(!source.contains("format_args!"), "{source}");
+    }
+
+    #[test]
+    fn fmt_write_calls_preserve_bounded_writers_and_results() {
+        let source = normalize_source(
+            r#"
+pub fn create_result_string(op: &str, val: i32) -> Option<Vec<u8>> {
+    struct BoundedWriter<'a>(&'a mut Vec<u8>);
+    impl std::fmt::Write for BoundedWriter<'_> {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let len = s.len().min(63 - self.0.len());
+            self.0.extend_from_slice(&s.as_bytes()[..len]);
+            Ok(())
+        }
+    }
+    let mut message = Vec::new();
+    message.try_reserve_exact(64).ok()?;
+    let op = op.split('\0').next().unwrap_or("");
+    std::fmt::write(&mut BoundedWriter(&mut message),
+        format_args!("Operation: {}, Value: {}", op, val)).ok()?;
+    message.push(0);
+    Some(message)
+}
+pub fn write_result(writer: &mut dyn core::fmt::Write, value: i32) -> core::fmt::Result {
+    core::fmt::write(writer, format_args!("{value}"))
+}
+"#,
+        );
+        for expected in [
+            "std::fmt::write(&mut BoundedWriter(&mut message)",
+            "core::fmt::write(writer, format_args!",
+            "s.len().min(63 - self.0.len())",
+            "self.0.extend_from_slice(&s.as_bytes()[..len])",
+            "message.try_reserve_exact(64).ok()?",
+            ").ok()?;",
+            "message.push(0)",
+        ] {
+            assert!(source.contains(expected), "{source}");
+        }
+        assert_eq!(source.matches("fmt::write(").count(), 2, "{source}");
+        assert_eq!(normalize_source(&source), source);
+    }
+
+    #[test]
+    fn other_fmt_calls_still_normalize_arguments() {
+        let source = normalize_source(
+            r#"
+#[repr(C)]
+struct Pair { left: u32, right: u32 }
+mod fmt {
+    pub const fn combine(left: usize, right: usize) -> usize { left + right }
+}
+const RESULT: usize = fmt::combine(core::mem::offset_of!(Pair, right), 3);
+const _: [(); 7] = [(); RESULT];
+"#,
+        );
+        assert!(source.contains("fmt::combine("), "{source}");
+        assert!(
+            source.contains("core::mem::offset_of!(Pair, right)"),
+            "{source}"
+        );
+        assert!(!source.contains("builtin # offset_of"), "{source}");
     }
 
     #[test]
