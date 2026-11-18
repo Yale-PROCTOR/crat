@@ -1211,6 +1211,11 @@ fn verify_rounds(
     backend: LoopBackend,
     repair: RepairMode,
 ) -> (Option<FxHashMap<SlotRef, SlotKind>>, RoundStats) {
+    // R1529-2 (review E1), log only: the optimize dump names this run's checks from its round 0.
+    crate::optimize_dump::enter_run(match repair {
+        RepairMode::Guarded => "guarded",
+        RepairMode::Plain => "plain",
+    });
     // The guarded planner lives across rounds, and is told of every round -- the
     // retirement pins' and the field-own repair's as empty ones -- so its validation counter
     // stays equal to `stats.rounds`. Its own cap (10S + 1) bounds the guarded rounds.

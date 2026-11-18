@@ -14,6 +14,8 @@ use super::model_checkpoint::model_checkpoint_tests::{
 const DIR: &str = "CRAT_BO_OPTIMIZE_DUMP_DIR";
 const CHECKS: &str = "CRAT_BO_OPTIMIZE_DUMP_CHECKS";
 const HEAD: &str = "[bo-dump]";
+/// D9's child runs its own solve when this is set.
+const D9_CHILD: &str = "R1529_2_D9_CHILD";
 
 /// An effective may-overlap pair: the precise verify runs and moves the model (the model checkpoint's
 /// `OVERLAP`).
@@ -72,10 +74,17 @@ fn index(dir: &Path) -> Vec<std::collections::BTreeMap<String, String>> {
 }
 
 /// The optimum of a dumped text read back in this process: z3's model of the text, scored on the
-/// text's own soft terms (the sum of the weights of the terms the model makes false).
+/// text's own soft terms (the sum of the weights of the terms the model makes false). The text's
+/// `set-option` lines (the query's timeout) are left out, so the parse sets no option in this
+/// process; they are no part of the problem.
 fn read_back(text: &str) -> (z3::SatResult, u64) {
+    let problem = text
+        .lines()
+        .filter(|line| !line.starts_with("(set-option ") && !line.starts_with(';'))
+        .collect::<Vec<_>>()
+        .join("\n");
     let optimize = z3::Optimize::new();
-    optimize.from_string(text);
+    optimize.from_string(problem);
     let result = optimize.check(&[]);
     let model = optimize.get_model().expect("a model of the read-back text");
     let mut objective = 0u64;
@@ -146,19 +155,19 @@ fn r1529_2_d2_one_selected_check_is_written_and_reads_back_to_its_optimum() {
     assert_eq!(r.kind, "emitted", "{r:?}");
     assert_eq!(
         names(&dir),
-        ["baseline-r00-optimize.smt2", "index.tsv"],
+        ["baseline-guarded-r00-optimize.smt2", "index.tsv"],
         "{err}"
     );
     let rows = index(&dir);
     assert_eq!(rows.len(), 1, "{rows:?}");
     let row = &rows[0];
-    assert_eq!(row["name"], "baseline-r00-optimize");
+    assert_eq!(row["name"], "baseline-guarded-r00-optimize");
     assert_eq!(
         row["result"], "sat",
         "a fixture whose solve is not cut: {row:?}"
     );
     assert_eq!(row["model"], "sat", "{row:?}");
-    let text = std::fs::read_to_string(dir.join("baseline-r00-optimize.smt2")).unwrap();
+    let text = std::fs::read_to_string(dir.join("baseline-guarded-r00-optimize.smt2")).unwrap();
     assert_eq!(row["bytes"], text.len().to_string());
     assert_eq!(row["hard"], count_lines(&text, "(assert ").to_string());
     assert_eq!(row["soft"], count_lines(&text, "(assert-soft ").to_string());
@@ -174,14 +183,14 @@ fn r1529_2_d2_one_selected_check_is_written_and_reads_back_to_its_optimum() {
     let line = dump_lines(&err);
     assert!(
         line.len() == 1
-            && line[0].contains("name=baseline-r00-optimize ")
+            && line[0].contains("name=baseline-guarded-r00-optimize ")
             && line[0].contains(&format!(" objective={} ", row["objective"]))
             && !line[0].contains("error="),
         "{err}"
     );
 }
 
-/// D3: `precise:*` writes the precise verify's checks only, each named `precise-rNN-<stage>`, one
+/// D3: `precise:*` writes the precise verify's checks only, each named `precise-<repair>-rNN-<stage>`, one
 /// row per file. RED at `c408c29c7`: nothing is written.
 #[test]
 fn r1529_2_d3_the_selection_names_the_precise_verify_only() {
@@ -208,14 +217,16 @@ fn r1529_2_d3_the_selection_names_the_precise_verify_only() {
     assert!(
         dumps
             .iter()
-            .any(|name| *name == "precise-r00-optimize.smt2"),
+            .any(|name| *name == "precise-guarded-r00-optimize.smt2"),
         "{files:?}"
     );
     for name in &dumps {
         let stem = name.trim_end_matches(".smt2");
         let rest = stem
-            .strip_prefix("precise-r")
+            .strip_prefix("precise-")
             .unwrap_or_else(|| panic!("{name}"));
+        let (repair, rest) = rest.split_once("-r").unwrap();
+        assert!(repair == "guarded" || repair == "plain", "{name}");
         let (round, stage) = rest.split_once('-').unwrap();
         assert!(
             round.len() == 2 && round.bytes().all(|b| b.is_ascii_digit()),
@@ -281,7 +292,7 @@ fn r1529_2_d5_a_failed_write_is_one_line_and_moves_nothing() {
     let line = dump_lines(&err);
     assert!(
         line.len() == 1
-            && line[0].contains("name=baseline-r00-optimize ")
+            && line[0].contains("name=baseline-guarded-r00-optimize ")
             && line[0].contains(" error="),
         "{err}"
     );
@@ -349,4 +360,115 @@ fn r1529_2_d7_the_dump_has_its_own_marks() {
     );
     let row = &index(&dir)[0];
     assert!(row["dump_wall_s"].parse::<f64>().is_ok(), "{row:?}");
+}
+
+/// D9 (review E1): a guarded run that declines falls back to the plain repair inside the same
+/// verify, from round 0; the plain run's checks have their own names, and no name is written twice.
+/// The decline is the test fault `guarded_decline_fault` (at the guarded run's first re-solve after a
+/// validation round), armed on the thread that solves: the child runs one baseline verify on
+/// `R1468_CASCADE` (`retirement/tests_rounds.rs`'s r1468_2_a) inside the compiler callback. RED at
+/// `2b446b787`: the plain run's first solve took the guarded run's last round, so a later plain
+/// round collided (an error line) and no name told the two runs apart.
+#[test]
+fn r1529_2_d9_a_guarded_decline_s_plain_run_has_its_own_names() {
+    use rustc_hir::{ItemKind, OwnerNode};
+
+    use crate::analyses::borrow_ownership::{
+        borrow_verify::guarded_decline_fault,
+        construction::{CopyLendMode, construct_bo_into, verify_bo_construction_counting},
+        crate_slots::CrateSlots,
+        mutability_facts::MutFacts,
+        origins::compute_origins,
+        solver::KindSolver,
+    };
+    const R1468_CASCADE: &str = "unsafe fn id(p: *mut i32) -> *mut i32 { p } \
+        pub unsafe fn f(p: *mut i32) -> i32 { let x = id(p); *x = 1; let b = p; *b = 2; *x }";
+    let name = test("r1529_2_d9_a_guarded_decline_s_plain_run_has_its_own_names");
+    if std::env::var_os(D9_CHILD).is_some() {
+        ::utils::compilation::run_compiler_on_str(R1468_CASCADE, |tcx| {
+            let mut functions = Vec::new();
+            for owner in tcx.hir_crate(()).owners.iter() {
+                let Some(owner) = owner.as_owner() else { continue };
+                let OwnerNode::Item(item) = owner.node() else { continue };
+                if let ItemKind::Fn { .. } = item.kind {
+                    functions.push(item.owner_id.def_id);
+                }
+            }
+            let program = crate::utils::rustc::RustProgram {
+                tcx,
+                functions,
+                structs: Vec::new(),
+            };
+            let slots = CrateSlots::build(&program);
+            let origins = compute_origins(&program);
+            let facts = MutFacts::from_program(&program);
+            let solver = KindSolver::new(&slots);
+            let construction = construct_bo_into(
+                &program,
+                &slots,
+                &origins,
+                &facts,
+                &solver,
+                CopyLendMode::Baseline,
+            )
+            .expect("production construction");
+            crate::optimize_dump::enter_verify(crate::optimize_dump::Solve::Baseline);
+            let ((model, stats), fired) = guarded_decline_fault::with_decline(|| {
+                verify_bo_construction_counting(
+                    &program,
+                    &slots,
+                    &origins,
+                    &solver,
+                    &construction,
+                    &facts,
+                )
+            });
+            assert!(fired.is_some(), "the guarded decline never fired");
+            assert!(stats.guarded_fallback.is_some(), "{stats:?}");
+            assert!(model.is_some(), "the plain repair accepts: {stats:?}");
+        })
+        .expect("D9's child compiles the fixture");
+        return;
+    }
+    let dir = dump_dir("r1529-d9");
+    let output = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+        .args([
+            name.as_str(),
+            "--exact",
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_clear()
+        .envs(std::env::vars_os().filter(|(name, _)| !name.to_string_lossy().starts_with("CRAT_")))
+        .env(D9_CHILD, "1")
+        .env(DIR, &dir)
+        .env(CHECKS, "baseline:*")
+        .output()
+        .expect("child");
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "{}\n{err}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let files = names(&dir);
+    for expected in [
+        "baseline-guarded-r00-optimize.smt2",
+        "baseline-plain-r00-optimize.smt2",
+        "baseline-plain-r01-optimize.smt2",
+    ] {
+        assert!(
+            files.contains(&expected.to_owned()),
+            "{expected}: {files:?}\n{err}"
+        );
+    }
+    let lines = dump_lines(&err);
+    assert!(
+        lines.iter().all(|line| !line.contains("error=")),
+        "{lines:#?}"
+    );
+    let dumps = files.iter().filter(|name| name.ends_with(".smt2")).count();
+    assert_eq!(index(&dir).len(), dumps, "{files:?}");
+    assert_eq!(lines.len(), dumps, "{lines:#?}");
 }

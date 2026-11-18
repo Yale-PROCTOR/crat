@@ -1944,6 +1944,7 @@ fn solve_bo_overlap_config_with_source_events(
                     error,
                 )
             })?;
+            crate::optimize_dump::enter_verify(crate::optimize_dump::Solve::Refined);
             let (model, round_stats) = verify_bo_construction_counting(
                 program,
                 slots,
@@ -2112,6 +2113,7 @@ fn solve_bo_overlap_config_with_source_events(
         }
         OverlapMode::CoarseConstraint => {
             apply_coarse_constraints(mode, &solver, plan.coarse_pairs.iter().copied());
+            crate::optimize_dump::enter_verify(crate::optimize_dump::Solve::Coarse);
             let (model, stats) = verify_bo_construction_counting(
                 program,
                 slots,
