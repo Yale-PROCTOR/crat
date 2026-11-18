@@ -36,6 +36,7 @@ pub struct Config {
 
 pub fn unexpand(config: Config, tcx: TyCtxt<'_>) -> String {
     let mut krate = utils::ast::expanded_ast(tcx);
+    crate::type_check_bodies(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
     utils::ast::remove_unnecessary_items_from_ast(&mut krate);
 
@@ -667,7 +668,7 @@ impl AstVisitor<'_> {
         let hir::ExprKind::Path(path) = &expression.kind else { return None };
         Some(
             self.tcx
-                .typeck(expression.hir_id.owner)
+                .typeck(self.tcx.hir_enclosing_body_owner(expression.hir_id))
                 .qpath_res(path, expression.hir_id),
         )
     }
@@ -1150,25 +1151,22 @@ impl<'ast> Visitor<'ast> for FeatureUses<'_, '_> {
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
-        if matches!(expression.kind, ExprKind::Path(..))
-            && let Some(expression) = self.ast_to_hir.get_expr(expression.id, self.tcx)
-            && let hir::ExprKind::Path(path) = &expression.kind
-            && let Some(definition) = self
-                .tcx
-                .typeck(expression.hir_id.owner)
-                .qpath_res(path, expression.hir_id)
-                .opt_def_id()
+        if matches!(
+            expression.kind,
+            ExprKind::Path(..) | ExprKind::MethodCall(..)
+        ) && let Some(expression) = self.ast_to_hir.get_expr(expression.id, self.tcx)
         {
-            self.definition(definition);
-        }
-        if matches!(expression.kind, ExprKind::MethodCall(..))
-            && let Some(expression) = self.ast_to_hir.get_expr(expression.id, self.tcx)
-            && let Some(definition) = self
-                .tcx
-                .typeck(expression.hir_id.owner)
-                .type_dependent_def_id(expression.hir_id)
-        {
-            self.definition(definition);
+            let definition = match expression.kind {
+                hir::ExprKind::Path(QPath::Resolved(_, path)) => path.res.opt_def_id(),
+                hir::ExprKind::Path(_) | hir::ExprKind::MethodCall(..) => self
+                    .tcx
+                    .typeck(self.tcx.hir_enclosing_body_owner(expression.hir_id))
+                    .type_dependent_def_id(expression.hir_id),
+                _ => None,
+            };
+            if let Some(definition) = definition {
+                self.definition(definition);
+            }
         }
         visit::walk_expr(self, expression);
     }
@@ -1483,6 +1481,29 @@ std::thread_local! { static ALIASED: (i32, i32) = (1, 2); static GENERIC: i32 = 
             "{normalized}"
         );
         assert!(!normalized.contains("::std::thread_local!"), "{normalized}");
+        assert!(
+            normalized.contains("#![feature(thread_local_internals)]"),
+            "{normalized}"
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_feature_uses_in_struct_field_constants() {
+        let normalized = normalize_source(
+            r#"
+#![feature(thread_local_internals)]
+const N: i32 = 4;
+struct Generic<const WIDTH: usize>;
+struct State {
+    buffer: [u8; N as usize],
+    typed: Generic<{
+        let _ = unsafe { std::thread::LocalKey::<i32>::new(|_| &1) };
+        3u8.count_ones() as usize
+    }>,
+}
+"#,
+        );
+        assert!(normalized.contains("N as usize"), "{normalized}");
         assert!(
             normalized.contains("#![feature(thread_local_internals)]"),
             "{normalized}"

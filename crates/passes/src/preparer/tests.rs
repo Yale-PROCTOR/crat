@@ -1119,6 +1119,38 @@ fn f() -> usize { DATA.len() }
 }
 
 #[test]
+fn rewrites_lifted_const_uses_in_struct_array_lengths() {
+    assert_prepares_to(
+        r#"
+const N: i32 = 1;
+static DATA: u8 = 1;
+fn f() -> u8 {
+    const N: i32 = 2;
+    struct State {
+        buffer: [u8; N as usize],
+        matched: [u8; match 2 { N => 3, _ => 1 }],
+    }
+    static DATA: u8 = N as u8;
+    DATA
+}
+"#,
+        r#"
+const N: i32 = 1;
+static DATA: u8 = 1;
+const N_0: i32 = 2;
+static DATA_0: u8 = N_0 as u8;
+fn f() -> u8 {
+    struct State {
+        buffer: [u8; N_0 as usize],
+        matched: [u8; match 2 { N_0 => { 3 }, _ => { 1 } }],
+    }
+    DATA_0
+}
+"#,
+    );
+}
+
+#[test]
 fn renames_const_references_in_patterns_array_types_and_initializers() {
     assert_prepares_to(
         r#"
@@ -1692,6 +1724,8 @@ fn compiler_rejection_remains_distinct_from_prepare_rejection() {
     for code in [
         "fn f(value: i32) -> i32 { static DATA: i32 = value; DATA }",
         "fn f<const N: usize>() -> usize { static DATA: [u8; N] = [0; N]; DATA.len() }",
+        "const DATA: u8 = 1; fn f() -> bool { DATA }",
+        "const N: u8 = 1; static DATA: bool = N;",
     ] {
         assert!(utils::compilation::run_compiler_on_str(code, prepare).is_err());
     }

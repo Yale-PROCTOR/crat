@@ -32,3 +32,14 @@ pub mod simplifier;
 pub mod splitter;
 pub mod unexpander;
 pub mod unsafe_resolver;
+
+fn type_check_bodies(tcx: rustc_middle::ty::TyCtxt<'_>) {
+    // Lower declared types before checking bodies that may use anonymous const arguments.
+    let _ = tcx.ensure_ok().check_type_wf(());
+    for owner in tcx.hir_body_owners() {
+        if tcx.def_kind(owner) != rustc_hir::def::DefKind::AnonConst {
+            tcx.ensure_ok().typeck(owner);
+        }
+    }
+    tcx.dcx().abort_if_errors();
+}
