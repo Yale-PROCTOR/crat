@@ -80,6 +80,7 @@ mod bo_pipeline;
 mod bo_rewriter;
 #[cfg(test)]
 mod coverage_recon;
+mod optimize_dump;
 mod phase_log;
 mod raw_boundary_census_schema;
 pub use bo_pipeline::{BoReceipt, Config, query_timeout_env_value, rewrite_bo};

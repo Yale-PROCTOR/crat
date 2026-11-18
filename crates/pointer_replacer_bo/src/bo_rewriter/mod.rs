@@ -101,6 +101,8 @@ mod local_pair_proof_tests;
 mod nested_one_sided_tests;
 #[cfg(test)]
 mod one_element_guard_tests;
+#[cfg(test)]
+mod optimize_dump_tests;
 pub(crate) mod ownership_fields;
 #[cfg(test)]
 mod ownership_fields_bodylocal_tests;

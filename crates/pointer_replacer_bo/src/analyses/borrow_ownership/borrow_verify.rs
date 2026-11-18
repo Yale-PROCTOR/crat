@@ -1312,6 +1312,7 @@ fn verify_rounds(
             "start",
             &format!("round={} repair={repair:?}", stats.rounds),
         );
+        crate::optimize_dump::enter_round(stats.rounds);
         // Each round re-runs the oracle under a DIFFERENT candidacy
         // predicate. Reset so the export holds the FINAL round's BorrowSet,
         // not the union over rejected intermediate models.

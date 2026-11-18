@@ -1760,6 +1760,7 @@ fn solve_bo_overlap_config_with_source_events(
             })?;
             crate::phase_log::mark("solve:baseline_construction", "end", "");
             crate::phase_log::mark("solve:baseline_verify", "start", "");
+            crate::optimize_dump::enter_verify(crate::optimize_dump::Solve::Baseline);
             // Relay main/388 walls 3+4 (R1363-1): the verify's `verify:<sub>` / `z3:<sub>` marks, here only.
             let (baseline_model, baseline_round_stats) = crate::phase_log::with_sub_marks(|| {
                 verify_bo_construction_counting(
@@ -2076,6 +2077,7 @@ fn solve_bo_overlap_config_with_source_events(
         OverlapMode::Baseline => unreachable!(),
         OverlapMode::PreciseReplay => {
             crate::phase_log::mark("solve:precise_verify", "start", "");
+            crate::optimize_dump::enter_verify(crate::optimize_dump::Solve::Precise);
             // R1490-2 (324 (v-a), task 36): the precise verify's `verify:<sub>` / `z3:<sub>` marks
             // too (log only), so process 2's run shows its rounds, checks and declines.
             let (model, stats) = crate::phase_log::with_sub_marks(|| {

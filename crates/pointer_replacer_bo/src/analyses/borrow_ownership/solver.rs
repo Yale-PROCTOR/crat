@@ -606,6 +606,9 @@ pub struct KindSolver {
     solver: Optimize,
     vars: FxHashMap<SlotRef, KindVars>,
     tracker: Option<CoreTracker>,
+    /// R1529-2 (main 338), log only: the Ref soft term's weight when the build asserted the
+    /// objective (the Own term weighs 1); read by the optimize dump's row alone.
+    objective_ref_weight: Option<u64>,
     check_sat_count: Cell<usize>,
     hard_check_count: Cell<usize>,
     optimize_materialization_count: Cell<usize>,
@@ -938,6 +941,7 @@ impl KindSolver {
             });
         }
 
+        let objective_ref_weight = add_objective.then(|| vars.len() as u64 + 1);
         if add_objective {
             // Prefer Ref where hard constraints allow it, then Owning over Raw.
             let big = vars.len() as u64 + 1;
@@ -953,6 +957,7 @@ impl KindSolver {
             solver,
             vars,
             tracker,
+            objective_ref_weight,
             check_sat_count: Cell::new(0),
             hard_check_count: Cell::new(0),
             optimize_materialization_count: Cell::new(0),
@@ -3465,11 +3470,22 @@ impl KindSolver {
         }
         self.assert_return_port_rows(&rows);
         self.prepare_demand_query(QueryPhase::Materialization, None);
+        // R1529-2: the dump (switch off: nothing) ends before the check's clock starts.
+        let mut dump =
+            crate::optimize_dump::before_check(&self.solver, "optimize", self.soft_terms());
         // Relay main/388 O2: the deciding check's own wall, for the budget predicate.
         let check_started = Instant::now();
         let mut outcome = crate::phase_log::z3_query("optimize", || self.solver.check(&[]));
         let mut check_wall = check_started.elapsed();
         if outcome == SatResult::Unsat && !rows.is_empty() {
+            crate::optimize_dump::after_check(
+                dump.take(),
+                outcome,
+                check_wall,
+                None,
+                None::<std::iter::Empty<&SlotKind>>,
+                self.objective_ref_weight,
+            );
             self.solver.pop();
             rows = self.return_port_admissible_subset(&rows, &bundle);
             self.solver.push();
@@ -3480,6 +3496,11 @@ impl KindSolver {
             self.prepare_demand_query(QueryPhase::Materialization, None);
             self.check_sat_count
                 .set(self.check_sat_count.get().saturating_add(1));
+            dump = crate::optimize_dump::before_check(
+                &self.solver,
+                "optimize-subset",
+                self.soft_terms(),
+            );
             let check_started = Instant::now();
             outcome = crate::phase_log::z3_query("optimize-subset", || self.solver.check(&[]));
             check_wall = check_started.elapsed();
@@ -3497,6 +3518,7 @@ impl KindSolver {
         );
         let unknown_reason =
             (outcome == SatResult::Unknown).then(|| query_reason.unwrap_or_else(|| "-".to_owned()));
+        let dump_reason = dump.as_ref().and(unknown_reason.clone());
         if self.demand_query_pending() {
             let core = if outcome == SatResult::Unsat {
                 self.solver.get_unsat_core()
@@ -3555,6 +3577,14 @@ impl KindSolver {
                 }
             }
         };
+        crate::optimize_dump::after_check(
+            dump,
+            outcome,
+            check_wall,
+            dump_reason.as_deref(),
+            kinds.as_ref().map(|kinds| kinds.values()),
+            self.objective_ref_weight,
+        );
         self.solver.pop();
         self.optimize_materialization_elapsed.set(
             self.optimize_materialization_elapsed
@@ -3562,6 +3592,15 @@ impl KindSolver {
                 .saturating_add(started.elapsed()),
         );
         kinds
+    }
+
+    /// R1529-2, log only: the soft terms the build asserted (two per slot with the objective).
+    fn soft_terms(&self) -> usize {
+        if self.objective_ref_weight.is_some() {
+            2 * self.vars.len()
+        } else {
+            0
+        }
     }
 
     /// The decomposed round model (hard relaxation, then the optimized model under
