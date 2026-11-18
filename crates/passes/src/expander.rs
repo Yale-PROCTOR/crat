@@ -155,6 +155,11 @@ impl MutVisitor for AstVisitor<'_> {
         });
         mut_visit::walk_field_def(self, fd);
     }
+
+    fn visit_variant(&mut self, variant: &mut ast::Variant) {
+        variant.attrs.retain(|attr| !attr.has_name(kw::Default));
+        mut_visit::walk_variant(self, variant);
+    }
 }
 
 #[cfg(test)]

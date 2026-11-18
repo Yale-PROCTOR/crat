@@ -216,6 +216,16 @@ impl MutVisitor for AstVisitor<'_> {
         mut_visit::walk_item(self, item);
     }
 
+    fn visit_variant(&mut self, variant: &mut Variant) {
+        let def_id = self.ast_to_hir.global_map.get(&variant.id).unwrap();
+        if self.ctx.default_variants.contains(def_id)
+            && !variant.attrs.iter().any(|attr| attr.has_name(kw::Default))
+        {
+            variant.attrs.extend(attr!("#[default]"));
+        }
+        mut_visit::walk_variant(self, variant);
+    }
+
     fn flat_map_stmt(&mut self, stmt: Stmt) -> SmallVec<[Stmt; 1]> {
         if let Some(mut condition) = expanded_assert_condition(&stmt) {
             self.visit_expr(&mut condition);
@@ -1100,6 +1110,7 @@ fn unexpand_cursor_macros(items: &mut ThinVec<P<Item>>) {
 #[derive(Default)]
 struct Ctx {
     derived_traits: FxHashMap<LocalDefId, Vec<Symbol>>,
+    default_variants: FxHashSet<LocalDefId>,
     bytemuck_traits: FxHashMap<LocalDefId, Vec<String>>,
     bitfields: FxHashMap<LocalDefId, FxHashMap<Symbol, Vec<BitField>>>,
     use_intrinsics: bool,
@@ -1196,6 +1207,29 @@ impl<'ast> Visitor<'ast> for Previsitor<'_> {
             let Res::Def(_, def_id) = self_ty.res else { panic!() };
             let def_id = def_id.expect_local();
             if let Some(of_trait) = imp.of_trait {
+                if self.tcx.def_kind(def_id) == DefKind::Enum
+                    && of_trait
+                        .trait_def_id()
+                        .is_some_and(|trait_id| self.tcx.is_diagnostic_item(sym::Default, trait_id))
+                {
+                    let [method] = imp.items else { panic!() };
+                    let method = self.tcx.hir_impl_item(method.id);
+                    let hir::ImplItemKind::Fn(_, body_id) = &method.kind else { panic!() };
+                    let body = self.tcx.hir_body(*body_id);
+                    let hir::ExprKind::Block(block, _) = body.value.kind else { panic!() };
+                    let expression = block.expr.unwrap();
+                    let hir::ExprKind::Path(path) = &expression.kind else { panic!() };
+                    let Res::Def(DefKind::Ctor(hir::def::CtorOf::Variant, _), constructor) = self
+                        .tcx
+                        .typeck(method.owner_id.def_id)
+                        .qpath_res(path, expression.hir_id)
+                    else {
+                        panic!()
+                    };
+                    let variant = self.tcx.parent(constructor);
+                    assert_eq!(self.tcx.parent(variant), def_id.to_def_id());
+                    self.ctx.default_variants.insert(variant.expect_local());
+                }
                 let of_trait = of_trait.path.segments.last().unwrap().ident.name;
                 self.ctx
                     .derived_traits
@@ -1328,6 +1362,28 @@ mod tests {
         .unwrap();
         utils::compilation::run_compiler_on_str(&normalized, utils::type_check).expect(&normalized);
         normalized
+    }
+
+    #[test]
+    fn direct_enum_default_unexpansion_keeps_one_marker_on_the_selected_variant() {
+        let source = utils::compilation::run_compiler_on_str(
+            r#"
+#[derive(Default)]
+pub enum State { First, #[default] Ready, Value(i32) }
+pub fn default() -> State { State::default() }
+"#,
+            |tcx| super::unexpand(super::Config::default(), tcx),
+        )
+        .unwrap();
+        utils::compilation::run_compiler_on_str(&source, utils::type_check).expect(&source);
+        assert_eq!(source.matches("#[default]").count(), 1, "{source}");
+        assert!(
+            source
+                .split_whitespace()
+                .collect::<String>()
+                .contains("#[default]Ready,"),
+            "{source}"
+        );
     }
 
     #[test]
