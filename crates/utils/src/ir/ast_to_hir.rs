@@ -986,66 +986,40 @@ impl<'tcx> AstToHirMapper<'tcx> {
             ExprKind::IncludedBytes(..) => todo!(),
             ExprKind::FormatArgs(box FormatArgs { arguments, .. }) => {
                 let args = arguments.all_args_mut();
-                if !args.is_empty() {
-                    let (lit, hargs) = match hexpr.kind {
-                        hir::ExprKind::Call(_, hargs) => (hargs[0], vec![]),
-                        hir::ExprKind::Block(block, _) => {
-                            let hargs = match block.stmts {
-                                [stmt] => {
-                                    let hir::StmtKind::Let(stmt) = stmt.kind else { panic!() };
-                                    let hir::ExprKind::Array(exprs) = stmt.init.unwrap().kind
-                                    else {
-                                        panic!()
-                                    };
-                                    let [expr] = exprs else { panic!() };
-                                    let hir::ExprKind::Call(_, hargs) = expr.kind else { panic!() };
-                                    let [harg] = hargs else { panic!() };
-                                    let hir::ExprKind::AddrOf(_, _, harg) = harg.kind else {
-                                        panic!()
-                                    };
-                                    vec![harg]
-                                }
-                                [stmt, _] => {
-                                    let hir::StmtKind::Let(stmt) = stmt.kind else { panic!() };
-                                    let hir::ExprKind::Tup(hargs) = stmt.init.unwrap().kind else {
-                                        panic!()
-                                    };
-                                    hargs
-                                        .iter()
-                                        .map(|harg| {
-                                            let hir::ExprKind::AddrOf(_, _, harg) = harg.kind
-                                            else {
-                                                panic!()
-                                            };
-                                            harg
-                                        })
-                                        .collect::<Vec<_>>()
-                                }
-                                _ => panic!(),
-                            };
-                            let mut expr = block.expr.unwrap();
-                            if let hir::ExprKind::Block(block, _) = expr.kind {
-                                assert_eq!(block.stmts.len(), 0);
-                                expr = block.expr.unwrap();
-                            }
-                            let hir::ExprKind::Call(_, cargs) = expr.kind else {
-                                panic!("{:?}", block.expr.unwrap().kind)
-                            };
-                            (cargs[0], hargs)
-                        }
-                        _ => panic!(),
-                    };
-                    let hir::ExprKind::AddrOf(_, _, lit) = lit.kind else { panic!() };
-                    let mut i = 0;
-                    for arg in args {
-                        if matches!(arg.expr.kind, ExprKind::Lit(_)) {
-                            self.add_local(&mut arg.expr.id, lit.hir_id);
-                        } else {
-                            let harg = hargs[i];
-                            self.map_expr_to_expr(&mut arg.expr, harg);
-                            i += 1;
-                        }
+                if args.is_empty() {
+                    return;
+                }
+                let hir::ExprKind::Block(block, _) = hexpr.kind else {
+                    panic!("expected a HIR block for format arguments");
+                };
+                let [first, rest @ ..] = block.stmts else {
+                    panic!("expected an operand binding for format arguments");
+                };
+                let hir::StmtKind::Let(hir::LetStmt {
+                    init: Some(init), ..
+                }) = first.kind
+                else {
+                    panic!("expected an initialized operand binding for format arguments");
+                };
+                // Lowering wraps a single operand directly or borrows all operands in a tuple.
+                let hargs = match (rest, init.kind) {
+                    ([], hir::ExprKind::Array([argument])) => {
+                        let hir::ExprKind::Call(_, operands @ [_]) = argument.kind else {
+                            panic!("expected a constructor call with one formatting operand");
+                        };
+                        operands
                     }
+                    ([_], hir::ExprKind::Tup(operands)) => operands,
+                    _ => panic!("unexpected operand bindings for format arguments"),
+                };
+                assert_eq!(args.len(), hargs.len(), "mismatched format argument count");
+                for (arg, harg) in args.iter_mut().zip(hargs) {
+                    let hir::ExprKind::AddrOf(hir::BorrowKind::Ref, hir::Mutability::Not, harg) =
+                        harg.kind
+                    else {
+                        panic!("expected a borrowed formatting operand");
+                    };
+                    self.map_expr_to_expr(&mut arg.expr, harg);
                 }
             }
             ExprKind::UnsafeBinderCast(cast, expr, ty) => {

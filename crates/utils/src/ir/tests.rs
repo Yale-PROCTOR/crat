@@ -1648,6 +1648,54 @@ fn test_expr_mac_call_format_3_lit() {
 }
 
 #[test]
+fn test_format_args_map_each_operand() {
+    let source = r#"
+        fn f(pointer: *const i32, value: i32, width: usize) {
+            if value < 0 {
+                unreachable!("a full simplex cannot grow");
+            }
+            format!("{}", format_args!("{:p}", pointer));
+            format!("{2:width$} {1} {0:x}", 42, "literal", value, width = width);
+            format!("{0:x} {0}", 7);
+        }"#;
+
+    struct Operands<'ast>(Vec<&'ast Expr>);
+    impl<'ast> Visitor<'ast> for Operands<'ast> {
+        fn visit_expr(&mut self, expr: &'ast Expr) {
+            if let ExprKind::FormatArgs(format_args) = &expr.kind {
+                self.0.extend(
+                    format_args
+                        .arguments
+                        .all_args()
+                        .iter()
+                        .map(|argument| &*argument.expr),
+                );
+            }
+            visit::walk_expr(self, expr);
+        }
+    }
+
+    compilation::run_compiler_on_str(source, |tcx| {
+        let mut krate = ast::expanded_ast(tcx);
+        let mapping = ast::make_ast_to_hir(&mut krate, tcx);
+        let mut operands = Operands(Vec::new());
+        operands.visit_crate(&krate);
+        assert_eq!(operands.0.len(), 8);
+        for operand in operands.0 {
+            let mapped = mapping.get_expr(operand.id, tcx).unwrap();
+            assert!(
+                operand.span.source_equal(mapped.span),
+                "{operand:?} mapped to {mapped:?}"
+            );
+            if matches!(operand.kind, ExprKind::Lit(_)) {
+                assert!(matches!(mapped.kind, hir::ExprKind::Lit(_)));
+            }
+        }
+    })
+    .unwrap();
+}
+
+#[test]
 fn test_expr_mac_call() {
     run_test(
         r#"

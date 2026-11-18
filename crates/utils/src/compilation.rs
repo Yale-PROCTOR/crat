@@ -18,7 +18,7 @@ use rustc_interface::Config;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::{
     EarlyDiagCtxt,
-    config::{CrateType, ErrorOutputType, Input, Options},
+    config::{CrateType, ErrorOutputType, Input, Options, UnstableOptions},
 };
 use rustc_span::{FileName, edition::Edition, source_map::SourceMap};
 
@@ -84,6 +84,11 @@ pub fn make_config(input: Input) -> Config {
             crate_types: vec![CrateType::Rlib],
             debug_assertions: false,
             edition: Edition::Edition2021,
+            unstable_opts: UnstableOptions {
+                // Preserve the operands that the AST-to-HIR mapper visits.
+                flatten_format_args: false,
+                ..UnstableOptions::default()
+            },
             ..Options::default()
         },
         crate_cfg: vec![],
