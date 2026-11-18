@@ -135,7 +135,7 @@ impl Emitter for ErrorEmitter {
     }
 
     fn emit_diagnostic(&mut self, diag: DiagInner, registry: &Registry) {
-        if matches!(diag.level(), Level::Fatal | Level::Error) {
+        if matches!(diag.level(), Level::Bug | Level::Fatal | Level::Error) {
             self.0.emit_diagnostic(diag, registry);
         }
     }

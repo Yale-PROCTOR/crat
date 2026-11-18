@@ -899,11 +899,9 @@ fn validate_use_mappings(
         }
 
         fn visit_expr(&mut self, expression: &'tcx hir::Expr<'tcx>) {
-            if let hir::ExprKind::Path(path) = expression.kind
-                && let Res::Def(DefKind::Static { .. }, definition) = self
-                    .tcx
-                    .typeck(expression.hir_id.owner)
-                    .qpath_res(&path, expression.hir_id)
+            // The path walker also visits asm symbols, which are counted per operand below.
+            if let hir::ExprKind::Path(hir::QPath::Resolved(_, path)) = expression.kind
+                && let Res::Def(DefKind::Static { .. }, definition) = path.res
                 && let Some(local) = definition.as_local()
                 && self.targets.contains(&local)
             {
@@ -1006,16 +1004,13 @@ fn resolved_const_pattern(
 ) -> Option<LocalDefId> {
     let pattern = ast_to_hir.get_pat(pattern.id, tcx)?;
     let hir::PatKind::Expr(hir::PatExpr {
-        kind: hir::PatExprKind::Path(path),
+        kind: hir::PatExprKind::Path(hir::QPath::Resolved(_, path)),
         ..
     }) = pattern.kind
     else {
         return None;
     };
-    let Res::Def(DefKind::Const, definition) = tcx
-        .typeck(pattern.hir_id.owner)
-        .qpath_res(path, pattern.hir_id)
-    else {
+    let Res::Def(DefKind::Const, definition) = path.res else {
         return None;
     };
     definition.as_local()
@@ -1352,6 +1347,7 @@ impl MutVisitor for InsertVisitor<'_> {
 pub fn prepare(tcx: TyCtxt<'_>) -> Result<PreparationResult, PrepareError> {
     let mut krate = utils::ast::expanded_ast(tcx);
     validate_supported_input(&krate)?;
+    crate::type_check_bodies(tcx);
     let ast_to_hir = utils::ast::make_ast_to_hir(&mut krate, tcx);
 
     let mut discovery = Discovery::new(tcx, &ast_to_hir);
