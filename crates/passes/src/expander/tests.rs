@@ -172,6 +172,55 @@ fn derived_debug_helpers_recompile_through_preparation_and_unexpansion() {
 }
 
 #[test]
+fn enum_default_helpers_recompile_through_repeated_preparation_and_unexpansion() {
+    let mut source = r#"
+pub struct NotDefault;
+pub mod left {
+    #[derive(Default)]
+    pub enum State<T> { First, #[default] Ready, Value(T) }
+    pub fn default() -> State<super::NotDefault> { State::default() }
+}
+pub mod right {
+    #[derive(Default)]
+    pub enum State { #[default] First, Ready, Value(super::NotDefault) }
+    pub fn default() -> State { State::default() }
+}
+#[derive(Default)]
+pub struct Holder { pub state: right::State }
+pub enum Manual { Empty, Value(NotDefault) }
+impl ::core::default::Default for Manual {
+    fn default() -> Self { Self::Value(NotDefault) }
+}
+"#
+    .to_owned();
+    for _ in 0..2 {
+        let expanded = expand(&source);
+        check(&expanded);
+        assert!(!expanded.contains("#[default]"), "{expanded}");
+        let prepared = run_compiler_on_str(&expanded, crate::preparer::prepare)
+            .unwrap()
+            .unwrap();
+        check(&prepared.code);
+        source = run_compiler_on_str(&prepared.code, |tcx| {
+            crate::unexpander::unexpand(crate::unexpander::Config::default(), tcx)
+        })
+        .unwrap();
+        check(&source);
+        assert_eq!(source.matches("#[default]").count(), 2, "{source}");
+        assert_eq!(source.matches("#[derive(Default)]").count(), 3, "{source}");
+        let (left, right) = source.split_once("pub mod right").unwrap();
+        let left = left.split_whitespace().collect::<String>();
+        let right = right.split_whitespace().collect::<String>();
+        assert!(left.contains("#[default]Ready,"), "{source}");
+        assert!(right.contains("#[default]First,"), "{source}");
+        assert!(
+            source.contains("impl ::core::default::Default for Manual"),
+            "{source}"
+        );
+    }
+}
+
+#[test]
 fn standard_thread_locals_recompile_through_postprocessing() {
     let expanded = expand(THREAD_LOCALS);
     let interfaces = run_compiler_on_str(&expanded, |tcx| {
