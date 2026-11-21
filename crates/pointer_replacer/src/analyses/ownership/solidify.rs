@@ -101,6 +101,76 @@ pub fn suffix(values: &[*mut i32]) -> *mut i32 {
         )
         .unwrap();
     }
+
+    #[test]
+    fn slice_rest_patterns_preserve_element_ownership() {
+        utils::compilation::run_compiler_on_str(
+            r#"
+pub fn tail(values: &[*mut i32]) -> &[*mut i32] {
+    if let [_, rest @ ..] = values { rest } else { values }
+}
+pub fn head(values: &[*mut i32]) -> &[*mut i32] {
+    if let [rest @ .., _] = values { rest } else { values }
+}
+pub fn whole(values: &[*mut i32]) -> &[*mut i32] { values }
+"#,
+            |tcx| {
+                let program = crate::rewriter::collect_input(tcx);
+                let output = program
+                    .functions
+                    .iter()
+                    .map(|&function| {
+                        let body = tcx
+                            .mir_drops_elaborated_and_const_checked(function)
+                            .borrow();
+                        (
+                            function,
+                            rustc_index::bit_set::MixedBitSet::new_empty(body.local_decls.len()),
+                        )
+                    })
+                    .collect();
+                let ownership = WholeProgramAnalysis::analyze(CrateCtxt::new(&program), &output)
+                    .expect("slice-rest ownership inference");
+                let solid = ownership.solidify(&program);
+                let mut rest_count = 0;
+                let mut returns = Vec::new();
+                for &function in &program.functions {
+                    let body = tcx
+                        .mir_drops_elaborated_and_const_checked(function)
+                        .borrow();
+                    returns.push(
+                        solid
+                            .fn_results(&function.to_def_id())
+                            .local_result(rustc_middle::mir::RETURN_PLACE)
+                            .to_vec(),
+                    );
+                    for statement in body.basic_blocks.iter().flat_map(|block| &block.statements) {
+                        let StatementKind::Assign(box (_, Rvalue::Ref(_, _, place))) =
+                            &statement.kind
+                        else {
+                            continue;
+                        };
+                        if place
+                            .projection
+                            .iter()
+                            .any(|projection| matches!(projection, ProjectionElem::Subslice { .. }))
+                        {
+                            rest_count += 1;
+                            assert_eq!(solid.place_result(&body, place).len(), 1);
+                        }
+                    }
+                }
+                assert_eq!(
+                    rest_count, 2,
+                    "fixtures must contain real subslice projections"
+                );
+                assert_eq!(returns.len(), 3);
+                assert_eq!(returns[0], returns[1]);
+                assert_eq!(returns[1], returns[2]);
+            },
+        )
+        .unwrap();
+    }
 }
 
 rustc_index::newtype_index! {
@@ -171,6 +241,10 @@ impl<Qualifier> TypeQualifiers<Qualifier> {
                 rustc_middle::mir::ProjectionElem::Index(_)
                 | rustc_middle::mir::ProjectionElem::ConstantIndex { .. } => {
                     ty = ty.builtin_index().unwrap();
+                }
+                rustc_middle::mir::ProjectionElem::Subslice { .. } => {}
+                rustc_middle::mir::ProjectionElem::Subtype(projected_ty) => {
+                    ty = projected_ty;
                 }
                 _ => unreachable!(),
             }
@@ -365,6 +439,10 @@ impl<'tcx> WholeProgramResults<'tcx> {
                                 rustc_middle::mir::ProjectionElem::Index(_)
                                 | rustc_middle::mir::ProjectionElem::ConstantIndex { .. } => {
                                     ty = ty.builtin_index().unwrap();
+                                }
+                                rustc_middle::mir::ProjectionElem::Subslice { .. } => {}
+                                rustc_middle::mir::ProjectionElem::Subtype(projected_ty) => {
+                                    ty = projected_ty;
                                 }
                                 _ => unreachable!(),
                             }

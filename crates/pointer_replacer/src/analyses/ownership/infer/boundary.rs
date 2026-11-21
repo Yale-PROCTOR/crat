@@ -531,7 +531,7 @@ impl<'ga, 'sc, 'db, 'tcx, DB: Database> GlobalAssumptionApplier<'ga, 'sc, 'db, '
             break;
         }
 
-        if let TyKind::Adt(adt_def, subst) = ty.kind() {
+        if let TyKind::Adt(adt_def, _) = ty.kind() {
             assert!(field_ctxt.next().is_none());
             if self.struct_ctxt.is_struct_of_concerned(&adt_def.did())
                 && self.struct_ctxt.measure_adt(*adt_def, 0) > 0
@@ -540,7 +540,7 @@ impl<'ga, 'sc, 'db, 'tcx, DB: Database> GlobalAssumptionApplier<'ga, 'sc, 'db, '
                     .global_assumptions
                     .fields(self.struct_ctxt, &adt_def.did());
                 for (mut field_ctxt, field_def) in itertools::izip!(fields, adt_def.all_fields()) {
-                    let field_ty = field_def.ty(self.tcx, subst);
+                    let field_ty = self.tcx.type_of(field_def.did).instantiate_identity();
                     self.apply(field_ty, dom, &mut field_ctxt, input, precision)
                 }
             }

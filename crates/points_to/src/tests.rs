@@ -176,6 +176,131 @@ fn e() -> Vec<usize> {
 }
 
 #[test]
+fn slice_rest_and_revealed_return_types_preserve_aliases() {
+    compilation::run_compiler_on_str(
+        r#"
+pub fn tail(values: &[*mut i32]) -> &[*mut i32] {
+    match values { [_, rest @ ..] => rest, _ => values }
+}
+pub fn pair(left: *mut i32, right: *mut i32) -> impl Copy { (left, right) }
+pub fn capture(left: *mut i32, right: *mut i32) -> impl Fn() -> (*mut i32, *mut i32) {
+    move || (left, right)
+}
+pub fn result(left: *mut i32, right: *mut i32, ok: bool) -> Result<impl Copy, *mut i32> {
+    if ok { Ok((left, right)) } else { Err(right) }
+}
+"#,
+        |tcx| {
+            for optimized in [false, true] {
+                let arena = Arena::new();
+                let shapes = ty_shape::get_ty_shapes(&arena, tcx, optimized);
+                let config = andersen::Config {
+                    use_optimized_mir: optimized,
+                    c_exposed_fns: ["tail", "pair", "capture", "result"]
+                        .map(str::to_owned)
+                        .into_iter()
+                        .collect(),
+                };
+                let pre = andersen::pre_analyze(&config, &shapes, tcx);
+                let solutions = andersen::analyze(&config, &pre, &shapes, tcx);
+                for name in ["tail", "pair", "capture", "result"] {
+                    let function = find(name, tcx);
+                    let output =
+                        pre.vars[&andersen::Var::Local(function, rustc_middle::mir::RETURN_PLACE)];
+                    let left =
+                        pre.vars[&andersen::Var::Arg(function, rustc_middle::mir::Local::new(1))];
+                    assert!(
+                        solutions[output].contains(left),
+                        "{name}: first field aliases its input"
+                    );
+                    if name != "tail" {
+                        let right = pre.vars
+                            [&andersen::Var::Arg(function, rustc_middle::mir::Local::new(2))];
+                        assert!(
+                            !solutions[output].contains(right),
+                            "{name}: fields remain distinct"
+                        );
+                        assert!(solutions[output + 1].contains(right));
+                        assert!(!solutions[output + 1].contains(left));
+                        if name == "result" {
+                            assert!(solutions[output + 2].contains(right));
+                            assert!(!solutions[output + 2].contains(left));
+                        }
+                    }
+                }
+                andersen::post_analyze(&config, pre, solutions, &shapes, tcx);
+            }
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn function_item_constant_arguments_have_registered_shapes() {
+    compilation::run_compiler_on_str(
+        r#"
+pub fn pass<T>(value: T) -> T { value }
+pub fn target(value: *mut i32) -> *mut i32 { value }
+pub fn call(value: *mut i32) -> *mut i32 { let _ = pass(target); target(value) }
+"#,
+        |tcx| {
+            let arena = Arena::new();
+            let shapes = ty_shape::get_ty_shapes(&arena, tcx, false);
+            let config = andersen::Config {
+                c_exposed_fns: ["call".to_owned()].into_iter().collect(),
+                ..Default::default()
+            };
+            let pre = andersen::pre_analyze(&config, &shapes, tcx);
+            let solutions = andersen::analyze(&config, &pre, &shapes, tcx);
+            let function = find("call", tcx);
+            let output = pre.vars[&andersen::Var::Local(function, rustc_middle::mir::RETURN_PLACE)];
+            let input = pre.vars[&andersen::Var::Arg(function, rustc_middle::mir::Local::new(1))];
+            assert!(solutions[output].contains(input));
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn unknown_trait_calls_and_generic_layouts_include_aliases_and_writes() {
+    for source in [
+        r#"
+pub trait Boundary { unsafe fn apply(value: *mut *mut i32) -> *mut i32; }
+pub unsafe fn call<T: Boundary>(value: *mut *mut i32) -> *mut i32 { T::apply(value) }
+"#,
+        r#"
+pub fn pass<T>(value: T) -> T { value }
+pub fn call(value: *mut *mut i32) -> (*mut *mut i32, *mut *mut i32) { pass((value, value)) }
+"#,
+    ] {
+        compilation::run_compiler_on_str(source, |tcx| {
+            let arena = Arena::new();
+            let shapes = ty_shape::get_ty_shapes(&arena, tcx, false);
+            let config = andersen::Config {
+                c_exposed_fns: ["call".to_owned()].into_iter().collect(),
+                ..Default::default()
+            };
+            let pre = andersen::pre_analyze(&config, &shapes, tcx);
+            let solutions = andersen::analyze(&config, &pre, &shapes, tcx);
+            let function = find("call", tcx);
+            let output = pre.vars[&andersen::Var::Local(function, rustc_middle::mir::RETURN_PLACE)];
+            let input = pre.vars[&andersen::Var::Arg(function, rustc_middle::mir::Local::new(1))];
+            assert!(
+                solutions[output].contains(input),
+                "unknown return may alias the argument"
+            );
+            assert!(
+                solutions[input].contains(output),
+                "unknown call may overwrite reachable pointers"
+            );
+            let result = andersen::post_analyze(&config, pre, solutions, &shapes, tcx);
+            assert!(result.fn_writes[&function].contains(input));
+        })
+        .unwrap();
+    }
+}
+
+#[test]
 fn test_eq_ref() {
     // _1 = const 0_i32
     // _3 = &mut _1

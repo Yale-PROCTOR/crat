@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn original_analysis_handles_slice_rest_and_generic_pointer_results() {
+    let source = r#"
+pub fn pass<T>(value: T) -> T { value }
+pub unsafe fn returned(value: *mut i32) -> *mut i32 { pass(value) }
+pub unsafe fn suffix(values: &[*mut i32]) -> &[*mut i32] {
+    match values { [_, rest @ ..] => { rest }, _ => { values } }
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        assert!(
+            !function(&records, "returned")
+                .target_signature
+                .contains("Box")
+        );
+        function(&records, "suffix");
+        let frozen = crate::freeze_project(source, &records, tcx).unwrap();
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    })
+    .unwrap();
+}
+
 fn compile_bodies(records: &[ItemRecord], bodies: &[(&str, &str)]) {
     let definitions = records
         .iter()

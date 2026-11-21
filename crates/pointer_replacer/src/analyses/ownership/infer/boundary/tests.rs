@@ -4,10 +4,10 @@ use crate::analyses::ownership::{
     AnalysisKind, CrateCtxt,
     ptr::Measurable,
     ssa::{
-        constraint::{Database, Gen, Z3Database},
+        constraint::{Database, Gen, GlobalAssumptions, SolverDatabase, Z3Database},
         consume::Consume,
     },
-    whole_program::WholeProgramAnalysis,
+    whole_program::{OwnershipSolver, WholeProgramAnalysis},
 };
 
 #[test]
@@ -173,6 +173,136 @@ pub fn array<T>(input: [T; 2]) {}
                     database.solver.pop(1);
                 }
             }
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn instantiated_generic_fields_keep_their_declared_ownership_slots() {
+    use rustc_abi::FieldIdx;
+    use rustc_middle::mir::ProjectionElem;
+
+    use crate::analyses::ownership::infer::InferCtxt;
+
+    utils::compilation::run_compiler_on_str(
+        r#"
+pub struct Node { pub pointer: *mut i32, pub next: *mut Node }
+pub struct Holder<'a, T> { pub generic: &'a mut T, pub deep: *mut *mut i32 }
+pub unsafe fn inspect(value: Holder<'_, Node>) -> *mut i32 {
+    let generic = value.generic;
+    let pointer = generic.pointer;
+    let deep = value.deep;
+    if pointer.is_null() { *deep } else { pointer }
+}
+"#,
+        |tcx| {
+            let program = crate::rewriter::collect_input(tcx);
+            let function = program.functions[0];
+            let body = tcx
+                .mir_drops_elaborated_and_const_checked(function)
+                .borrow();
+            let holder = body.local_decls[rustc_middle::mir::Local::from_usize(1)].ty;
+            let rustc_middle::ty::TyKind::Adt(adt, args) = holder.kind() else { unreachable!() };
+            let fields = &adt.non_enum_variant().fields;
+            let generic_ty = fields[FieldIdx::from_usize(0)].ty(tcx, args);
+            let deep_ty = fields[FieldIdx::from_usize(1)].ty(tcx, args);
+            let node_pointer = body.return_ty();
+
+            for precision in [2, 3] {
+                let mut context = CrateCtxt::new(&program);
+                while context.struct_ctxt.max_ptr_chased() < precision {
+                    context.struct_ctxt.increase_precision(tcx);
+                }
+                let mut database = SolverDatabase::new(OwnershipSolver::Z3);
+                let mut generator = Gen::new();
+                let globals = GlobalAssumptions::new(&context, &mut generator, &mut database);
+                let inter_context = Default::default();
+                let mut inference = InferCtxt::<WholeProgramAnalysis> {
+                    tcx,
+                    inter_ctxt: &inter_context,
+                    database: &mut database,
+                    var_gen: &mut generator,
+                    struct_ctxt: context.struct_ctxt.with_max_precision(precision),
+                    fn_body_sig: Default::default(),
+                    deref_copy: None,
+                    call_args: Vec::new(),
+                    global_assumptions: &globals,
+                };
+                let vars = inference.new_vars(holder);
+                assert_eq!(vars.clone().count(), 3);
+                let consume = Consume {
+                    r#use: vars.clone(),
+                    def: inference.new_vars(holder),
+                };
+                let generic_field = ProjectionElem::Field(FieldIdx::from_usize(0), generic_ty);
+                let generic = InferCtxt::project_deeper(
+                    consume.clone(),
+                    holder,
+                    &[generic_field],
+                    &mut inference,
+                )
+                .unwrap();
+                assert_eq!(generic.r#use, vars.start..vars.start + 1u32);
+                let deep = InferCtxt::project_deeper(
+                    consume.clone(),
+                    holder,
+                    &[ProjectionElem::Field(FieldIdx::from_usize(1), deep_ty)],
+                    &mut inference,
+                )
+                .unwrap();
+                assert_eq!(deep.r#use, vars.start + 1u32..vars.end);
+                assert!(
+                    InferCtxt::project_deeper(
+                        consume,
+                        holder,
+                        &[
+                            generic_field,
+                            ProjectionElem::Deref,
+                            ProjectionElem::Field(FieldIdx::from_usize(0), node_pointer)
+                        ],
+                        &mut inference,
+                    )
+                    .is_none()
+                );
+                super::GlobalAssumptionApplier {
+                    global_assumptions: &globals,
+                    struct_ctxt: &context.struct_ctxt,
+                    database: inference.database,
+                    tcx,
+                }
+                .apply(
+                    holder,
+                    None,
+                    &mut std::iter::empty(),
+                    &mut vars.clone(),
+                    precision,
+                );
+                database.open_scope();
+                database.push_assume_impl(vars.start, false);
+                database.push_assume_impl(vars.start + 1u32, true);
+                database.push_assume_impl(vars.start + 2u32, true);
+                assert_eq!(database.check_scope(), Some(true));
+                database.close_scope(false);
+                database.push_assume_impl(vars.start + 1u32, false);
+                database.push_assume_impl(vars.start + 2u32, true);
+                assert_eq!(database.check_scope(), Some(false));
+            }
+
+            let output = program
+                .functions
+                .iter()
+                .map(|&function| {
+                    let body = tcx
+                        .mir_drops_elaborated_and_const_checked(function)
+                        .borrow();
+                    (function, MixedBitSet::new_empty(body.local_decls.len()))
+                })
+                .collect();
+            let ownership = WholeProgramAnalysis::analyze(CrateCtxt::new(&program), &output)
+                .expect("instantiated generic-field ownership inference");
+            assert!(ownership.precision(&function.to_def_id()) > 0);
+            ownership.solidify(&program);
         },
     )
     .unwrap();

@@ -1,6 +1,61 @@
 use super::{fatness::fatness_analysis, mutability::mutability_analysis};
 
 #[test]
+fn generic_calls_with_different_pointer_shapes_constrain_inputs_and_results() {
+    utils::compilation::run_compiler_on_str(
+        r#"
+pub fn pass<T>(value: T) -> T { value }
+pub fn returned(value: *mut i32) -> *mut i32 { pass(value) }
+pub unsafe fn accept<T>(pointer: *mut i32, value: T) { *pointer = 1; }
+pub unsafe fn arguments(left: *mut i32, right: *mut i32) { accept(left, right); }
+"#,
+        |tcx| {
+            let program = crate::rewriter::collect_input(tcx);
+            let mutable = mutability_analysis(&program);
+            let fatness = fatness_analysis(&program);
+            for &function in &program.functions {
+                let name = tcx.item_name(function.to_def_id());
+                if !matches!(name.as_str(), "returned" | "arguments") {
+                    continue;
+                }
+                for facts in mutable.function_facts(function, tcx) {
+                    assert!(facts.iter().all(|value| value.is_mutable()), "{name}");
+                }
+                for facts in fatness.function_facts(function, tcx) {
+                    assert!(facts.iter().all(|value| value.is_arr()), "{name}");
+                }
+            }
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn slice_rest_patterns_keep_mutability_and_array_requirements() {
+    utils::compilation::run_compiler_on_str(
+        r#"
+pub unsafe fn tail(values: &mut [*mut i32], offset: isize) {
+    if let [_, rest @ ..] = values { *rest[0].offset(offset) = 1; }
+}
+pub unsafe fn head(values: &mut [*mut i32; 3], offset: isize) {
+    let [ref mut rest @ .., _] = *values;
+    *rest[0].offset(offset) = 1;
+}
+"#,
+        |tcx| {
+            let program = crate::rewriter::collect_input(tcx);
+            let mutable = mutability_analysis(&program);
+            let fatness = fatness_analysis(&program);
+            for &function in &program.functions {
+                assert!(mutable.function_facts(function, tcx).nth(1).unwrap()[1].is_mutable());
+                assert!(fatness.function_facts(function, tcx).nth(1).unwrap()[1].is_arr());
+            }
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn constant_index_patterns_preserve_pointer_qualifiers() {
     use rustc_middle::mir::{ProjectionElem, Rvalue, StatementKind};
 

@@ -186,6 +186,8 @@ pub struct PreAnalysisData<'tcx> {
     pub var_nodes: FxHashMap<(LocalDefId, Local), LocNode>,
 
     pub exposed_fn_arg_vars: Vec<Var>,
+    unknown_calls: FxHashSet<(LocalDefId, BasicBlock)>,
+    unknown_locations: Option<(Loc, Loc)>,
 }
 
 pub type Solutions = IndexVec<Loc, ChunkedBitSet<Loc>>;
@@ -277,6 +279,7 @@ pub fn pre_analyze<'a, 'tcx>(
     let mut indirect_call_args: FxHashMap<_, FxHashMap<_, _>> = FxHashMap::default();
     let mut call_args: FxHashMap<_, Vec<Vec<_>>> = FxHashMap::default();
     let mut var_nodes = FxHashMap::default();
+    let mut unknown_calls = FxHashSet::default();
     for item in &bodies {
         let body = if !config.use_optimized_mir {
             // use MIR before optimization
@@ -416,6 +419,21 @@ pub fn pre_analyze<'a, 'tcx>(
                 _ => {
                     let def_id = some_or!(operand_to_fn(func), continue);
                     let local_def_id = some_or!(def_id.as_local(), continue);
+                    if !is_c_fn(def_id, tcx)
+                        && tcx.impl_of_method(def_id).is_none()
+                        && (!fn_def_ids.contains(&local_def_id)
+                            || !call_layout_matches(
+                                local_def_id,
+                                args,
+                                *destination,
+                                body,
+                                tss,
+                                tcx,
+                                config.use_optimized_mir,
+                            ))
+                    {
+                        unknown_calls.insert((item.local_def_id, bb));
+                    }
                     let ty = destination.ty(&body.local_decls, tcx).ty;
                     if ty.is_raw_ptr()
                         && (is_c_fn(def_id, tcx) || alloc_fns.contains(&local_def_id))
@@ -464,6 +482,14 @@ pub fn pre_analyze<'a, 'tcx>(
         }
     }
 
+    let unknown_locations = unknown_calls.iter().next().map(|&(owner, _)| {
+        let unknown = index_info.next_index();
+        index_info.push(unknown, tcx.types.unit, owner);
+        let reachable = index_info.next_index();
+        index_info.push(reachable, tcx.types.unit, owner);
+        (unknown, reachable)
+    });
+
     PreAnalysisData {
         bodies,
         alloc_fns,
@@ -481,7 +507,31 @@ pub fn pre_analyze<'a, 'tcx>(
         graph,
         var_nodes,
         exposed_fn_arg_vars,
+        unknown_calls,
+        unknown_locations,
     }
+}
+
+fn call_layout_matches<'tcx>(
+    callee: LocalDefId,
+    args: &[Spanned<Operand<'tcx>>],
+    destination: Place<'tcx>,
+    caller: &rustc_middle::mir::Body<'tcx>,
+    shapes: &TyShapes<'_, 'tcx>,
+    tcx: TyCtxt<'tcx>,
+    optimized: bool,
+) -> bool {
+    let body = if optimized {
+        tcx.optimized_mir(callee)
+    } else {
+        &tcx.mir_drops_elaborated_and_const_checked(callee).borrow()
+    };
+    shapes.tys[&destination.ty(&caller.local_decls, tcx).ty].len()
+        == shapes.tys[&body.return_ty()].len()
+        && args.iter().zip(body.args_iter()).all(|(arg, parameter)| {
+            shapes.tys[&arg.node.ty(&caller.local_decls, tcx)].len()
+                == shapes.tys[&body.local_decls[parameter].ty].len()
+        })
 }
 
 fn compute_ends<'tcx>(ty: &TyShape<'_, 'tcx>, ends: &mut IndexInfo<'tcx>, def_id: LocalDefId) {
@@ -643,10 +693,16 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     if let TyShape::Struct(_, ts, _) = self.tss.tys[&ty] {
                         let TyKind::Adt(adt_def, generic_args) = ty.kind() else { unreachable!() };
                         let variant = adt_def.variant(*v_idx);
+                        let field_base: usize = adt_def
+                            .variants()
+                            .iter()
+                            .take(v_idx.index())
+                            .map(|variant| variant.fields.len())
+                            .sum();
                         for ((i, d), f) in variant.fields.iter_enumerated().zip(fs) {
                             if let Some(r) = self.transfer_op(f, ctx) {
                                 let i = if let Some(idx) = idx { *idx } else { i };
-                                let proj = ts[i.index()].0;
+                                let proj = ts[field_base + i.index()].0;
                                 let ty = d.ty(self.tcx, generic_args);
                                 self.transfer_assign(l.add(proj), r, ty);
                             }
@@ -664,7 +720,18 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     }
                 }
                 AggregateKind::Closure(_, _) => {
-                    // TODO
+                    if let TyShape::Struct(_, fields, _) = self.tss.tys[&ty] {
+                        let TyKind::Closure(_, arguments) = ty.kind() else { unreachable!() };
+                        for (((offset, _), field_ty), operand) in fields
+                            .iter()
+                            .zip(arguments.as_closure().upvar_tys())
+                            .zip(fs)
+                        {
+                            if let Some(source) = self.transfer_op(operand, ctx) {
+                                self.transfer_assign(l.add(*offset), source, field_ty);
+                            }
+                        }
+                    }
                 }
                 _ => unreachable!("{r:?}"),
             },
@@ -681,17 +748,19 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
         assert!(!l.r#ref);
         let len = self.tss.tys[&ty].len();
         for i in 0..len {
-            let l = l.add(i);
-            let r = r.add(i);
-            match (l.deref, r.r#ref, r.deref) {
-                (true, true, _) => unreachable!(),
-                (true, false, true) => unreachable!(),
-                (true, false, false) => self.graph.add_deref_eq(l.var.root, l.var.proj, r.index()), /* *l = r : *l >= r */
-                (false, true, true) => self.graph.add_edge(l.index(), r.var.root, r.var.proj), /* l = &*r ? */
-                (false, true, false) => self.graph.add_solution(l.index(), r.index()), /* l = &r : l >= { r } */
-                (false, false, true) => self.graph.add_eq_deref(l.index(), r.var.root, r.var.proj), /* l = *r : l >= *r // edge from sol(r) to l */
-                (false, false, false) => self.graph.add_edge(l.index(), r.index(), 0), /* l = r : l >= r */
-            }
+            self.transfer_location(l.add(i), r.add(i));
+        }
+    }
+
+    fn transfer_location(&mut self, l: PrefixedLoc, r: PrefixedLoc) {
+        match (l.deref, r.r#ref, r.deref) {
+            (true, true, _) => unreachable!(),
+            (true, false, true) => unreachable!(),
+            (true, false, false) => self.graph.add_deref_eq(l.var.root, l.var.proj, r.index()), /* *l = r : *l >= r */
+            (false, true, true) => self.graph.add_edge(l.index(), r.var.root, r.var.proj), /* l = &*r ? */
+            (false, true, false) => self.graph.add_solution(l.index(), r.index()), /* l = &r : l >= { r } */
+            (false, false, true) => self.graph.add_eq_deref(l.index(), r.var.root, r.var.proj), /* l = *r : l >= *r // edge from sol(r) to l */
+            (false, false, false) => self.graph.add_edge(l.index(), r.index(), 0), /* l = r : l >= r */
         }
     }
 
@@ -754,6 +823,11 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
             .collect();
         let output = destination.ty(ctx.locals, self.tcx).ty;
         let dst = self.prefixed_loc(*destination, ctx);
+
+        if self.pre.unknown_calls.contains(&(ctx.owner, block)) {
+            self.transfer_unknown_call(dst, output, args, ctx);
+            return;
+        }
 
         match func {
             Operand::Copy(func) | Operand::Move(func) => {
@@ -824,6 +898,45 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
         }
     }
 
+    fn transfer_unknown_call(
+        &mut self,
+        destination: PrefixedLoc,
+        output: Ty<'tcx>,
+        args: &[Spanned<Operand<'tcx>>],
+        ctx: Context<'_, 'tcx>,
+    ) {
+        let (unknown, reachable) = self.pre.unknown_locations.unwrap();
+        self.graph.solutions[unknown].insert_all();
+        let unknown_value = PrefixedLoc::new(ProjectedLoc::new_root(unknown));
+        for offset in 0..self.tss.tys[&output].len() {
+            self.transfer_location(destination.add(offset), unknown_value);
+        }
+        let reachable_value = PrefixedLoc::new(ProjectedLoc::new_root(reachable));
+        for argument in args {
+            let Some(source) = self.transfer_op(&argument.node, ctx) else { continue };
+            for offset in 0..self.tss.tys[&argument.node.ty(ctx.locals, self.tcx)].len() {
+                self.transfer_location(reachable_value, source.add(offset));
+            }
+        }
+        // Unknown callees can mutate transitively reachable memory and globals.
+        self.graph.add_eq_deref(reachable, reachable, 0);
+        let width = self
+            .pre
+            .index_info
+            .ends
+            .iter_enumerated()
+            .map(|(start, end)| end.index() - start.index() + 1)
+            .max()
+            .unwrap_or(1);
+        for offset in 0..width {
+            self.graph.add_deref_eq(reachable, offset, unknown);
+        }
+        for &global in &self.pre.non_fn_globals {
+            self.graph.add_edge(global, unknown, 0);
+            self.graph.add_solution(reachable, global);
+        }
+    }
+
     fn static_ref(&self, def_id: DefId) -> Option<PrefixedLoc> {
         let var = Var::Local(def_id.as_local()?, Local::new(0));
         let loc = ProjectedLoc::new_root(self.pre.vars.get(&var).copied()?);
@@ -847,6 +960,15 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                         unreachable!("{ty:?}")
                     };
                     ty = t;
+                    mir_ty = mir_ty.builtin_index().unwrap();
+                }
+                // Arrays and slices share one field-insensitive element location.
+                PlaceElem::Subslice { .. } => {}
+                PlaceElem::Subtype(projected)
+                | PlaceElem::OpaqueCast(projected)
+                | PlaceElem::UnwrapUnsafeBinder(projected) => {
+                    mir_ty = projected;
+                    ty = self.tss.tys[&projected];
                 }
                 PlaceElem::Downcast(_, variant_idx) => {
                     let TyKind::Adt(adt_def, _) = mir_ty.kind() else { unreachable!() };
@@ -865,7 +987,6 @@ impl<'tcx> Analyzer<'_, '_, 'tcx> {
                     mir_ty = field_ty;
                     variant_field_offset = 0;
                 }
-                _ => unreachable!("{proj:?}"),
             }
         }
         let var = Var::Local(ctx.owner, place.local);
@@ -964,6 +1085,18 @@ pub fn post_analyze<'a, 'tcx>(
                     &analyzer,
                     writes,
                 );
+                if pre.unknown_calls.contains(&(item.local_def_id, block)) {
+                    let (_, reachable) = pre.unknown_locations.unwrap();
+                    let written = writes.get_mut(&location).unwrap();
+                    for start in solutions[reachable].iter() {
+                        for index in start..=pre.index_info.ends[start] {
+                            written.insert(index);
+                        }
+                    }
+                    for &global in &pre.non_fn_globals {
+                        written.insert(global);
+                    }
+                }
                 compute_bitfield_writes(
                     func,
                     args,

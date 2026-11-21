@@ -424,7 +424,7 @@ fn place_not_reachable_to_union<'tcx>(place: &Place<'tcx>, body: &Body<'tcx>) ->
             ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
                 base_ty = base_ty.builtin_index().unwrap();
             }
-            ProjectionElem::Subslice { .. } => unreachable!(),
+            ProjectionElem::Subslice { .. } => {}
             ProjectionElem::OpaqueCast(_) => unreachable!("unexpected opaque cast"),
             ProjectionElem::UnwrapUnsafeBinder(ty) | ProjectionElem::Subtype(ty) => {
                 base_ty = ty;

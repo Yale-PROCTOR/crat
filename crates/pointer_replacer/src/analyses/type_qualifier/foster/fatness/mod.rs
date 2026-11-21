@@ -277,6 +277,32 @@ impl<'infer, 'tcx, D: HasLocalDecls<'tcx>> Visitor<'tcx> for FatnessAnalysis<'in
                     let dest = place_vars(destination, local_decls, locals, struct_fields);
                     let ret = callee_vars.next().unwrap();
 
+                    let matches = dest.clone().count() == ret.clone().count()
+                        && args
+                            .iter()
+                            .zip(
+                                fn_locals
+                                    .0
+                                    .contents_iter(callee)
+                                    .skip(1)
+                                    .take(callee_body.arg_count),
+                            )
+                            .all(|(argument, parameter)| {
+                                struct_fields.count_ptr(argument.node.ty(local_decls, tcx))
+                                    == parameter.count()
+                            });
+                    if !matches {
+                        conservative_call(
+                            destination,
+                            args,
+                            local_decls,
+                            locals,
+                            struct_fields,
+                            database,
+                        );
+                        return;
+                    }
+
                     let mut dest_ret = dest.zip(ret);
 
                     if let Some((dest, ret)) = dest_ret.next() {
@@ -355,6 +381,9 @@ fn place_vars<'tcx>(
     for projection_elem in place.projection {
         match projection_elem {
             ProjectionElem::Deref => {
+                if place_vars.is_empty() {
+                    return place_vars;
+                }
                 place_vars.start += 1;
                 base_ty = base_ty.builtin_deref(true).unwrap();
             }
@@ -389,6 +418,9 @@ fn place_vars<'tcx>(
                             .map(|t| struct_fields.count_ptr(t))
                             .sum();
                         let field_count = struct_fields.count_ptr(ty);
+                        if offset + field_count > place_vars.clone().count() {
+                            return place_vars.end..place_vars.end;
+                        }
                         place_vars = Range {
                             start: place_vars.start + offset,
                             end: place_vars.start + offset + field_count,
@@ -401,15 +433,17 @@ fn place_vars<'tcx>(
             ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
                 base_ty = base_ty.builtin_index().unwrap();
             }
-            ProjectionElem::Subslice { .. } => unreachable!("unexpected subslicing"),
-            ProjectionElem::OpaqueCast(_) => unreachable!("unexpected opaque cast"),
+            ProjectionElem::Subslice { .. } => {}
+            ProjectionElem::OpaqueCast(ty)
+            | ProjectionElem::Subtype(ty)
+            | ProjectionElem::UnwrapUnsafeBinder(ty) => {
+                base_ty = ty;
+            }
             ProjectionElem::Downcast(..) => {
                 // happens when asserting nonnullness of fn ptrs
                 assert!(place_vars.is_empty());
                 return place_vars;
             }
-            ProjectionElem::UnwrapUnsafeBinder(_) => unreachable!("unexpected UnwrapUnsafeBinder"),
-            ProjectionElem::Subtype(_) => unreachable!("unexpected Subtype"),
         }
     }
 

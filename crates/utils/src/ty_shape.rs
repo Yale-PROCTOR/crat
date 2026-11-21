@@ -2,7 +2,13 @@ use rustc_abi::FieldIdx;
 use rustc_ast::UintTy;
 use rustc_hash::FxHashMap;
 use rustc_hir::{FnRetTy, ImplItemKind, ItemKind, PrimTy, QPath, TyKind as HirTyKind, def::Res};
-use rustc_middle::ty::{Ty, TyCtxt, TyKind};
+use rustc_middle::{
+    mir::{
+        Body, Location, Operand, Place, PlaceElem,
+        visit::{PlaceContext, Visitor},
+    },
+    ty::{Ty, TyCtxt, TyKind, TypingEnv},
+};
 use rustc_span::def_id::{DefId, LocalDefId};
 use typed_arena::Arena;
 
@@ -183,6 +189,51 @@ fn compute_ty_shapes<'tcx>(
                 compute_ty_shape(ty, def_id, tss, tcx);
             }
         }
+        ShapeCollector {
+            tss,
+            tcx,
+            owner: def_id,
+            body,
+        }
+        .visit_body(body);
+    }
+}
+
+struct ShapeCollector<'a, 'b, 'tcx> {
+    tss: &'b mut TyShapes<'a, 'tcx>,
+    tcx: TyCtxt<'tcx>,
+    owner: DefId,
+    body: &'b Body<'tcx>,
+}
+
+impl<'tcx> Visitor<'tcx> for ShapeCollector<'_, '_, 'tcx> {
+    fn visit_operand(&mut self, operand: &Operand<'tcx>, location: Location) {
+        compute_ty_shape(
+            operand.ty(&self.body.local_decls, self.tcx),
+            self.owner,
+            self.tss,
+            self.tcx,
+        );
+        self.super_operand(operand, location);
+    }
+
+    fn visit_place(&mut self, place: &Place<'tcx>, context: PlaceContext, location: Location) {
+        compute_ty_shape(
+            place.ty(&self.body.local_decls, self.tcx).ty,
+            self.owner,
+            self.tss,
+            self.tcx,
+        );
+        for element in place.projection {
+            if let PlaceElem::Field(_, ty)
+            | PlaceElem::Subtype(ty)
+            | PlaceElem::OpaqueCast(ty)
+            | PlaceElem::UnwrapUnsafeBinder(ty) = element
+            {
+                compute_ty_shape(ty, self.owner, self.tss, self.tcx);
+            }
+        }
+        self.super_place(place, context, location);
     }
 }
 
@@ -228,6 +279,20 @@ fn compute_ty_shape<'a, 'tcx>(
             tss.arena.alloc(TyShape::Slice(t))
         }
         TyKind::Tuple(tys) => compute_ty_shape_many(tys.iter(), 0, false, owner, tss, tcx),
+        TyKind::Closure(_, args) => compute_ty_shape_many(
+            args.as_closure().upvar_tys().iter(),
+            0,
+            false,
+            owner,
+            tss,
+            tcx,
+        ),
+        TyKind::Alias(..) => {
+            match tcx.try_normalize_erasing_regions(TypingEnv::post_analysis(tcx, owner), ty) {
+                Ok(revealed) if revealed != ty => compute_ty_shape(revealed, owner, tss, tcx),
+                _ => tss.arena.alloc(TyShape::Primitive(ty)),
+            }
+        }
         _ => tss.arena.alloc(TyShape::Primitive(ty)),
     };
     tss.tys.insert(ty, ts);

@@ -240,11 +240,12 @@ where
                 break;
             }
 
-            if let TyKind::Adt(adt_def, subst) = ty.kind()
+            if let TyKind::Adt(adt_def, _) = ty.kind()
                 && struct_ctxt.is_struct_of_concerned(&adt_def.did())
             {
                 for field_def in adt_def.all_fields() {
-                    let field_ty = field_def.ty(tcx, subst);
+                    // Struct slots describe the declaration, with generic contents opaque.
+                    let field_ty = tcx.type_of(field_def.did).instantiate_identity();
                     dominate(field_ty, dom, vars, precision, database, struct_ctxt, tcx)
                 }
             }
@@ -282,10 +283,14 @@ where
         let mut ptr_chased = max_ptr_chased - precision;
 
         let mut proj_start_offset = 0;
+        let mut proj_end_limit = base_measure;
 
         // let mut deref_var = None;
 
         for projection_elem in projection {
+            if proj_start_offset >= proj_end_limit {
+                break;
+            }
             match projection_elem {
                 // do not track pointers behind dereferences for now
                 ProjectionElem::Deref => {
@@ -309,19 +314,24 @@ where
                 }
                 ProjectionElem::Field(field, ty) => {
                     let TyKind::Adt(adt_def, _) = base_ty.kind() else { unreachable!() };
-                    proj_start_offset +=
+                    let start =
                         infer_cx
                             .struct_ctxt
                             .field_offset(*adt_def, field.index(), ptr_chased);
+                    let end =
+                        infer_cx
+                            .struct_ctxt
+                            .field_offset(*adt_def, field.index() + 1, ptr_chased);
+                    // Instantiating an opaque field must not consume its sibling's slots.
+                    proj_end_limit = proj_end_limit.min(proj_start_offset + end);
+                    proj_start_offset += start;
                     base_ty = *ty;
                 }
                 // [ty] is equivalent to ty
                 ProjectionElem::Index(_) | ProjectionElem::ConstantIndex { .. } => {
                     base_ty = base_ty.builtin_index().unwrap();
                 }
-                ProjectionElem::Subslice { .. } => {
-                    unreachable!("unexpected subslicing")
-                }
+                ProjectionElem::Subslice { .. } => {}
                 ProjectionElem::OpaqueCast(_) => unreachable!("unexpected opaque cast"),
                 ProjectionElem::UnwrapUnsafeBinder(ty) | ProjectionElem::Subtype(ty) => {
                     base_ty = *ty;
@@ -330,7 +340,7 @@ where
             }
         }
 
-        if base.r#use.start + proj_start_offset >= base.r#use.end {
+        if proj_start_offset >= proj_end_limit {
             for (pre, post) in base.r#use.zip(base.def) {
                 infer_cx
                     .database
@@ -363,7 +373,9 @@ where
                 .push_equal::<crate::analyses::ownership::ssa::constraint::Debug>((), pre, post);
         }
 
-        let proj_end_offset = proj_start_offset + infer_cx.struct_ctxt.measure(base_ty, ptr_chased);
+        let proj_end_offset = (proj_start_offset
+            + infer_cx.struct_ctxt.measure(base_ty, ptr_chased))
+        .min(proj_end_limit);
 
         #[cfg(debug_assertions)]
         assert!(
