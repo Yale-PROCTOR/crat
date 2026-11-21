@@ -2678,7 +2678,7 @@ fn wildcard_parameter_patterns_must_be_preserved() {
 }
 
 #[test]
-fn destructuring_parameters_remain_unsupported() {
+fn destructuring_parameter_changes_are_rejected() {
     for (source, path, name, transformation) in [
         (
             "unsafe fn f(pair: (i32, i32)) {}",
@@ -2694,10 +2694,38 @@ pub fn main() { unsafe { main_0((0, 0), 0) } }"#,
             "unsafe fn main_0((_, _): (i32, i32), _: i32) { #[proctor(0)] return; }",
         ),
     ] {
-        let error = add_source(source, &request(path, name, transformation)).unwrap_err();
+        let mut request = request(path, name, transformation);
+        request.items[0].view = skeleton_view(&request.transformation, vec![], false);
+        let error = add_source(source, &request).unwrap_err();
         assert_eq!(error.kind, ReplacementErrorKind::InvalidTransformation);
-        assert!(error.message.contains("simple by-value identifier"));
+        assert!(
+            error.message.contains("returned parameter 0 uses pattern"),
+            "{error:?}"
+        );
     }
+}
+
+#[test]
+fn destructured_parameters_survive_additive_replacement_and_observation() {
+    let source = "pub unsafe fn f([left, right]: [i32; 2], pointer: *const i32) -> i32 { left + right + *pointer }";
+    let skeleton = "unsafe fn f([mut left, mut right]: [i32; 2], mut pointer: &i32) -> i32 { #[proctor(0)] todo!() }";
+    let request = ReplacementRequest {
+        items: vec![preservation_item(7, "f", "f", skeleton, vec![0])],
+        transformation: skeleton.replace("todo!()", "left + right + *pointer"),
+        accepted_correspondence: vec![],
+    };
+    let initial = make_initial_source(source).unwrap();
+    let output = add(source, &initial, &request).unwrap();
+    compile_checked(&output.replacement.source);
+    let metadata = observation_metadata(
+        &output,
+        output.replacement.source.as_bytes(),
+        b"pairs",
+        output.observation_source.as_bytes(),
+    );
+    let document =
+        crate::extract_observations_from_source(&output.observation_source, &metadata).unwrap();
+    assert!(!document.observations.is_empty());
 }
 
 #[test]

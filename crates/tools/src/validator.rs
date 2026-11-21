@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use crate::{
     SkeletonView,
     preservation::{
-        canonical_statement_group, canonicalize_function_with_view, validate_skeleton_view,
+        canonical_parameter_pattern, canonical_statement_group, canonicalize_function_with_view,
+        validate_skeleton_view,
     },
     printf::{parse_print_macro_statement, validate_print_macro_statement},
 };
@@ -504,15 +505,6 @@ fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &
         return Err("variadic functions require an external calling convention");
     }
     if function
-        .sig
-        .decl
-        .inputs
-        .iter()
-        .any(|parameter| !is_supported_parameter_pattern(&parameter.pat))
-    {
-        return Err("every parameter must be a simple by-value identifier pattern or `_`");
-    }
-    if function
         .generics
         .params
         .iter()
@@ -533,13 +525,6 @@ fn validate_supported_target_signature(function: &rustc_ast::Fn) -> Result<(), &
         );
     }
     Ok(())
-}
-
-fn is_supported_parameter_pattern(pattern: &Pat) -> bool {
-    matches!(
-        pattern.kind,
-        PatKind::Ident(BindingMode(ByRef::No, _), _, None) | PatKind::Wild
-    )
 }
 
 fn validate_expected_block(block: &rustc_ast::Block) -> Result<(), String> {
@@ -1130,17 +1115,15 @@ fn validate_signature(expected: &ParsedExpected, result: &Item) -> Vec<Validatio
     for (index, (expected_param, result_param)) in
         expected_params.iter().zip(result_params).enumerate()
     {
-        let expected_pattern = parameter_pattern(&expected_param.pat);
-        let result_pattern = parameter_pattern(&result_param.pat);
+        let expected_pattern = canonical_parameter_pattern(&expected_param.pat);
+        let result_pattern = canonical_parameter_pattern(&result_param.pat);
         if expected_pattern != result_pattern {
             errors.push(error(
                 "parameter_name_mismatch",
                 function_message(
                     expected,
                     format!(
-                        "parameter {index} must use pattern `{}` but used `{}`; restore the target parameter pattern",
-                        expected_pattern.description(),
-                        result_pattern.description()
+                        "parameter {index} must use pattern `{expected_pattern}` but used `{result_pattern}`; restore the target parameter pattern"
                     ),
                 ),
             ));
@@ -1191,33 +1174,6 @@ fn simple_pattern_name(pat: &Pat) -> Option<&str> {
         return None;
     };
     Some(ident.name.as_str())
-}
-
-#[derive(PartialEq, Eq)]
-enum ParameterPattern<'a> {
-    Identifier(&'a str),
-    Wildcard,
-    Unsupported,
-}
-
-impl ParameterPattern<'_> {
-    fn description(&self) -> &str {
-        match self {
-            Self::Identifier(name) => name,
-            Self::Wildcard => "_",
-            Self::Unsupported => "<unsupported pattern>",
-        }
-    }
-}
-
-fn parameter_pattern(pattern: &Pat) -> ParameterPattern<'_> {
-    match &pattern.kind {
-        PatKind::Ident(BindingMode(ByRef::No, _), ident, None) => {
-            ParameterPattern::Identifier(ident.name.as_str())
-        }
-        PatKind::Wild => ParameterPattern::Wildcard,
-        _ => ParameterPattern::Unsupported,
-    }
 }
 
 fn canonical_return(return_ty: &FnRetTy) -> String {
@@ -2003,26 +1959,7 @@ fn validate_declarations(
 ) {
     let mut expected_errors = vec![];
     let mut matched_result_bindings = HashSet::new();
-    let ItemKind::Fn(box expected_function) = &expected.item.kind else { unreachable!() };
-    let mut expected_names = expected_scan
-        .bindings
-        .iter()
-        .map(|binding| binding.name.as_str())
-        .collect::<HashSet<_>>();
-    expected_names.extend(
-        expected_scan
-            .items
-            .iter()
-            .flat_map(|item| item.names.iter().map(String::as_str)),
-    );
-    expected_names.extend(
-        expected_function
-            .sig
-            .decl
-            .inputs
-            .iter()
-            .filter_map(|parameter| simple_pattern_name(&parameter.pat)),
-    );
+    let expected_names = expected_binding_names(expected, expected_scan);
 
     for expected_binding in &expected_scan.bindings {
         let exact = result_scan
@@ -3213,14 +3150,16 @@ fn expected_binding_names(expected: &ParsedExpected, scan: &BodyScanner) -> Hash
             .iter()
             .flat_map(|item| item.names.iter().cloned()),
     );
-    names.extend(
-        function
-            .sig
-            .decl
-            .inputs
-            .iter()
-            .filter_map(|parameter| simple_pattern_name(&parameter.pat).map(str::to_owned)),
-    );
+    for parameter in &function.sig.decl.inputs {
+        let mut bindings = vec![];
+        collect_pattern_bindings(&parameter.pat, "root", &mut bindings);
+        names.extend(
+            bindings
+                .into_iter()
+                .filter(|binding| !binding.constructor_like)
+                .map(|binding| binding.name),
+        );
+    }
     names
 }
 

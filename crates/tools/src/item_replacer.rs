@@ -4,8 +4,8 @@ use std::{
 };
 
 use rustc_ast::{
-    AttrKind, Attribute, BindingMode, ByRef, Crate, Expr, ExprKind, Extern, FnRetTy,
-    GenericParamKind, Item, ItemKind, NodeId, PatKind, Safety, Stmt, StmtKind, Ty, TyKind,
+    AttrKind, Attribute, Crate, Expr, ExprKind, Extern, FnRetTy, GenericParamKind, Item, ItemKind,
+    NodeId, Safety, Stmt, StmtKind, Ty, TyKind,
     mut_visit::{self, MutVisitor},
     ptr::P,
     visit::{self, Visitor},
@@ -26,7 +26,8 @@ use thin_vec::ThinVec;
 use crate::{
     SkeletonView,
     preservation::{
-        canonical_statement_group, canonicalize_function_with_view, validate_skeleton_view,
+        canonical_parameter_pattern, canonical_statement_group, canonicalize_function_with_view,
+        validate_skeleton_view,
     },
     skeleton::{
         annotate_function, collect_opaque_expressions, is_supported_two_argument_main_0,
@@ -1088,20 +1089,6 @@ fn validate_supported_transformation(
             "returned async functions are unsupported".to_owned(),
         ));
     }
-    if function
-        .sig
-        .decl
-        .inputs
-        .iter()
-        .any(|parameter| simple_parameter_pattern(parameter).is_none())
-    {
-        return Err(item_error(
-            ReplacementErrorKind::InvalidTransformation,
-            requested,
-            "every returned parameter must use a simple by-value identifier pattern or `_`"
-                .to_owned(),
-        ));
-    }
     let expected = parse_replacement_skeleton(requested)?;
     let ItemKind::Fn(expected) = &expected.kind else { unreachable!() };
     if function.generics.params.iter().any(|parameter| {
@@ -1362,52 +1349,19 @@ fn validate_transformed_header(
         .zip(&transformed.sig.decl.inputs)
         .enumerate()
     {
-        let source_pattern = simple_parameter_pattern(source).ok_or_else(|| {
-            item_error(
-                ReplacementErrorKind::TargetResolution,
-                requested,
-                format!("current parameter {index} is not a supported parameter pattern"),
-            )
-        })?;
-        let target_pattern = simple_parameter_pattern(target).expect("returned header was checked");
+        let source_pattern = canonical_parameter_pattern(&source.pat);
+        let target_pattern = canonical_parameter_pattern(&target.pat);
         if source_pattern != target_pattern {
             return Err(item_error(
                 ReplacementErrorKind::InvalidTransformation,
                 requested,
                 format!(
-                    "returned parameter {index} uses pattern `{}` rather than `{}`",
-                    target_pattern.description(),
-                    source_pattern.description()
+                    "returned parameter {index} uses pattern `{target_pattern}` rather than `{source_pattern}`"
                 ),
             ));
         }
     }
     Ok(())
-}
-
-#[derive(PartialEq, Eq)]
-enum SimpleParameterPattern {
-    Identifier(String),
-    Wildcard,
-}
-
-impl SimpleParameterPattern {
-    fn description(&self) -> &str {
-        match self {
-            Self::Identifier(name) => name,
-            Self::Wildcard => "_",
-        }
-    }
-}
-
-fn simple_parameter_pattern(parameter: &rustc_ast::Param) -> Option<SimpleParameterPattern> {
-    match &parameter.pat.kind {
-        PatKind::Ident(BindingMode(ByRef::No, _), ident, None) => {
-            Some(SimpleParameterPattern::Identifier(ident.to_string()))
-        }
-        PatKind::Wild => Some(SimpleParameterPattern::Wildcard),
-        _ => None,
-    }
 }
 
 fn signature_types(function: &rustc_ast::Fn) -> Vec<String> {

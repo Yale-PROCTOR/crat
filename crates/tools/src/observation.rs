@@ -1895,29 +1895,30 @@ fn pair_bindings(
         .zip(&target_fn.sig.decl.inputs)
         .enumerate()
     {
-        match (&source_parameter.pat.kind, &target_parameter.pat.kind) {
-            (PatKind::Wild, PatKind::Wild) => continue,
-            (PatKind::Wild, _) | (_, PatKind::Wild) => {
-                return Err(correspondence_error(&format!(
-                    "parameter {index} has a mismatched wildcard pattern"
-                )));
-            }
-            _ => {}
-        }
-        let (source_name, source_id) = simple_binding(&source_parameter.pat, ast_to_hir, tcx)
-            .ok_or_else(|| {
-                correspondence_error(&format!("source parameter {index} is not a simple binding"))
-            })?;
-        let (target_name, target_id) = simple_binding(&target_parameter.pat, ast_to_hir, tcx)
-            .ok_or_else(|| {
-                correspondence_error(&format!("target parameter {index} is not a simple binding"))
-            })?;
-        if source_name != target_name {
+        if crate::preservation::canonical_parameter_pattern(&source_parameter.pat)
+            != crate::preservation::canonical_parameter_pattern(&target_parameter.pat)
+        {
             return Err(correspondence_error(&format!(
-                "parameter {index} symbols differ"
+                "parameter {index} patterns differ"
             )));
         }
-        result.insert(source_id, target_id);
+        let source_bindings = parameter_bindings(&source_parameter.pat, ast_to_hir, tcx)?;
+        let target_bindings = parameter_bindings(&target_parameter.pat, ast_to_hir, tcx)?;
+        if source_bindings.len() != target_bindings.len() {
+            return Err(correspondence_error(&format!(
+                "parameter {index} binding count differs"
+            )));
+        }
+        for ((source_name, source_id), (target_name, target_id)) in
+            source_bindings.into_iter().zip(target_bindings)
+        {
+            if source_name != target_name {
+                return Err(correspondence_error(&format!(
+                    "parameter {index} symbols differ"
+                )));
+            }
+            result.insert(source_id, target_id);
+        }
     }
     let required_locals = required_local_bindings(labels, source_statements, ast_to_hir, tcx);
     for &(source_ordinal, target_ordinal) in local_pairs {
@@ -1958,6 +1959,23 @@ fn pair_bindings(
         }
     }
     Ok(result)
+}
+
+fn parameter_bindings(
+    pattern: &rustc_ast::Pat,
+    ast_to_hir: &utils::ir::AstToHir,
+    tcx: TyCtxt<'_>,
+) -> Result<Vec<(Symbol, hir::HirId)>, ObservationError> {
+    let pattern = ast_to_hir
+        .get_pat(pattern.id, tcx)
+        .ok_or_else(|| correspondence_error("parameter pattern has no HIR mapping"))?;
+    let mut bindings = vec![];
+    pattern.walk_always(|pattern| {
+        if let hir::PatKind::Binding(_, binding, ident, _) = pattern.kind {
+            bindings.push((ident.name, binding));
+        }
+    });
+    Ok(bindings)
 }
 
 fn required_local_bindings(
@@ -6766,11 +6784,54 @@ unsafe fn target(mut left: &i32, mut right: &i32) -> i32 {
     }
 
     #[test]
+    fn destructured_parameters_pair_nested_resolved_bindings() {
+        for (parameter, expression) in [
+            ("(value, _): (i32, i32)", "value"),
+            ("[first, .., last]: [i32; 3]", "first + last"),
+            ("Pair { value, .. }: Pair", "value"),
+            ("Wrap(value): Wrap", "value"),
+            ("whole @ [first, ..]: [i32; 2]", "first + whole[1]"),
+            ("ref value: i32", "*value"),
+            ("ref mut value: i32", "*value"),
+            ("&[first, ..]: &[i32; 2]", "first"),
+            ("Unit: Unit", "0"),
+            (
+                "(Choice::Left(value) | Choice::Right(value)): Choice",
+                "value",
+            ),
+        ] {
+            let source = format!(
+                "struct Pair {{ value: i32, other: i32 }} struct Wrap(i32); struct Unit; enum Choice {{ Left(i32), Right(i32) }}
+                unsafe fn source_copy({parameter}, pointer: *const i32) -> i32 {{ #[proctor(0)] *pointer + ({expression}) }}
+                unsafe fn target({parameter}, pointer: &i32) -> i32 {{ #[proctor(0)] *pointer + ({expression}) }}"
+            );
+            let document = extract_case(&source, "source_copy", "target", vec![0]).unwrap();
+            assert!(!document.observations.is_empty(), "{parameter}");
+        }
+
+        let changed = r#"
+unsafe fn source_copy([left, right]: [i32; 2], pointer: *const i32) -> i32 {
+    #[proctor(0)] *pointer + left + right
+}
+unsafe fn target([right, left]: [i32; 2], pointer: &i32) -> i32 {
+    #[proctor(0)] *pointer + left + right
+}
+"#;
+        assert_eq!(
+            extract_case(changed, "source_copy", "target", vec![0])
+                .unwrap_err()
+                .code,
+            "binding_correspondence"
+        );
+    }
+
+    #[test]
     fn wildcard_parameters_pair_only_with_wildcards() {
         for (target, parameters) in [
             ("main_0", "_: i32, _: i32"),
             ("target", "_: i32, _: i32"),
             ("main_0", "_: i32"),
+            ("main_0", "(_, _): (i32, i32), _: i32"),
         ] {
             let source = format!(
                 "unsafe fn source_copy({parameters}) {{}} unsafe fn {target}({parameters}) {{}}"
@@ -6788,11 +6849,6 @@ unsafe fn target(_: i32, _: i32) { return; }"#,
             (
                 r#"unsafe fn source_copy(_: i32, _: i32) { return; }
 unsafe fn main_0(value: i32, _: i32) { let _ = value; }"#,
-                "main_0",
-            ),
-            (
-                r#"unsafe fn source_copy((_, _): (i32, i32), _: i32) { return; }
-unsafe fn main_0((_, _): (i32, i32), _: i32) { return; }"#,
                 "main_0",
             ),
         ] {

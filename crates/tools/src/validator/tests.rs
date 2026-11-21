@@ -1449,7 +1449,6 @@ fn invalid_expected_skeleton_is_setup_error() {
         "unsafe fn f() { #[proctor(0)] type Local = i32; }",
         "unsafe fn f() { #[proctor(0)] struct Local(i32); }",
         "unsafe fn f() { #[proctor(0)] macro_rules! local { () => {}; } }",
-        "unsafe fn f((x, y): (i32, i32)) { #[proctor(0)] return; }",
         "unsafe fn f<T>(x: T) { #[proctor(0)] return; }",
         "unsafe fn f<'a>(x: &'a i32) where 'a: 'static { #[proctor(0)] return; }",
         "unsafe fn f<#[allow(unused)] 'a>(x: &'a i32) { #[proctor(0)] return; }",
@@ -1622,6 +1621,56 @@ fn parameter_count_and_names_are_exact() {
         "unsafe fn f(a: i32, right: i32) -> i32 { #[proctor(0)] a + right }",
         "parameter_name_mismatch",
     );
+}
+
+#[test]
+fn destructured_parameters_preserve_patterns_and_reference_modes() {
+    for (expected, returned, ty, changed) in [
+        (
+            "[mut left, mut right]",
+            "[left, right]",
+            "[i32; 2]",
+            "[right, left]",
+        ),
+        (
+            "(mut left, (mut right, _))",
+            "(left, (right, _))",
+            "(i32, (i32, i32))",
+            "(left, (other, _))",
+        ),
+        (
+            "Pair { left: mut value, right: ref borrowed }",
+            "Pair { left: value, right: ref borrowed }",
+            "Pair",
+            "Pair { left: value, right: borrowed }",
+        ),
+        ("Wrap(mut value)", "Wrap(value)", "Wrap", "Other(value)"),
+        (
+            "mut whole @ [mut first, ..]",
+            "whole @ [first, ..]",
+            "[i32; 2]",
+            "[first, ..]",
+        ),
+        (
+            "&[mut first, .., mut last]",
+            "&[first, .., last]",
+            "&[i32; 3]",
+            "&[first, last, ..]",
+        ),
+        ("ref mut value", "ref mut value", "i32", "ref value"),
+        ("ref value", "ref value", "i32", "value"),
+        ("(mut value,)", "(value,)", "(i32,)", "[value]"),
+    ] {
+        let skeleton = format!("unsafe fn f({expected}: {ty}) -> i32 {{ #[proctor(0)] todo!() }}");
+        let transformation =
+            |pattern| format!("unsafe fn f({pattern}: {ty}) -> i32 {{ #[proctor(0)] 0 }}");
+        assert_valid(&skeleton, &transformation(returned));
+        assert_codes(
+            &skeleton,
+            &transformation(changed),
+            &["parameter_name_mismatch"],
+        );
+    }
 }
 
 #[test]
@@ -2639,6 +2688,36 @@ fn existing_temporary_shaped_bindings_retain_lexical_identity() {
 }"#,
         &["unresolved_generated_temporary"],
     );
+}
+
+#[test]
+fn destructured_parameter_names_are_existing_bindings() {
+    for parameter in [
+        "(mut proctor_temp_var_0, _): (i32, i32)",
+        "[mut proctor_temp_var_0, ..]: [i32; 2]",
+        "Pair { field: mut proctor_temp_var_0 }: Pair",
+        "mut proctor_temp_var_0 @ (_, _): (i32, i32)",
+    ] {
+        let skeleton = format!("unsafe fn f({parameter}) {{ #[proctor(0)] todo!(); }}");
+        for expression in [
+            "consume(proctor_temp_var_0)",
+            "consume!(proctor_temp_var_0)",
+        ] {
+            assert_valid(&skeleton, &skeleton.replace("todo!()", expression));
+        }
+        assert_code(
+            &skeleton,
+            &skeleton.replace("todo!()", "let proctor_temp_var_0 = 1"),
+            "invalid_generated_binding_name",
+        );
+        let print_skeleton = format!(
+            "unsafe fn f({parameter}) {{ #[proctor(0)] ::std::print!(\"{{}}\", todo!()); }}"
+        );
+        assert_valid(
+            &print_skeleton,
+            &print_skeleton.replace("todo!()", "proctor_temp_var_0"),
+        );
+    }
 }
 
 #[test]

@@ -1982,10 +1982,15 @@ impl MutVisitor for PresentationBindingNormalizer<'_, '_> {
     fn visit_pat(&mut self, pat: &mut Pat) {
         if let PatKind::Ident(BindingMode(by_ref, mutability), ..) = &mut pat.kind
             && *by_ref == ByRef::No
-            && self
-                .ast_to_hir
-                .get_pat(pat.id, self.tcx)
-                .is_some_and(|pattern| matches!(pattern.kind, hir::PatKind::Binding(..)))
+            && let Some(pattern) = self.ast_to_hir.get_pat(pat.id, self.tcx)
+            && matches!(pattern.kind, hir::PatKind::Binding(..))
+            && matches!(
+                self.tcx
+                    .typeck(pattern.hir_id.owner)
+                    .pat_binding_modes()
+                    .get(pattern.hir_id),
+                Some(BindingMode(ByRef::No, _))
+            )
         {
             *mutability = Mutability::Mut;
         }

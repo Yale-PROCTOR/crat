@@ -33,6 +33,25 @@ pub(crate) fn function_signature(function: &rustc_ast::Fn) -> String {
     pprust::item_to_string(&item)
 }
 
+pub(crate) fn canonical_parameter_pattern(pattern: &rustc_ast::Pat) -> String {
+    struct BindingNormalizer;
+    impl MutVisitor for BindingNormalizer {
+        fn visit_pat(&mut self, pattern: &mut rustc_ast::Pat) {
+            if let rustc_ast::PatKind::Ident(
+                rustc_ast::BindingMode(rustc_ast::ByRef::No, mutability),
+                ..,
+            ) = &mut pattern.kind
+            {
+                *mutability = rustc_ast::Mutability::Not;
+            }
+            mut_visit::walk_pat(self, pattern);
+        }
+    }
+    let mut pattern = pattern.clone();
+    BindingNormalizer.visit_pat(&mut pattern);
+    pprust::pat_to_string(&pattern)
+}
+
 pub(crate) fn supported_local_item(item: &Item) -> bool {
     matches!(
         item.kind,

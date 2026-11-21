@@ -2052,6 +2052,78 @@ fn unstructured_preserves_destructured_parameter_signatures() {
 }
 
 #[test]
+fn destructured_parameters_survive_frozen_replacement_and_observation() {
+    for use_bo_analysis in [false, true] {
+        for (parameter, expression) in [
+            ("[mut a, mut b]: [Vertex; 2]", "a.value + b.value"),
+            (
+                "[mut a, mut b, mut c]: [Vertex; 3]",
+                "a.value + b.value + c.value",
+            ),
+            (
+                "(mut whole @ [mut a, ..], Vertex { value: ref b }): ([i32; 2], Vertex)",
+                "whole[1] + a + *b",
+            ),
+            ("[a, b]: &[String; 2]", "a.len() as i32 + b.len() as i32"),
+            (
+                "[a, b]: &mut [String; 2]",
+                "a.len() as i32 + b.len() as i32",
+            ),
+        ] {
+            let source = format!(
+                "pub mod geometry {{
+                    #[derive(Clone, Copy)] pub struct Vertex {{ pub value: i32 }}
+                    #[inline] pub unsafe extern \"C\" fn target({parameter}, pointer: *const i32) -> i32 {{ {expression} + *pointer }}
+                }}"
+            );
+            let frozen = freeze_with_analysis(&source, use_bo_analysis);
+            let frozen =
+                frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
+            check_frozen_project_sources(&frozen, &source, Some(&frozen.target_source), true)
+                .unwrap();
+            run_compiler_on_str(&frozen.target_source, utils::type_check).unwrap();
+            let function = &frozen.functions[0];
+            assert!(!function.record.unstructured);
+            assert!(function.record.baseline.needs_transformation);
+            let transformation = format!(
+                "{} {{ #[proctor(0)] {expression} + *pointer }}",
+                function.record.target_signature
+            );
+            assert_eq!(
+                crate::validate(&crate::ValidationRequest {
+                    expected_functions: vec![crate::ExpectedFunction {
+                        id: function.record.id,
+                        name: function.record.name.clone(),
+                        view: function.record.baseline.clone(),
+                    }],
+                    transformation: transformation.clone(),
+                }),
+                crate::ValidationResponse::Valid
+            );
+            let (output, metadata) = metadata(&frozen, &request(function, Some(&transformation)));
+            run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+            let observations =
+                crate::extract_observations_from_source(&output.observation_source, &metadata)
+                    .unwrap();
+            assert!(!observations.observations.is_empty());
+            let assembled = assemble_frozen_project(
+                &frozen,
+                &[AcceptedScc {
+                    members: vec![function.record.id],
+                    source: output.replacement.source,
+                    stubbed_items: vec![],
+                }],
+            )
+            .unwrap();
+            assert!(assembled.contains("extern \"C\""));
+            assert!(assembled.contains("#[inline]"));
+            assert!(!assembled.contains("todo!()"));
+            run_compiler_on_str(&assembled, utils::type_check).unwrap();
+        }
+    }
+}
+
+#[test]
 fn unstructured_preserves_other_scc_stubs_and_rejects_invalid_members() {
     let frozen = freeze(
         "pub unsafe fn first(x: i32) -> i32 { x } pub unsafe fn second(x: i32) -> i32 { x }",
