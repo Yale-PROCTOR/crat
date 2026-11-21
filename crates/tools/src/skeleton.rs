@@ -161,7 +161,6 @@ pub enum GenerationErrorKind {
     NestedControlPayload,
     AstHirMismatch,
     TypeSpelling,
-    UnsupportedGeneric,
     PointerAnalysis,
 }
 
@@ -238,7 +237,6 @@ fn make_skeletons_with_preservation_overrides(
     use_bo_analysis: bool,
 ) -> Result<Vec<ItemRecord>, GenerationError> {
     let mut surface = utils::ast::parse_crate(source.to_owned());
-    reject_unsupported_function_generics(&surface.items, &mut vec![])?;
     let mut mapper = utils::ir::AstToHirMapper::new(tcx);
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         mapper.map_crate_to_mod(&mut surface, tcx.hir_root_module(), false);
@@ -274,7 +272,7 @@ fn make_skeletons_with_preservation_overrides(
         })?;
     for item in &raw_items {
         let ItemKind::Fn(function) = &item.item.kind else { continue };
-        if !function.sig.decl.c_variadic() && !has_type_parameters(function) {
+        if !function.sig.decl.c_variadic() && !has_unstructured_generics(function) {
             continue;
         }
         if let Some(signature) = decisions.signatures.data.get_mut(&item.def_id) {
@@ -349,61 +347,13 @@ fn make_skeletons_with_preservation_overrides(
     Ok(records)
 }
 
-fn reject_unsupported_function_generics(
-    items: &[P<Item>],
-    path: &mut Vec<String>,
-) -> Result<(), GenerationError> {
-    for item in items {
-        if let ItemKind::Mod(_, ident, rustc_ast::ModKind::Loaded(children, ..)) = &item.kind {
-            path.push(ident.to_string());
-            reject_unsupported_function_generics(children, path)?;
-            path.pop();
-            continue;
-        }
-        let ItemKind::Fn(box function) = &item.kind else {
-            continue;
-        };
-        let name = item.kind.ident().unwrap().to_string();
-        if name == "main" || has_type_parameters(function) {
-            continue;
-        }
-        let Some(parameter) = function
-            .generics
-            .params
-            .iter()
-            .find(|parameter| !matches!(parameter.kind, GenericParamKind::Lifetime))
-        else {
-            continue;
-        };
-        let function_path = path
-            .iter()
-            .cloned()
-            .chain(std::iter::once(name))
-            .collect::<Vec<_>>()
-            .join("::");
-        let kind = match parameter.kind {
-            GenericParamKind::Type { .. } => "type",
-            GenericParamKind::Const { .. } => "const",
-            GenericParamKind::Lifetime => unreachable!(),
-        };
-        return Err(GenerationError {
-            kind: GenerationErrorKind::UnsupportedGeneric,
-            function_path: function_path.clone(),
-            message: format!(
-                "source-defined transformable function `{function_path}` declares an unsupported {kind} generic parameter"
-            ),
-        });
-    }
-    Ok(())
-}
-
-pub(crate) fn has_type_parameters(function: &rustc_ast::Fn) -> bool {
-    if function
-        .generics
-        .params
-        .iter()
-        .any(|parameter| matches!(parameter.kind, GenericParamKind::Type { .. }))
-    {
+pub(crate) fn has_unstructured_generics(function: &rustc_ast::Fn) -> bool {
+    if function.generics.params.iter().any(|parameter| {
+        matches!(
+            parameter.kind,
+            GenericParamKind::Type { .. } | GenericParamKind::Const { .. }
+        )
+    }) {
         return true;
     }
     struct ImplTraitFinder(bool);
@@ -713,7 +663,7 @@ fn make_function_record<'tcx>(
     let mut source = surface.item.clone();
     sanitize_item(&mut source);
     if let ItemKind::Fn(function) = &mut source.kind
-        && has_type_parameters(function)
+        && has_unstructured_generics(function)
     {
         function.sig.header.safety = Safety::Unsafe(DUMMY_SP);
         let name = function.ident.to_string();

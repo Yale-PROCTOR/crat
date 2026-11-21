@@ -139,7 +139,13 @@ pub(super) fn foreign_types(
                     .generics_of(item.owner_id)
                     .own_params
                     .iter()
-                    .any(|parameter| matches!(parameter.kind, ty::GenericParamDefKind::Type { .. }))
+                    .any(|parameter| {
+                        matches!(
+                            parameter.kind,
+                            ty::GenericParamDefKind::Type { .. }
+                                | ty::GenericParamDefKind::Const { .. }
+                        )
+                    })
             {
                 let previous = std::mem::replace(&mut self.fixed_header, true);
                 intravisit::walk_fn_decl(self, sig.decl);

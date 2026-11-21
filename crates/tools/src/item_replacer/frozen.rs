@@ -156,7 +156,7 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
             || record.name != original_fn.ident.to_string()
             || pprust::item_to_string(&original) != pprust::item_to_string(&originals[&record.path])
             || !matches!(original_fn.sig.header.safety, Safety::Unsafe(_))
-            || record.unstructured != crate::skeleton::has_type_parameters(original_fn)
+            || record.unstructured != crate::skeleton::has_unstructured_generics(original_fn)
         {
             return Err(global_error(
                 ReplacementErrorKind::InvalidRequest,

@@ -86,7 +86,12 @@ pub(super) fn initial_pointer_decisions(
             .generics_of(function)
             .own_params
             .iter()
-            .any(|parameter| matches!(parameter.kind, ty::GenericParamDefKind::Type { .. }))
+            .any(|parameter| {
+                matches!(
+                    parameter.kind,
+                    ty::GenericParamDefKind::Type { .. } | ty::GenericParamDefKind::Const { .. }
+                )
+            })
         {
             continue;
         }

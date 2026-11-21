@@ -836,7 +836,8 @@ fn generic_dependency_source_stubs_preserve_explicit_type_arguments() {
     let source = r#"
 pub fn size<T>() -> usize { core::mem::size_of::<T>() }
 pub fn identity<T: Copy>(value: T) -> T { value }
-pub unsafe fn read(p: *mut i32) -> i32 { identity(*p) + size::<u32>() as i32 }
+pub fn count<const N: usize>() -> usize { N }
+pub unsafe fn read(p: *mut i32) -> i32 { identity(*p) + size::<u32>() as i32 + count::<4>() as i32 }
 "#;
     let frozen = freeze(source);
     let index = frozen
@@ -845,12 +846,12 @@ pub unsafe fn read(p: *mut i32) -> i32 { identity(*p) + size::<u32>() as i32 }
         .position(|f| f.record.name == "read")
         .unwrap();
     assert!(frozen.functions[index].source_copy.contains("::<u32>"));
+    assert!(frozen.functions[index].source_copy.contains("::<4>"));
     let read = &frozen.functions[index];
-    let body = read
-        .record
-        .baseline
-        .skeleton
-        .replace("todo!()", "identity(*p) + size::<u32>() as i32");
+    let body = read.record.baseline.skeleton.replace(
+        "todo!()",
+        "identity(*p) + size::<u32>() as i32 + count::<4>() as i32",
+    );
     let (output, metadata) = metadata(&frozen, &request(read, Some(&body)));
     crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
         .unwrap();
@@ -864,19 +865,101 @@ pub unsafe fn read(p: *mut i32) -> i32 { identity(*p) + size::<u32>() as i32 }
 
 #[test]
 fn generic_functions_preserve_type_const_and_lifetime_parameters_together() {
-    let source = "pub fn identity<'a, T, const N: usize>(values: &'a [T; N]) -> &'a [T; N] where T: Copy { values }";
+    for source in [
+        "pub fn identity<'a, T, const N: usize>(values: &'a [T; N]) -> &'a [T; N] where T: Copy { values }",
+        "pub fn identity<'a, const N: usize>(values: &'a [i32; N]) -> &'a [i32; N] { values }",
+    ] {
+        let frozen = freeze(source);
+        let function = &frozen.functions[0];
+        assert!(function.record.unstructured);
+        let result = replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members: vec![function.record.id],
+                transformation: format!("{} {{ values }}", function.record.target_signature),
+            },
+        )
+        .unwrap();
+        run_compiler_on_str(&result.source, utils::type_check).unwrap();
+    }
+}
+
+#[test]
+fn const_only_generic_bodies_replace_and_assemble_with_frozen_headers() {
+    let source = r#"
+pub mod buffers {
+    #[inline]
+    pub unsafe extern "C" fn bytes<const N: usize, const COPY: bool>(input: *const u8) -> [u8; N] {
+        let count = N;
+        let copy = COPY;
+        let mut output = [0; N];
+        if copy {
+            let mut index = 0;
+            while index < count { output[index] = *input.add(index); index += 1; }
+        }
+        output
+    }
+}
+"#;
     let frozen = freeze(source);
+    frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).unwrap();
     let function = &frozen.functions[0];
     assert!(function.record.unstructured);
+    assert_eq!(function.record.path, "buffers::bytes");
+    assert_eq!(
+        function.record.source_signature,
+        function.record.target_signature
+    );
+    let returned = format!(
+        "{} {{ let mut output = [0; N]; for index in 0..N {{ if COPY {{ output[index] = *input.add(index); }} }} output }}",
+        function.record.target_signature
+    );
     let result = replace_unstructured_scc(
         &frozen,
         &UnstructuredReplacementRequest {
             members: vec![function.record.id],
-            transformation: format!("{} {{ values }}", function.record.target_signature),
+            transformation: returned.clone(),
         },
     )
     .unwrap();
+    assert!(result.source.contains("extern \"C\""));
+    assert!(result.source.contains("#[inline]"));
+    assert!(result.source.contains("input: *const u8"));
     run_compiler_on_str(&result.source, utils::type_check).unwrap();
+    let assembled = assemble_frozen_project(
+        &frozen,
+        &[AcceptedScc {
+            members: vec![function.record.id],
+            source: result.source,
+            stubbed_items: vec![],
+        }],
+    )
+    .unwrap();
+    assert!(!assembled.contains("todo!()"));
+    run_compiler_on_str(&assembled, utils::type_check).unwrap();
+    for changed in [
+        returned.replace("const N : usize", "const N : u8"),
+        returned.replace("const N : usize", "const M : usize"),
+        returned.replace("const COPY : bool", "const COPY : u8"),
+        returned.replace("[u8; N]", "[u8; 4]"),
+        returned.replace("input: *const u8", "input: &u8"),
+    ] {
+        assert_ne!(changed, returned);
+        assert!(
+            replace_unstructured_scc(
+                &frozen,
+                &UnstructuredReplacementRequest {
+                    members: vec![function.record.id],
+                    transformation: changed,
+                }
+            )
+            .is_err()
+        );
+    }
+    let mut changed = frozen.clone();
+    changed.functions[0].record.unstructured = false;
+    assert!(frozen_project_from_json(&serde_json::to_string(&changed).unwrap()).is_err());
 }
 
 #[test]
@@ -893,21 +976,28 @@ pub unsafe fn body_only<T>(p: *mut i32, extra: T) -> i32 {
 pub unsafe fn fixed_read(value: Fixed) -> i32 { *value.p }
 pub unsafe fn changed_read(value: Changed) -> i32 { *value.p }
 "#;
-    let frozen = freeze(source);
-    let fixed = frozen.types.iter().find(|t| t.path == "Fixed").unwrap();
-    let changed = frozen.types.iter().find(|t| t.path == "Changed").unwrap();
-    assert_eq!(fixed.source_definition, fixed.target_definition);
-    assert_ne!(changed.source_definition, changed.target_definition);
-    let generic = frozen
-        .functions
-        .iter()
-        .find(|f| f.record.name == "generic")
-        .unwrap();
-    assert_eq!(
-        generic.record.source_signature,
-        generic.record.target_signature
-    );
-    run_compiler_on_str(&frozen.target_source, utils::type_check).unwrap();
+    for source in [
+        source.to_owned(),
+        source
+            .replace("<T>", "<const N: usize>")
+            .replace("extra: T", "extra: usize"),
+    ] {
+        let frozen = freeze(&source);
+        let fixed = frozen.types.iter().find(|t| t.path == "Fixed").unwrap();
+        let changed = frozen.types.iter().find(|t| t.path == "Changed").unwrap();
+        assert_eq!(fixed.source_definition, fixed.target_definition);
+        assert_ne!(changed.source_definition, changed.target_definition);
+        let generic = frozen
+            .functions
+            .iter()
+            .find(|f| f.record.name == "generic")
+            .unwrap();
+        assert_eq!(
+            generic.record.source_signature,
+            generic.record.target_signature
+        );
+        run_compiler_on_str(&frozen.target_source, utils::type_check).unwrap();
+    }
 }
 
 fn request(function: &FrozenFunction, transformation: Option<&str>) -> ReplacementRequest {

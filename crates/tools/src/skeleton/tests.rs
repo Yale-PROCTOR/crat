@@ -1763,24 +1763,50 @@ pub unsafe fn third(x: i32) {{ printf(b"{specifier}\0" as *const u8 as *const i8
 }
 
 #[test]
-fn const_only_generics_reject_before_rule_application() {
-    let source = "pub unsafe fn g<const N: usize>(p: *mut [i32; N]) { let _ = p; }";
+fn const_only_generics_use_unstructured_views_with_and_without_rules() {
+    let source = "pub unsafe fn g<const N: usize>(p: *mut [i32; N]) -> usize { let _ = p; N }";
     run_compiler_on_str(source, |tcx| {
-        let without_rules = make_skeletons(source, tcx).unwrap_err();
         let empty = crate::RuleDocument::default();
-        let with_rules = make_skeletons_with_rules(source, Some(&empty), tcx).unwrap_err();
-        for error in [&without_rules, &with_rules] {
-            assert_eq!(error.kind, GenerationErrorKind::UnsupportedGeneric);
-            assert_eq!(error.function_path, "g");
-            assert!(error.message.contains("const"), "{}", error.message);
+        for use_bo_analysis in [false, true] {
+            let without_rules = make_skeletons_with_analysis(
+                source,
+                None,
+                &FxHashSet::default(),
+                use_bo_analysis,
+                tcx,
+            )
+            .unwrap();
+            let with_rules = make_skeletons_with_analysis(
+                source,
+                Some(&empty),
+                &FxHashSet::default(),
+                use_bo_analysis,
+                tcx,
+            )
+            .unwrap();
+            assert_eq!(without_rules, with_rules);
+            let record = function(&without_rules, "g");
+            assert!(record.unstructured);
+            assert_eq!(record.source_signature, record.target_signature);
+            assert!(
+                record.target_signature.contains("const N : usize"),
+                "{}",
+                record.target_signature
+            );
+            assert!(record.target_signature.contains("p: *mut [i32; N]"));
+            assert!(!record.annotated_source.contains("#[proctor("));
+            assert!(!record.baseline.needs_transformation);
+            assert!(record.baseline.statement_dispositions.is_empty());
+            assert!(record.baseline.statement_pair_metadata.is_empty());
+            assert_eq!(record.baseline, record.applied);
         }
-        assert_eq!(without_rules, with_rules);
     })
     .unwrap();
 
     let lifetime_only = "pub unsafe fn h<'a>(p: *mut i32) { let _ = p; }";
     run_compiler_on_str(lifetime_only, |tcx| {
-        assert!(make_skeletons(lifetime_only, tcx).is_ok());
+        let records = make_skeletons(lifetime_only, tcx).unwrap();
+        assert!(!function(&records, "h").unstructured);
         assert!(
             make_skeletons_with_rules(lifetime_only, Some(&crate::RuleDocument::default()), tcx,)
                 .is_ok()

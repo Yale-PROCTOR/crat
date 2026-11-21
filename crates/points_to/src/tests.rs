@@ -262,6 +262,43 @@ pub fn call(value: *mut i32) -> *mut i32 { let _ = pass(target); target(value) }
 }
 
 #[test]
+fn symbolic_scalar_consts_leave_pointer_aliases_unchanged() {
+    compilation::run_compiler_on_str(
+        r#"
+pub fn length<const N: usize>(pointer: *mut i32) -> (*mut i32, usize) { (pointer, N) }
+pub fn flag<const B: bool>(pointer: *mut i32) -> (*mut i32, bool) { (pointer, B) }
+pub fn character<const C: char>(pointer: *mut i32) -> (*mut i32, char) { (pointer, C) }
+"#,
+        |tcx| {
+            let arena = Arena::new();
+            let shapes = ty_shape::get_ty_shapes(&arena, tcx, false);
+            let config = andersen::Config {
+                c_exposed_fns: ["length", "flag", "character"]
+                    .map(str::to_owned)
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let pre = andersen::pre_analyze(&config, &shapes, tcx);
+            let solutions = andersen::analyze(&config, &pre, &shapes, tcx);
+            for name in ["length", "flag", "character"] {
+                let function = find(name, tcx);
+                let output =
+                    pre.vars[&andersen::Var::Local(function, rustc_middle::mir::RETURN_PLACE)];
+                let input =
+                    pre.vars[&andersen::Var::Arg(function, rustc_middle::mir::Local::new(1))];
+                assert!(solutions[output].contains(input));
+                assert!(
+                    solutions[output + 1].is_empty(),
+                    "{name}: scalar const has no pointer target"
+                );
+            }
+        },
+    )
+    .unwrap();
+}
+
+#[test]
 fn unknown_trait_calls_and_generic_layouts_include_aliases_and_writes() {
     for source in [
         r#"
