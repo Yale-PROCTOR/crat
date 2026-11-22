@@ -134,18 +134,8 @@ pub(super) fn foreign_types(
                 }
             }
             if let hir::ItemKind::Fn { sig, generics, .. } = item.kind
-                && self
-                    .tcx
-                    .generics_of(item.owner_id)
-                    .own_params
-                    .iter()
-                    .any(|parameter| {
-                        matches!(
-                            parameter.kind,
-                            ty::GenericParamDefKind::Type { .. }
-                                | ty::GenericParamDefKind::Const { .. }
-                        )
-                    })
+                && (sig.decl.c_variadic
+                    || super::requires_unstructured_body(item.owner_id.def_id, self.tcx))
             {
                 let previous = std::mem::replace(&mut self.fixed_header, true);
                 intravisit::walk_fn_decl(self, sig.decl);

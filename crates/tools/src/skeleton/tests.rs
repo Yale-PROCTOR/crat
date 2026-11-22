@@ -1763,6 +1763,71 @@ pub unsafe fn third(x: i32) {{ printf(b"{specifier}\0" as *const u8 as *const i8
 }
 
 #[test]
+fn opaque_local_types_use_unstructured_views_and_protect_header_types() {
+    let source = r#"
+pub struct Prepared<I> { pub values: I }
+pub struct Fixed { pub pointer: *mut i32 }
+pub struct Changed { pub pointer: *mut i32 }
+pub fn values(input: &[i32]) -> Prepared<impl Iterator<Item = i32> + '_> {
+    Prepared { values: input.iter().copied() }
+}
+pub fn copy(input: &[i32]) -> Prepared<impl Iterator<Item = i32> + '_> {
+    let prepared = values(input);
+    prepared
+}
+pub fn callback() -> impl Fn(i32) -> i32 { |value| value + 1 }
+pub unsafe fn use_callback(context: Fixed) -> i32 {
+    let equal = callback();
+    equal(*context.pointer)
+}
+pub unsafe fn read_fixed(context: Fixed) -> i32 { *context.pointer }
+pub unsafe fn read_changed(context: Changed) -> i32 { *context.pointer }
+"#;
+    run_compiler_on_str(source, |tcx| {
+        for use_bo_analysis in [false, true] {
+            let records = make_skeletons_with_analysis(
+                source,
+                None,
+                &FxHashSet::default(),
+                use_bo_analysis,
+                tcx,
+            )
+            .unwrap();
+            for name in ["values", "copy", "callback", "use_callback"] {
+                let record = function(&records, name);
+                assert!(record.unstructured, "{name}");
+                assert_eq!(record.source_signature, record.target_signature);
+                assert!(!record.annotated_source.contains("#[proctor("));
+                assert!(!record.baseline.needs_transformation);
+                assert!(record.baseline.statement_dispositions.is_empty());
+                assert!(record.baseline.statement_pair_metadata.is_empty());
+                assert_eq!(record.baseline, record.applied);
+            }
+            for name in ["read_fixed", "read_changed"] {
+                assert!(!function(&records, name).unstructured);
+            }
+            let fixed = records
+                .iter()
+                .find_map(|record| match record {
+                    ItemRecord::Type(record) if record.path == "Fixed" => Some(record),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(fixed.source_definition, fixed.target_definition);
+            let changed = records
+                .iter()
+                .find_map(|record| match record {
+                    ItemRecord::Type(record) if record.path == "Changed" => Some(record),
+                    _ => None,
+                })
+                .unwrap();
+            assert_ne!(changed.source_definition, changed.target_definition);
+        }
+    })
+    .unwrap();
+}
+
+#[test]
 fn const_only_generics_use_unstructured_views_with_and_without_rules() {
     let source = "pub unsafe fn g<const N: usize>(p: *mut [i32; N]) -> usize { let _ = p; N }";
     run_compiler_on_str(source, |tcx| {
@@ -3736,17 +3801,22 @@ fn type_spelling_failures_are_structured_and_atomic() {
             assert!(!error.message.contains("requires bare `Option`"));
         }
     }
+}
 
-    let unnameable = type_spelling_source("unnameable");
-    let error = generate_bo_error(unnameable);
-    assert_eq!(error.kind, GenerationErrorKind::TypeSpelling);
-    assert_eq!(error.function_path, "consume");
-    assert!(error.message.contains("local `iterator`"));
-    assert!(
-        error.message.contains("opaque")
-            || error.message.contains("unnameable")
-            || error.message.contains("alias")
-    );
+#[test]
+fn unnameable_inferred_iterators_use_unstructured_views() {
+    let source = type_spelling_source("unnameable");
+    for records in [generate(source), generate_bo(source)] {
+        for name in ["values", "consume"] {
+            let record = function(&records, name);
+            assert!(record.unstructured);
+            assert_eq!(record.source_signature, record.target_signature);
+        }
+        assert_eq!(
+            function(&records, "consume").dependencies,
+            [function(&records, "values").id]
+        );
+    }
 }
 
 #[test]

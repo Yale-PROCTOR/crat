@@ -864,6 +864,69 @@ pub fn callback(mut emit: impl FnMut(i32), p: *mut i32) {
 }
 
 #[test]
+fn opaque_return_types_and_inferred_locals_replace_and_assemble_unstructured() {
+    let source = r#"
+pub struct Prepared<I> { pub values: I }
+pub fn values(input: &[i32]) -> Prepared<impl Iterator<Item = i32> + '_> {
+    Prepared { values: input.iter().copied() }
+}
+pub fn copy(input: &[i32]) -> Prepared<impl Iterator<Item = i32> + '_> {
+    let prepared = values(input);
+    prepared
+}
+pub fn callback() -> impl Fn(i32) -> i32 { |value| value + 1 }
+pub fn use_callback(value: i32) -> i32 {
+    let equal = callback();
+    equal(value)
+}
+"#;
+    let frozen = freeze(source);
+    let frozen = frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
+    let mut accepted = vec![];
+    for function in &frozen.functions {
+        assert!(function.record.unstructured, "{}", function.record.path);
+        let result = replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members: vec![function.record.id],
+                transformation: function.record.annotated_source.clone(),
+            },
+        )
+        .unwrap();
+        accepted.push(AcceptedScc {
+            members: vec![function.record.id],
+            source: result.source,
+            stubbed_items: vec![],
+        });
+        let changed_header = function.record.annotated_source.replacen("i32", "i64", 1);
+        assert!(
+            replace_unstructured_scc(
+                &frozen,
+                &UnstructuredReplacementRequest {
+                    members: vec![function.record.id],
+                    transformation: changed_header,
+                },
+            )
+            .is_err()
+        );
+        if function.record.name != "use_callback" {
+            let mut changed = frozen.clone();
+            changed
+                .functions
+                .iter_mut()
+                .find(|f| f.record.id == function.record.id)
+                .unwrap()
+                .record
+                .unstructured = false;
+            assert!(frozen_project_from_json(&serde_json::to_string(&changed).unwrap()).is_err());
+        }
+    }
+    let assembled = assemble_frozen_project(&frozen, &accepted).unwrap();
+    assert!(!assembled.contains("todo!"));
+    run_compiler_on_str(&assembled, utils::type_check).expect(&assembled);
+}
+
+#[test]
 fn generic_dependency_source_stubs_preserve_explicit_type_arguments() {
     let source = r#"
 pub fn size<T>() -> usize { core::mem::size_of::<T>() }
@@ -1132,6 +1195,71 @@ pub unsafe fn caller(fmt: *const i8) -> i32 { emit(fmt, 7i32, 8i32) }
         assert!(
             transform_frozen_scc(&frozen, &changed).is_err(),
             "{old} -> {new}"
+        );
+    }
+}
+
+#[test]
+fn variadic_headers_and_their_nominal_types_remain_fixed() {
+    let source = r#"
+#![feature(c_variadic)]
+pub struct Token { pub pointer: *mut i32 }
+pub struct Changed { pub pointer: *mut i32 }
+pub unsafe fn read(token: &Token) -> i32 { *token.pointer }
+pub unsafe fn read_changed(value: Changed) -> i32 { *value.pointer }
+pub unsafe extern "C" fn emit(mut token: *mut Token, mut args: ...) -> *mut Token {
+    let current = token;
+    current
+}
+"#;
+    for use_bo_analysis in [false, true] {
+        let frozen = freeze_with_analysis(source, use_bo_analysis);
+        let frozen = frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
+        let token = frozen
+            .types
+            .iter()
+            .find(|record| record.path == "Token")
+            .unwrap();
+        assert_eq!(token.source_definition, token.target_definition);
+        let changed = frozen
+            .types
+            .iter()
+            .find(|record| record.path == "Changed")
+            .unwrap();
+        assert_ne!(changed.source_definition, changed.target_definition);
+        let emit = frozen
+            .functions
+            .iter()
+            .find(|function| function.record.name == "emit")
+            .unwrap();
+        assert!(!emit.record.unstructured);
+        assert_eq!(emit.record.source_signature, emit.record.target_signature);
+        assert!(
+            emit.record
+                .target_signature
+                .contains("mut token: *mut Token")
+        );
+        assert!(emit.record.target_signature.contains("mut args: ..."));
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+        let returned = format!("{} {{ token }}", emit.record.target_signature);
+        let result = replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members: vec![emit.record.id],
+                transformation: returned.clone(),
+            },
+        )
+        .unwrap();
+        run_compiler_on_str(&result.source, utils::type_check).expect(&result.source);
+        assert!(
+            replace_unstructured_scc(
+                &frozen,
+                &UnstructuredReplacementRequest {
+                    members: vec![emit.record.id],
+                    transformation: returned.replacen("*mut Token", "*const Token", 1),
+                },
+            )
+            .is_err()
         );
     }
 }
@@ -1577,6 +1705,64 @@ fn frozen_views_are_checked_before_canonical_replacement() {
         .accepted_correspondence
         .push(correspondence(&frozen.functions[0].record));
     assert!(transform_frozen_scc(&frozen, &changed).is_err());
+}
+
+#[test]
+fn opaque_locals_in_main_0_preserve_the_original_raw_argv_entry_point() {
+    let source = r#"
+pub fn values() -> impl Iterator<Item = i32> { 0..2 }
+pub unsafe fn main_0(argc: i32, argv: *mut *mut i8) -> i32 {
+    let values = values();
+    values.count() as i32 + argc
+}
+pub fn main() { unsafe { main_0(0, core::ptr::null_mut()); } }
+pub mod nested {
+    pub unsafe fn main_0(argc: i32, argv: *mut *mut i8) -> i32 { argc }
+    pub fn main() { unsafe { main_0(0, core::ptr::null_mut()); } }
+}
+"#;
+    let frozen = freeze(source);
+    let mut accepted = vec![];
+    for function in &frozen.functions {
+        let transformation = if function.record.unstructured {
+            function.record.annotated_source.clone()
+        } else {
+            assert_eq!(function.record.path, "nested::main_0");
+            assert!(
+                function
+                    .record
+                    .target_signature
+                    .contains("&mut [&mut [i8]]")
+            );
+            format!("{} {{ argc }}", function.record.target_signature)
+        };
+        let result = replace_unstructured_scc(
+            &frozen,
+            &UnstructuredReplacementRequest {
+                members: vec![function.record.id],
+                transformation,
+            },
+        )
+        .unwrap();
+        accepted.push(AcceptedScc {
+            members: vec![function.record.id],
+            source: result.source,
+            stubbed_items: vec![],
+        });
+    }
+    let assembled = assemble_frozen_project(&frozen, &accepted).unwrap();
+    let finalized = finalize_frozen_project(&frozen, &assembled, "executable", &[]).unwrap();
+    run_compiler_on_str(&finalized.source, utils::type_check).expect(&finalized.source);
+    with_parse_session(|| {
+        let parsed = parse_crate(&finalized.source, ReplacementErrorKind::RewriteFailure)?;
+        let root_main = function_at_path(&parsed.items, &["main".into()]).unwrap();
+        assert!(pprust::item_to_string(root_main).contains("null_mut"));
+        let nested_main =
+            function_at_path(&parsed.items, &["nested".into(), "main".into()]).unwrap();
+        assert!(pprust::item_to_string(nested_main).contains("command_line_arg_slices"));
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]

@@ -82,17 +82,7 @@ pub(super) fn initial_pointer_decisions(
         tcx,
     );
     for (&function, signature) in &original.signatures.data {
-        if tcx
-            .generics_of(function)
-            .own_params
-            .iter()
-            .any(|parameter| {
-                matches!(
-                    parameter.kind,
-                    ty::GenericParamDefKind::Type { .. } | ty::GenericParamDefKind::Const { .. }
-                )
-            })
-        {
+        if requires_unstructured_body(function, tcx) {
             continue;
         }
         let body = tcx

@@ -10355,6 +10355,31 @@ pub unsafe fn passthrough_unknown(p: *mut i32) -> *mut i32 {
     }
 
     #[test]
+    fn unknown_trait_calls_are_treated_conservatively() {
+        run_compiler(
+            r#"
+pub trait Boundary {
+    fn exchange(&mut self, pointer: *mut i32) -> *mut i32;
+}
+
+pub fn exchange<B: Boundary>(boundary: &mut B, pointer: *mut i32) -> *mut i32 {
+    boundary.exchange(pointer)
+}
+"#,
+            |tcx| {
+                let program = collect_program(tcx);
+                let results = analyze_program(&program);
+                let function = find_function(&program, "exchange");
+                let mut signature = results.fn_sig(function);
+                let returned = signature.next().unwrap().unwrap().expect_normal();
+                assert_eq!(returned, [Ownership::Transient]);
+                let pointer = signature.nth(1).unwrap().unwrap().into_input();
+                assert_eq!(pointer, [Ownership::Owning]);
+            },
+        );
+    }
+
+    #[test]
     fn mutable_pointer_to_pointer_argument_becomes_output_param() {
         run_compiler(
             r#"

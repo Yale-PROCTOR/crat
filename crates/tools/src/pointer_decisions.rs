@@ -125,6 +125,37 @@ pub(super) fn initial_pointer_decisions(
     initial_pointer_decisions_for_api(tcx, &FxHashSet::default(), false)
 }
 
+pub(super) fn requires_unstructured_body(function: LocalDefId, tcx: TyCtxt<'_>) -> bool {
+    if tcx
+        .generics_of(function)
+        .own_params
+        .iter()
+        .any(|parameter| {
+            matches!(
+                parameter.kind,
+                ty::GenericParamDefKind::Type { .. } | ty::GenericParamDefKind::Const { .. }
+            )
+        })
+    {
+        return true;
+    }
+    let signature = tcx.fn_sig(function).instantiate_identity().skip_binder();
+    let typeck = tcx.typeck(function);
+    // MIR can reveal opaque aliases to their hidden types; skeletons use HIR types.
+    let contains_opaque = |source: ty::Ty<'_>| {
+        source.walk().any(|argument| {
+            argument
+                .as_type()
+                .is_some_and(|ty| matches!(ty.kind(), TyKind::Alias(ty::AliasTyKind::Opaque, _)))
+        })
+    };
+    signature.inputs_and_output.iter().any(contains_opaque)
+        || typeck
+            .node_types()
+            .items()
+            .any(|(_, ty)| contains_opaque(*ty))
+}
+
 pub(super) fn initial_pointer_decisions_for_api(
     tcx: TyCtxt<'_>,
     api: &FxHashSet<String>,

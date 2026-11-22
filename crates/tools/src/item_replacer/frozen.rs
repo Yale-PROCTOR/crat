@@ -156,7 +156,8 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
             || record.name != original_fn.ident.to_string()
             || pprust::item_to_string(&original) != pprust::item_to_string(&originals[&record.path])
             || !matches!(original_fn.sig.header.safety, Safety::Unsafe(_))
-            || record.unstructured != crate::skeleton::has_unstructured_generics(original_fn)
+            // Opaque local types are compiler facts unavailable to this parser.
+            || (crate::skeleton::has_unstructured_signature(original_fn) && !record.unstructured)
         {
             return Err(global_error(
                 ReplacementErrorKind::InvalidRequest,
@@ -199,8 +200,11 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
                     || crate::preservation::function_signature(skeleton_fn) != expected_signature
                     || !unstructured::whole_function_stub(skeleton_fn.body.as_ref().unwrap())
                 {
-                    return Err(global_error(ReplacementErrorKind::InvalidRequest,
-                        "generic functions require an unchanged signature and empty unstructured views".to_owned()));
+                    return Err(global_error(
+                        ReplacementErrorKind::InvalidRequest,
+                        "unstructured functions require an unchanged signature and empty views"
+                            .to_owned(),
+                    ));
                 }
             }
             validate_supported_transformation(&skeleton, &requested, record.unstructured)?;
@@ -821,7 +825,7 @@ pub fn finalize_frozen_project(
         let mut partial = parse_crate(assembled, ReplacementErrorKind::RewriteFailure)?;
         let target = parse_crate(&frozen.target_source, ReplacementErrorKind::RewriteFailure)?;
         require_same_context(&target, &partial)?;
-        finalize_source_functions(&analysis, &mut partial, target_kind, api)?;
+        finalize_source_functions(frozen, &analysis, &mut partial, target_kind, api)?;
         Ok(FinalizedProject {
             source: pprust::crate_to_string_for_macros(&partial),
         })
@@ -829,6 +833,7 @@ pub fn finalize_frozen_project(
 }
 
 fn finalize_source_functions(
+    frozen: &FrozenProject,
     analysis: &Crate,
     partial: &mut Crate,
     target_kind: &str,
@@ -870,7 +875,12 @@ fn finalize_source_functions(
             return Err(global_error(ReplacementErrorKind::RewriteFailure, "two-argument `main_0` requires exactly one sibling `main`".to_owned()));
         }
         if function.ident.name == sym::main {
-            let supported = functions.iter().any(|(path, item)| path == module && matches!(&item.kind, ItemKind::Fn(function) if is_supported_two_argument_main_0(function)));
+            let main_0_path = absolute_item_path(module, "main_0");
+            let supported = functions.iter().any(|(path, item)| path == module && matches!(&item.kind, ItemKind::Fn(function) if is_supported_two_argument_main_0(function)))
+                && frozen.functions.iter().any(|function| {
+                    function.record.path == main_0_path.trim_start_matches("crate::")
+                        && !function.record.unstructured
+                });
             insert_item_at_path(
                 &mut partial.items,
                 module,

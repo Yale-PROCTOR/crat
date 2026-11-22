@@ -713,8 +713,10 @@ where
                     rustc_hir::Node::Item(_) => {
                         <Analysis as Boundary>::call(infer_cx, destination, &args, callee, substs)
                     }
-                    // extern
-                    rustc_hir::Node::ForeignItem(_) => infer_cx.unknown_call(destination, &args),
+                    // Externs and trait dispatch have no local function summary.
+                    rustc_hir::Node::ForeignItem(_) | rustc_hir::Node::TraitItem(_) => {
+                        infer_cx.unknown_call(destination, &args)
+                    }
                     // in libxml2.rust/src/xmlschemastypes.rs/{} impl_xmlSchemaValDate/set_mon
                     rustc_hir::Node::ImplItem(_) => { /* TODO */ }
                     _ => unreachable!(),

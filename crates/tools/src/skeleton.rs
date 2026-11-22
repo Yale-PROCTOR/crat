@@ -41,7 +41,7 @@ use crate::{
     },
     pointer_decisions::{
         InitialPointerDecisions, PointerLayer, PointerTarget, PtrKind,
-        initial_pointer_decisions_for_api,
+        initial_pointer_decisions_for_api, requires_unstructured_body,
     },
     preservation::{make_disposition_forest, validate_skeleton_views},
     printf::{eligible_printf_statement, supported_printf_call},
@@ -272,7 +272,7 @@ fn make_skeletons_with_preservation_overrides(
         })?;
     for item in &raw_items {
         let ItemKind::Fn(function) = &item.item.kind else { continue };
-        if !function.sig.decl.c_variadic() && !has_unstructured_generics(function) {
+        if !function.sig.decl.c_variadic() && !requires_unstructured_body(item.def_id, tcx) {
             continue;
         }
         if let Some(signature) = decisions.signatures.data.get_mut(&item.def_id) {
@@ -347,7 +347,7 @@ fn make_skeletons_with_preservation_overrides(
     Ok(records)
 }
 
-pub(crate) fn has_unstructured_generics(function: &rustc_ast::Fn) -> bool {
+pub(crate) fn has_unstructured_signature(function: &rustc_ast::Fn) -> bool {
     if function.generics.params.iter().any(|parameter| {
         matches!(
             parameter.kind,
@@ -369,6 +369,9 @@ pub(crate) fn has_unstructured_generics(function: &rustc_ast::Fn) -> bool {
     let mut finder = ImplTraitFinder(false);
     for parameter in &function.sig.decl.inputs {
         finder.visit_ty(&parameter.ty);
+    }
+    if let FnRetTy::Ty(output) = &function.sig.decl.output {
+        finder.visit_ty(output);
     }
     finder.0
 }
@@ -663,7 +666,7 @@ fn make_function_record<'tcx>(
     let mut source = surface.item.clone();
     sanitize_item(&mut source);
     if let ItemKind::Fn(function) = &mut source.kind
-        && has_unstructured_generics(function)
+        && requires_unstructured_body(surface.def_id, tcx)
     {
         function.sig.header.safety = Safety::Unsafe(DUMMY_SP);
         let name = function.ident.to_string();
@@ -1654,6 +1657,9 @@ fn apply_target_signature<'a, 'tcx>(
     tcx: TyCtxt<'tcx>,
 ) -> Result<(), GenerationError> {
     let ItemKind::Fn(box function) = &mut item.kind else { unreachable!() };
+    if function.sig.decl.c_variadic() {
+        return Ok(());
+    }
     let source_inputs = function
         .sig
         .decl
