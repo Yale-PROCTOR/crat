@@ -175,6 +175,132 @@ fn inferred_struct_locals_gain_required_type_lifetimes_without_promoting_raw_loc
 }
 
 #[test]
+fn labeled_cast_initializers_round_trip_through_bundle_validation_and_installation() {
+    let source = r#"
+pub struct Holder { pub pointer: *const i32 }
+static VALUE: i32 = 7;
+static mut GLOBAL: Holder = Holder { pointer: &VALUE };
+static mut RAW: *mut Holder = unsafe { &GLOBAL as *const Holder as *mut Holder };
+pub unsafe fn read(holder: *const Holder) -> i32 { *(*holder).pointer }
+"#;
+    let frozen = freeze(source);
+    assert_eq!(
+        frozen
+            .initializers
+            .iter()
+            .map(|initializer| initializer.record.path.as_str())
+            .collect::<Vec<_>>(),
+        ["GLOBAL", "RAW"]
+    );
+    let frozen = frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
+    let transformations = [
+        "static mut GLOBAL: Holder = Holder { pointer: Some(&VALUE) };",
+        "static mut RAW: *mut Holder = unsafe { #[proctor(0)] &GLOBAL as *const Holder as *mut Holder };",
+    ];
+    let mut histories = vec![];
+    for (initializer, transformation) in frozen.initializers.iter().zip(transformations) {
+        let result = transform_frozen_initializer(
+            &frozen,
+            &InitializerTransformationRequest {
+                item_id: initializer.record.id,
+                transformation: transformation.into(),
+            },
+        )
+        .unwrap();
+        let InitializerTransformationResponse::Valid { source } = result else {
+            panic!("{result:?}")
+        };
+        histories.push(InitializerHistory {
+            item_id: initializer.record.id,
+            transformations: vec![source],
+        });
+    }
+    let installed = install_frozen_initializers(
+        &frozen,
+        &InitializerInstallationRequest { items: histories },
+    )
+    .unwrap();
+    let installed = frozen_project_from_json(&serde_json::to_string(&installed).unwrap()).unwrap();
+    assert!(!installed.target_source.contains("#[proctor("));
+    assert!(installed.initializers[1].target_item.contains("unsafe {"));
+    run_compiler_on_str(&installed.target_source, utils::type_check).unwrap();
+}
+
+#[test]
+fn labeled_scalar_casts_and_binary_expressions_round_trip() {
+    for (ty, expression, replacement) in [
+        (
+            "usize",
+            "Holder { pointer: core::ptr::null() }.pointer.is_null() as usize",
+            "Holder { pointer: None }.pointer.is_none() as usize",
+        ),
+        (
+            "bool",
+            "Holder { pointer: core::ptr::null() }.pointer.is_null() || false",
+            "Holder { pointer: None }.pointer.is_none() || false",
+        ),
+    ] {
+        let source = format!(
+            "pub struct Holder {{ pub pointer: *const i32 }} const TEST: {ty} = {{ {expression} }}; pub unsafe fn read(holder: *const Holder) -> i32 {{ *(*holder).pointer }}"
+        );
+        let frozen = freeze(&source);
+        assert_eq!(frozen.initializers.len(), 1);
+        let frozen = frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
+        let result = transform(
+            &frozen,
+            &format!("const TEST: {ty} = {{ #[proctor(0)] {replacement} }};"),
+        );
+        let InitializerTransformationResponse::Valid { source } = result else {
+            panic!("{result:?}")
+        };
+        let installed = install(&frozen, &[&source]);
+        run_compiler_on_str(&installed.target_source, utils::type_check).unwrap();
+    }
+}
+
+#[test]
+fn initializer_source_comparison_rejects_real_changes_and_macro_token_changes() {
+    let frozen = fixture(
+        "{ stringify!((1 + 2)); let number: i32 = (1 + 2) * 3; Holder { pointer: &VALUE as *const i32 } }",
+    );
+    frozen_project_from_json(&serde_json::to_string(&frozen).unwrap()).unwrap();
+    for (before, after) in [
+        ("(1 + 2) * 3", "1 + 2 * 3"),
+        ("* 3", "* 4"),
+        ("(1 + 2) * 3", "(1 - 2) * 3"),
+        ("&VALUE", "&OTHER"),
+        ("as *const i32", "as *const i64"),
+        ("let number", "#[allow(unused)] let number"),
+        ("(1 + 2) * 3", "#[allow(unused)] ((1 + 2) * 3)"),
+        ("stringify!((1 + 2))", "stringify!(1 + 2)"),
+    ] {
+        let mut changed = frozen.clone();
+        let source = &mut changed.initializers[0]
+            .record
+            .initializer
+            .as_mut()
+            .unwrap()
+            .annotated_source;
+        let replacement = source.replace(before, after);
+        assert_ne!(*source, replacement, "{before} -> {after}");
+        *source = replacement;
+        let error =
+            frozen_project_from_json(&serde_json::to_string(&changed).unwrap()).unwrap_err();
+        assert_eq!(
+            error.kind,
+            ReplacementErrorKind::InvalidRequest,
+            "{before} -> {after}: {error:?}"
+        );
+        assert!(
+            error
+                .message
+                .contains("frozen initializer source differs from analysis"),
+            "{before} -> {after}: {error:?}"
+        );
+    }
+}
+
+#[test]
 fn root_unsafe_initializer_keeps_its_boundary_through_generation_and_installation() {
     let frozen = fixture("unsafe { Holder { pointer: &*(&VALUE as *const i32) } }");
     let record = frozen.initializers[0].record.initializer.as_ref().unwrap();

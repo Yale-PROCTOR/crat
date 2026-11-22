@@ -104,6 +104,23 @@ fn header(item: &Item) -> String {
     pprust::item_to_string(&item)
 }
 
+fn canonical_initializer_source(item: &Item) -> String {
+    struct ExpressionParenRemover;
+    impl MutVisitor for ExpressionParenRemover {
+        fn visit_expr(&mut self, expression: &mut Expr) {
+            while expression.attrs.is_empty() {
+                let ExprKind::Paren(inner) = &expression.kind else { break };
+                *expression = (**inner).clone();
+            }
+            mut_visit::walk_expr(self, expression);
+        }
+    }
+
+    let mut item = item.clone();
+    ExpressionParenRemover.visit_item(&mut item);
+    pprust::item_to_string(&item)
+}
+
 pub(super) fn freeze_initializers(
     records: &[crate::ItemRecord],
     analysis: &Crate,
@@ -201,7 +218,7 @@ pub(super) fn validate_frozen_initializers(
         }
         let mut stripped = annotated.clone();
         ProctorLabelRemover.visit_item(&mut stripped);
-        if pprust::item_to_string(&stripped) != pprust::item_to_string(&original) {
+        if canonical_initializer_source(&stripped) != canonical_initializer_source(&original) {
             return Err(global_error(
                 ReplacementErrorKind::InvalidRequest,
                 "frozen initializer source differs from analysis".into(),
