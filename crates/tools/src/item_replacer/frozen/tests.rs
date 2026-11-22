@@ -149,6 +149,38 @@ pub unsafe fn caller(p: *const i32) -> i32 {
 }
 
 #[test]
+fn nested_generic_print_arguments_survive_validation_replacement_and_observation() {
+    let source = r#"
+extern "C" { fn printf(format: *const i8, ...) -> i32; }
+pub unsafe fn read(pointer: *const i32) {
+    printf(b"%d\0" as *const u8 as *const i8, *pointer);
+}
+"#;
+    let frozen = freeze(source);
+    let function = &frozen.functions[0];
+    let transformation = format!(
+        "{} {{ #[proctor(0)] ::std::print!(\"{{}}\", ::proctor_libc::printf::signed(*pointer as <i32 as std::ops::Add<i32>>::Output)); }}",
+        function.record.target_signature
+    );
+    assert_eq!(
+        crate::validate(&crate::ValidationRequest {
+            expected_functions: vec![crate::ExpectedFunction {
+                id: function.record.id,
+                name: function.record.name.clone(),
+                view: function.record.baseline.clone(),
+            }],
+            transformation: transformation.clone(),
+        }),
+        crate::ValidationResponse::Valid
+    );
+    let (output, metadata) = metadata(&frozen, &request(function, Some(&transformation)));
+    run_compiler_on_str(&output.replacement.source, utils::type_check).unwrap();
+    let observations =
+        crate::extract_observations_from_source(&output.observation_source, &metadata).unwrap();
+    assert_eq!(observations.printf_observations.len(), 1);
+}
+
+#[test]
 fn a_child_macro_does_not_disable_the_parent_condition_observation() {
     let frozen = freeze(
         r#"

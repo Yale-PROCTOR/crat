@@ -2,13 +2,14 @@ use std::fmt::Write as _;
 
 use rustc_ast::{
     Expr, ExprKind, LitKind, Stmt, StmtKind, Ty,
+    mut_visit::{self, MutVisitor},
     ptr::P,
     token::{Delimiter, TokenKind},
-    tokenstream::TokenStream,
+    tokenstream::{TokenStream, TokenTree},
 };
 use rustc_hir as hir;
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_span::{Span, def_id::DefId};
+use rustc_span::{BytePos, FileName, Span, def_id::DefId};
 
 use crate::observation::{local_c_foreign_function_symbol, resolved_definition};
 
@@ -191,12 +192,38 @@ pub(crate) fn validate_print_template_statement(
 }
 
 fn parse_macro_arguments(tokens: &TokenStream) -> Result<Vec<P<Expr>>, PrintMacroError> {
-    let psess = utils::ast::new_parse_sess();
+    let psess =
+        rustc_session::parse::ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
+    let mut source = String::new();
+    let mut spans = vec![];
+    // The incoming spans can belong to a parser session that has already been
+    // dropped. Give rustc real source for token splitting, then restore identity.
+    let tokens = map_macro_token_spans(tokens, &mut |original, kind| {
+        let lo = BytePos(source.len().try_into().unwrap());
+        source.push_str(&rustc_ast_pretty::pprust::token_kind_to_string(kind));
+        let hi = BytePos(source.len().try_into().unwrap());
+        source.push(' ');
+        let parsed = original.with_lo(lo).with_hi(hi);
+        spans.push((parsed, original));
+        parsed
+    });
+    let file = psess
+        .source_map()
+        .new_source_file(FileName::Custom("print arguments".to_owned()), source);
+    let shift = |span: Span| {
+        span.with_lo(span.lo() + file.start_pos)
+            .with_hi(span.hi() + file.start_pos)
+    };
+    let tokens = map_macro_token_spans(&tokens, &mut |span, _| shift(span));
+    for (parsed, _) in &mut spans {
+        *parsed = shift(*parsed);
+    }
     let mut parser =
-        rustc_parse::parser::Parser::new(&psess, tokens.clone(), Some("print macro arguments"));
+        rustc_parse::parser::Parser::new(&psess, tokens, Some("print macro arguments"));
     let mut expressions = vec![];
     while !matches!(parser.token.kind, TokenKind::Eof) {
-        expressions.push(parser.parse_expr().map_err(|_| {
+        expressions.push(parser.parse_expr().map_err(|diagnostic| {
+            diagnostic.emit();
             print_error(
                 "printf_argument_count",
                 "print value argument is not one complete Rust expression",
@@ -213,7 +240,84 @@ fn parse_macro_arguments(tokens: &TokenStream) -> Result<Vec<P<Expr>>, PrintMacr
         }
         parser.bump();
     }
+    psess.dcx().emit_stashed_diagnostics();
+    if psess.dcx().has_errors_or_delayed_bugs().is_some() {
+        return Err(print_error(
+            "printf_argument_count",
+            "print value argument is not one complete Rust expression",
+        ));
+    }
+    let mut restorer = MacroSpanRestorer { spans };
+    for expression in &mut expressions {
+        restorer.visit_expr(expression);
+    }
     Ok(expressions)
+}
+
+fn map_macro_token_spans(
+    tokens: &TokenStream,
+    map: &mut impl FnMut(Span, &TokenKind) -> Span,
+) -> TokenStream {
+    TokenStream::new(
+        tokens
+            .iter()
+            .cloned()
+            .map(|tree| match tree {
+                TokenTree::Token(mut token, spacing) => {
+                    token.span = map(token.span, &token.kind);
+                    TokenTree::Token(token, spacing)
+                }
+                TokenTree::Delimited(mut span, spacing, delimiter, tokens) => {
+                    span.open = map(span.open, &delimiter.as_open_token_kind());
+                    let tokens = map_macro_token_spans(&tokens, map);
+                    span.close = map(span.close, &delimiter.as_close_token_kind());
+                    TokenTree::Delimited(span, spacing, delimiter, tokens)
+                }
+            })
+            .collect(),
+    )
+}
+
+struct MacroSpanRestorer {
+    spans: Vec<(Span, Span)>,
+}
+
+impl MacroSpanRestorer {
+    fn restore(&self, span: Span) -> Span {
+        if span.is_dummy() {
+            return span;
+        }
+        let start = self
+            .spans
+            .partition_point(|(parsed, _)| parsed.lo() <= span.lo());
+        let end = self
+            .spans
+            .partition_point(|(parsed, _)| parsed.hi() < span.hi());
+        let (parsed_start, original_start) = self.spans[start - 1];
+        let (parsed_end, original_end) = self.spans[end];
+        let position = |position: BytePos, parsed: Span, original: Span| {
+            if position == parsed.hi() {
+                original.hi()
+            } else {
+                original.lo() + (position - parsed.lo()).min(original.hi() - original.lo())
+            }
+        };
+        let lo = position(span.lo(), parsed_start, original_start);
+        let hi = position(span.hi(), parsed_end, original_end);
+        original_start.with_lo(lo).with_hi(hi)
+    }
+}
+
+impl MutVisitor for MacroSpanRestorer {
+    fn visit_span(&mut self, span: &mut Span) {
+        *span = self.restore(*span);
+    }
+
+    fn visit_mac_call(&mut self, mac: &mut rustc_ast::MacCall) {
+        mut_visit::walk_mac(self, mac);
+        mac.args.tokens =
+            map_macro_token_spans(&mac.args.tokens, &mut |span, _| self.restore(span));
+    }
 }
 
 fn implicit_placeholder_count(format: &str) -> Option<usize> {
@@ -1283,6 +1387,145 @@ mod tests {
                 let parsed = parse_print_macro_statement(&statement).unwrap();
                 assert_eq!(parsed.arguments.len(), 3);
                 assert_eq!(parsed.format, "{} {} {}");
+            },
+        );
+    }
+
+    #[test]
+    fn expression_parser_splits_generic_and_reference_tokens() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                for argument in [
+                    "values.iter().collect::<Vec<_>>()",
+                    "value::<Vec<Vec<u8>>>()",
+                    "values as *const Vec<Vec<u8>>",
+                    "&&values",
+                    "|value: &&i32| **value",
+                    "|| -> Vec<Vec<u8>> { Vec::new() }",
+                    "value >> 1",
+                    "value >= 1",
+                ] {
+                    let statement =
+                        utils::ast::parse_stmt(format!("::std::print!(\"{{:?}}\", {argument},);"));
+                    let parsed = parse_print_macro_statement(&statement).unwrap();
+                    assert_eq!(parsed.arguments.len(), 1, "{argument}");
+                    let expected = utils::ast::parse_expr(argument.to_owned());
+                    assert_eq!(
+                        rustc_ast_pretty::pprust::expr_to_string(&parsed.arguments[0]),
+                        rustc_ast_pretty::pprust::expr_to_string(&expected),
+                        "{argument}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn expression_parser_retains_original_spans_after_token_splitting() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                let psess = utils::ast::new_parse_sess();
+                psess.source_map().new_source_file(
+                    FileName::Custom("padding".to_owned()),
+                    "padding\n".repeat(100),
+                );
+                let mut parser = utils::ast::new_parser_from_str(
+                    &psess,
+                    r#"::std::print!("é {:?} {}", values.iter().collect::<Vec<_>>(), nested!("λ", values));"#.to_owned(),
+                );
+                let statement = parser
+                    .parse_full_stmt(rustc_parse::parser::AttemptLocalParseRecovery::No)
+                    .unwrap()
+                    .unwrap();
+                let parsed = parse_print_macro_statement(&statement).unwrap();
+                let snippet = |span| psess.source_map().span_to_snippet(span).unwrap();
+                assert_eq!(snippet(parsed.format_span), r#""é {:?} {}""#);
+                assert_eq!(
+                    snippet(parsed.arguments[0].span),
+                    "values.iter().collect::<Vec<_>>()"
+                );
+                let ExprKind::MethodCall(call) = &parsed.arguments[0].kind else { panic!() };
+                let rustc_ast::GenericArgs::AngleBracketed(arguments) =
+                    call.seg.args.as_deref().unwrap()
+                else {
+                    panic!()
+                };
+                let rustc_ast::AngleBracketedArg::Arg(rustc_ast::GenericArg::Type(ty)) =
+                    &arguments.args[0]
+                else {
+                    panic!()
+                };
+                assert_eq!(snippet(ty.span), "Vec<_>");
+                let ExprKind::MacCall(mac) = &parsed.arguments[1].kind else { panic!() };
+                assert_eq!(snippet(mac.args.tokens.get(0).unwrap().span()), r#""λ""#);
+                assert_eq!(snippet(mac.args.dspan.entire()), r#"("λ", values)"#);
+            },
+        );
+    }
+
+    #[test]
+    fn expression_parser_handles_generated_token_spans() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                let statement = utils::ast::parse_stmt(
+                    r#"::std::print!("{}", values.iter().collect::<Vec<_>>());"#.to_owned(),
+                );
+                let StmtKind::MacCall(mut mac) = statement.kind.clone() else { panic!() };
+                let mut closing = None;
+                mac.mac.args.tokens =
+                    map_macro_token_spans(&mac.mac.args.tokens, &mut |span, kind| {
+                        if *kind == TokenKind::Shr {
+                            closing = Some(span);
+                            span.with_hi(span.hi() + BytePos(4))
+                        } else {
+                            span
+                        }
+                    });
+                let mut widened = statement.clone();
+                widened.kind = StmtKind::MacCall(mac);
+                let parsed = parse_print_macro_statement(&widened).unwrap();
+                let ExprKind::MethodCall(call) = &parsed.arguments[0].kind else { panic!() };
+                let rustc_ast::GenericArgs::AngleBracketed(arguments) =
+                    call.seg.args.as_deref().unwrap()
+                else {
+                    panic!()
+                };
+                let rustc_ast::AngleBracketedArg::Arg(rustc_ast::GenericArg::Type(ty)) =
+                    &arguments.args[0]
+                else {
+                    panic!()
+                };
+                assert_eq!(ty.span.hi(), closing.unwrap().lo() + BytePos(1));
+
+                let StmtKind::MacCall(mut mac) = statement.kind else { panic!() };
+                mac.mac.args.tokens =
+                    map_macro_token_spans(&mac.mac.args.tokens, &mut |_, _| rustc_span::DUMMY_SP);
+                let parsed = parse_macro_arguments(&mac.mac.args.tokens).unwrap();
+                assert_eq!(parsed.len(), 2);
+                assert!(parsed.iter().all(|expression| expression.span.is_dummy()));
+            },
+        );
+    }
+
+    #[test]
+    fn malformed_print_arguments_return_errors() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                for argument in [
+                    "values.iter().collect::<Vec<_>()",
+                    "value::<Vec<i32>>() +",
+                    "value::<Vec<i32>>() unexpected",
+                    "value as u8 as i32 < 0xa0",
+                ] {
+                    let statement =
+                        utils::ast::parse_stmt(format!("::std::print!(\"{{}}\", {argument});"));
+                    let error = parse_print_macro_statement(&statement).unwrap_err();
+                    assert_eq!(error.code, "printf_argument_count", "{argument}");
+                }
             },
         );
     }

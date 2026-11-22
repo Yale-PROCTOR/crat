@@ -931,6 +931,31 @@ fn printf_argument_semantics_remain_outside_structural_validation() {
 }
 
 #[test]
+fn print_arguments_with_nested_generics_validate_without_parser_panics() {
+    let skeleton = r#"unsafe fn f(bytes: &[i8]) {
+        #[proctor(0)] ::std::print!("Operation performed: {}\n", todo!());
+    }"#;
+    let argument = "std::ffi::CStr::from_bytes_until_nul(&bytes.iter().map(|&c| c as u8).collect::<Vec<_>>()).unwrap().to_str().unwrap()";
+    let transformation = skeleton.replace("todo!()", argument);
+    assert_valid(skeleton, &transformation);
+    assert_code(
+        skeleton,
+        &transformation.replace("Operation performed:", "Other operation:"),
+        "printf_format_literal",
+    );
+    let malformed = skeleton.replace("todo!()", "bytes.iter().collect::<Vec<_>()");
+    let response = validate(&request(skeleton, &malformed));
+    assert!(
+        matches!(response, ValidationResponse::Invalid { .. }),
+        "{response:?}"
+    );
+    assert!(
+        codes(&response).contains(&"printf_argument_count"),
+        "{response:?}"
+    );
+}
+
+#[test]
 fn preservation_forest_must_follow_depth_first_lexical_order() {
     let skeleton = r#"unsafe fn f() {
 #[proctor(7)] if true {
