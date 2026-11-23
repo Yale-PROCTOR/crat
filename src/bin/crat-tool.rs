@@ -53,6 +53,8 @@ enum Command {
     },
     NormalizeSafety {
         #[arg(long)]
+        frozen: Option<PathBuf>,
+        #[arg(long)]
         output: PathBuf,
         input: PathBuf,
     },
@@ -680,9 +682,23 @@ fn main() {
             publish_files(&[(&output, json.as_bytes())])
                 .unwrap_or_else(|error| fail("output_io", error));
         }
-        Command::NormalizeSafety { output, input } => {
+        Command::NormalizeSafety {
+            frozen,
+            output,
+            input,
+        } => {
+            if let Some(frozen) = &frozen {
+                validate_output_input_paths(&[&output], &[frozen])
+                    .unwrap_or_else(|error| fail("output_path_collision", error));
+            }
             let source = std::fs::read_to_string(input).unwrap();
-            let normalized = tools::normalize_target_safety(&source).unwrap_or_else(|error| {
+            let normalized = match frozen {
+                Some(frozen) => {
+                    tools::normalize_frozen_target_safety(&source, &read_frozen_project(&frozen))
+                }
+                None => tools::normalize_target_safety(&source),
+            }
+            .unwrap_or_else(|error| {
                 eprintln!("{:?}: {}", error.kind, error.message);
                 std::process::exit(1);
             });

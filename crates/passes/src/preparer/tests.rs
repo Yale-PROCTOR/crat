@@ -47,6 +47,40 @@ fn compact(code: &str) -> String {
 }
 
 #[test]
+fn removes_empty_statements_from_nested_blocks() {
+    assert_prepares_to(
+        "pub fn f(flag: bool) -> u32 { ; if flag { ; return 1; ; }; ; 2 }",
+        "pub fn f(flag: bool) -> u32 { if flag { return 1; }; 2 }",
+    );
+    assert_prepares_to(
+        "pub fn f() { let result: () = { { 1_u32 }; ; }; }",
+        "pub fn f() { let result: () = { { 1_u32 }; }; }",
+    );
+}
+
+#[test]
+fn empty_macro_tail_does_not_change_a_block_statements_expected_type() {
+    for value in ["{ Default::default() }", "Default::default()"] {
+        let input = format!(
+            "pub fn f() {{
+                macro_rules! value {{ () => {{ {value} }} }}
+                macro_rules! extra {{ () => {{ ; }} }}
+                value! {{}}
+                extra! {{}}
+            }}"
+        );
+        let expanded = utils::compilation::run_compiler_on_str(&input, |tcx| {
+            crate::expander::expand(crate::expander::Config::default(), tcx)
+        })
+        .unwrap();
+        for source in [&input, &expanded] {
+            let prepared = transform_and_compile(source);
+            assert!(!prepared.lines().any(|line| line.trim() == ";"));
+        }
+    }
+}
+
+#[test]
 fn preparation_result_publishes_in_dependency_order() {
     let events = std::cell::RefCell::new(vec![]);
     let source = std::path::Path::new("/work/project/lib.rs");

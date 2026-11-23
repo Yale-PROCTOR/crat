@@ -62,6 +62,7 @@ pub struct InitialPointerDecisions {
 }
 
 pub struct Analysis {
+    pub(crate) opaque_pointer_accesses: decision::OpaquePointerAccesses,
     #[allow(dead_code)]
     pub(crate) borrow_promotion_result: BorrowPromotionResults,
     #[allow(dead_code)]
@@ -206,8 +207,16 @@ fn analyze<'tcx>(
     let ownership_schemes = maybe_solidified_ownership(config, &input, &output_params);
     let source_var_groups = analyses::mir_variable_grouping::SourceVarGroups::new(&input);
     let mutables = source_var_groups.postprocess_mut_res(&input, &mutability_result);
-    let borrow_promotion_result =
+    let mut borrow_promotion_result =
         analyses::borrow::mutable_references_no_guarantee(&input, &mutables);
+    let opaque_pointer_accesses =
+        decision::opaque_pointer_accesses(&input, &mutability_result.struct_fields);
+    borrow_promotion_result
+        .mutable_fields
+        .retain(|field| !opaque_pointer_accesses.fields.contains(field));
+    borrow_promotion_result
+        .shared_fields
+        .retain(|field| !opaque_pointer_accesses.fields.contains(field));
     let borrow_lifetime_flows = borrow_promotion_result.lifetime_flows.clone();
     let struct_copy_result =
         analyses::struct_copy::analyze(&input, &borrow_promotion_result.mutable_fields);
@@ -227,6 +236,7 @@ fn analyze<'tcx>(
     nullity_result.non_null_locals =
         source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
     let analysis_results = Analysis {
+        opaque_pointer_accesses,
         borrow_promotion_result,
         borrow_lifetime_flows,
         promoted_mut_ref_result,

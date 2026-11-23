@@ -143,9 +143,16 @@ pub fn replacement_request_from_json(input: &str) -> Result<ReplacementRequest, 
 }
 
 pub fn normalize_target_safety(source: &str) -> Result<String, ReplacementError> {
+    normalize_target_safety_except(source, &HashSet::new())
+}
+
+fn normalize_target_safety_except(
+    source: &str,
+    preserve: &HashSet<String>,
+) -> Result<String, ReplacementError> {
     with_parse_session(|| {
         let mut krate = parse_crate(source, ReplacementErrorKind::RewriteFailure)?;
-        SafetyNormalizer.visit_crate(&mut krate);
+        SafetyNormalizer::new(preserve).visit_crate(&mut krate);
         Ok(pprust::crate_to_string_for_macros(&krate))
     })
 }
@@ -371,7 +378,7 @@ pub fn add_functions_with_observations(
                 "pending function is absent from partial target".to_owned(),
             ));
         }
-        validate_current_target(current, requested)?;
+        validate_current_target(current, requested, false)?;
         let transformation = transformations
             .get(&requested.name)
             .expect("validated transformation set");
@@ -764,9 +771,21 @@ fn prepare_transformations(
     Ok((transformations, statement_pairs))
 }
 
-struct SafetyNormalizer;
+struct SafetyNormalizer<'a> {
+    preserve: &'a HashSet<String>,
+    module_path: Vec<String>,
+}
 
-impl MutVisitor for SafetyNormalizer {
+impl<'a> SafetyNormalizer<'a> {
+    fn new(preserve: &'a HashSet<String>) -> Self {
+        Self {
+            preserve,
+            module_path: Vec::new(),
+        }
+    }
+}
+
+impl MutVisitor for SafetyNormalizer<'_> {
     fn flat_map_stmt(&mut self, statement: Stmt) -> SmallVec<[Stmt; 1]> {
         if matches!(statement.kind, StmtKind::Item(_)) {
             SmallVec::from_buf([statement])
@@ -776,9 +795,20 @@ impl MutVisitor for SafetyNormalizer {
     }
 
     fn visit_item(&mut self, item: &mut Item) {
+        if let ItemKind::Mod(_, ident, _) = &item.kind {
+            self.module_path.push(ident.to_string());
+            mut_visit::walk_item(self, item);
+            self.module_path.pop();
+            return;
+        }
         if let ItemKind::Fn(box function) = &mut item.kind
             && function.body.is_some()
             && function.ident.name.as_str() != "main"
+            && (self.preserve.is_empty()
+                || !self.preserve.contains(
+                    absolute_item_path(&self.module_path, &function.ident.to_string())
+                        .trim_start_matches("crate::"),
+                ))
         {
             function.sig.header.safety = Safety::Unsafe(function.sig.span);
         }
@@ -1267,6 +1297,7 @@ fn collect_occupied_use_names(
 fn validate_current_target(
     current: &CurrentFunction,
     requested: &ReplacementItem,
+    preserve_safety: bool,
 ) -> Result<(), ReplacementError> {
     let ItemKind::Fn(box function) = &current.item.kind else { unreachable!() };
     if function.ident.to_string() != requested.name {
@@ -1279,7 +1310,7 @@ fn validate_current_target(
             ),
         ));
     }
-    if !matches!(function.sig.header.safety, Safety::Unsafe(_)) {
+    if !preserve_safety && !matches!(function.sig.header.safety, Safety::Unsafe(_)) {
         return Err(item_error(
             ReplacementErrorKind::TargetResolution,
             requested,

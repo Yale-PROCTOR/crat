@@ -54,6 +54,11 @@ impl FnPtrGroups {
         let mut uf = UnionFind::<FnPtrIdx>::new(participants.len());
 
         for (_, pointees) in solutions.iter_enumerated() {
+            // An unconstrained value can point to every address. It gives no
+            // evidence for rewriting any address-taken function's signature.
+            if pointees.count() == solutions.len() {
+                return FnPtrGroups::default();
+            }
             let fn_idxs: Vec<FnPtrIdx> = pointees
                 .iter()
                 .filter_map(|loc| pre.inv_fns.get(&loc))
@@ -85,9 +90,14 @@ impl FnPtrGroups {
 
         let mut group_decisions: FxHashMap<LocalDefId, Vec<Option<PtrKind>>> = FxHashMap::default();
 
+        let tcx = rust_program.tcx;
+        let signature = |did| tcx.anonymize_bound_vars(tcx.fn_sig(did).instantiate_identity());
         for (rep, members) in &group_members {
-            let tcx = rust_program.tcx;
-            let input_len = tcx.fn_sig(*rep).skip_binder().inputs().skip_binder().len();
+            let representative = signature(*rep);
+            if members.iter().any(|&did| signature(did) != representative) {
+                continue;
+            }
+            let input_len = representative.skip_binder().inputs().len();
 
             let mut all_input_decs: Vec<Vec<Option<PtrKind>>> = Vec::new();
 
@@ -130,6 +140,7 @@ impl FnPtrGroups {
             group_decisions.insert(*rep, joint_inputs);
         }
 
+        fn_to_group.retain(|_, rep| group_decisions.contains_key(rep));
         FnPtrGroups {
             fn_to_group,
             group_decisions,
@@ -232,6 +243,7 @@ mod tests {
             nullity_result.non_null_locals =
                 source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
             let analysis = crate::rewriter::Analysis {
+                opaque_pointer_accesses: Default::default(),
                 borrow_promotion_result,
                 borrow_lifetime_flows,
                 promoted_mut_ref_result,
@@ -276,6 +288,37 @@ pub unsafe fn test(p: *const i32) -> i32 {
         let rep_f = groups.fn_to_group[&did_f];
         let rep_g = groups.fn_to_group[&did_g];
         assert_eq!(rep_f, rep_g, "f and g should share a group representative");
+    }
+
+    #[test]
+    fn erased_callbacks_with_different_types_keep_their_signatures() {
+        let code = r#"
+pub unsafe fn read(p: *const i32) -> i32 { *p }
+pub unsafe fn write(p: *mut i32) -> i32 { *p = 1; *p }
+pub fn erased(flag: bool) -> *const () {
+    let mut callback = read as unsafe fn(*const i32) -> i32 as *const ();
+    if flag { callback = write as unsafe fn(*mut i32) -> i32 as *const (); }
+    callback
+}
+"#;
+        let (groups, _) = build_groups_for(code);
+        assert!(groups.fn_to_group.is_empty());
+        ::utils::compilation::run_compiler_on_str(code, |tcx| {
+            let decisions = crate::initial_pointer_decisions(
+                &Config::default(),
+                crate::PointerDecisionOptions {
+                    assume_nonnegative_offsets: true,
+                },
+                tcx,
+            );
+            let named = named_fns(tcx);
+            for name in ["read", "write"] {
+                let signature = &decisions.signatures.data[&find_did(&named, name)];
+                assert!(signature.signature_locked);
+                assert_eq!(signature.input_decs, [None]);
+            }
+        })
+        .unwrap();
     }
 
     #[test]

@@ -6,7 +6,10 @@ use rustc_hir::{
 };
 use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
-    mir::{Local, LocalDecl, Operand, Rvalue, StatementKind, TerminatorKind},
+    mir::{
+        Body, Local, LocalDecl, Location, Operand, Place, PlaceElem, Rvalue, StatementKind,
+        TerminatorKind, visit,
+    },
     ty::{self, TyCtxt},
 };
 use rustc_span::{Symbol, def_id::LocalDefId};
@@ -16,7 +19,12 @@ use super::{
     collector::collect_fn_ptrs,
     diagnostics::{DecisionDiagnostics, DecisionReason, DecisionStage, DecisionSubject},
 };
-use crate::{analyses::ownership::Ownership, utils::rustc::RustProgram};
+use crate::{
+    analyses::{
+        borrow::StructFieldSlot, ownership::Ownership, type_qualifier::foster::StructFields,
+    },
+    utils::rustc::RustProgram,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PtrKind {
@@ -88,6 +96,7 @@ impl PtrKind {
 
 pub struct DecisionMaker<'tcx> {
     tcx: TyCtxt<'tcx>,
+    pub(crate) opaque_pointer_fields: bool,
     mutable_pointers: IndexVec<Local, bool>,
     array_pointers: IndexVec<Local, bool>,
     _owning_pointers: IndexVec<Local, bool>,
@@ -97,6 +106,99 @@ pub struct DecisionMaker<'tcx> {
     /// Locals that need a SliceCursor because they are offset with potentially-negative values.
     needs_cursor: DenseBitSet<Local>,
     non_null_locals: DenseBitSet<Local>,
+}
+
+struct OpaquePointerFields<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    body: &'a Body<'tcx>,
+    fields: &'a StructFields,
+    found: bool,
+}
+
+impl<'tcx> visit::Visitor<'tcx> for OpaquePointerFields<'_, 'tcx> {
+    fn visit_place(&mut self, place: &Place<'tcx>, _: visit::PlaceContext, _: Location) {
+        if !self.found {
+            let mut opaque = false;
+            self.found = place.iter_projections().any(|(base, elem)| {
+                let PlaceElem::Field(_, field_ty) = elem else { return false };
+                let base_ty = base.ty(self.body, self.tcx).ty;
+                opaque |= matches!(base_ty.kind(), ty::TyKind::Adt(adt, _) if !adt.did().is_local())
+                    && !self.fields.is_pointer_carrier(base_ty);
+                opaque && visit_local_types([field_ty], self.tcx, |ty| ty.is_raw_ptr())
+            });
+        }
+    }
+}
+
+fn visit_local_types<'tcx>(
+    types: impl IntoIterator<Item = ty::Ty<'tcx>>,
+    tcx: TyCtxt<'tcx>,
+    mut stop: impl FnMut(ty::Ty<'tcx>) -> bool,
+) -> bool {
+    let mut pending: Vec<_> = types.into_iter().collect();
+    let mut visited = FxHashSet::default();
+    while let Some(root) = pending.pop() {
+        for value in root.walk().filter_map(|arg| arg.as_type()) {
+            if stop(value) {
+                return true;
+            }
+            if let ty::TyKind::Adt(adt, args) = value.kind()
+                && adt.did().is_local()
+                && visited.insert(adt.did())
+            {
+                pending.extend(adt.all_fields().map(|field| field.ty(tcx, args)));
+            }
+        }
+    }
+    false
+}
+
+#[derive(Default)]
+pub(crate) struct OpaquePointerAccesses {
+    pub functions: FxHashSet<LocalDefId>,
+    pub fields: FxHashSet<StructFieldSlot>,
+}
+
+pub(super) fn opaque_pointer_accesses(
+    program: &RustProgram<'_>,
+    fields: &StructFields,
+) -> OpaquePointerAccesses {
+    let tcx = program.tcx;
+    let mut accesses = OpaquePointerAccesses::default();
+    for &function in &program.functions {
+        let body = tcx
+            .mir_drops_elaborated_and_const_checked(function)
+            .borrow();
+        let mut visitor = OpaquePointerFields {
+            tcx,
+            body: &body,
+            fields,
+            found: false,
+        };
+        visit::Visitor::visit_body(&mut visitor, &body);
+        if !visitor.found {
+            continue;
+        }
+        accesses.functions.insert(function);
+        // The opaque pointer may alias another raw pointer used by this body.
+        visit_local_types(body.local_decls.iter().map(|decl| decl.ty), tcx, |ty| {
+            if let ty::TyKind::Adt(adt, args) = ty.kind()
+                && adt.is_struct()
+                && let Some(struct_did) = adt.did().as_local()
+            {
+                for (field_index, field) in adt.all_fields().enumerate() {
+                    if field.ty(tcx, args).is_raw_ptr() {
+                        accesses.fields.insert(StructFieldSlot {
+                            struct_did,
+                            field_index,
+                        });
+                    }
+                }
+            }
+            false
+        });
+    }
+    accesses
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,6 +286,7 @@ impl<'tcx> DecisionMaker<'tcx> {
             .unwrap_or_else(|| DenseBitSet::new_empty(mutable_pointers.len()));
         DecisionMaker {
             tcx,
+            opaque_pointer_fields: analysis.opaque_pointer_accesses.functions.contains(&did),
             array_pointers,
             mutable_pointers,
             _owning_pointers,
@@ -214,6 +317,18 @@ impl<'tcx> DecisionMaker<'tcx> {
         let Some((ty, m)) = super::transform::unwrap_ptr_from_mir_ty(decl.ty) else {
             return DecisionInfo { kind: None, events };
         };
+        if self.opaque_pointer_fields && decl.ty.is_raw_ptr() {
+            let kind = Some(PtrKind::Raw(m.is_mut()));
+            return DecisionInfo {
+                kind,
+                events: vec![DecisionInfoEvent {
+                    before: None,
+                    after: kind,
+                    reason: DecisionReason::UnmodeledExternalPointerField,
+                    detail: None,
+                }],
+            };
+        }
         let is_local_struct = matches!(
             ty.kind(),
             ty::TyKind::Adt(adt_def, _) if adt_def.did().is_local() && adt_def.is_struct()
@@ -454,8 +569,10 @@ impl SigDecisions {
                 let input_decs = fn_ptr_groups
                     .fn_to_group
                     .get(did)
-                    .and_then(|rep| fn_ptr_groups.group_decisions.get(rep).cloned())
-                    .unwrap_or_else(|| vec![None; input_len]);
+                    .and_then(|rep| fn_ptr_groups.group_decisions.get(rep))
+                    .filter(|decisions| decisions.len() == input_len);
+                let signature_locked = input_decs.is_none();
+                let input_decs = input_decs.cloned().unwrap_or_else(|| vec![None; input_len]);
                 if let Some(diagnostics) = diagnostics.as_deref_mut() {
                     record_param_decisions(
                         diagnostics,
@@ -477,7 +594,7 @@ impl SigDecisions {
                         input_lifetimes: vec![None; input_len],
                         output_dec: None,
                         output_lifetime: None,
-                        signature_locked: false,
+                        signature_locked,
                     },
                 );
                 continue;
@@ -1113,6 +1230,7 @@ mod tests {
 
         DecisionMaker {
             tcx,
+            opaque_pointer_fields: false,
             mutable_pointers,
             array_pointers,
             _owning_pointers: owning_pointers,

@@ -886,17 +886,24 @@ fn validate_function(
     );
 
     let mut safety_errors = vec![];
+    let target_is_unsafe = matches!(&expected.item.kind,
+        ItemKind::Fn(function) if matches!(function.sig.header.safety, rustc_ast::Safety::Unsafe(_)));
     for occurrence in result_scan
         .unsafe_blocks
         .iter()
         .filter(|_| !allow_unsafe_blocks)
     {
+        let repair = if target_is_unsafe {
+            "remove the block because the transformed function is already unsafe"
+        } else {
+            "replace the block with safe Rust to preserve the target function's safety"
+        };
         safety_errors.push(error(
             "explicit_unsafe_block",
             function_message(
                 expected,
                 format!(
-                    "an explicit unsafe block occurs{}; remove the block because the transformed function is already unsafe",
+                    "an explicit unsafe block occurs{}; {repair}",
                     label_context(occurrence.label)
                 ),
             ),

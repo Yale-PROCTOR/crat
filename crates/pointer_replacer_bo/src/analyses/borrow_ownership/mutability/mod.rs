@@ -408,17 +408,11 @@ fn place_vars<'tcx, Ctxt: PlaceContext>(
                 match base_ty.kind() {
                     TyKind::Adt(adt_def, _) => {
                         assert!(place_vars.is_empty());
-                        // FIXME correctness?
-                        if adt_def.is_union() {
+                        let Some(field_vars) = struct_fields.field(adt_def.did(), field.index())
+                        else {
                             return place_vars;
-                        }
-                        let field_vars = struct_fields
-                            .fields(adt_def.did().expect_local())
-                            .nth(field.index())
-                            .unwrap();
-
+                        };
                         place_vars = field_vars;
-
                         base_ty = ty;
                     }
                     TyKind::Tuple(tys) => {

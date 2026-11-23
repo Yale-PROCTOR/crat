@@ -19,7 +19,7 @@ use rustc_hir::{
 };
 use rustc_middle::{hir::nested_filter, ty::TyCtxt};
 use rustc_span::{
-    Span, Symbol,
+    DUMMY_SP, Span, Symbol,
     def_id::{DefId, LocalDefId},
     kw, sym,
 };
@@ -1159,6 +1159,44 @@ impl MutVisitor for IgnoredSetlocaleRemover {
     }
 }
 
+struct EmptyStatementRemover;
+
+pub(crate) fn remove_empty_statements(krate: &mut ast::Crate) {
+    EmptyStatementRemover.visit_crate(krate);
+}
+
+impl MutVisitor for EmptyStatementRemover {
+    fn visit_block(&mut self, block: &mut ast::Block) {
+        let had_empty_tail = block
+            .stmts
+            .last()
+            .is_some_and(|statement| matches!(statement.kind, ast::StmtKind::Empty));
+        block
+            .stmts
+            .retain(|statement| !matches!(statement.kind, ast::StmtKind::Empty));
+        // Keep a preceding expression in statement position, where Rust's
+        // expected type can differ from a semicolon expression.
+        if had_empty_tail
+            && let Some(last) = block.stmts.last_mut()
+            && let ast::StmtKind::Expr(expression) = &mut last.kind
+        {
+            // Macro expansion can put a bare expression here. Printing it
+            // directly would attach a semicolon when the source is reparsed.
+            if ast::util::classify::expr_requires_semi_to_be_stmt(expression) {
+                let previous = std::mem::replace(expression, P(utils::expr!("{{ () }}")));
+                let ast::ExprKind::Block(inner, _) = &mut expression.kind else { unreachable!() };
+                inner.stmts[0].kind = ast::StmtKind::Expr(previous);
+            }
+            block.stmts.push(ast::Stmt {
+                id: ast::DUMMY_NODE_ID,
+                kind: ast::StmtKind::Expr(P(utils::expr!("()"))),
+                span: DUMMY_SP,
+            });
+        }
+        mut_visit::walk_block(self, block);
+    }
+}
+
 #[derive(Default)]
 struct CtypeRewriteVisitor {
     rewrote: bool,
@@ -1411,6 +1449,7 @@ pub fn prepare(tcx: TyCtxt<'_>) -> Result<PreparationResult, PrepareError> {
     ctype_rewriter.visit_crate(&mut krate);
 
     unsafe_blocks::normalize(&mut krate, &ast_to_hir, tcx)?;
+    remove_empty_statements(&mut krate);
 
     Ok(PreparationResult {
         code: pprust::crate_to_string_for_macros(&krate),

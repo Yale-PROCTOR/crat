@@ -98,7 +98,7 @@ fn frozen_function_items(
     Ok(())
 }
 
-fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementError> {
+fn validate_frozen_project(frozen: &FrozenProject) -> Result<HashSet<String>, ReplacementError> {
     let analysis = parse_crate(
         &frozen.analysis_source,
         ReplacementErrorKind::InvalidRequest,
@@ -136,6 +136,7 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
         ));
     }
     let mut helpers = originals.keys().cloned().collect::<HashSet<_>>();
+    let mut preserve_safety = HashSet::new();
     for function in &frozen.functions {
         let record = &function.record;
         if !record.unstructured {
@@ -155,7 +156,6 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
         if record.kind != crate::ItemKindName::Fn
             || record.name != original_fn.ident.to_string()
             || pprust::item_to_string(&original) != pprust::item_to_string(&originals[&record.path])
-            || !matches!(original_fn.sig.header.safety, Safety::Unsafe(_))
             // Opaque local types are compiler facts unavailable to this parser.
             || (crate::skeleton::has_unstructured_signature(original_fn) && !record.unstructured)
         {
@@ -166,6 +166,10 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
                     record.path
                 ),
             ));
+        }
+        let original_unsafe = matches!(original_fn.sig.header.safety, Safety::Unsafe(_));
+        if !original_unsafe {
+            preserve_safety.insert(record.path.clone());
         }
         for view in [&record.baseline, &record.applied] {
             let skeleton = one_item(&view.skeleton)?;
@@ -180,6 +184,13 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
                 return Err(global_error(
                     ReplacementErrorKind::InvalidRequest,
                     "frozen skeleton function name differs from its record".to_owned(),
+                ));
+            }
+            if original_unsafe != matches!(skeleton_fn.sig.header.safety, Safety::Unsafe(_)) {
+                return Err(item_error(
+                    ReplacementErrorKind::InvalidRequest,
+                    &requested,
+                    "frozen skeleton and original function disagree on safety".to_owned(),
                 ));
             }
             if record.unstructured {
@@ -277,7 +288,32 @@ fn validate_frozen_project(frozen: &FrozenProject) -> Result<(), ReplacementErro
             }
         }
     }
-    Ok(())
+    Ok(preserve_safety)
+}
+
+fn matching_frozen_analysis(
+    analysis: &str,
+    frozen: &FrozenProject,
+    preserve_safety: &HashSet<String>,
+) -> Result<String, ReplacementError> {
+    let normalized = normalize_target_safety_except(analysis, preserve_safety)?;
+    if normalized != frozen.analysis_source {
+        return Err(global_error(
+            ReplacementErrorKind::TargetResolution,
+            "analysis source differs from frozen project".to_owned(),
+        ));
+    }
+    Ok(normalized)
+}
+
+pub fn normalize_frozen_target_safety(
+    source: &str,
+    frozen: &FrozenProject,
+) -> Result<String, ReplacementError> {
+    with_parse_session(|| {
+        let preserve_safety = validate_frozen_project(frozen)?;
+        matching_frozen_analysis(source, frozen, &preserve_safety)
+    })
 }
 
 pub fn check_frozen_project_sources(
@@ -287,13 +323,8 @@ pub fn check_frozen_project_sources(
     require_template: bool,
 ) -> Result<(), ReplacementError> {
     with_parse_session(|| {
-        validate_frozen_project(frozen)?;
-        if normalize_target_safety(analysis)? != frozen.analysis_source {
-            return Err(global_error(
-                ReplacementErrorKind::TargetResolution,
-                "analysis source differs from frozen project".to_owned(),
-            ));
-        }
+        let preserve_safety = validate_frozen_project(frozen)?;
+        matching_frozen_analysis(analysis, frozen, &preserve_safety)?;
         if let Some(current) = current {
             let template =
                 parse_crate(&frozen.target_source, ReplacementErrorKind::RewriteFailure)?;
@@ -319,7 +350,18 @@ pub fn freeze_project(
 ) -> Result<FrozenProject, ReplacementError> {
     let mut analysis = parse_crate(source, ReplacementErrorKind::RewriteFailure)?;
     let ast_to_hir = map_surface_to_hir(&mut analysis, tcx)?;
-    SafetyNormalizer.visit_crate(&mut analysis);
+    let mut preserve_safety = HashSet::new();
+    for record in records {
+        let crate::ItemRecord::Function(record) = record else { continue };
+        let skeleton = one_item(&record.baseline.skeleton)?;
+        if !matches!(
+            frozen_function(&skeleton)?.sig.header.safety,
+            Safety::Unsafe(_)
+        ) {
+            preserve_safety.insert(record.path.clone());
+        }
+    }
+    SafetyNormalizer::new(&preserve_safety).visit_crate(&mut analysis);
     let mut functions = vec![];
     let mut occupied = HashMap::new();
     collect_current_functions(
@@ -361,7 +403,7 @@ pub fn freeze_project(
             name: record.name.clone(),
             view: record.baseline.clone(),
         };
-        validate_current_target(current, &requested)?;
+        validate_current_target(current, &requested, preserve_safety.contains(&record.path))?;
         let skeleton = if record.unstructured {
             one_item(&record.baseline.skeleton)?
         } else {

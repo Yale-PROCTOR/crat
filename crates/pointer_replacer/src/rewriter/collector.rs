@@ -58,6 +58,10 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
             .borrow();
 
         let used_as_fn_ptr = fn_ptrs.contains(did);
+        let signature_locked = sig_decs
+            .data
+            .get(did)
+            .is_some_and(|signature| signature.signature_locked);
         let input_len = rust_program
             .tcx
             .fn_sig(*did)
@@ -92,7 +96,7 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                 });
             let aliases = aliases.and_then(|aliases| aliases.get(&local));
 
-            let group_input_dec = if is_input && used_as_fn_ptr {
+            let group_input_dec = if is_input && used_as_fn_ptr && !signature_locked {
                 fn_ptr_groups
                     .fn_to_group
                     .get(did)
@@ -159,7 +163,10 @@ pub fn collect_diffs_with_diagnostics<'tcx>(
                         info,
                     );
                 }
-                if !is_input && let Some(init) = binding_inits.get(hir_id).copied() {
+                if !is_input
+                    && !decision_maker.opaque_pointer_fields
+                    && let Some(init) = binding_inits.get(hir_id).copied()
+                {
                     if let Some(alias_kind) = cursor_field_offset_alias_kind(
                         rust_program.tcx,
                         analysis,
@@ -673,8 +680,8 @@ pub fn collect_fn_ptrs(rust_program: &RustProgram) -> FxHashSet<LocalDefId> {
         fn_ptrs: FxHashSet::default(),
     };
 
-    for def_id in rust_program.functions.iter() {
-        let body = rust_program.tcx.hir_body_owned_by(*def_id);
+    for def_id in rust_program.tcx.hir_body_owners() {
+        let body = rust_program.tcx.hir_body_owned_by(def_id);
         collector.visit_body(body);
     }
 

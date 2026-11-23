@@ -86,6 +86,7 @@ pub(super) struct PointerLayer {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct InitialPointerDecisions {
     pub signatures: SigDecisions,
+    pub preserve_safety: FxHashSet<LocalDefId>,
     pub bindings: FxHashMap<HirId, PtrKind>,
     nested: FxHashMap<PointerTarget, Vec<PointerLayer>>,
     pub bounds: FxHashMap<LocalDefId, Vec<(Symbol, Symbol)>>,
@@ -171,6 +172,7 @@ pub(super) fn initial_pointer_decisions_for_api(
         signatures: SigDecisions {
             data: FxHashMap::default(),
         },
+        preserve_safety: FxHashSet::default(),
         bindings: FxHashMap::default(),
         nested: FxHashMap::default(),
         bounds: FxHashMap::default(),

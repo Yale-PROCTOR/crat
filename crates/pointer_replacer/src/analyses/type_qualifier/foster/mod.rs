@@ -35,6 +35,12 @@ impl StructFields {
         self.fields.fields(did)
     }
 
+    pub fn field(&self, did: DefId, index: usize) -> Option<std::ops::Range<Var>> {
+        let index_in_table = *self.fields.0.did_idx.get(&did.as_local()?)?;
+        let offsets = &self.fields.0.contents[index_in_table];
+        Some(*offsets.get(index)?..*offsets.get(index + 1)?)
+    }
+
     pub fn count_ptr(&self, ty: Ty<'_>) -> usize {
         count_ptr(ty, self.carriers)
     }

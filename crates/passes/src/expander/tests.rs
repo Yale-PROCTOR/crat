@@ -437,6 +437,47 @@ pub fn captured_closure(value: usize) -> usize {
 }
 
 #[test]
+fn colliding_macro_bindings_preserve_call_site_uses_and_field_names() {
+    let source = r#"
+struct Slot { header: usize }
+macro_rules! update {
+    ($slot:ident) => {
+        let Slot { header } = Slot { header: $slot.header + 1 };
+        let next = Slot { header };
+        $slot.header = next.header;
+    };
+}
+pub const fn calculate() -> usize {
+    let __crat_macro_0 = 5;
+    let mut header = Slot { header: 2 };
+    update!(header);
+    header.header + __crat_macro_0
+}
+"#;
+    let expanded = expand(source);
+    check(&format!(
+        "{expanded}\nconst _: [(); 8] = [(); calculate()];"
+    ));
+    assert_eq!(expand(&expanded), expanded);
+}
+
+#[test]
+fn macro_uses_keep_their_definition_site_binding_after_shadowing() {
+    let source = r#"
+pub const fn calculate() -> usize {
+    let value = 3;
+    macro_rules! captured { () => { value }; }
+    let value = 5;
+    value + captured!()
+}
+"#;
+    let expanded = expand(source);
+    check(&format!(
+        "{expanded}\nconst _: [(); 8] = [(); calculate()];"
+    ));
+}
+
+#[test]
 fn module_and_exported_local_macro_definitions_are_preserved() {
     let source = r#"
 macro_rules! root_value { () => { 1usize }; }

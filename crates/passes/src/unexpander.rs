@@ -1484,19 +1484,14 @@ std::thread_local! { static ALIASED: (i32, i32) = (1, 2); static GENERIC: i32 = 
             expanded.contains("::std::thread::LocalKey<(i32, i32)>"),
             "{expanded}"
         );
-        let expanded = expanded
-            .replace("::std::thread::LocalKey<(i32, i32)>", "Key<i32>")
-            .replace("fn __init() -> i32", "fn __init<T: Default>() -> i32")
-            .replace(
-                "get_or_init(init, __init)",
-                "get_or_init(init, __init::<()>)",
-            );
-        // The tuple helper is not generic, so only specialize calls in GENERIC's item.
+        let expanded = expanded.replace("::std::thread::LocalKey<(i32, i32)>", "Key<i32>");
         let start = expanded.find("const GENERIC:").unwrap();
         let expanded = format!(
             "{}{}",
-            expanded[..start].replace("__init::<()>", "__init"),
-            &expanded[start..]
+            &expanded[..start],
+            expanded[start..]
+                .replace("fn __init() -> i32", "fn __init<T: Default>() -> i32")
+                .replace(", __init)", ", __init::<()>)"),
         );
         let normalized = utils::compilation::run_compiler_on_str(&expanded, |tcx| {
             super::unexpand(super::Config::default(), tcx)

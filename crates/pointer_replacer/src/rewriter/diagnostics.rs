@@ -108,6 +108,7 @@ impl DecisionStage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DecisionReason {
+    UnmodeledExternalPointerField,
     CVoidOrFilePointee,
     MutableAliasCluster,
     OwningArrayOutputParam,
@@ -203,6 +204,7 @@ pub enum DecisionReason {
 impl DecisionReason {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::UnmodeledExternalPointerField => "unmodeled_external_pointer_field",
             Self::CVoidOrFilePointee => "c_void_or_file_pointee",
             Self::MutableAliasCluster => "mutable_alias_cluster",
             Self::OwningArrayOutputParam => "owning_array_output_param",

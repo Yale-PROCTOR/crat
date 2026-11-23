@@ -14964,6 +14964,9 @@ fn owning_struct_field_scalar_inner_ty<'tcx>(
 }
 
 fn struct_field_is_exactly_owning(analysis: &Analysis, field: StructFieldSlot) -> bool {
+    if analysis.opaque_pointer_accesses.fields.contains(&field) {
+        return false;
+    }
     let Some(ownership_schemes) = analysis.ownership_schemes.as_ref() else {
         return false;
     };
@@ -16957,6 +16960,7 @@ mod tests {
         nullity_result.non_null_locals =
             source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
         let analysis = super::super::Analysis {
+            opaque_pointer_accesses: Default::default(),
             borrow_promotion_result,
             borrow_lifetime_flows,
             promoted_mut_ref_result,

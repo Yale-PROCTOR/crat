@@ -20,6 +20,7 @@ pub(super) fn initial_pointer_decisions(
         signatures: SigDecisions {
             data: FxHashMap::default(),
         },
+        preserve_safety: FxHashSet::default(),
         bindings: FxHashMap::default(),
         nested: FxHashMap::default(),
         bounds: FxHashMap::default(),
@@ -82,13 +83,17 @@ pub(super) fn initial_pointer_decisions(
         tcx,
     );
     for (&function, signature) in &original.signatures.data {
+        let source_signature = tcx.fn_sig(function).instantiate_identity().skip_binder();
+        if signature.signature_locked && !source_signature.safety.is_unsafe() {
+            result.preserve_safety.insert(function);
+        }
         if requires_unstructured_body(function, tcx) {
             continue;
         }
         let body = tcx
             .mir_drops_elaborated_and_const_checked(function)
             .borrow();
-        let arguments = signature.input_decs.len();
+        let arguments = source_signature.inputs().len();
         let mapping = utils::ir::map_thir_to_mir(function, false, tcx);
         let mut kinds = FxHashMap::default();
         for (&binding, &local) in &mapping.binding_to_local {
@@ -96,7 +101,7 @@ pub(super) fn initial_pointer_decisions(
                 kinds.insert(local, kind);
             }
         }
-        for (index, &kind) in signature.input_decs.iter().enumerate() {
+        for (index, &kind) in signature.input_decs.iter().take(arguments).enumerate() {
             if let Some(kind) = kind {
                 kinds.insert(Local::from_usize(index + 1), kind);
             }
@@ -106,6 +111,9 @@ pub(super) fn initial_pointer_decisions(
         }
         let mut locals = FxHashMap::default();
         for (local, declaration) in body.local_decls.iter_enumerated() {
+            if signature.signature_locked && local.index() <= arguments {
+                continue;
+            }
             let non_null = original
                 .non_null_locals
                 .get(&function)
@@ -136,43 +144,45 @@ pub(super) fn initial_pointer_decisions(
                 locals.insert(local, layers);
             }
         }
-        let origins = original
-            .lifetime_flows
-            .get(&function)
-            .map(signature_origins);
-        let bounds = signature_lifetimes(
-            function,
-            arguments,
-            origins.as_ref(),
-            &lifetime_flow,
-            &mut locals,
-            &mut result,
-            tcx,
-        );
-        result.bounds.insert(function, bounds);
-        let mut signature = SigDecision {
-            input_decs: vec![None; arguments],
-            input_lifetimes: vec![None; arguments],
-            output_dec: None,
-            output_lifetime: None,
-        };
-        for index in 0..arguments {
-            if let Some(layers) = locals.get(&Local::from_usize(index + 1)) {
-                signature.input_decs[index] = Some(layers[0].kind);
-                signature.input_lifetimes[index] = layers[0].lifetime;
+        if !signature.signature_locked {
+            let origins = original
+                .lifetime_flows
+                .get(&function)
+                .map(signature_origins);
+            let bounds = signature_lifetimes(
+                function,
+                arguments,
+                origins.as_ref(),
+                &lifetime_flow,
+                &mut locals,
+                &mut result,
+                tcx,
+            );
+            result.bounds.insert(function, bounds);
+            let mut signature = SigDecision {
+                input_decs: vec![None; arguments],
+                input_lifetimes: vec![None; arguments],
+                output_dec: None,
+                output_lifetime: None,
+            };
+            for index in 0..arguments {
+                if let Some(layers) = locals.get(&Local::from_usize(index + 1)) {
+                    signature.input_decs[index] = Some(layers[0].kind);
+                    signature.input_lifetimes[index] = layers[0].lifetime;
+                    result
+                        .nested
+                        .insert(PointerTarget::Input(function, index), layers[1..].to_vec());
+                }
+            }
+            if let Some(layers) = locals.get(&RETURN_PLACE) {
+                signature.output_dec = Some(layers[0].kind);
+                signature.output_lifetime = layers[0].lifetime;
                 result
                     .nested
-                    .insert(PointerTarget::Input(function, index), layers[1..].to_vec());
+                    .insert(PointerTarget::Output(function), layers[1..].to_vec());
             }
+            result.signatures.data.insert(function, signature);
         }
-        if let Some(layers) = locals.get(&RETURN_PLACE) {
-            signature.output_dec = Some(layers[0].kind);
-            signature.output_lifetime = layers[0].lifetime;
-            result
-                .nested
-                .insert(PointerTarget::Output(function), layers[1..].to_vec());
-        }
-        result.signatures.data.insert(function, signature);
         for (binding, local) in mapping.binding_to_local {
             if let Some(layers) = locals.get(&local) {
                 result.bindings.insert(binding, layers[0].kind);

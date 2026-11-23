@@ -1,6 +1,67 @@
 use super::*;
 
 #[test]
+fn original_analysis_handles_external_tuple_struct_projections() {
+    let source = r#"
+use std::cmp::Reverse;
+pub fn number(value: Reverse<(i32, i32)>) -> i32 {
+    let Reverse((first, _)) = value;
+    first
+}
+pub unsafe fn read(value: Reverse<*mut i32>) -> i32 {
+    let Reverse(pointer) = value;
+    *pointer
+}
+pub struct Slot { pointer: *mut i32 }
+pub unsafe fn transfer(slot: *mut Slot, incoming: Reverse<Slot>) -> i32 {
+    let pointer = incoming.0.pointer;
+    (*slot).pointer = pointer;
+    *pointer
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        let frozen = crate::freeze_project(source, &records, tcx).unwrap();
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+        let decisions = initial_pointer_decisions(tcx).unwrap();
+        assert!(
+            !decisions.bindings.is_empty()
+                && decisions
+                    .bindings
+                    .values()
+                    .all(|kind| *kind == PtrKind::Raw(true)),
+            "{:?}",
+            decisions.bindings
+        );
+        assert!(decisions.fields.is_empty(), "{:?}", decisions.fields);
+    })
+    .unwrap();
+}
+
+#[test]
+fn unknown_callees_do_not_share_callback_signature_decisions() {
+    let source = r#"
+unsafe fn zero() {}
+unsafe fn read(pointer: *const i32) -> i32 { *pointer }
+fn identity<T>(value: T) -> T { value }
+pub unsafe fn exercise(pointer: *const i32) -> i32 {
+    let first: unsafe fn() = zero;
+    let second: unsafe fn(*const i32) -> i32 = read;
+    first();
+    second(identity((pointer, pointer)).0)
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        let callback = function(&records, "read");
+        assert_eq!(callback.target_signature, callback.source_signature);
+        let frozen = crate::freeze_project(source, &records, tcx).unwrap();
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    })
+    .unwrap();
+}
+
+#[test]
 fn original_analysis_handles_slice_rest_and_generic_pointer_results() {
     let source = r#"
 pub fn pass<T>(value: T) -> T { value }

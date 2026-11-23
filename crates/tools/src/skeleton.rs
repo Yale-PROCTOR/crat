@@ -270,6 +270,7 @@ fn make_skeletons_with_preservation_overrides(
                 message,
             }
         })?;
+    retain_safe_dependencies(&raw_items, &item_ids, &mut decisions.preserve_safety, tcx);
     for item in &raw_items {
         let ItemKind::Fn(function) = &item.item.kind else { continue };
         if !function.sig.decl.c_variadic() && !requires_unstructured_body(item.def_id, tcx) {
@@ -668,7 +669,9 @@ fn make_function_record<'tcx>(
     if let ItemKind::Fn(function) = &mut source.kind
         && requires_unstructured_body(surface.def_id, tcx)
     {
-        function.sig.header.safety = Safety::Unsafe(DUMMY_SP);
+        if !decisions.preserve_safety.contains(&surface.def_id) {
+            function.sig.header.safety = Safety::Unsafe(DUMMY_SP);
+        }
         let name = function.ident.to_string();
         let signature = render_signature(&source);
         let view = SkeletonView {
@@ -1669,7 +1672,9 @@ fn apply_target_signature<'a, 'tcx>(
         .collect::<Vec<_>>();
     let source_output = function.sig.decl.output.clone();
     let force_main_argv = is_supported_two_argument_main_0(function);
-    function.sig.header.safety = Safety::Unsafe(DUMMY_SP);
+    if !decisions.preserve_safety.contains(&def_id) {
+        function.sig.header.safety = Safety::Unsafe(DUMMY_SP);
+    }
     let Some(decision) = decisions.signatures.data.get(&def_id) else {
         if force_main_argv {
             function.sig.decl.inputs[1].ty = P(utils::ast::parse_ty("&mut [&mut [i8]]".to_owned()));
@@ -1678,6 +1683,18 @@ fn apply_target_signature<'a, 'tcx>(
     };
     let body = tcx.mir_drops_elaborated_and_const_checked(def_id).borrow();
     let source_signature = tcx.fn_sig(def_id).instantiate_identity().skip_binder();
+    let arguments = source_signature.inputs().len();
+    if decision.input_decs.len() != arguments || decision.input_lifetimes.len() != arguments {
+        return Err(GenerationError {
+            kind: GenerationErrorKind::PointerAnalysis,
+            function_path: function_path.to_owned(),
+            message: format!(
+                "expected pointer decisions for {arguments} parameters, found {} decisions and {} lifetimes",
+                decision.input_decs.len(),
+                decision.input_lifetimes.len(),
+            ),
+        });
+    }
     let mut lifetimes = vec![];
     for lifetime in decision
         .input_lifetimes
@@ -5560,6 +5577,61 @@ fn collect_dependencies<'tcx>(
     };
     visitor.visit_item(item);
     visitor.dependencies.into_iter().collect()
+}
+
+fn retain_safe_dependencies(
+    items: &[SurfaceItem],
+    item_ids: &FxHashMap<DefId, u64>,
+    preserve_safety: &mut FxHashSet<LocalDefId>,
+    tcx: TyCtxt<'_>,
+) {
+    let safe_functions: FxHashMap<_, _> = items
+        .iter()
+        .filter(|item| {
+            matches!(&item.item.kind, ItemKind::Fn(f) if !matches!(f.sig.header.safety, Safety::Unsafe(_)))
+        })
+        .map(|item| (item.id, item.def_id))
+        .collect();
+    if safe_functions.is_empty() {
+        return;
+    }
+
+    // Retained bodies are never turned into unsafe free functions. Some
+    // initializers (including thread_local!) put their calls in nested items.
+    for owner in tcx.hir_body_owners() {
+        let kind = tcx.def_kind(owner);
+        let retained = matches!(
+            kind,
+            DefKind::Static { .. } | DefKind::Const | DefKind::AssocConst | DefKind::AssocFn
+        ) || (kind == DefKind::Fn && !item_ids.contains_key(&owner.to_def_id()));
+        if !retained {
+            continue;
+        }
+        let mut visitor = DependencyVisitor {
+            tcx,
+            item_ids,
+            dependencies: BTreeSet::new(),
+        };
+        visitor.visit_body(tcx.hir_body_owned_by(owner));
+        preserve_safety.extend(
+            visitor
+                .dependencies
+                .iter()
+                .filter_map(|id| safe_functions.get(id).copied()),
+        );
+    }
+
+    let mut pending: Vec<_> = preserve_safety.iter().copied().collect();
+    while let Some(owner) = pending.pop() {
+        let item = tcx.hir_node_by_def_id(owner).expect_item();
+        for dependency in collect_dependencies(item, item_ids, tcx) {
+            if let Some(&function) = safe_functions.get(&dependency)
+                && preserve_safety.insert(function)
+            {
+                pending.push(function);
+            }
+        }
+    }
 }
 
 fn collect_signature_dependencies<'tcx>(

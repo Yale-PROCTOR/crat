@@ -22,6 +22,48 @@ fn freeze_with_analysis(source: &str, use_bo_analysis: bool) -> FrozenProject {
 }
 
 #[test]
+fn frozen_callbacks_and_retained_initializers_keep_callable_safety() {
+    let source = r#"
+mod shutdown {
+    pub extern "C" fn cleanup() { helper(); }
+    fn helper() { leaf(); }
+    fn leaf() {}
+}
+static CALLBACK: extern "C" fn() = shutdown::cleanup;
+unsafe extern "C" { fn atexit(callback: extern "C" fn()); }
+pub unsafe fn register() { atexit(shutdown::cleanup); }
+fn identity<T>(value: T) -> T { value }
+pub fn unknown() { let _ = identity((1u32, 2u32)); }
+mod scope {
+    ::std::thread_local! { static SCOPE: core::cell::Cell<u32> = new_scope(); }
+    fn new_scope() -> core::cell::Cell<u32> { core::cell::Cell::new(0) }
+}
+"#;
+    let frozen = freeze(source);
+    let normalized = normalize_frozen_target_safety(source, &frozen).unwrap();
+    assert_eq!(normalized, frozen.analysis_source);
+    check_frozen_project_sources(&frozen, &normalized, Some(&frozen.target_source), true).unwrap();
+    run_compiler_on_str(&normalized, utils::type_check).unwrap();
+    run_compiler_on_str(&frozen.target_source, utils::type_check).unwrap();
+
+    for path in ["shutdown::cleanup", "register"] {
+        let function = frozen
+            .functions
+            .iter()
+            .find(|f| f.record.path == path)
+            .unwrap();
+        let (output, metadata) = metadata(
+            &frozen,
+            &request(function, Some(&function.record.annotated_source)),
+        );
+        run_compiler_on_str(&output.replacement.source, utils::type_check)
+            .expect(&output.replacement.source);
+        crate::observation::extract_observations_from_source(&output.observation_source, &metadata)
+            .expect(&output.observation_source);
+    }
+}
+
+#[test]
 fn macro_statements_skip_only_their_own_observations() {
     let frozen = freeze(
         r#"
