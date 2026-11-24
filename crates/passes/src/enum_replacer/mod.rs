@@ -826,7 +826,6 @@ struct BodyVisitor<'a, 'tcx> {
     data: &'a HirData,
     analysis: &'a mut EnumAnalysis,
     current_ret_ty: Option<HirEnumTy>,
-    enum_required_exprs: FxHashSet<HirId>,
     cast_sites: FxHashSet<(LocalDefId, HirId, CastSiteKind)>,
 }
 
@@ -837,7 +836,6 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
             data,
             analysis,
             current_ret_ty: None,
-            enum_required_exprs: FxHashSet::default(),
             cast_sites: FxHashSet::default(),
         }
     }
@@ -898,7 +896,6 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
             return;
         }
 
-        self.enum_required_exprs.insert(expr.hir_id);
         match self.classify_expr(expr) {
             ExprEnumClass::Enum(alias) if alias == expected => {}
             ExprEnumClass::Enum(_) => self.add_reject(
@@ -1429,6 +1426,9 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
                 _ => None,
             },
             hir::ExprKind::Field(base, field) => self.field_type(base, field.name),
+            hir::ExprKind::Unary(hir::UnOp::Deref, pointer) => {
+                self.expr_decl_ty(pointer).and_then(HirEnumTy::pointee)
+            }
             _ => None,
         }
     }
@@ -1501,10 +1501,6 @@ impl<'a, 'tcx> BodyVisitor<'a, 'tcx> {
         lhs: &'tcx hir::Expr<'tcx>,
         rhs: &'tcx hir::Expr<'tcx>,
     ) {
-        if self.enum_required_exprs.contains(&expr.hir_id) {
-            return;
-        }
-
         let lhs_class = self.classify_expr(lhs);
         let rhs_class = self.classify_expr(rhs);
         if is_comparison(op) {

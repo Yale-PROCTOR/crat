@@ -422,7 +422,11 @@ impl<'tcx> AstVisitor<'tcx> {
                     return true;
                 }
                 hir::ExprKind::Index(_, idx, _) if idx.hir_id == curr_id => return true,
-                hir::ExprKind::Index(_, _, _) | hir::ExprKind::Cast(_, _) => return false,
+                hir::ExprKind::Index(_, _, _) => return false,
+                hir::ExprKind::Cast(_, _) => {
+                    let typeck = self.tcx.typeck(parent.hir_id.owner);
+                    return typeck.expr_ty(parent).is_raw_ptr();
+                }
                 _ => {}
             }
             curr_id = parent_id;
@@ -755,6 +759,15 @@ mod tests {
     #[test]
     fn test_neg_int_cast() {
         run_test("fn f() { -1 as i32 as i64; }", &["-1"], &["as"])
+    }
+
+    #[test]
+    fn test_keep_signed_operand_in_raw_pointer_cast() {
+        run_test(
+            "const SENTINEL: *mut core::ffi::c_void = -(1 as core::ffi::c_int) as *mut core::ffi::c_void;",
+            &["-1i32 as *mut core::ffi::c_void"],
+            &[],
+        )
     }
 
     #[test]

@@ -1083,6 +1083,57 @@ fn transform_alias_through_pointer_compiles() {
 }
 
 #[test]
+fn transform_keeps_integer_aliases_for_numeric_pointer_writes() {
+    let code = transform_and_compile(
+        r#"
+            pub type Status = core::ffi::c_uint;
+            pub const EMPTY: Status = 0;
+            pub const FILTERED: Status = 1;
+
+            pub type Mode = core::ffi::c_uint;
+            pub const OFF: Mode = 0;
+            pub const ON: Mode = 1;
+
+            pub unsafe extern "C" fn write_status(out: *mut Status, filtered: bool) {
+                *out = (if filtered { FILTERED as core::ffi::c_int }
+                        else { EMPTY as core::ffi::c_int }) as Status;
+            }
+
+            pub unsafe extern "C" fn write_mode(out: *mut Mode, value: core::ffi::c_int) {
+                *out = value as Mode;
+            }
+            "#,
+    );
+
+    assert!(code.contains("pub type Status = core::ffi::c_uint;"));
+    assert!(code.contains("pub type Mode = core::ffi::c_uint;"));
+}
+
+#[test]
+fn transform_casts_enum_operands_when_pointer_destination_stays_integer() {
+    let code = transform_and_compile(
+        r#"
+            pub type Status = core::ffi::c_uint;
+            pub const EMPTY: Status = 0;
+            pub const FILTERED: Status = 1;
+
+            pub type Mode = core::ffi::c_uint;
+            pub const OFF: Mode = 0;
+            pub const ON: Mode = 1;
+
+            pub unsafe extern "C" fn write_status(out: *mut Status) {
+                let _status: Status = 7;
+                *out = ON + 1;
+            }
+            "#,
+    );
+
+    assert!(code.contains("pub type Status = core::ffi::c_uint;"));
+    assert!(code.contains("pub enum Mode"));
+    assert!(code.contains("*out = (ON) as u32 + 1;"));
+}
+
+#[test]
 fn transform_rewrites_enum_match() {
     let code = transform_and_compile(
         r#"
