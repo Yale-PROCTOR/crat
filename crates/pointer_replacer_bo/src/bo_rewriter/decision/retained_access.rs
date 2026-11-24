@@ -73,6 +73,41 @@ const SLOW_BODY_S: u64 = 60;
 pub(super) static MARKS_SLOW_ZERO: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// The relations built in this process with the phase log on, for the lines' `relation=`.
+static MARK_RELATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn mark_slow(limit_s: u64) -> std::time::Duration {
+    #[cfg(test)]
+    if MARKS_SLOW_ZERO.load(std::sync::atomic::Ordering::Relaxed) {
+        return std::time::Duration::ZERO;
+    }
+    std::time::Duration::from_secs(limit_s)
+}
+
+/// The marks' state in one [`Relation`]; read by the lines only.
+#[derive(Default)]
+struct Marks {
+    /// This relation's number in the process (from 1); 0 with the phase log off.
+    relation: usize,
+    /// The `solve_points` calls of this relation so far.
+    points_calls: usize,
+    /// The body and block `flow_body` is in, for m2.
+    at: Option<(LocalDefId, BasicBlock)>,
+    /// The `copy_memory` calls and their wall since the last read (m1, m3).
+    copies: usize,
+    copy_wall: f64,
+}
+
+/// m2's tally of one `copy_memory` call's key loop.
+#[derive(Default)]
+struct CopyTally {
+    keys: usize,
+    objs: usize,
+    max_set: usize,
+    stores: usize,
+    grew: usize,
+}
+
 /// A call's callee, as `analyses::mir::CallKind` classifies it (that module is private
 /// to `analyses`, whose tree this module must not touch).
 enum CallKind {
@@ -763,6 +798,8 @@ struct Relation<'tcx> {
     foreign_taken: FxHashSet<DefId>,
     allocators: FxHashSet<LocalDefId>,
     functions: Vec<LocalDefId>,
+    /// R1543-2: the marks' state (log only).
+    marks: Marks,
 }
 
 impl<'tcx> Relation<'tcx> {
@@ -823,7 +860,13 @@ impl<'tcx> Relation<'tcx> {
             foreign_taken: FxHashSet::default(),
             allocators: FxHashSet::default(),
             functions: program.functions.clone(),
+            marks: Marks::default(),
         };
+        let marks_started = crate::phase_log::on().then(std::time::Instant::now);
+        if marks_started.is_some() {
+            this.marks.relation =
+                MARK_RELATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        }
         this.find_exposed(program);
         this.find_called();
         this.find_handed_callbacks();
@@ -832,6 +875,21 @@ impl<'tcx> Relation<'tcx> {
         this.seed_statics();
         let trace = cfg!(test) && std::env::var("CRAT_E5C_HOLD_TRACE").is_ok();
         let started = std::time::Instant::now();
+        let relation = this.marks.relation;
+        // R1543-2: the stage line, from the relation's start (the setup above included).
+        let stage = |what: &str, extra: &str| {
+            if let Some(t0) = marks_started {
+                crate::phase_log::mark(
+                    "retained_access:relation",
+                    "progress",
+                    &format!(
+                        "relation={relation} stage={} wall={:.1}{extra}",
+                        what.replace(' ', "_"),
+                        t0.elapsed().as_secs_f64()
+                    ),
+                );
+            }
+        };
         let mark = |what: &str| {
             if trace {
                 eprintln!(
@@ -839,7 +897,23 @@ impl<'tcx> Relation<'tcx> {
                     started.elapsed().as_secs_f64()
                 );
             }
+            stage(what, "");
         };
+        if marks_started.is_some() {
+            let o = &this.options;
+            stage(
+                "setup",
+                &format!(
+                    " functions={} closed={} facts={} file_buffers={} evident={} faults={:#x}",
+                    this.functions.len(),
+                    o.closed,
+                    o.facts,
+                    o.file_buffers,
+                    o.evident,
+                    o.faults
+                ),
+            );
+        }
         this.solve_points();
         mark("points");
         this.compute_escapes();
@@ -1807,7 +1881,14 @@ impl<'tcx> Relation<'tcx> {
 
     /// A copy of memory: every pointer the source objects hold, the destination
     /// objects may hold. `Top` as a source holds anything.
+    ///
+    /// R1543-2: `track_caller` names the call site on m2's line (`line=`), nothing else.
+    #[track_caller]
     fn copy_memory(&mut self, from: &FxHashSet<Obj>, to: &FxHashSet<Obj>) -> bool {
+        let mark_started = (self.marks.relation != 0).then(std::time::Instant::now);
+        let mark_line = mark_started.map(|_| std::panic::Location::caller().line());
+        let mark_in = mark_started.map(|_| (from.len(), to.len()));
+        let mut tally = CopyTally::default();
         // 3.3: a copy between two pointer members moves one field's pointers into the
         // other (`memcpy(&h.b, &h.a)`).
         let pointer_member = |this: &Self, o: Obj| match o {
@@ -1907,9 +1988,15 @@ impl<'tcx> Relation<'tcx> {
                 .collect();
             for key in keys {
                 let objs = self.contents.get(&key).cloned().unwrap_or_default();
+                tally.keys += 1;
+                tally.objs += objs.len();
+                tally.max_set = tally.max_set.max(objs.len());
                 for &(target, ty) in &target_types {
                     for at in self.placed(key, target, ty) {
-                        changed |= self.store(at, &objs);
+                        let grew = self.store(at, &objs);
+                        tally.stores += 1;
+                        tally.grew += usize::from(grew);
+                        changed |= grew;
                     }
                 }
             }
@@ -1945,7 +2032,44 @@ impl<'tcx> Relation<'tcx> {
                 }
             }
         }
+        // R1543-2 m2: one line per call of at least `SLOW_COPY_S`.
+        if let (Some(t0), Some(line), Some((in_from, in_to))) = (mark_started, mark_line, mark_in) {
+            let wall = t0.elapsed();
+            self.marks.copies += 1;
+            self.marks.copy_wall += wall.as_secs_f64();
+            if wall >= mark_slow(SLOW_COPY_S) {
+                let (at_fn, at_block) = match self.marks.at {
+                    Some((g, block)) => (self.mark_name(g), format!("{block:?}")),
+                    None => ("-".to_owned(), "-".to_owned()),
+                };
+                crate::phase_log::mark(
+                    "retained_access:copy_memory",
+                    "progress",
+                    &format!(
+                        "relation={} fn={at_fn} block={at_block} line={line} from={in_from} to={in_to} sources={} targets={} keys={} objs={} max_set={} stores={} grew={} changed={changed} wall={:.1}",
+                        self.marks.relation,
+                        from.len(),
+                        target_types.len(),
+                        tally.keys,
+                        tally.objs,
+                        tally.max_set,
+                        tally.stores,
+                        tally.grew,
+                        wall.as_secs_f64()
+                    ),
+                );
+            }
+        }
         changed
+    }
+
+    /// R1543-2: a function's path for a mark line, one word.
+    fn mark_name(&self, f: LocalDefId) -> String {
+        self.tcx
+            .def_path_str(f.to_def_id())
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_")
     }
 
     /// Where a copied key lands in `target` of type `ty` (H2): a field of a struct the
@@ -3124,19 +3248,99 @@ impl<'tcx> Relation<'tcx> {
             }
         }
         let trace = cfg!(test) && std::env::var("CRAT_E5C_HOLD_TRACE").is_ok();
+        // R1543-2 m1: the call's start line.
+        let call_started = (self.marks.relation != 0).then(std::time::Instant::now);
+        if call_started.is_some() {
+            self.marks.points_calls += 1;
+            self.marks.copies = 0;
+            self.marks.copy_wall = 0.0;
+            crate::phase_log::mark(
+                "retained_access:points",
+                "progress",
+                &format!(
+                    "relation={} call={} at=start functions={}",
+                    self.marks.relation,
+                    self.marks.points_calls,
+                    functions.len()
+                ),
+            );
+        }
         let mut round = 0usize;
         loop {
             let mut changed = false;
             let mut grew: Vec<LocalDefId> = vec![];
+            let round_started = call_started.map(|_| std::time::Instant::now());
+            let mut changed_fns = 0usize;
+            let mut slowest: Option<(LocalDefId, f64)> = None;
             for &f in &functions {
                 let body = self.body(f);
+                let body_started = call_started.map(|_| {
+                    (
+                        std::time::Instant::now(),
+                        self.marks.copies,
+                        self.marks.copy_wall,
+                    )
+                });
                 let c = self.flow_body(f, &body);
+                if let Some((t0, copies, copy_wall)) = body_started {
+                    let wall = t0.elapsed();
+                    changed_fns += usize::from(c);
+                    if slowest.is_none_or(|(_, w)| wall.as_secs_f64() > w) {
+                        slowest = Some((f, wall.as_secs_f64()));
+                    }
+                    // m3: one line per body of at least `SLOW_BODY_S`.
+                    if wall >= mark_slow(SLOW_BODY_S) {
+                        crate::phase_log::mark(
+                            "retained_access:flow_body",
+                            "progress",
+                            &format!(
+                                "relation={} call={} round={} fn={} blocks={} changed={c} copies={} copy_wall={:.1} wall={:.1}",
+                                self.marks.relation,
+                                self.marks.points_calls,
+                                round + 1,
+                                self.mark_name(f),
+                                body.basic_blocks.len(),
+                                self.marks.copies - copies,
+                                self.marks.copy_wall - copy_wall,
+                                wall.as_secs_f64()
+                            ),
+                        );
+                    }
+                }
                 if c && trace {
                     grew.push(f);
                 }
                 changed |= c;
             }
             round += 1;
+            // m1: one line per round.
+            if let Some(t0) = round_started {
+                let points: usize = self.points.values().map(|s| s.len()).sum();
+                let contents: usize = self.contents.values().map(|s| s.len()).sum();
+                let (slow_fn, slow_wall) = match slowest {
+                    Some((g, w)) => (self.mark_name(g), w),
+                    None => ("-".to_owned(), 0.0),
+                };
+                crate::phase_log::mark(
+                    "retained_access:points",
+                    "progress",
+                    &format!(
+                        "relation={} call={} at=round round={round} changed_fns={changed_fns} points_keys={} points={points} contents_keys={} contents={contents} fresh={} fresh_backed={} copies={} copy_wall={:.1} slowest_fn={slow_fn} slowest_wall={slow_wall:.1} wall={:.1}{}",
+                        self.marks.relation,
+                        self.marks.points_calls,
+                        self.points.len(),
+                        self.contents.len(),
+                        self.fresh.len(),
+                        self.fresh_backed.len(),
+                        self.marks.copies,
+                        self.marks.copy_wall,
+                        t0.elapsed().as_secs_f64(),
+                        crate::phase_log::malloc_totals()
+                    ),
+                );
+                self.marks.copies = 0;
+                self.marks.copy_wall = 0.0;
+            }
             if trace {
                 let points: usize = self.points.values().map(|s| s.len()).sum();
                 let contents: usize = self.contents.values().map(|s| s.len()).sum();
@@ -3152,12 +3356,29 @@ impl<'tcx> Relation<'tcx> {
                 break;
             }
         }
+        // R1543-2 m1: the call's end line.
+        if let Some(t0) = call_started {
+            crate::phase_log::mark(
+                "retained_access:points",
+                "progress",
+                &format!(
+                    "relation={} call={} at=end rounds={round} wall={:.1}",
+                    self.marks.relation,
+                    self.marks.points_calls,
+                    t0.elapsed().as_secs_f64()
+                ),
+            );
+        }
     }
 
     /// One body, exhaustively over the statement and terminator kinds.
     fn flow_body(&mut self, f: LocalDefId, body: &Body<'tcx>) -> bool {
         let mut changed = false;
         for (block, data) in body.basic_blocks.iter_enumerated() {
+            // R1543-2: where m2's copies happen.
+            if self.marks.relation != 0 {
+                self.marks.at = Some((f, block));
+            }
             for statement in &data.statements {
                 match &statement.kind {
                     StatementKind::Assign(box (dst, rvalue)) => {
@@ -3190,6 +3411,7 @@ impl<'tcx> Relation<'tcx> {
         if self.on(Rule::AddressTaken) {
             changed |= self.sync_addr_taken(f, body);
         }
+        self.marks.at = None;
         changed | std::mem::take(&mut self.dirty)
     }
 
@@ -5449,6 +5671,7 @@ impl RetainedAccessCheck {
         options: Options,
     ) -> Self {
         let tcx = program.tcx;
+        let pass_started = crate::phase_log::on().then(std::time::Instant::now);
         let relation = Relation::new(program, options);
         let on = |rule: Rule| relation.on(rule);
         let facts = |rule: Rule| relation.facts(rule);
@@ -6092,6 +6315,19 @@ impl RetainedAccessCheck {
         }
         let mut container_of: Vec<_> = relation.container_of.iter().copied().collect();
         container_of.sort_by_key(|&(f, local)| (f.local_def_index, local));
+        // R1543-2: the pass's end line.
+        if let Some(t0) = pass_started {
+            crate::phase_log::mark(
+                "retained_access:pass",
+                "progress",
+                &format!(
+                    "relation={} at=end verdicts={} wall={:.1}",
+                    relation.marks.relation,
+                    verdicts.len(),
+                    t0.elapsed().as_secs_f64()
+                ),
+            );
+        }
         RetainedAccessCheck {
             verdicts,
             bodies,
