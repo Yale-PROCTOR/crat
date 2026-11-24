@@ -949,7 +949,7 @@ fn solve_round_model(
             let hard = hard.expect("R1a validation owns a hard checker");
             let relaxed = solver.relax_selectors_hard_reporting(hard, selectors)?;
             let dropped = relaxed.dropped().to_vec();
-            let model = solver.optimized_model_under(&relaxed)?;
+            let model = solver.optimized_model_under_hard(&relaxed, Some(hard))?;
             Some((model, dropped))
         }
     }

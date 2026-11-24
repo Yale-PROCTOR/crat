@@ -79,6 +79,10 @@ pub(crate) struct Config {
     pub(crate) matched_probe: Option<String>,
     pub(crate) guard_budget: Option<String>,
     pub(crate) lineage_depth: Option<String>,
+    /// R1543-2 Part 2 (main 346 §2): `CRAT_BO_MAXSAT_CMD`'s run line and its binary's sha256;
+    /// `None` unset, and in a checkpoint written before this field.
+    #[serde(default)]
+    pub(crate) maxsat: Option<String>,
 }
 
 /// The baseline verification's stats that the precise stage's receipt reads (`repair_keys`,
@@ -319,6 +323,7 @@ fn config(overlap: OverlapMode, attestation: Option<WholeProgramAttestation>) ->
         matched_probe: raw("CRAT_BO_MATCHED_PROBE"),
         guard_budget: raw("CRAT_BO_GUARD_BUDGET"),
         lineage_depth: raw("CRAT_BO_LINEAGE_DEPTH"),
+        maxsat: crate::maxsat::config(),
     }
 }
 

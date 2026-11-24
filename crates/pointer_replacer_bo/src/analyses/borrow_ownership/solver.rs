@@ -3439,13 +3439,24 @@ impl KindSolver {
         })
     }
 
-    /// Materialize the objective-selected model for one validation round after
-    /// hard-only selector decisions have fixed its active set. The fixed
-    /// mandatory and surviving endpoint-retraction literals are temporary plain-hard assertions;
-    /// the Optimize check itself carries no assumptions.
+    /// [`Self::optimized_model_under_hard`] without the round's hard solver.
+    #[cfg(test)]
     pub(crate) fn optimized_model_under(
         &self,
         relaxed: &RelaxedSelectors,
+    ) -> Option<FxHashMap<SlotRef, SlotKind>> {
+        self.optimized_model_under_hard(relaxed, None)
+    }
+
+    /// Materialize the objective-selected model for one validation round after
+    /// hard-only selector decisions have fixed its active set. The fixed
+    /// mandatory and surviving endpoint-retraction literals are temporary plain-hard assertions;
+    /// the Optimize check itself carries no assumptions. `hard` is the round's hard solver, which
+    /// an external optimum (R1543-2 Part 2, [`Self::external_optimum`]) is handed back to.
+    pub(crate) fn optimized_model_under_hard(
+        &self,
+        relaxed: &RelaxedSelectors,
+        hard: Option<&HardLoopSolver>,
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
         self.optimize_materialization_count
             .set(self.optimize_materialization_count.get().saturating_add(1));
@@ -3475,7 +3486,14 @@ impl KindSolver {
             crate::optimize_dump::before_check(&self.solver, "optimize", self.soft_terms());
         // Relay main/388 O2: the deciding check's own wall, for the budget predicate.
         let check_started = Instant::now();
-        let mut outcome = crate::phase_log::z3_query("optimize", || self.solver.check(&[]));
+        // R1543-2 Part 2: the external process's optimum when the switch is set; else, and on a
+        // fallback, today's check.
+        let external = self.external_optimum(hard);
+        let mut outcome = if external.is_some() {
+            SatResult::Sat
+        } else {
+            crate::phase_log::z3_query("optimize", || self.solver.check(&[]))
+        };
         let mut check_wall = check_started.elapsed();
         if outcome == SatResult::Unsat && !rows.is_empty() {
             crate::optimize_dump::after_check(
@@ -3535,7 +3553,7 @@ impl KindSolver {
             outcome,
         );
         let kinds = if outcome == SatResult::Sat {
-            match self.solver.get_model() {
+            match external.or_else(|| self.solver.get_model()) {
                 Some(model) => {
                     self.read_version_owns(&model);
                     Some(self.read_kinds(&model))
@@ -3594,6 +3612,40 @@ impl KindSolver {
         kinds
     }
 
+    /// R1543-2 Part 2 (main 346, R1543-4): with `CRAT_BO_MAXSAT_CMD` set and the objective built,
+    /// this check's optimum from the external process, handed back to z3 (`maxsat.rs`). `None` --
+    /// the switch unset, no objective (R1543-4 (4): no line either), or a fallback (its line
+    /// written) -- leaves the check to z3's `Optimize`. The hand-back runs on `hard`, the round's
+    /// hard solver, whose assertions are a prefix of the `Optimize`'s; without one, on a plain
+    /// solver built here.
+    fn external_optimum(&self, hard: Option<&HardLoopSolver>) -> Option<Model> {
+        let line = crate::maxsat::run_line()?;
+        let ref_weight = self.objective_ref_weight?;
+        let soft: Vec<(Bool, u64)> = self
+            .vars
+            .values()
+            .flat_map(|vars| [(vars.ref_.clone(), ref_weight), (vars.own.clone(), 1)])
+            .collect();
+        let scope = self.solver.get_assertions();
+        let plain;
+        let (solver, synced) = match hard {
+            Some(hard) => (&hard.solver, hard.synced_assertions.get()),
+            None => {
+                plain = Solver::new();
+                plain.set_params(&fixed_query_params());
+                (&plain, 0)
+            }
+        };
+        let check = crate::maxsat::Check {
+            scope: &scope,
+            soft: &soft,
+            solver,
+            synced,
+        };
+        let limit = Duration::from_millis(u64::from(execution_guard::query_timeout_ms()));
+        crate::maxsat::optimum(line, &check, limit)
+    }
+
     /// R1529-2, log only: the soft terms the build asserted (two per slot with the objective).
     fn soft_terms(&self) -> usize {
         if self.objective_ref_weight.is_some() {
@@ -3613,7 +3665,7 @@ impl KindSolver {
         match self.relax_selectors_hard_typed(hard, selectors) {
             HardRelaxResult::Sat(relaxed) => {
                 let dropped = relaxed.dropped.clone();
-                let kinds = self.optimized_model_under(&relaxed);
+                let kinds = self.optimized_model_under_hard(&relaxed, Some(hard));
                 if kinds.is_none() {
                     // R1468-2 (i), log only: the relaxation was Sat; the optimize declined.
                     self.last_relax_exit

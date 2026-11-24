@@ -78,6 +78,12 @@ pub(crate) fn read_enabled() -> bool {
 }
 
 pub(crate) fn dir() -> Option<PathBuf> {
+    // R1543-2 Part 2 (main 346 §2): under `CRAT_BO_MAXSAT_CMD` no entry is read or written. The key
+    // takes nothing from the environment, so a model solved under the switch must not serve a run
+    // without it.
+    if crate::maxsat::run_line().is_some() {
+        return None;
+    }
     #[cfg(test)]
     if let Some(dir) = TEST_CONFIG.with(|config| config.borrow().clone()) {
         return Some(dir);
