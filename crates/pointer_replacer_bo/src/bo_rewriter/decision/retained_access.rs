@@ -1882,11 +1882,14 @@ impl<'tcx> Relation<'tcx> {
     /// A copy of memory: every pointer the source objects hold, the destination
     /// objects may hold. `Top` as a source holds anything.
     ///
-    /// R1543-2: `track_caller` names the call site on m2's line (`line=`), nothing else.
+    /// R1543-2: `track_caller` names the call site on m2's line (`line=`); a panic inside this
+    /// body also reports the caller's line. It changes no result.
     #[track_caller]
     fn copy_memory(&mut self, from: &FxHashSet<Obj>, to: &FxHashSet<Obj>) -> bool {
+        // Read here, outside any closure: a closure does not inherit `track_caller`.
+        let caller = std::panic::Location::caller();
         let mark_started = (self.marks.relation != 0).then(std::time::Instant::now);
-        let mark_line = mark_started.map(|_| std::panic::Location::caller().line());
+        let mark_line = mark_started.map(|_| caller.line());
         let mark_in = mark_started.map(|_| (from.len(), to.len()));
         let mut tally = CopyTally::default();
         // 3.3: a copy between two pointer members moves one field's pointers into the

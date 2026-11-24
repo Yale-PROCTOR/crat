@@ -90,6 +90,11 @@ fn logged(test: &str, tag: &str) -> String {
 /// and off; off, stderr carries no phase line. (It passes at the RED stage: the marks are log only.)
 #[test]
 fn r1543_2_m0_unset_writes_no_mark_and_changes_nothing() {
+    // The zero limit in both children: with the log on, m2 and m3 write a line for every call, so
+    // their reads run under the equality; with it off, nothing is written at any limit.
+    if in_child() {
+        super::MARKS_SLOW_ZERO.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     if child() {
         return;
     }
