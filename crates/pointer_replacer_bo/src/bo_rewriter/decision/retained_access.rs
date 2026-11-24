@@ -56,6 +56,23 @@ use crate::{
 /// byte view of an object that it also hands it typed". `false` drops the premise.
 pub(crate) const OUTSIDE_BYTES_DISJOINT: bool = true;
 
+/// **R1543-2 (main 343 §8, B4): the points loop's marks, log only.** Under the phase log
+/// (`CRAT_BO_PHASE_LOG=on`) the check writes `[bo-phase]` lines with the edge `progress`:
+/// `retained_access:relation` at each stage of [`Relation::new`] (the stages of the test trace)
+/// and `retained_access:pass` at each pass's end; m1 `retained_access:points` at each
+/// `solve_points` call's start and end and after each round; m2 `retained_access:copy_memory`
+/// per `copy_memory` call of at least [`SLOW_COPY_S`]; m3 `retained_access:flow_body` per
+/// `flow_body` call of at least [`SLOW_BODY_S`]. Off, nothing is timed or written. On or off,
+/// no fact the check reads or returns changes.
+const SLOW_COPY_S: u64 = 10;
+const SLOW_BODY_S: u64 = 60;
+
+/// Test builds only: the r1543_2 witnesses set it in their child process, so m2 and m3 write a
+/// line for every call there; every other process keeps [`SLOW_COPY_S`] / [`SLOW_BODY_S`].
+#[cfg(test)]
+pub(super) static MARKS_SLOW_ZERO: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A call's callee, as `analyses::mir::CallKind` classifies it (that module is private
 /// to `analyses`, whose tree this module must not touch).
 enum CallKind {
@@ -6373,3 +6390,7 @@ pub(crate) fn file_binding_scan<'tcx>(program: &RustProgram<'tcx>) -> Vec<String
     found.extend(fields);
     found.into_iter().collect()
 }
+
+#[cfg(test)]
+#[path = "retained_access_marks_tests.rs"]
+mod marks_tests;
