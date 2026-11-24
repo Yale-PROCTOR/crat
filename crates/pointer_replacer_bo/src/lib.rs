@@ -80,6 +80,7 @@ mod bo_pipeline;
 mod bo_rewriter;
 #[cfg(test)]
 mod coverage_recon;
+mod maxsat;
 mod optimize_dump;
 mod phase_log;
 mod raw_boundary_census_schema;

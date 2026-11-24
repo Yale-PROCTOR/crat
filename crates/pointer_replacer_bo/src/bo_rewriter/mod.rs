@@ -98,6 +98,8 @@ pub(crate) mod flexible_tail_ast;
 #[cfg(test)]
 mod local_pair_proof_tests;
 #[cfg(test)]
+mod maxsat_tests;
+#[cfg(test)]
 mod nested_one_sided_tests;
 #[cfg(test)]
 mod one_element_guard_tests;
