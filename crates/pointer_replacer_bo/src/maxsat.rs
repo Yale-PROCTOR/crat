@@ -12,10 +12,10 @@
 //!    format): a top-level unit assertion on a symbol fixes it (unit substitution), the top level
 //!    becomes clauses where its shape allows, and every compound term below gets a full Tseitin
 //!    definition, hash-consed (main 341's `smt2wcnf.py`, over the z3 terms instead of their text);
-//! 2. the file `<temp>/crat-maxsat-<pid>/<n>.wcnf` is written, and the run line's process solves it
-//!    under its own address-space limit and crat's query limit (its pipes are read up to the same
-//!    limit); the file goes when the process ends, on every path, and the directory with it when it
-//!    is left empty;
+//! 2. the file `<temp>/crat-maxsat-<pid>-<n>/problem.wcnf` is written in a directory the check
+//!    makes new (mode 0700; a name that exists is refused, a `Write` fallback), and the run line's
+//!    process solves it under its own address-space limit and crat's query limit (its pipes are read
+//!    up to the same limit); the file and the directory go when the process ends, on every path;
 //! 3. only `s OPTIMUM FOUND` with a `v` line over every index the file holds goes on (the `s` line
 //!    is read, never the exit code; an index in no clause takes false): the assignment is handed back
 //!    to a z3 solver that holds the same assertions (the round's hard solver, or a plain one), with
@@ -638,8 +638,8 @@ pub(crate) fn encode(hard: &[Bool], soft: &[(Bool, u64)]) -> Result<Wcnf, Cause>
     })
 }
 
-/// The check's file, removed when dropped (on every path, a panic too), with its directory when
-/// that is left empty.
+/// The check's file in the directory this check made, both removed when dropped (on every path, a
+/// panic too). It is built only after the directory is made, so it never removes anything else.
 struct WcnfFile(PathBuf);
 
 impl Drop for WcnfFile {
@@ -651,18 +651,35 @@ impl Drop for WcnfFile {
     }
 }
 
-/// The directory of this process's files.
+/// A new directory name for one check: `<temp>/crat-maxsat-<pid>-<n>`.
 fn wcnf_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("crat-maxsat-{}", std::process::id()))
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    std::env::temp_dir().join(format!(
+        "crat-maxsat-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Makes `dir` new, never accepting one that exists (a symlink planted at the name included), with
+/// mode 0700 on Unix (the review of 9595db605, note 6).
+fn make_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
 }
 
 fn write_file(wcnf: &Wcnf, dir: &Path) -> Result<(WcnfFile, u64), Cause> {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
     let error = |error: std::io::Error| Cause::Write(error.to_string());
-    let file = WcnfFile(dir.join(format!("{}.wcnf", NEXT.fetch_add(1, Ordering::Relaxed))));
-    std::fs::create_dir_all(dir).map_err(error)?;
-    let mut out =
-        std::io::BufWriter::with_capacity(1 << 22, std::fs::File::create(&file.0).map_err(error)?);
+    make_dir(dir).map_err(error)?;
+    let file = WcnfFile(dir.join("problem.wcnf"));
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&file.0)
+        .map_err(error)?;
+    let mut out = std::io::BufWriter::with_capacity(1 << 22, created);
     wcnf.write_to(&mut out).map_err(error)?;
     out.flush().map_err(error)?;
     drop(out);
