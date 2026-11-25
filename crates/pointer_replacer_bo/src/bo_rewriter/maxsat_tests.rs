@@ -1,4 +1,5 @@
-//! R1543-2 Part 2 (main 346 §4; the seat's R1543-4): the external MaxSAT path's witnesses P1–P5.
+//! R1543-2 Part 2 (main 346 §4; the seat's R1543-4): the external MaxSAT path's witnesses P1–P5;
+//! P6–P8 come from the review of 9595db605.
 //! P1's fixtures, P2's hook half, P3 and P5 run the whole rewrite in child processes of this test
 //! binary (the switches are read once per process), with the model checkpoint's child harness. The
 //! rest runs here, with test-built shell scripts in place of a solver: no external binary but P5's.
@@ -65,6 +66,19 @@ fn index(lit: i32) -> usize {
 
 fn true_under(values: &[bool], lit: i32) -> bool {
     values[index(lit)] == (lit > 0)
+}
+
+/// The highest index the written file holds: a 2022+ solver's variable count (the format has no
+/// header).
+fn top_written(wcnf: &Wcnf) -> usize {
+    let (clauses, wsoft) = written(wcnf);
+    clauses
+        .iter()
+        .flatten()
+        .chain(wsoft.iter().map(|(_, lit)| lit))
+        .map(|&lit| index(lit) + 1)
+        .max()
+        .unwrap_or(0)
 }
 
 /// The WCNF as written to its file, read back: (hard clauses, soft terms).
@@ -452,7 +466,7 @@ fn cases(dir: &Path, wcnf: &Wcnf) -> Vec<Case> {
         dir: None,
         expected,
     };
-    let vars = usize::try_from(wcnf.vars).unwrap();
+    let top = top_written(wcnf);
     let not_a_dir = dir.join("a-file");
     std::fs::write(&not_a_dir, "").unwrap();
     vec![
@@ -491,7 +505,7 @@ fn cases(dir: &Path, wcnf: &Wcnf) -> Vec<Case> {
         case(
             "short-v",
             &format!("echo 'o {o}'; echo 's OPTIMUM FOUND'; echo 'v 0'"),
-            Err(Cause::Values { got: 1, want: vars }),
+            Err(Cause::Values { got: 1, want: top }),
         ),
         case(
             "no-o",
@@ -758,5 +772,123 @@ fn r1543_2_p5_uwrmaxsat_on_a_fixture() {
             line.contains("cause=hard-false ") || line.contains("cause=status:UNSATISFIABLE "),
             "{line}"
         );
+    }
+}
+
+/// P6 (the review of 9595db605, defect 1): on a fallback the check's wall -- the input of the budget
+/// predicate for an `Unknown` -- is z3's check alone, as today. A run line that sleeps 2 s and
+/// prints no `s` line makes every optimize check of the fixture fall back; the optimize dump's
+/// `check_wall_s` of each stays under 1 s.
+#[test]
+fn r1543_2_p6_a_fallback_check_wall_is_z3s_alone() {
+    if child() {
+        return;
+    }
+    let name = test("r1543_2_p6_a_fallback_check_wall_is_z3s_alone");
+    let dir = scratch("r1543-p6");
+    let dump = scratch("r1543-p6-dump");
+    let line = script(&dir, "slow-no-s", "sleep 2");
+    let (on, err) = spawn(
+        &name,
+        CASCADE_TIE,
+        "r1543-p6-on",
+        "frozen",
+        &[
+            (SWITCH, line.into()),
+            ("CRAT_BO_PHASE_LOG", "on".into()),
+            (DUMP_DIR, os(&dump)),
+            (DUMP_CHECKS, ALL_CHECKS.into()),
+        ],
+    );
+    assert_eq!(on.kind, "emitted", "{on:?}");
+    let fallbacks = lines(&err, "maxsat:fallback");
+    assert!(
+        !fallbacks.is_empty()
+            && fallbacks
+                .iter()
+                .all(|line| line.contains("cause=status:none ")),
+        "{err}"
+    );
+    let index = std::fs::read_to_string(dump.join("index.tsv")).unwrap();
+    let mut rows = index.lines();
+    let head: Vec<&str> = rows.next().unwrap().split('\t').collect();
+    let at = head
+        .iter()
+        .position(|column| *column == "check_wall_s")
+        .unwrap();
+    let walls: Vec<f64> = rows
+        .map(|row| row.split('\t').nth(at).unwrap().parse().unwrap())
+        .collect();
+    assert!(walls.len() >= fallbacks.len(), "{index}");
+    assert!(walls.iter().all(|&wall| wall < 1.0), "{index}");
+}
+
+/// P7 (the review, defect 2): the limit holds when the run line forks. The shell runs `sleep 30` as
+/// its own child (not by `exec`), so the pipes stay open after the shell is killed at the limit; the
+/// check still ends near the limit, with `Limit`, and its file is gone.
+#[test]
+fn r1543_2_p7_the_limit_holds_when_the_line_forks() {
+    let dir = scratch("r1543-p7");
+    let (hard, soft) = operator_problem();
+    let case = Case {
+        tag: "limit-fork",
+        line: script(&dir, "limit-fork", "sleep 30; true"),
+        limit: Duration::from_secs(1),
+        base: None,
+        synced: None,
+        extra: None,
+        dir: None,
+        expected: Err(Cause::Limit),
+    };
+    let (result, wall, gone) = run(&case, &dir, &hard, &soft);
+    assert!(
+        matches!(result, Err(Cause::Limit)),
+        "{:?}",
+        result.as_ref().map(|_| ())
+    );
+    assert!(wall < Duration::from_secs(10), "{wall:?}");
+    assert!(gone);
+}
+
+/// P8 (the review, defect 3): an index the encoder handed out but wrote in no clause is not asked of
+/// the solver. `or(c, true)` gives `c` the highest index and folds away, so a 2022+ solver reads two
+/// variables from the file and answers two values; in either `v` form the answer is handed back
+/// (`c`, in no clause, takes false).
+#[test]
+fn r1543_2_p8_an_unwritten_top_index_is_not_asked_for() {
+    let dir = scratch("r1543-p8");
+    let a = Bool::new_const("r1543_2_p8_a");
+    let b = Bool::new_const("r1543_2_p8_b");
+    let c = Bool::new_const("r1543_2_p8_c");
+    let hard = vec![
+        Bool::or(&[a.clone(), b.clone()]),
+        Bool::or(&[c, Bool::from_bool(true)]),
+    ];
+    let soft = vec![(a, 1), (b, 2)];
+    let wcnf = encode(&hard, &soft).expect("supported");
+    assert_eq!(
+        (wcnf.vars, top_written(&wcnf)),
+        (3, 2),
+        "c's index is the highest and unwritten"
+    );
+    for (tag, values) in [("bits", "11"), ("lits", "1 2")] {
+        let case = Case {
+            tag,
+            line: script(
+                &dir,
+                tag,
+                &format!("echo 'o 0'; echo 's OPTIMUM FOUND'; echo 'v {values}'"),
+            ),
+            limit: Duration::from_secs(60),
+            base: None,
+            synced: None,
+            extra: None,
+            dir: None,
+            expected: Ok(()),
+        };
+        let (result, _, gone) = run(&case, &dir, &hard, &soft);
+        let model = result.unwrap_or_else(|cause| panic!("{tag}: {cause:?}"));
+        assert_eq!(soft_cost(&model, &soft), 0, "{tag}");
+        assert!(gone, "{tag}");
     }
 }
