@@ -224,7 +224,7 @@ fn operator_problem() -> (Vec<Bool>, Vec<(Bool, u64)>) {
         !Bool::and(&[e.clone(), f.clone(), g.clone()]),
         !!Bool::or(&[d.clone(), e.clone(), h.clone()]),
         !a.xor(&f),
-        d._eq(e.xor(&f)),
+        d.eq(e.xor(&f)),
         a.implies(&b).implies(&c),
         Bool::and(&[
             Bool::or(&[a.clone(), b.clone(), c.clone()]),
@@ -519,7 +519,7 @@ fn cases(dir: &Path, wcnf: &Wcnf) -> Vec<Case> {
             ..case("write", &found, Err(Cause::Write(String::new())))
         },
         Case {
-            extra: Some(Int::new_const("r1543_2_p2_n")._eq(Int::from_i64(1))),
+            extra: Some(Int::new_const("r1543_2_p2_n").eq(Int::from_i64(1))),
             ..case(
                 "unsupported",
                 &found,
