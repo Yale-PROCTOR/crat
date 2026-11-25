@@ -11,7 +11,12 @@ use rustc_ast::{
 };
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_hir::{self as hir, def::Res, definitions::DefPathData, intravisit};
+use rustc_hir::{
+    self as hir,
+    def::{DefKind, Res},
+    definitions::DefPathData,
+    intravisit,
+};
 use rustc_middle::{
     hir::nested_filter,
     ty::{self, List, TyCtxt, TypeSuperVisitable, TypeVisitor},
@@ -1112,6 +1117,32 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
                     }
                 }
             }
+        }
+    }
+
+    fn visit_pat(&mut self, pat: &mut ast::Pat) {
+        if matches!(pat.kind, ast::PatKind::Ident(_, _, None))
+            && let Some(hir_pat) = self.ast_to_hir.get_pat(pat.id, self.tcx)
+            && let hir::PatKind::Expr(hir::PatExpr {
+                kind: hir::PatExprKind::Path(hir::QPath::Resolved(_, path)),
+                ..
+            }) = hir_pat.kind
+            && let Res::Def(DefKind::Const, def_id) = path.res
+            && let Some(def_id) = def_id.as_local()
+            && let Some(resolved) = self.resolve_map.get(&def_id)
+        {
+            pat.kind =
+                ast::PatKind::Path(None, path!("crate::{}", self.tcx.def_path_str(*resolved)));
+            self.updated = true;
+        } else {
+            mut_visit::walk_pat(self, pat);
+        }
+    }
+
+    fn visit_pat_field(&mut self, field: &mut ast::PatField) {
+        mut_visit::walk_pat_field(self, field);
+        if field.is_shorthand && matches!(field.pat.kind, ast::PatKind::Path(..)) {
+            field.is_shorthand = false;
         }
     }
 

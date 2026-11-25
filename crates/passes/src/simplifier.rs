@@ -425,7 +425,8 @@ impl<'tcx> AstVisitor<'tcx> {
                 hir::ExprKind::Index(_, _, _) => return false,
                 hir::ExprKind::Cast(_, _) => {
                     let typeck = self.tcx.typeck(parent.hir_id.owner);
-                    return typeck.expr_ty(parent).is_raw_ptr();
+                    let target = typeck.expr_ty(parent);
+                    return target.is_raw_ptr() || target.is_floating_point();
                 }
                 _ => {}
             }
@@ -766,6 +767,20 @@ mod tests {
         run_test(
             "const SENTINEL: *mut core::ffi::c_void = -(1 as core::ffi::c_int) as *mut core::ffi::c_void;",
             &["-1i32 as *mut core::ffi::c_void"],
+            &[],
+        )
+    }
+
+    #[test]
+    fn preserves_integer_arithmetic_width_before_float_cast() {
+        run_test(
+            r#"
+                type Wide = i64;
+                const LOWER: f64 = (-(21086676 as i32) as Wide * 10000 as Wide) as f64;
+                const UPPER: f64 =
+                    (25340230 as Wide * 10000 as i32 as Wide + 799 as Wide) as f64;
+            "#,
+            &["-21086676i64 * 10000i64", "25340230i64 * 10000i64 + 799i64"],
             &[],
         )
     }

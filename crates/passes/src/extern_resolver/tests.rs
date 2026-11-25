@@ -31,6 +31,40 @@ fn test_simple() {
 }
 
 #[test]
+fn preserves_match_patterns_for_deduplicated_constants() {
+    let code = r#"
+        pub mod a {
+            pub const OPEN: i32 = 1;
+            pub const CLOSE: i32 = 2;
+        }
+        pub mod b {
+            pub const OPEN: i32 = 1;
+            pub const CLOSE: i32 = 2;
+            pub fn single(value: i32) -> bool {
+                match value { OPEN => true, _ => false }
+            }
+            pub fn alternative(value: i32) -> i32 {
+                match value { OPEN | CLOSE => 0, other => other }
+            }
+            pub struct Flags { pub OPEN: i32 }
+            pub fn shorthand(value: Flags) -> bool {
+                match value { Flags { OPEN } => true, _ => false }
+            }
+        }
+    "#;
+    let code = utils::compilation::run_compiler_on_str(code, |tcx| {
+        super::resolve_extern(&super::Config::default(), tcx)
+    })
+    .unwrap();
+    utils::compilation::run_compiler_on_str(&code, utils::type_check).expect(&code);
+    assert_eq!(code.matches("pub const OPEN:").count(), 1, "{code}");
+    assert!(code.contains("crate::a::OPEN => true"), "{code}");
+    assert!(code.contains("crate::a::OPEN | crate::a::CLOSE"), "{code}");
+    assert!(code.contains("other => other"), "{code}");
+    assert!(code.contains("Flags { OPEN: crate::a::OPEN }"), "{code}");
+}
+
+#[test]
 fn test_simple_diff() {
     let code1 = "
     pub struct s {
