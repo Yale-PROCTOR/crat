@@ -1,5 +1,5 @@
 //! R1543-2 Part 2 (main 346 §4; the seat's R1543-4): the external MaxSAT path's witnesses P1–P5;
-//! P6–P8 come from the review of 9595db605.
+//! P6–P9 come from the review of 9595db605.
 //! P1's fixtures, P2's hook half, P3 and P5 run the whole rewrite in child processes of this test
 //! binary (the switches are read once per process), with the model checkpoint's child harness. The
 //! rest runs here, with test-built shell scripts in place of a solver: no external binary but P5's.
@@ -891,4 +891,54 @@ fn r1543_2_p8_an_unwritten_top_index_is_not_asked_for() {
         assert_eq!(soft_cost(&model, &soft), 0, "{tag}");
         assert!(gone, "{tag}");
     }
+}
+
+/// P9 (the review, note 6; R1547-3 §4): crat writes and removes only inside a directory it made for
+/// the check. A name already taken -- here a symlink to another directory, planted where the
+/// check's directory goes -- is refused (`Write`), and nothing under the symlink's target is
+/// written or removed.
+#[cfg(unix)]
+#[test]
+fn r1543_2_p9_a_planted_directory_is_refused() {
+    let dir = scratch("r1543-p9");
+    let target = dir.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("keep"), "keep").unwrap();
+    std::os::unix::fs::symlink(&target, dir.join("planted")).unwrap();
+    let (hard, soft) = operator_problem();
+    let wcnf = encode(&hard, &soft).expect("supported");
+    let (o, bits) = answer(&wcnf);
+    let case = Case {
+        tag: "planted",
+        line: script(
+            &dir,
+            "planted",
+            &format!("echo 'o {o}'; echo 's OPTIMUM FOUND'; echo 'v {bits}'"),
+        ),
+        limit: Duration::from_secs(60),
+        base: None,
+        synced: None,
+        extra: None,
+        dir: None,
+        expected: Err(Cause::Write(String::new())),
+    };
+    let (result, _, _) = run(&case, &dir, &hard, &soft);
+    assert!(
+        matches!(result, Err(Cause::Write(_))),
+        "{:?}",
+        result.as_ref().map(|_| ())
+    );
+    let mut left: Vec<String> = std::fs::read_dir(&target)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["keep"]);
+    assert!(
+        dir.join("planted")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
 }
