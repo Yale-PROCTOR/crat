@@ -13,10 +13,12 @@
 //!    becomes clauses where its shape allows, and every compound term below gets a full Tseitin
 //!    definition, hash-consed (main 341's `smt2wcnf.py`, over the z3 terms instead of their text);
 //! 2. the file `<temp>/crat-maxsat-<pid>/<n>.wcnf` is written, and the run line's process solves it
-//!    under its own address-space limit and crat's query limit; the file goes when the process ends,
-//!    on every path, and the directory with it when it is left empty;
-//! 3. only `s OPTIMUM FOUND` with a full `v` line goes on (the `s` line is read, never the exit
-//!    code): the assignment is handed back to a plain z3 solver that holds the same assertions, with
+//!    under its own address-space limit and crat's query limit (its pipes are read up to the same
+//!    limit); the file goes when the process ends, on every path, and the directory with it when it
+//!    is left empty;
+//! 3. only `s OPTIMUM FOUND` with a `v` line over every index the file holds goes on (the `s` line
+//!    is read, never the exit code; an index in no clause takes false): the assignment is handed back
+//!    to a z3 solver that holds the same assertions (the round's hard solver, or a plain one), with
 //!    every WCNF-mapped original variable fixed, and that solver's model is the round's model when
 //!    its soft cost equals the `o` line plus the weight of the soft terms folded to false.
 //!
@@ -189,6 +191,18 @@ pub(crate) struct Wcnf {
 }
 
 impl Wcnf {
+    /// The highest index the file holds. The 2022+ format has no header, so a solver reads its
+    /// variable count from it; an index above it went into no clause (it was folded away), and any
+    /// value of it satisfies the file (the review of 9595db605).
+    pub(crate) fn written_vars(&self) -> i32 {
+        self.hard
+            .iter()
+            .chain(self.soft.iter().map(|(_, lit)| lit))
+            .map(|lit| lit.abs())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The file's text: a comment, the hard clauses (`h … 0`), then the soft terms (`w lit 0`).
     pub(crate) fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
         writeln!(
@@ -759,11 +773,24 @@ fn run_child(line: &RunLine, file: &Path, limit: Duration) -> ChildRun {
             }
         }
     };
-    let stdout = stdout.map(join).unwrap_or_default();
-    let stderr = tail(&stderr.map(join).unwrap_or_default());
+    // The review of 9595db605: a run line that forks (a wrapper that does not `exec`) can leave a
+    // process holding the pipes after the child is gone. The drains are waited for up to the limit
+    // only; a pipe still open then is left to its thread, and the check is a `Limit`.
+    let deadline = started.checked_add(limit);
+    let stdout = match stdout {
+        Some(handle) => collect(handle, deadline),
+        None => Some(Vec::new()),
+    };
+    let stderr = tail(
+        &stderr
+            .and_then(|handle| collect(handle, deadline))
+            .unwrap_or_default(),
+    );
     let stdout = ended.and_then(|status| match signal(&status) {
         Some(signal) => Err(Cause::Signal(signal)),
-        None => Ok(String::from_utf8_lossy(&stdout).into_owned()),
+        None => stdout
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .ok_or(Cause::Limit),
     });
     ChildRun {
         stdout,
@@ -782,6 +809,18 @@ fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8
 
 fn join(handle: std::thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
     handle.join().unwrap_or_default()
+}
+
+/// A drain's bytes, or `None` when its pipe is still open at `deadline` (the thread is left to end
+/// on its own). No deadline (a limit past `Instant`'s range) waits as long as the pipe is open.
+fn collect(handle: std::thread::JoinHandle<Vec<u8>>, deadline: Option<Instant>) -> Option<Vec<u8>> {
+    while !handle.is_finished() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return None;
+        }
+        std::thread::sleep(POLL);
+    }
+    Some(join(handle))
 }
 
 #[cfg(unix)]
@@ -805,8 +844,9 @@ fn tail(bytes: &[u8]) -> String {
 
 /// The `o` line and the values of the variables `1..=vars`, when the `s` line is `OPTIMUM FOUND`
 /// (R1543-4 (2): the `s` line decides, never the exit code). A `v` line is one 0/1 string (the
-/// 2022+ format) or signed literals over one or more lines.
-fn parse_answer(stdout: &str, vars: usize) -> Result<(u64, Vec<bool>), Cause> {
+/// 2022+ format) or signed literals over one or more lines. It must give `1..=written`, the indices
+/// the file holds; it may give more, up to `vars`; the rest, in no clause, take false.
+fn parse_answer(stdout: &str, written: usize, vars: usize) -> Result<(u64, Vec<bool>), Cause> {
     let mut status = None;
     let mut cost = None;
     let mut bodies = Vec::new();
@@ -825,43 +865,48 @@ fn parse_answer(stdout: &str, vars: usize) -> Result<(u64, Vec<bool>), Cause> {
         Some("OPTIMUM FOUND") => {}
         other => return Err(Cause::Status(other.unwrap_or("none").to_owned())),
     }
-    let values = parse_values(&bodies, vars)?;
+    let values = parse_values(&bodies, written, vars)?;
     let cost = cost.ok_or(Cause::NoCost)?;
     Ok((cost, values))
 }
 
-fn parse_values(bodies: &[&str], vars: usize) -> Result<Vec<bool>, Cause> {
+fn parse_values(bodies: &[&str], written: usize, vars: usize) -> Result<Vec<bool>, Cause> {
     if let [body] = bodies
         && !body.is_empty()
         && body.bytes().all(|byte| byte == b'0' || byte == b'1')
     {
-        return if body.len() == vars {
-            Ok(body.bytes().map(|byte| byte == b'1').collect())
-        } else {
-            Err(Cause::Values {
+        if !(written..=vars).contains(&body.len()) {
+            return Err(Cause::Values {
                 got: body.len(),
-                want: vars,
-            })
-        };
+                want: written,
+            });
+        }
+        let mut values: Vec<bool> = body.bytes().map(|byte| byte == b'1').collect();
+        values.resize(vars, false);
+        return Ok(values);
     }
     let mut values = vec![None; vars];
     for token in bodies.iter().flat_map(|body| body.split_whitespace()) {
-        let lit: i64 = token
-            .parse()
-            .map_err(|_| Cause::Values { got: 0, want: vars })?;
+        let lit: i64 = token.parse().map_err(|_| Cause::Values {
+            got: 0,
+            want: written,
+        })?;
         if lit == 0 {
             continue;
         }
         let index = usize::try_from(lit.unsigned_abs()).unwrap_or(usize::MAX);
         let slot = values.get_mut(index.wrapping_sub(1)).ok_or(Cause::Values {
             got: index,
-            want: vars,
+            want: written,
         })?;
         *slot = Some(lit > 0);
     }
-    let got = values.iter().filter(|value| value.is_some()).count();
-    if got != vars {
-        return Err(Cause::Values { got, want: vars });
+    let got = values[..written]
+        .iter()
+        .filter(|value| value.is_some())
+        .count();
+    if got != written {
+        return Err(Cause::Values { got, want: written });
     }
     Ok(values
         .into_iter()
@@ -1012,7 +1057,8 @@ pub(crate) fn attempt(
     report.as_limit = run.as_limit;
     report.stderr = run.stderr;
     let vars = usize::try_from(wcnf.vars).expect("a variable count is not negative");
-    let (cost, values) = parse_answer(&run.stdout?, vars)?;
+    let written = usize::try_from(wcnf.written_vars()).expect("an index is not negative");
+    let (cost, values) = parse_answer(&run.stdout?, written, vars)?;
     report.o = cost;
     let started = Instant::now();
     let model = hand_back(check.solver, check.synced, check.scope, &wcnf, &values)?;

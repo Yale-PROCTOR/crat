@@ -3484,11 +3484,12 @@ impl KindSolver {
         // R1529-2: the dump (switch off: nothing) ends before the check's clock starts.
         let mut dump =
             crate::optimize_dump::before_check(&self.solver, "optimize", self.soft_terms());
-        // Relay main/388 O2: the deciding check's own wall, for the budget predicate.
-        let check_started = Instant::now();
         // R1543-2 Part 2: the external process's optimum when the switch is set; else, and on a
         // fallback, today's check.
         let external = self.external_optimum(hard);
+        // Relay main/388 O2: the deciding check's own wall, for the budget predicate. It starts after
+        // the external attempt, so a fallback's wall is z3's check alone (the review of 9595db605).
+        let check_started = Instant::now();
         let mut outcome = if external.is_some() {
             SatResult::Sat
         } else {
