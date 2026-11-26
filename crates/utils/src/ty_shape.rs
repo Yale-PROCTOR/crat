@@ -1,7 +1,9 @@
 use rustc_abi::FieldIdx;
-use rustc_ast::UintTy;
 use rustc_hash::FxHashMap;
-use rustc_hir::{FnRetTy, ImplItemKind, ItemKind, PrimTy, QPath, TyKind as HirTyKind, def::Res};
+use rustc_hir::{
+    BodyId, ExprKind, FnRetTy, ImplItemKind, ImplItemRef, ItemKind, QPath, StmtKind,
+    TyKind as HirTyKind,
+};
 use rustc_middle::{
     mir::{
         Body, Location, Operand, Place, PlaceElem,
@@ -58,101 +60,106 @@ pub fn get_ty_shapes<'a, 'tcx>(
 }
 
 fn compute_bitfields<'tcx>(tss: &mut TyShapes<'_, 'tcx>, tcx: TyCtxt<'tcx>) {
-    let mut bitfield_structs = FxHashMap::default();
-    let mut bitfield_impls = FxHashMap::default();
     for item_id in tcx.hir_free_items() {
         let item = tcx.hir_item(item_id);
-        match item.kind {
-            ItemKind::Struct(_, _, vd) => {
-                let mut names = vec![];
-                for field in vd.fields() {
-                    let HirTyKind::Array(ty, _) = field.ty.kind else {
-                        continue;
-                    };
-                    let HirTyKind::Path(QPath::Resolved(_, path)) = ty.kind else {
-                        continue;
-                    };
-                    if !matches!(path.res, Res::PrimTy(PrimTy::Uint(UintTy::U8))) {
-                        continue;
-                    }
-                    let name = field.ident.name.to_ident_string();
-                    if !name.starts_with("c2rust_padding") {
-                        names.push(name);
-                    }
-                }
-                if !names.is_empty() {
-                    let len = vd.fields().len();
-                    bitfield_structs.insert(item_id.owner_id.def_id, (names, len));
-                }
-            }
-            ItemKind::Impl(imp) if imp.of_trait.is_none() => {
-                let HirTyKind::Path(QPath::Resolved(_, path)) = imp.self_ty.kind else {
-                    unreachable!()
-                };
-                let Res::Def(_, def_id) = path.res else { unreachable!() };
-                let local_def_id = def_id.expect_local();
-                if !imp.items.is_empty()
-                    && tcx.is_automatically_derived(item_id.owner_id.def_id.to_def_id())
-                {
-                    let fields: Vec<_> = imp
-                        .items
-                        .chunks(2)
-                        .map(|items| {
-                            let name0 = items[0].ident.name.to_ident_string();
-                            let name0 = name0.strip_prefix("set_").unwrap();
-                            let name1 = items[1].ident.name.to_ident_string();
-                            assert_eq!(name0, name1);
-                            let ImplItemKind::Fn(sig, _) = tcx.hir_impl_item(items[1].id).kind
-                            else {
-                                unreachable!()
-                            };
-                            let FnRetTy::Return(ty) = sig.decl.output else { unreachable!() };
-                            let rustc_hir::TyKind::Path(QPath::Resolved(_, path)) = ty.kind else {
-                                unreachable!()
-                            };
-                            let ty: String = path
-                                .segments
-                                .iter()
-                                .map(|seg| seg.ident.name.to_ident_string())
-                                .intersperse("::".to_string())
-                                .collect();
-                            (name1, ty)
-                        })
-                        .collect();
-                    bitfield_impls.insert(local_def_id, fields);
-                }
-            }
-            _ => {}
+        let ItemKind::Impl(imp) = item.kind else { continue };
+        if imp.of_trait.is_some()
+            || imp.items.is_empty()
+            || !tcx.is_automatically_derived(item.owner_id.to_def_id())
+        {
+            continue;
         }
+        let self_ty = tcx.type_of(item.owner_id.def_id).instantiate_identity();
+        let TyKind::Adt(adt, _) = self_ty.kind() else { continue };
+        let Some(struct_id) = adt.did().as_local() else { continue };
+        if !adt.is_struct() {
+            continue;
+        }
+
+        let first_index = adt.non_enum_variant().fields.len();
+        // BitfieldStruct emits a setter and getter for each bitfield in declaration order.
+        let Some(fields) = imp
+            .items
+            .chunks(2)
+            .map(|pair| bitfield_accessor_pair(pair, tcx))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+
+        tss.bitfields.insert(
+            struct_id,
+            BitField {
+                name_to_idx: fields
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, _))| (name.clone(), FieldIdx::from_usize(first_index + i)))
+                    .collect(),
+                fields: fields
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, field)| (FieldIdx::from_usize(first_index + i), field))
+                    .collect(),
+            },
+        );
     }
-    tss.bitfields = bitfield_impls
-        .into_iter()
-        .map(|(ty, fields)| {
-            let bf1: String = fields
-                .iter()
-                .map(|(f, _)| f.as_str())
-                .intersperse("_")
-                .collect();
-            let (ref bf2, len) = bitfield_structs[&ty];
-            let bf2: String = bf2.iter().map(|f| f.as_str()).intersperse("_").collect();
-            assert_eq!(bf1, bf2);
-            let name_to_idx = fields
-                .iter()
-                .enumerate()
-                .map(|(i, (f, _))| (f.clone(), FieldIdx::from_usize(len + i)))
-                .collect();
-            let fields = fields
-                .into_iter()
-                .enumerate()
-                .map(|(i, p)| (FieldIdx::from_usize(len + i), p))
-                .collect();
-            let bitfield = BitField {
-                name_to_idx,
-                fields,
-            };
-            (ty, bitfield)
-        })
+}
+
+fn bitfield_accessor_pair<'tcx>(
+    pair: &[ImplItemRef],
+    tcx: TyCtxt<'tcx>,
+) -> Option<(String, String)> {
+    let [setter, getter] = pair else { return None };
+    let name = getter.ident.name.to_ident_string();
+    if setter.ident.name.as_str().strip_prefix("set_") != Some(name.as_str()) {
+        return None;
+    }
+    let ImplItemKind::Fn(_, setter_body) = tcx.hir_impl_item(setter.id).kind else { return None };
+    let ImplItemKind::Fn(signature, getter_body) = tcx.hir_impl_item(getter.id).kind else {
+        return None;
+    };
+    let FnRetTy::Return(ty) = signature.decl.output else { return None };
+    let HirTyKind::Path(QPath::Resolved(_, path)) = ty.kind else { return None };
+    if !calls_bitfield_helper(setter_body, "set_field", tcx)
+        || !calls_bitfield_helper(getter_body, "get_field", tcx)
+    {
+        return None;
+    }
+    let ty = path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.name.to_ident_string())
+        .intersperse("::".to_string())
         .collect();
+    Some((name, ty))
+}
+
+fn calls_bitfield_helper<'tcx>(body: BodyId, helper: &str, tcx: TyCtxt<'tcx>) -> bool {
+    let body = tcx.hir_body(body);
+    let ExprKind::Block(block, _) = body.value.kind else { return false };
+    let Some(call) = block.expr.or_else(|| match block.stmts.last()?.kind {
+        StmtKind::Semi(call) => Some(call),
+        _ => None,
+    }) else {
+        return false;
+    };
+    let typeck = tcx.typeck(body.value.hir_id.owner);
+    let callee = match call.kind {
+        ExprKind::Call(callee, _) => match typeck.expr_ty(callee).kind() {
+            TyKind::FnDef(def_id, _) => Some(*def_id),
+            _ => None,
+        },
+        ExprKind::MethodCall(..) => typeck.type_dependent_def_id(call.hir_id),
+        _ => None,
+    };
+    callee.is_some_and(|callee| {
+        tcx.item_name(callee).as_str() == helper
+            && tcx.trait_of_item(callee).is_some_and(|trait_id| {
+                !trait_id.is_local()
+                    && tcx.crate_name(trait_id.krate).as_str() == "c2rust_bitfields"
+                    && tcx.item_name(trait_id).as_str() == "FieldType"
+            })
+    })
 }
 
 fn compute_ty_shapes<'tcx>(
@@ -439,35 +446,101 @@ pub fn keep(value: Flags) -> Flags { value }
         .unwrap();
     }
 
+    fn assert_bitfields(source: &str, array_lengths: &[usize], expected: &[(&str, &str)]) {
+        crate::compilation::run_compiler_on_str(source, |tcx| {
+            let arena = Arena::new();
+            let shapes = get_ty_shapes(&arena, tcx, false);
+            let flags = flags_type(tcx);
+            let TyKind::Adt(adt, _) = flags.kind() else { panic!("expected Flags struct") };
+            let bitfields = &shapes.bitfields[&adt.did().expect_local()];
+            assert_eq!(bitfields.len(), expected.len());
+            assert_eq!(bitfields.name_to_idx.len(), expected.len());
+            for (ordinal, &(name, ty)) in expected.iter().enumerate() {
+                let index = FieldIdx::from_usize(array_lengths.len() + ordinal);
+                assert_eq!(bitfields.name_to_idx[name], index);
+                assert_eq!(bitfields.fields[&index], (name.to_owned(), ty.to_owned()));
+            }
+
+            let TyShape::Struct(len, fields, false) = shapes.tys[&flags] else {
+                panic!("expected physical and logical struct fields");
+            };
+            assert_eq!(*len, array_lengths.len() + expected.len());
+            assert_eq!(fields.len(), *len);
+            for ((_, shape), &length) in fields.iter().zip(array_lengths) {
+                assert!(matches!(shape, TyShape::Array(_, n) if *n == length));
+            }
+            for (_, shape) in &fields[array_lengths.len()..] {
+                assert!(matches!(shape, TyShape::Primitive(ty) if *ty == tcx.types.u8));
+            }
+        })
+        .unwrap();
+    }
+
     #[test]
-    fn populated_bitfields_retain_logical_fields() {
-        crate::compilation::run_compiler_on_str(
+    fn bitfields_with_an_ordinary_byte_array_retain_logical_fields() {
+        assert_bitfields(
             r#"
 use c2rust_bitfields::BitfieldStruct;
 #[repr(C)]
 #[derive(BitfieldStruct)]
 pub struct Flags {
+    pub checksum: [u8; 32],
     #[bitfield(name = "ready", ty = "u8", bits = "0..=0")]
-    #[bitfield(name = "busy", ty = "u8", bits = "1..=1")]
+    #[bitfield(name = "busy", ty = "libc::c_uint", bits = "1..=1")]
     pub ready_busy: [u8; 1],
+    #[bitfield(padding)]
     pub c2rust_padding: [u8; 7],
+}
+pub fn read(value: Flags) -> u8 { value.ready() }
+"#,
+            &[32, 1, 7],
+            &[("ready", "u8"), ("busy", "libc::c_uint")],
+        );
+    }
+
+    #[test]
+    fn renamed_bitfield_storage_retains_logical_fields_in_an_expanded_impl() {
+        assert_bitfields(
+            r#"
+use c2rust_bitfields::FieldType;
+#[repr(C)]
+pub struct Flags {
+    pub flags: [u8; 2],
+}
+#[automatically_derived]
+impl Flags {
+    pub fn set_ready(&mut self, value: u8) {
+        value.set_field(&mut self.flags, (0, 0));
+    }
+    pub fn ready(&self) -> u8 {
+        <u8 as FieldType>::get_field(&self.flags, (0, 0))
+    }
+}
+pub fn read(value: Flags) -> u8 { value.ready() }
+"#,
+            &[2],
+            &[("ready", "u8")],
+        );
+    }
+
+    #[test]
+    fn similar_generated_methods_without_bitfield_helpers_are_ignored() {
+        crate::compilation::run_compiler_on_str(
+            r#"
+pub struct Flags {
+    pub ready: [u8; 1],
+}
+#[automatically_derived]
+impl Flags {
+    pub fn set_ready(&mut self, value: u8) { self.ready[0] = value; }
+    pub fn ready(&self) -> u8 { self.ready[0] }
 }
 pub fn read(value: Flags) -> u8 { value.ready() }
 "#,
             |tcx| {
                 let arena = Arena::new();
                 let shapes = get_ty_shapes(&arena, tcx, false);
-                let flags = flags_type(tcx);
-                let bitfields = shapes.bitfields.values().next().unwrap();
-                assert_eq!(bitfields.len(), 2);
-                assert_eq!(bitfields.name_to_idx["ready"], FieldIdx::from_usize(2));
-                assert_eq!(bitfields.name_to_idx["busy"], FieldIdx::from_usize(3));
-                assert_eq!(bitfields.fields[&FieldIdx::from_usize(2)].1, "u8");
-                let TyShape::Struct(len, fields, false) = shapes.tys[&flags] else {
-                    panic!("expected physical and logical struct fields");
-                };
-                assert_eq!(*len, 4);
-                assert_eq!(fields.len(), 4);
+                assert!(shapes.bitfields.is_empty());
             },
         )
         .unwrap();
