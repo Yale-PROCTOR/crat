@@ -97,18 +97,20 @@ pub(super) fn contains_file_type(
     })
 }
 
-pub(super) fn foreign_types(
+pub(super) fn fixed_types(
     tcx: TyCtxt<'_>,
     file_types: &FxHashSet<DefId>,
+    callbacks: &FxHashSet<LocalDefId>,
 ) -> FxHashSet<LocalDefId> {
-    struct TypeVisitor<'tcx> {
+    struct TypeVisitor<'a, 'tcx> {
         tcx: TyCtxt<'tcx>,
+        callbacks: &'a FxHashSet<LocalDefId>,
         roots: FxHashSet<LocalDefId>,
         dependencies: FxHashMap<LocalDefId, FxHashSet<LocalDefId>>,
         fixed_header: bool,
     }
 
-    impl<'tcx> Visitor<'tcx> for TypeVisitor<'tcx> {
+    impl<'tcx> Visitor<'tcx> for TypeVisitor<'_, 'tcx> {
         type NestedFilter = rustc_middle::hir::nested_filter::All;
 
         fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
@@ -116,6 +118,19 @@ pub(super) fn foreign_types(
         }
 
         fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
+            let owner = item.owner_id.def_id;
+            // Generated inherent impls such as BitfieldStruct can require the
+            // original type parameters, including those of types in its fields.
+            if let hir::ItemKind::Impl(implementation) = item.kind
+                && implementation.of_trait.is_none()
+                && (self.tcx.is_automatically_derived(owner.to_def_id())
+                    || item.span.in_derive_expansion())
+                && let TyKind::Adt(definition, _) =
+                    self.tcx.type_of(owner).instantiate_identity().kind()
+                && let Some(definition) = definition.did().as_local()
+            {
+                self.roots.insert(definition);
+            }
             if self
                 .tcx
                 .opt_local_parent(item.owner_id.def_id)
@@ -135,7 +150,8 @@ pub(super) fn foreign_types(
             }
             if let hir::ItemKind::Fn { sig, generics, .. } = item.kind
                 && (sig.decl.c_variadic
-                    || super::requires_unstructured_body(item.owner_id.def_id, self.tcx))
+                    || self.callbacks.contains(&owner)
+                    || super::requires_unstructured_body(owner, self.tcx))
             {
                 let previous = std::mem::replace(&mut self.fixed_header, true);
                 intravisit::walk_fn_decl(self, sig.decl);
@@ -184,6 +200,7 @@ pub(super) fn foreign_types(
 
     let mut visitor = TypeVisitor {
         tcx,
+        callbacks,
         roots: file_types
             .iter()
             .filter_map(|definition| definition.as_local())

@@ -55,6 +55,27 @@ impl PtrKind {
             Self::Box | Self::OptBox | Self::BoxedSlice | Self::OptBoxedSlice => true,
         }
     }
+
+    fn is_slice(self) -> bool {
+        matches!(
+            self,
+            Self::Slice(_) | Self::OptSlice(_) | Self::BoxedSlice | Self::OptBoxedSlice
+        )
+    }
+
+    fn for_pointee<'tcx>(
+        self,
+        pointee: ty::Ty<'tcx>,
+        source_mutability: ty::Mutability,
+        owner: LocalDefId,
+        tcx: TyCtxt<'tcx>,
+    ) -> Self {
+        if self.is_slice() && !pointee.is_sized(tcx, ty::TypingEnv::post_analysis(tcx, owner)) {
+            Self::Raw(source_mutability.is_mut())
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,7 +112,7 @@ pub(super) struct InitialPointerDecisions {
     nested: FxHashMap<PointerTarget, Vec<PointerLayer>>,
     pub bounds: FxHashMap<LocalDefId, Vec<(Symbol, Symbol)>>,
     pub fields: FxHashMap<StructFieldSlot, Vec<PointerLayer>>,
-    pub foreign_types: FxHashSet<LocalDefId>,
+    pub fixed_types: FxHashSet<LocalDefId>,
     file_types: FxHashSet<DefId>,
     pub types: TypeLifetimes,
     pub type_arguments: FxHashMap<(LocalDefId, usize), BTreeMap<FieldRegion, Symbol>>,
@@ -157,13 +178,56 @@ pub(super) fn requires_unstructured_body(function: LocalDefId, tcx: TyCtxt<'_>) 
             .any(|(_, ty)| contains_opaque(*ty))
 }
 
+fn collect_frozen_callbacks(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
+    struct CallbackVisitor<'a, 'tcx> {
+        typeck: &'tcx ty::TypeckResults<'tcx>,
+        callbacks: &'a mut FxHashSet<LocalDefId>,
+    }
+
+    impl<'tcx> Visitor<'tcx> for CallbackVisitor<'_, 'tcx> {
+        fn visit_expr(&mut self, expression: &'tcx hir::Expr<'tcx>) {
+            let source = match expression.kind {
+                hir::ExprKind::Cast(operand, _) => operand,
+                _ => expression,
+            };
+            if self
+                .typeck
+                .expr_ty_adjusted_opt(expression)
+                .is_some_and(|ty| ty.is_fn_ptr())
+                && let Some(TyKind::FnDef(definition, _)) =
+                    self.typeck.expr_ty_opt(source).map(|ty| ty.kind())
+                && let Some(definition) = definition.as_local()
+            {
+                self.callbacks.insert(definition);
+            }
+            intravisit::walk_expr(self, expression);
+        }
+    }
+
+    let mut callbacks = FxHashSet::default();
+    for owner in tcx.hir_body_owners() {
+        CallbackVisitor {
+            typeck: tcx.typeck(owner),
+            callbacks: &mut callbacks,
+        }
+        .visit_body(tcx.hir_body_owned_by(owner));
+    }
+    callbacks.retain(|&function| {
+        matches!(tcx.hir_node_by_def_id(function), hir::Node::Item(item)
+            if matches!(item.kind, hir::ItemKind::Fn { .. }))
+    });
+    callbacks
+}
+
 pub(super) fn initial_pointer_decisions_for_api(
     tcx: TyCtxt<'_>,
     api: &FxHashSet<String>,
     use_bo_analysis: bool,
 ) -> Result<InitialPointerDecisions, String> {
+    // Frozen stubs share the original callback types in preserved crate context.
+    let callbacks = collect_frozen_callbacks(tcx);
     if !use_bo_analysis {
-        return Ok(original::initial_pointer_decisions(tcx, api));
+        return Ok(original::initial_pointer_decisions(tcx, api, &callbacks));
     }
     let mut analysis = analyze_pointers(tcx)?;
     let representations = representation_facts(&analysis, tcx);
@@ -172,12 +236,16 @@ pub(super) fn initial_pointer_decisions_for_api(
         signatures: SigDecisions {
             data: FxHashMap::default(),
         },
-        preserve_safety: FxHashSet::default(),
+        preserve_safety: callbacks
+            .iter()
+            .copied()
+            .filter(|&function| !tcx.fn_sig(function).skip_binder().safety().is_unsafe())
+            .collect(),
         bindings: FxHashMap::default(),
         nested: FxHashMap::default(),
         bounds: FxHashMap::default(),
         fields: FxHashMap::default(),
-        foreign_types: struct_types::foreign_types(tcx, &file_types),
+        fixed_types: struct_types::fixed_types(tcx, &file_types, &callbacks),
         file_types,
         types: TypeLifetimes::default(),
         type_arguments: FxHashMap::default(),
@@ -193,7 +261,7 @@ pub(super) fn initial_pointer_decisions_for_api(
         };
         if field.depth != 0
             || analysis.slots.field_slots.is_array_field(owner)
-            || result.foreign_types.contains(&owner.struct_did)
+            || result.fixed_types.contains(&owner.struct_did)
         {
             continue;
         }
@@ -255,7 +323,7 @@ pub(super) fn initial_pointer_decisions_for_api(
                     representation(kind, mutable, mutability.is_mut(), array, optional)
                 };
             layers.push(PointerLayer {
-                kind,
+                kind: kind.for_pointee(inner, mutability, owner.struct_did, tcx),
                 lifetime: None,
             });
             current = inner;
@@ -297,8 +365,12 @@ pub(super) fn initial_pointer_decisions_for_api(
                 .skip_binder()
                 .inputs()
                 .len();
+            let fixed_signature = callbacks.contains(&function);
             let mut locals = FxHashMap::default();
             for (local, declaration) in body.local_decls.iter_enumerated() {
+                if fixed_signature && local.index() <= arguments {
+                    continue;
+                }
                 let mut original = declaration.ty;
                 let mut layers = Vec::new();
                 loop {
@@ -367,7 +439,7 @@ pub(super) fn initial_pointer_decisions_for_api(
                         representation(*kind, mutable, source_mutability.is_mut(), array, optional)
                     };
                     layers.push(PointerLayer {
-                        kind,
+                        kind: kind.for_pointee(inner, source_mutability, function, tcx),
                         lifetime: None,
                     });
                     original = inner;
@@ -377,43 +449,45 @@ pub(super) fn initial_pointer_decisions_for_api(
                     locals.insert(local, layers);
                 }
             }
-            let origins = analysis
-                .origins
-                .get(&function)
-                .map(SignatureOrigins::from_bo);
-            let bounds = signature_lifetimes(
-                function,
-                arguments,
-                origins.as_ref(),
-                &lifetime_flow,
-                &mut locals,
-                &mut result,
-                tcx,
-            );
-            result.bounds.insert(function, bounds);
-            let mut signature = SigDecision {
-                input_decs: vec![None; arguments],
-                input_lifetimes: vec![None; arguments],
-                output_dec: None,
-                output_lifetime: None,
-            };
-            for index in 0..arguments {
-                if let Some(layers) = locals.get(&Local::from_usize(index + 1)) {
-                    signature.input_decs[index] = Some(layers[0].kind);
-                    signature.input_lifetimes[index] = layers[0].lifetime;
+            if !fixed_signature {
+                let origins = analysis
+                    .origins
+                    .get(&function)
+                    .map(SignatureOrigins::from_bo);
+                let bounds = signature_lifetimes(
+                    function,
+                    arguments,
+                    origins.as_ref(),
+                    &lifetime_flow,
+                    &mut locals,
+                    &mut result,
+                    tcx,
+                );
+                result.bounds.insert(function, bounds);
+                let mut signature = SigDecision {
+                    input_decs: vec![None; arguments],
+                    input_lifetimes: vec![None; arguments],
+                    output_dec: None,
+                    output_lifetime: None,
+                };
+                for index in 0..arguments {
+                    if let Some(layers) = locals.get(&Local::from_usize(index + 1)) {
+                        signature.input_decs[index] = Some(layers[0].kind);
+                        signature.input_lifetimes[index] = layers[0].lifetime;
+                        result
+                            .nested
+                            .insert(PointerTarget::Input(function, index), layers[1..].to_vec());
+                    }
+                }
+                if let Some(layers) = locals.get(&RETURN_PLACE) {
+                    signature.output_dec = Some(layers[0].kind);
+                    signature.output_lifetime = layers[0].lifetime;
                     result
                         .nested
-                        .insert(PointerTarget::Input(function, index), layers[1..].to_vec());
+                        .insert(PointerTarget::Output(function), layers[1..].to_vec());
                 }
+                result.signatures.data.insert(function, signature);
             }
-            if let Some(layers) = locals.get(&RETURN_PLACE) {
-                signature.output_dec = Some(layers[0].kind);
-                signature.output_lifetime = layers[0].lifetime;
-                result
-                    .nested
-                    .insert(PointerTarget::Output(function), layers[1..].to_vec());
-            }
-            result.signatures.data.insert(function, signature);
             let mapping = utils::ir::map_thir_to_mir(function, false, tcx);
             for (binding, local) in mapping.binding_to_local {
                 if let Some(layers) = locals.get(&local) {

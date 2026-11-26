@@ -64,6 +64,91 @@ mod scope {
 }
 
 #[test]
+fn frozen_callback_signatures_match_casts_coercions_and_direct_promotions() {
+    let source = r#"
+type Callback = unsafe extern "C" fn(*const i32) -> i32;
+pub struct Dispatch { pub read: Callback }
+unsafe extern "C" fn explicit(p: *const i32) -> i32 { *p.offset(1) }
+unsafe extern "C" fn projected(p: *const i32) -> i32 { *p.offset(1) }
+pub static TABLE: [Dispatch; 2] = [
+    Dispatch { read: explicit as Callback },
+    Dispatch { read: (projected,).0 },
+];
+fn safe(value: i32) -> i32 { value }
+pub fn safe_callback() -> fn(i32) -> i32 { safe }
+pub unsafe fn direct(p: *const i32) -> i32 { *p.offset(1) }
+"#;
+    for use_bo_analysis in [false, true] {
+        let frozen = freeze_with_analysis(source, use_bo_analysis);
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+        let function = |name| {
+            &frozen
+                .functions
+                .iter()
+                .find(|f| f.record.name == name)
+                .unwrap()
+                .record
+        };
+        for name in ["explicit", "projected", "safe"] {
+            let record = function(name);
+            assert_eq!(record.target_signature, record.source_signature);
+        }
+        let direct = function("direct");
+        assert_ne!(direct.target_signature, direct.source_signature);
+    }
+}
+
+#[test]
+fn frozen_template_keeps_opaque_extern_pointees_out_of_slices() {
+    let source = r#"
+#![feature(extern_types)]
+unsafe extern "C" { pub type Opaque; }
+pub unsafe fn read(p: *const Opaque) -> i32 {
+    let data = p as *const i32;
+    *data + *data.offset(1)
+}
+"#;
+    for use_bo_analysis in [false, true] {
+        let frozen = freeze_with_analysis(source, use_bo_analysis);
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+        let record = &frozen.functions[0].record;
+        assert!(record.target_signature.contains("p: *const Opaque"));
+    }
+}
+
+#[test]
+fn frozen_bitfield_derive_keeps_its_type_and_field_dependencies_nongeneric() {
+    let source = r#"
+pub struct Child { pub data: *const i32 }
+#[derive(c2rust_bitfields::BitfieldStruct)]
+#[repr(C)]
+pub struct Flags {
+    #[bitfield(name = "active", ty = "u8", bits = "0..=0")]
+    pub storage: [u8; 1],
+    pub child: Child,
+    pub reader: *const i32,
+}
+pub unsafe fn update(flags: *mut Flags, p: *const i32) -> i32 {
+    (*flags).child.data = p;
+    (*flags).reader = p;
+    *(*flags).reader + *(*flags).child.data + (*flags).active() as i32
+}
+"#;
+    for use_bo_analysis in [false, true] {
+        let frozen = freeze_with_analysis(source, use_bo_analysis);
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+        for path in ["Flags", "Child"] {
+            let record = frozen
+                .types
+                .iter()
+                .find(|record| record.path == path)
+                .unwrap();
+            assert_eq!(record.target_definition, record.source_definition);
+        }
+    }
+}
+
+#[test]
 fn macro_statements_skip_only_their_own_observations() {
     let frozen = freeze(
         r#"

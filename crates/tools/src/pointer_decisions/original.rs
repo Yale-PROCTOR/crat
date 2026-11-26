@@ -7,6 +7,7 @@ use super::*;
 pub(super) fn initial_pointer_decisions(
     tcx: TyCtxt<'_>,
     api: &FxHashSet<String>,
+    callbacks: &FxHashSet<LocalDefId>,
 ) -> InitialPointerDecisions {
     let original = pointer_replacer::initial_pointer_decisions(
         &pointer_replacer::Config::default(),
@@ -25,14 +26,14 @@ pub(super) fn initial_pointer_decisions(
         nested: FxHashMap::default(),
         bounds: FxHashMap::default(),
         fields: FxHashMap::default(),
-        foreign_types: struct_types::foreign_types(tcx, &file_types),
+        fixed_types: struct_types::fixed_types(tcx, &file_types, callbacks),
         file_types,
         types: TypeLifetimes::default(),
         type_arguments: FxHashMap::default(),
     };
     let (exposed, _) = struct_types::api_structs(tcx, api);
     for (&field, &kind) in &original.fields {
-        if result.foreign_types.contains(&field.struct_did) {
+        if result.fixed_types.contains(&field.struct_did) {
             continue;
         }
         let source = tcx.adt_def(field.struct_did).non_enum_variant().fields
@@ -42,17 +43,10 @@ pub(super) fn initial_pointer_decisions(
             ty::GenericArgs::identity_for_item(tcx, field.struct_did),
         );
         let TyKind::RawPtr(inner, mutable) = *source.kind() else { continue };
-        let mut kind = convert_kind(kind, false);
+        let mut kind = convert_kind(kind, false).for_pointee(inner, mutable, field.struct_did, tcx);
         if inner.is_c_void(tcx)
             || result.preserves_file_type(inner, tcx)
-            || (exposed.contains(&field.struct_did)
-                && matches!(
-                    kind,
-                    PtrKind::Slice(_)
-                        | PtrKind::OptSlice(_)
-                        | PtrKind::BoxedSlice
-                        | PtrKind::OptBoxedSlice
-                ))
+            || (exposed.contains(&field.struct_did) && kind.is_slice())
         {
             kind = PtrKind::Raw(mutable.is_mut());
         }
@@ -84,7 +78,8 @@ pub(super) fn initial_pointer_decisions(
     );
     for (&function, signature) in &original.signatures.data {
         let source_signature = tcx.fn_sig(function).instantiate_identity().skip_binder();
-        if signature.signature_locked && !source_signature.safety.is_unsafe() {
+        let fixed_signature = signature.signature_locked || callbacks.contains(&function);
+        if fixed_signature && !source_signature.safety.is_unsafe() {
             result.preserve_safety.insert(function);
         }
         if requires_unstructured_body(function, tcx) {
@@ -111,7 +106,7 @@ pub(super) fn initial_pointer_decisions(
         }
         let mut locals = FxHashMap::default();
         for (local, declaration) in body.local_decls.iter_enumerated() {
-            if signature.signature_locked && local.index() <= arguments {
+            if fixed_signature && local.index() <= arguments {
                 continue;
             }
             let non_null = original
@@ -135,7 +130,7 @@ pub(super) fn initial_pointer_decisions(
                     PtrKind::Raw(mutable.is_mut())
                 };
                 layers.push(PointerLayer {
-                    kind,
+                    kind: kind.for_pointee(inner, mutable, function, tcx),
                     lifetime: None,
                 });
                 source = inner;
@@ -144,7 +139,7 @@ pub(super) fn initial_pointer_decisions(
                 locals.insert(local, layers);
             }
         }
-        if !signature.signature_locked {
+        if !fixed_signature {
             let origins = original
                 .lifetime_flows
                 .get(&function)

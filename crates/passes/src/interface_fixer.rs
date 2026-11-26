@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use rustc_ast::{mut_visit::MutVisitor as _, ptr::P, *};
+use rustc_ast::{mut_visit::MutVisitor as _, ptr::P, visit::Visitor as _, *};
 use rustc_ast_pretty::pprust;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
@@ -10,7 +10,7 @@ use rustc_hir::{
     intravisit,
 };
 use rustc_middle::{hir::nested_filter, ty, ty::TyCtxt};
-use rustc_span::{Symbol, sym};
+use rustc_span::{Ident, Symbol, sym};
 use serde::Deserialize;
 use utils::{
     field_spec::{FieldSpecAttr, FieldSpecEntry, FieldSpecParam},
@@ -48,10 +48,13 @@ pub fn fix_interfaces(config: &Config, tcx: TyCtxt<'_>) -> String {
     };
     tcx.hir_visit_all_item_likes_in_crate(&mut hir_visitor);
 
+    let mut names = OccupiedNames(FxHashSet::default());
+    names.visit_crate(&expanded_ast);
     let mut visitor = AstVisitor {
         tcx,
         ast_to_hir,
         fixes: hir_visitor.fixes,
+        occupied: names.0,
     };
     visitor.visit_crate(&mut expanded_ast);
 
@@ -90,9 +93,38 @@ struct AstVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     ast_to_hir: AstToHir,
     fixes: FxHashMap<LocalDefId, FixEntry<'tcx>>,
+    occupied: FxHashSet<Symbol>,
+}
+
+struct OccupiedNames(FxHashSet<Symbol>);
+
+impl<'ast> visit::Visitor<'ast> for OccupiedNames {
+    fn visit_ident(&mut self, ident: &'ast Ident) {
+        self.0.insert(ident.name);
+    }
 }
 
 impl mut_visit::MutVisitor for AstVisitor<'_> {
+    fn flat_map_stmt(&mut self, stmt: Stmt) -> smallvec::SmallVec<[Stmt; 1]> {
+        let Stmt {
+            kind: StmtKind::Item(item),
+            id,
+            span,
+        } = stmt
+        else {
+            return mut_visit::walk_flat_map_stmt(self, stmt);
+        };
+        self.flat_map_item(item)
+            .into_iter()
+            .enumerate()
+            .map(|(index, item)| Stmt {
+                kind: StmtKind::Item(item),
+                id: if index == 0 { id } else { DUMMY_NODE_ID },
+                span,
+            })
+            .collect()
+    }
+
     fn flat_map_item(&mut self, item: P<Item>) -> smallvec::SmallVec<[P<Item>; 1]> {
         let id = item.id;
         let mut items = mut_visit::walk_flat_map_item(self, item);
@@ -105,17 +137,45 @@ impl mut_visit::MutVisitor for AstVisitor<'_> {
             // internal name for the Rename flow, or the (unchanged) internal
             // fn's own current name for the FieldSpec flow
             let call_target = match &fix.action {
-                FixAction::Rename { internal_name } => *internal_name,
-                FixAction::FieldSpec { .. } => orig_f.ident.name,
+                FixAction::Rename { internal_name } => {
+                    Ident::new(*internal_name, orig_f.ident.span)
+                }
+                FixAction::FieldSpec { .. } => orig_f.ident,
             };
 
             let mut new_item = items[0].clone();
             {
                 let ItemKind::Fn(f) = &mut new_item.kind else { panic!() };
+                let module = self.tcx.parent_module_from_def_id(*def_id).into();
+                let module_children = self.tcx.module_children_local(module);
+                let mut next_name = 0;
                 let mut call = format!("{call_target}(");
                 for (i, param) in f.sig.decl.inputs.iter_mut().enumerate() {
-                    let PatKind::Ident(_, ident, _) = &param.pat.kind else { panic!() };
-                    let x = ident.name;
+                    let x = match param.pat.kind {
+                        PatKind::Ident(BindingMode(ByRef::No, _), ident, None)
+                            if ident.name != call_target.name
+                                && self.ast_to_hir.get_pat(param.pat.id, self.tcx).is_some_and(
+                                    |pat| matches!(pat.kind, hir::PatKind::Binding(..)),
+                                ) =>
+                        {
+                            ident
+                        }
+                        _ => {
+                            let name = loop {
+                                let name = Symbol::intern(&format!("__crat_arg{next_name}"));
+                                next_name += 1;
+                                if !self.occupied.contains(&name)
+                                    && !module_children.iter().any(|child| child.ident.name == name)
+                                {
+                                    break name;
+                                }
+                            };
+                            let ident = Ident::new(name, param.pat.span);
+                            param.pat.kind = PatKind::Ident(BindingMode::NONE, ident, None);
+                            param.pat.tokens = None;
+                            ident
+                        }
+                    };
                     if let Some(pfix) = fix.param_fixes.get(&i) {
                         let m = if pfix.mutability.is_mut() {
                             "mut"
@@ -415,7 +475,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
     }
 
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
-        if let hir::ItemKind::Fn { ident, body, .. } = item.kind {
+        if let hir::ItemKind::Fn { ident, .. } = item.kind {
             let name = ident.name.as_str();
             if self.config.c_exposed_fns.contains(name)
                 || self
@@ -430,7 +490,7 @@ impl<'tcx> intravisit::Visitor<'tcx> for HirVisitor<'_, 'tcx> {
             } else if let Some((exported_symbol, entry)) =
                 find_field_spec_entry(self.config, self.tcx, item.owner_id.def_id, name)
             {
-                self.analyze_field_spec_target(item, name, body, exported_symbol, entry);
+                self.analyze_field_spec_target(item, name, exported_symbol, entry);
             }
         }
 
@@ -466,19 +526,16 @@ impl<'tcx> HirVisitor<'_, 'tcx> {
         &mut self,
         item: &hir::Item<'tcx>,
         name: &str,
-        body: hir::BodyId,
         exported_symbol: &str,
         entry: &FieldSpecEntry,
     ) {
-        let body = self.tcx.hir_body(body);
-        let typeck = self.tcx.typeck(item.owner_id.def_id);
         let signature = self.tcx.liberate_late_bound_regions(
             item.owner_id.def_id.to_def_id(),
             self.tcx.fn_sig(item.owner_id).instantiate_identity(),
         );
         let mut fixes = detect_slice_cursor_fixes(self.tcx, signature);
         for p in &entry.params {
-            match resolve_struct_field_fix(self.tcx, body, typeck, p, self.struct_fields) {
+            match resolve_struct_field_fix(self.tcx, signature, p, self.struct_fields) {
                 Some(fix) => {
                     fixes.insert(p.index, fix);
                 }
@@ -634,13 +691,11 @@ fn field_module_path(tcx: TyCtxt<'_>, did: LocalDefId) -> String {
 // should be skipped
 fn resolve_struct_field_fix<'tcx>(
     tcx: TyCtxt<'tcx>,
-    body: &hir::Body<'tcx>,
-    typeck: &ty::TypeckResults<'tcx>,
+    signature: ty::FnSig<'tcx>,
     param: &FieldSpecParam,
     struct_fields: &FxHashMap<(String, String), ty::Ty<'tcx>>,
 ) -> Option<ParamFix<'tcx>> {
-    let hir_param = body.params.get(param.index)?;
-    let ty = typeck.node_type(hir_param.pat.hir_id);
+    let ty = signature.inputs().get(param.index)?;
     let expected = *struct_fields.get(&(param.struct_name.clone(), param.field.clone()))?;
     // mutability below is derived from `ty.kind()`, the observed promoted
     // shape, which is authoritative; `param.mutbl` is not consulted here
@@ -721,6 +776,45 @@ mod tests {
         utils::compilation::run_compiler_on_str(&transformed, utils::type_check)
             .expect(&transformed);
         transformed
+    }
+
+    #[test]
+    fn forwards_wildcards_and_avoids_names_in_the_wrapper_scope() {
+        let code = r#"
+pub fn outer() {
+    struct __crat_arg0;
+    #[no_mangle]
+    pub unsafe extern "C" fn api(_: i64, r#type: &[i32], api_internal: i16, _: u8) -> i32 {
+        r#type[0] + i32::from(api_internal)
+    }
+}
+"#;
+        let transformed = transform(code, &["api"]);
+        let source = transformed.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            source.contains("fn api_internal(_: i64, r#type: &[i32], api_internal: i16, _: u8)")
+        );
+        assert!(source.contains(
+            "fn api(__crat_arg1: i64, r#type: *const i32, __crat_arg2: i16, __crat_arg3: u8)"
+        ));
+        assert!(source.contains("api_internal(__crat_arg1, if r#type.is_null()"));
+        assert!(source.contains("__crat_arg2, __crat_arg3)"));
+        assert_eq!(source.matches("#[no_mangle]").count(), 1);
+    }
+
+    #[test]
+    fn forwards_values_before_the_internal_function_applies_its_patterns() {
+        let code = r#"
+pub struct Token;
+pub fn api((left, right): (u8, u16), ref value: i32, Token: Token) -> &'static [i32] {
+    let _ = (left, right, *value);
+    &[]
+}
+"#;
+        let transformed = transform(code, &["api"]);
+        assert!(transformed.contains("fn api_internal((left, right): (u8, u16), ref value: i32,"));
+        assert!(transformed.contains("api_internal(__crat_arg0, __crat_arg1, __crat_arg2)"));
+        assert!(transformed.contains("-> *const i32"));
     }
 
     #[test]
@@ -889,7 +983,7 @@ mod other {
     fn field_specialization_combines_optional_slices_and_return_conversion() {
         let source = r#"
 pub struct Ctx { pub data: [u8; 4] }
-pub fn read_field<'a>(ctx: Option<&'a [u8; 4]>, p: Option<&'a [u8]>) -> Option<&'a [u8]> {
+pub fn read_field<'a>(ref ctx: Option<&'a [u8; 4]>, p: Option<&'a [u8]>) -> Option<&'a [u8]> {
     p.or_else(|| ctx.map(|data| &data[..]))
 }
 "#;
@@ -917,10 +1011,11 @@ pub fn read_field<'a>(ctx: Option<&'a [u8; 4]>, p: Option<&'a [u8]>) -> Option<&
         utils::compilation::run_compiler_on_str(&transformed, utils::type_check)
             .expect(&transformed);
         assert!(
-            transformed.contains("fn read<'a>(ctx: *const Ctx, p: *const u8) -> *const u8"),
+            transformed.contains("fn read<'a>(__crat_arg0: *const Ctx, p: *const u8) -> *const u8"),
             "{transformed}"
         );
-        assert!(transformed.contains("Some(&(*ctx).data)"));
+        assert!(transformed.contains("fn read_field<'a>(ref ctx:"));
+        assert!(transformed.contains("Some(&(*__crat_arg0).data)"));
         assert!(transformed.contains("::core::option::Option::Some"));
         assert!(transformed.contains(".map_or("));
         assert_eq!(transformed.matches("fn read_field").count(), 1);

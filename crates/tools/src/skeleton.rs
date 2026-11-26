@@ -524,7 +524,7 @@ fn apply_target_definition<'tcx>(
     path: &str,
     tcx: TyCtxt<'tcx>,
 ) -> Result<(), GenerationError> {
-    if decisions.foreign_types.contains(&did) {
+    if decisions.fixed_types.contains(&did) {
         return Ok(());
     }
     let names = decisions.types.plans.get(&did);
