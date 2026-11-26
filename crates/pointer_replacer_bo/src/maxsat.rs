@@ -17,10 +17,12 @@
 //!    process solves it under its own address-space limit and crat's query limit (its pipes are read
 //!    up to the same limit); the file and the directory go when the process ends, on every path;
 //! 3. only `s OPTIMUM FOUND` with a `v` line over every index the file holds goes on (the `s` line
-//!    is read, never the exit code; an index in no clause takes false): the assignment is handed back
-//!    to a z3 solver that holds the same assertions (the round's hard solver, or a plain one), with
-//!    every WCNF-mapped original variable fixed, and that solver's model is the round's model when
-//!    its soft cost equals the `o` line plus the weight of the soft terms folded to false.
+//!    is read, never the exit code; an index in no clause takes false);
+//! 4. R1555-2 (main 357): no z3 after the answer. Before it, the scope's hard assertions, the soft
+//!    terms and the readers' terms were also translated into a crat-owned [`Circuit`]; the answer
+//!    is accepted when every hard root of it is true under the answer and the soft roots cost the
+//!    `o` line plus the weight of the soft terms folded to false. The readers then take their
+//!    values from the circuit's roots (`analyses/borrow_ownership/solver.rs`).
 //!
 //! Anything else is a fallback: the check runs on z3's `Optimize` exactly as today, and one
 //! `[bo-phase] maxsat:fallback` line names the cause. Lines are written with the phase log on only.
@@ -38,7 +40,7 @@ use std::{
 
 use rustc_hash::FxHashMap;
 use z3::{
-    DeclKind, Model, SatResult, Solver,
+    DeclKind,
     ast::{Ast, Bool},
 };
 
@@ -139,12 +141,12 @@ pub(crate) enum Cause {
     Values { got: usize, want: usize },
     /// No `o` line.
     NoCost,
-    /// The hand-back solver holds more assertions than the scope (assertions only grow).
-    Sync,
-    /// The hand-back check was not `Sat`.
-    HandBack(String),
-    /// The handed-back model's soft cost differs from the `o` line plus the folded weight.
+    /// R1555-2: a hard root of the circuit is false under the answer.
+    HardEval,
+    /// The answer's soft cost differs from the `o` line plus the folded weight.
     Cost { model: u64, line: u64 },
+    /// R1555-2: a reader could not take its values from the circuit (the replay's count).
+    Readers(String),
 }
 
 impl Cause {
@@ -161,9 +163,9 @@ impl Cause {
             Cause::Status(status) => format!("status:{}", word(status)),
             Cause::Values { got, want } => format!("values:{got}/{want}"),
             Cause::NoCost => "no-o".to_owned(),
-            Cause::Sync => "sync".to_owned(),
-            Cause::HandBack(outcome) => format!("handback:{}", word(outcome)),
+            Cause::HardEval => "hard-eval-failed".to_owned(),
             Cause::Cost { model, line } => format!("cost:{model}/{line}"),
+            Cause::Readers(what) => format!("readers:{}", word(what)),
         }
     }
 }
@@ -184,10 +186,15 @@ pub(crate) struct Wcnf {
     pub(crate) soft: Vec<(u64, i32)>,
     /// The weight of the soft terms folded to false: every assignment pays it.
     pub(crate) offset: u64,
-    /// Every original symbol that got an index, with its index.
+    /// Every original symbol that got an index, with its index (the tests' oracle reads it).
+    #[cfg(test)]
     pub(crate) originals: Vec<(Bool, i32)>,
-    /// The symbols a top-level unit fixed: in no clause, fixed by the same unit at the hand-back.
+    /// The symbols a top-level unit fixed: in no clause; constants of the circuit.
     pub(crate) units: usize,
+    /// R1555-2 (main 357 §2): the circuit of the hard assertions, the soft terms and the reads.
+    pub(crate) circuit: Circuit,
+    /// The wall of building `circuit`, in seconds (part of `encode`'s).
+    pub(crate) circuit_wall: f64,
 }
 
 impl Wcnf {
@@ -290,6 +297,7 @@ struct Encoder {
     consts: FxHashMap<Bool, bool>,
     /// The other symbols, by index.
     var: FxHashMap<Bool, i32>,
+    #[cfg(test)]
     originals: Vec<(Bool, i32)>,
     /// Every compound term met, by term identity (z3 shares equal terms).
     memo: FxHashMap<Bool, Val>,
@@ -321,6 +329,7 @@ impl Encoder {
         }
         let index = self.fresh()?;
         self.var.insert(term.clone(), index);
+        #[cfg(test)]
         self.originals.push((term.clone(), index));
         Ok(Val::Lit(index))
     }
@@ -596,8 +605,9 @@ impl Encoder {
     }
 }
 
-/// Encode `hard` (the scope's assertions) and `soft` (`(term, weight)`) as WCNF.
-pub(crate) fn encode(hard: &[Bool], soft: &[(Bool, u64)]) -> Result<Wcnf, Cause> {
+/// Encode `hard` (the scope's assertions) and `soft` (`(term, weight)`) as WCNF, and translate
+/// them with `reads` (the readers' terms) into the check's [`Circuit`].
+pub(crate) fn encode(hard: &[Bool], soft: &[(Bool, u64)], reads: &[Bool]) -> Result<Wcnf, Cause> {
     let mut encoder = Encoder::default();
     // A top-level unit on a symbol fixes it: exact, since the unit is hard.
     let mut units = 0;
@@ -627,14 +637,27 @@ pub(crate) fn encode(hard: &[Bool], soft: &[(Bool, u64)]) -> Result<Wcnf, Cause>
             Val::Lit(lit) => soft_lits.push((*weight, lit)),
         }
     }
+    let started = Instant::now();
+    let mut builder = CircuitBuilder::new(&encoder.var, &encoder.consts);
+    let hard_roots = builder.roots(hard)?;
+    let soft_roots = builder.roots(soft.iter().map(|(term, _)| term))?;
+    let read_roots = builder.roots(reads)?;
+    let CircuitBuilder { mut circuit, .. } = builder;
+    circuit.hard = hard_roots;
+    circuit.soft = soft_roots;
+    circuit.reads = read_roots;
+    let circuit_wall = started.elapsed().as_secs_f64();
     Ok(Wcnf {
         vars: encoder.n,
         hard: encoder.hard,
         hard_count: encoder.hard_count,
         soft: soft_lits,
         offset,
+        #[cfg(test)]
         originals: encoder.originals,
         units,
+        circuit,
+        circuit_wall,
     })
 }
 
@@ -939,84 +962,38 @@ pub(crate) struct Check<'a> {
     /// The objective's soft terms as the build asserted them: per slot, `ref` (its weight) then
     /// `own` (1).
     pub(crate) soft: &'a [(Bool, u64)],
-    /// The hand-back solver: a plain z3 solver whose first `synced` assertions are the scope's
-    /// first `synced`.
-    pub(crate) solver: &'a Solver,
-    pub(crate) synced: usize,
+    /// R1555-2: the terms the readers will ask for, in the order they ask.
+    pub(crate) reads: &'a [Bool],
+    /// When the check started (before its scope was collected), for the line's `total=`.
+    pub(crate) started: Instant,
+    /// The wall of collecting the scope, the soft terms and the reads, for `prepare=`.
+    pub(crate) prepare: f64,
 }
 
-/// R1543-4 (1): the hand-back. `solver` takes the rest of the scope in a pushed scope and is checked
-/// with every WCNF-mapped original variable fixed at the external value; the symbols a unit fixed
-/// are in no clause, and the same units fix them here. Its model, after the pop, is the check's.
-pub(crate) fn hand_back(
-    solver: &Solver,
-    synced: usize,
-    scope: &[Bool],
-    wcnf: &Wcnf,
-    values: &[bool],
-) -> Result<Model, Cause> {
-    let Some(rest) = scope.get(synced..) else {
-        return Err(Cause::Sync);
-    };
-    let assumptions: Vec<Bool> = wcnf
-        .originals
-        .iter()
-        .map(|(symbol, index)| {
-            let index = usize::try_from(*index - 1).expect("a WCNF index is positive");
-            if values[index] {
-                symbol.clone()
-            } else {
-                !symbol
-            }
-        })
-        .collect();
-    solver.push();
-    for assertion in rest {
-        solver.assert(assertion);
-    }
-    let outcome = solver.check_assumptions(&assumptions);
-    let model = if outcome == SatResult::Sat {
-        solver.get_model()
-    } else {
-        None
-    };
-    let reason = (outcome == SatResult::Unknown)
-        .then(|| solver.get_reason_unknown())
-        .flatten();
-    solver.pop(1);
-    model.ok_or_else(|| {
-        Cause::HandBack(match outcome {
-            SatResult::Sat => "no-model".to_owned(),
-            SatResult::Unsat => "unsat".to_owned(),
-            SatResult::Unknown => format!("unknown:{}", reason.unwrap_or_else(|| "-".to_owned())),
-        })
-    })
-}
-
-fn holds(model: &Model, term: &Bool) -> bool {
-    model.eval(term, true).and_then(|value| value.as_bool()) == Some(true)
-}
-
-/// The weight of the soft terms `model` does not make true.
-pub(crate) fn soft_cost(model: &Model, soft: &[(Bool, u64)]) -> u64 {
-    soft.iter()
-        .filter(|(term, _)| !holds(model, term))
-        .map(|(_, weight)| *weight)
-        .sum()
+/// The accepted answer, as crat's own values (R1555-2): the soft roots' and the reads' values.
+pub(crate) struct Answer {
+    pub(crate) soft: Vec<bool>,
+    pub(crate) reads: Vec<bool>,
 }
 
 /// One check's walls and sizes, for its line.
 #[derive(Default)]
 pub(crate) struct Report {
+    prepare: f64,
     encode: f64,
+    circuit: f64,
     write: f64,
     solve: f64,
-    handback: f64,
+    eval: f64,
+    readers: f64,
+    total: f64,
     bytes: u64,
     vars: i32,
     hard: usize,
     soft: usize,
     units: usize,
+    nodes: usize,
+    reads: usize,
     offset: u64,
     o: u64,
     as_limit: String,
@@ -1024,19 +1001,27 @@ pub(crate) struct Report {
 }
 
 impl Report {
-    fn fields(&self) -> String {
+    /// The line's fields (R1555-2, main 357 §5).
+    pub(crate) fn fields(&self) -> String {
         format!(
-            "encode={:.3} write={:.3} solve={:.3} handback={:.3} wcnf_bytes={} vars={} hard={} \
-             soft={} units={} offset={} as_limit={}",
+            "prepare={:.3} encode={:.3} circuit={:.3} write={:.3} solve={:.3} eval={:.3} \
+             readers={:.3} total={:.3} wcnf_bytes={} vars={} hard={} soft={} units={} nodes={} \
+             reads={} offset={} as_limit={}",
+            self.prepare,
             self.encode,
+            self.circuit,
             self.write,
             self.solve,
-            self.handback,
+            self.eval,
+            self.readers,
+            self.total,
             self.bytes,
             self.vars,
             self.hard,
             self.soft,
             self.units,
+            self.nodes,
+            self.reads,
             self.offset,
             if self.as_limit.is_empty() {
                 "-"
@@ -1047,21 +1032,25 @@ impl Report {
     }
 }
 
-/// One check through the run line: the handed-back model, or why not. `dir` holds the file.
+/// One check through the run line: the accepted answer, or why not. `dir` holds the file.
 pub(crate) fn attempt(
     line: &RunLine,
     dir: &Path,
     limit: Duration,
     check: &Check<'_>,
     report: &mut Report,
-) -> Result<Model, Cause> {
+) -> Result<Answer, Cause> {
+    report.prepare = check.prepare;
     let started = Instant::now();
-    let wcnf = encode(check.scope, check.soft)?;
-    report.encode = started.elapsed().as_secs_f64();
+    let wcnf = encode(check.scope, check.soft, check.reads)?;
+    report.circuit = wcnf.circuit_wall;
+    report.encode = started.elapsed().as_secs_f64() - wcnf.circuit_wall;
     report.vars = wcnf.vars;
     report.hard = wcnf.hard_count;
     report.soft = wcnf.soft.len();
     report.units = wcnf.units;
+    report.nodes = wcnf.circuit.node_count();
+    report.reads = wcnf.circuit.reads.len();
     report.offset = wcnf.offset;
     let started = Instant::now();
     let (file, bytes) = write_file(&wcnf, dir)?;
@@ -1077,11 +1066,37 @@ pub(crate) fn attempt(
     let written = usize::try_from(wcnf.written_vars()).expect("an index is not negative");
     let (cost, values) = parse_answer(&run.stdout?, written, vars)?;
     report.o = cost;
+    // R1555-2: from here on, crat's own values only.
     let started = Instant::now();
-    let model = hand_back(check.solver, check.synced, check.scope, &wcnf, &values)?;
-    report.handback = started.elapsed().as_secs_f64();
-    // R1543-4 (5a): the handed-back model's soft cost is the `o` line's, plus the folded weight.
-    let model_cost = soft_cost(&model, check.soft);
+    let accepted = accept(&wcnf, check.soft, cost, &values);
+    report.eval = started.elapsed().as_secs_f64();
+    accepted
+}
+
+/// The acceptance (R1555-2, main 357 §3): every hard root true under `values`, and the soft roots'
+/// cost equal to the `o` line plus the folded weight. The circuit is crat's; no z3.
+pub(crate) fn accept(
+    wcnf: &Wcnf,
+    soft: &[(Bool, u64)],
+    cost: u64,
+    values: &[bool],
+) -> Result<Answer, Cause> {
+    let circuit = &wcnf.circuit;
+    let nodes = circuit.values(values);
+    if !circuit.hard.iter().all(|&root| nodes[root as usize]) {
+        return Err(Cause::HardEval);
+    }
+    let soft_values: Vec<bool> = circuit
+        .soft
+        .iter()
+        .map(|&root| nodes[root as usize])
+        .collect();
+    let model_cost: u64 = soft_values
+        .iter()
+        .zip(soft)
+        .filter(|(value, _)| !**value)
+        .map(|(_, (_, weight))| *weight)
+        .sum();
     let line_cost = cost.saturating_add(wcnf.offset);
     if model_cost != line_cost {
         return Err(Cause::Cost {
@@ -1089,24 +1104,45 @@ pub(crate) fn attempt(
             line: line_cost,
         });
     }
-    Ok(model)
+    Ok(Answer {
+        soft: soft_values,
+        reads: circuit
+            .reads
+            .iter()
+            .map(|&root| nodes[root as usize])
+            .collect(),
+    })
 }
 
-/// The check's model from the run line's process, handed back to z3; `None` is a fallback (its
-/// line written), and the caller runs today's check. `limit` is crat's query limit.
-pub(crate) fn optimum(line: &RunLine, check: &Check<'_>, limit: Duration) -> Option<Model> {
+/// The check's answer from the run line's process, turned by `readers` into what the caller
+/// reads; `None` is a fallback (its line written), and the caller runs today's check. `limit` is
+/// crat's query limit.
+pub(crate) fn optimum<T>(
+    line: &RunLine,
+    check: &Check<'_>,
+    limit: Duration,
+    readers: impl FnOnce(&Answer) -> Result<T, Cause>,
+) -> Option<T> {
     let mut report = Report::default();
-    match attempt(line, &wcnf_dir(), limit, check, &mut report) {
-        Ok(model) => {
-            crate::phase_log::mark("maxsat:check", "end", &{
-                let (refs, owns, raws) = kinds(&model, check.soft);
-                format!(
+    let result = attempt(line, &wcnf_dir(), limit, check, &mut report).and_then(|answer| {
+        let started = Instant::now();
+        let read = readers(&answer);
+        report.readers = started.elapsed().as_secs_f64();
+        read.map(|read| (read, kinds(&answer.soft)))
+    });
+    report.total = check.started.elapsed().as_secs_f64();
+    match result {
+        Ok((read, (refs, owns, raws))) => {
+            crate::phase_log::mark(
+                "maxsat:check",
+                "end",
+                &format!(
                     "{} status=OPTIMUM o={} ref={refs} own={owns} raw={raws}",
                     report.fields(),
                     report.o
-                )
-            });
-            Some(model)
+                ),
+            );
+            Some(read)
         }
         Err(cause) => {
             crate::phase_log::mark(
@@ -1128,17 +1164,206 @@ pub(crate) fn optimum(line: &RunLine, check: &Check<'_>, limit: Duration) -> Opt
     }
 }
 
-/// The handed-back kinds, counted from the soft pairs (per slot, `ref` then `own`; neither is Raw).
-fn kinds(model: &Model, soft: &[(Bool, u64)]) -> (usize, usize, usize) {
+/// The answer's kinds, counted from the soft pairs (per slot, `ref` then `own`; neither is Raw).
+fn kinds(soft: &[bool]) -> (usize, usize, usize) {
     let (mut refs, mut owns, mut raws) = (0, 0, 0);
     for pair in soft.chunks_exact(2) {
-        if holds(model, &pair[0].0) {
+        if pair[0] {
             refs += 1;
-        } else if holds(model, &pair[1].0) {
+        } else if pair[1] {
             owns += 1;
         } else {
             raws += 1;
         }
     }
     (refs, owns, raws)
+}
+
+/// R1555-2 (main 357 §2): a crat-owned Boolean circuit of the check's terms, built before the
+/// answer. Nodes are in topological order (children first); a node's children are a range of
+/// `children`. After the answer only this is read: no z3 term is walked, hashed or evaluated.
+#[derive(Clone, Copy, Debug)]
+enum Node {
+    Const(bool),
+    /// A WCNF-mapped symbol: its index − 1 in the answer's values.
+    Var(u32),
+    Not(u32),
+    Or(u32, u32),
+    And(u32, u32),
+    /// Right-nested: a₁ ⇒ (a₂ ⇒ … ⇒ aₙ), as the encoder reads it.
+    Implies(u32, u32),
+    Xor(u32, u32),
+    /// All equal.
+    Eq(u32, u32),
+    Ite(u32, u32, u32),
+}
+
+/// The circuit and its roots: the scope's hard assertions, the soft terms (in `Check::soft`
+/// order) and the readers' terms (in `Check::reads` order).
+#[derive(Default)]
+pub(crate) struct Circuit {
+    nodes: Vec<Node>,
+    children: Vec<u32>,
+    pub(crate) hard: Vec<u32>,
+    pub(crate) soft: Vec<u32>,
+    pub(crate) reads: Vec<u32>,
+}
+
+/// The constant nodes every circuit starts with.
+const FALSE: u32 = 0;
+const TRUE: u32 = 1;
+
+impl Circuit {
+    pub(crate) fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Every node's value under `values` (the answer, by WCNF index − 1; an index past its end
+    /// reads false). One pass in order; no z3.
+    pub(crate) fn values(&self, values: &[bool]) -> Vec<bool> {
+        // RED: the evaluation is not built yet; every node reads false.
+        if self.nodes.len() > 1 {
+            let _ = values;
+            return vec![false; self.nodes.len()];
+        }
+        let mut out: Vec<bool> = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let kids = |start: u32, len: u32| {
+                self.children[start as usize..(start + len) as usize]
+                    .iter()
+                    .map(|&child| out[child as usize])
+            };
+            let value = match *node {
+                Node::Const(value) => value,
+                Node::Var(at) => values.get(at as usize).copied().unwrap_or(false),
+                Node::Not(child) => !out[child as usize],
+                Node::Or(start, len) => kids(start, len).any(|value| value),
+                Node::And(start, len) => kids(start, len).all(|value| value),
+                Node::Implies(start, len) => {
+                    let all: Vec<bool> = kids(start, len).collect();
+                    let (last, init) = all.split_last().expect("an implication has a child");
+                    init.iter()
+                        .rev()
+                        .fold(*last, |value, &premise| !premise || value)
+                }
+                Node::Xor(start, len) => {
+                    kids(start, len).fold(false, |parity, value| parity ^ value)
+                }
+                Node::Eq(start, len) => {
+                    let mut all = kids(start, len);
+                    let first = all.next().expect("an equality has children");
+                    all.all(|value| value == first)
+                }
+                Node::Ite(condition, then, otherwise) => {
+                    if out[condition as usize] {
+                        out[then as usize]
+                    } else {
+                        out[otherwise as usize]
+                    }
+                }
+            };
+            out.push(value);
+        }
+        out
+    }
+}
+
+/// Builds a [`Circuit`] from z3 terms, before the answer. The leaves come from the encoder's own
+/// maps: a mapped symbol is its WCNF index, a unit-fixed symbol its unit's value, any other symbol
+/// false (z3's model completion). An unknown kind is a typed failure (`Unsupported`).
+struct CircuitBuilder<'e> {
+    var: &'e FxHashMap<Bool, i32>,
+    consts: &'e FxHashMap<Bool, bool>,
+    memo: FxHashMap<Bool, u32>,
+    circuit: Circuit,
+}
+
+impl<'e> CircuitBuilder<'e> {
+    fn new(var: &'e FxHashMap<Bool, i32>, consts: &'e FxHashMap<Bool, bool>) -> Self {
+        let mut circuit = Circuit::default();
+        circuit.nodes.push(Node::Const(false));
+        circuit.nodes.push(Node::Const(true));
+        CircuitBuilder {
+            var,
+            consts,
+            memo: FxHashMap::default(),
+            circuit,
+        }
+    }
+
+    fn push(&mut self, node: Node) -> Result<u32, Cause> {
+        let at = u32::try_from(self.circuit.nodes.len()).map_err(|_| Cause::TooLarge)?;
+        self.circuit.nodes.push(node);
+        Ok(at)
+    }
+
+    fn node(&mut self, term: &Bool) -> Result<u32, Cause> {
+        if let Some(value) = term.as_bool() {
+            return Ok(if value { TRUE } else { FALSE });
+        }
+        if let Some(&at) = self.memo.get(term) {
+            return Ok(at);
+        }
+        let at = if is_symbol(term) {
+            if let Some(&value) = self.consts.get(term) {
+                if value { TRUE } else { FALSE }
+            } else if let Some(&index) = self.var.get(term) {
+                self.push(Node::Var(
+                    u32::try_from(index - 1).expect("a WCNF index is positive"),
+                ))?
+            } else {
+                FALSE
+            }
+        } else {
+            let kind =
+                decl_kind(term).ok_or_else(|| Cause::Unsupported(format!("{:?}", term.kind())))?;
+            let children = bool_children(term)?;
+            let n = children.len();
+            match kind {
+                DeclKind::NOT if n == 1 => {
+                    let child = self.node(&children[0])?;
+                    self.push(Node::Not(child))?
+                }
+                DeclKind::ITE if n == 3 => {
+                    let condition = self.node(&children[0])?;
+                    let then = self.node(&children[1])?;
+                    let otherwise = self.node(&children[2])?;
+                    self.push(Node::Ite(condition, then, otherwise))?
+                }
+                DeclKind::OR | DeclKind::AND | DeclKind::XOR => self.nary(kind, &children)?,
+                DeclKind::IMPLIES if n >= 1 => self.nary(kind, &children)?,
+                DeclKind::EQ | DeclKind::IFF if n >= 2 => self.nary(kind, &children)?,
+                other => return Err(Cause::Unsupported(format!("{other:?}/{n}"))),
+            }
+        };
+        self.memo.insert(term.clone(), at);
+        Ok(at)
+    }
+
+    fn nary(&mut self, kind: DeclKind, children: &[Bool]) -> Result<u32, Cause> {
+        let kids = children
+            .iter()
+            .map(|child| self.node(child))
+            .collect::<Result<Vec<u32>, Cause>>()?;
+        let start = u32::try_from(self.circuit.children.len()).map_err(|_| Cause::TooLarge)?;
+        let len = u32::try_from(kids.len()).map_err(|_| Cause::TooLarge)?;
+        self.circuit.children.extend_from_slice(&kids);
+        self.push(match kind {
+            DeclKind::OR => Node::Or(start, len),
+            DeclKind::AND => Node::And(start, len),
+            DeclKind::IMPLIES => Node::Implies(start, len),
+            DeclKind::XOR => Node::Xor(start, len),
+            _ => Node::Eq(start, len),
+        })
+    }
+
+    fn roots(
+        &mut self,
+        terms: impl IntoIterator<Item = impl std::borrow::Borrow<Bool>>,
+    ) -> Result<Vec<u32>, Cause> {
+        terms
+            .into_iter()
+            .map(|term| self.node(term.borrow()))
+            .collect()
+    }
 }

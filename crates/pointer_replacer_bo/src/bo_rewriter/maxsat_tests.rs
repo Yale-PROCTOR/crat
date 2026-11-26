@@ -1,5 +1,6 @@
 //! R1543-2 Part 2 (main 346 §4; the seat's R1543-4): the external MaxSAT path's witnesses P1–P5;
-//! P6–P9 come from the review of 9595db605.
+//! P6–P9 come from the review of 9595db605. R1555-2 (main 357): no z3 after the answer -- P1, P2
+//! amended (the circuit against z3's own evaluation, z3 the oracle in tests only); P10–P12 new.
 //! P1's fixtures, P2's hook half, P3 and P5 run the whole rewrite in child processes of this test
 //! binary (the switches are read once per process), with the model checkpoint's child harness. The
 //! rest runs here, with test-built shell scripts in place of a solver: no external binary but P5's.
@@ -18,7 +19,7 @@ use z3::{
 use super::model_checkpoint::model_checkpoint_tests::{
     CASCADE_TIE, ChildResult, child, scratch, spawn,
 };
-use crate::maxsat::{Cause, Check, Report, RunLine, Wcnf, attempt, encode, hand_back, soft_cost};
+use crate::maxsat::{Answer, Cause, Check, Report, RunLine, Wcnf, accept, attempt, encode};
 
 const SWITCH: &str = "CRAT_BO_MAXSAT_CMD";
 const DUMP_DIR: &str = "CRAT_BO_OPTIMIZE_DUMP_DIR";
@@ -58,6 +59,32 @@ fn lines<'a>(stderr: &'a str, phase: &str) -> Vec<&'a str> {
 
 fn holds(model: &Model, term: &Bool) -> bool {
     model.eval(term, true).and_then(|value| value.as_bool()) == Some(true)
+}
+
+/// The weight of the soft terms `model` does not make true (z3 as the tests' oracle).
+fn soft_cost(model: &Model, soft: &[(Bool, u64)]) -> u64 {
+    soft.iter()
+        .filter(|(term, _)| !holds(model, term))
+        .map(|(_, weight)| *weight)
+        .sum()
+}
+
+/// The weight of the soft terms an accepted answer leaves false (crat's own values).
+fn answer_cost(answer: &Answer, soft: &[(Bool, u64)]) -> u64 {
+    answer
+        .soft
+        .iter()
+        .zip(soft)
+        .filter(|(value, _)| !**value)
+        .map(|(_, (_, weight))| *weight)
+        .sum()
+}
+
+/// The circuit's values of the hard and soft roots under the WCNF values `values`.
+fn circuit_roots(wcnf: &Wcnf, values: &[bool]) -> (Vec<bool>, Vec<bool>) {
+    let nodes = wcnf.circuit.values(values);
+    let at = |roots: &[u32]| roots.iter().map(|&root| nodes[root as usize]).collect();
+    (at(&wcnf.circuit.hard), at(&wcnf.circuit.soft))
 }
 
 fn index(lit: i32) -> usize {
@@ -260,10 +287,11 @@ fn operator_problem() -> (Vec<Bool>, Vec<(Bool, u64)>) {
 }
 
 /// P1 on one problem: the written WCNF's optimum is z3's on the problem, and its optimal assignment
-/// handed back is `Sat`, every mapped variable reading back its value, at the same soft cost.
+/// is accepted by the circuit (R1555-2) at the same soft cost; z3's own model of that assignment (the
+/// oracle) gives every hard and soft term the circuit's value.
 fn differential(name: &str, hard: &[Bool], soft: &[(Bool, u64)]) {
     let optimum = z3_optimum(hard, soft);
-    let wcnf = match encode(hard, soft) {
+    let wcnf = match encode(hard, soft, &[]) {
         Ok(wcnf) => wcnf,
         Err(Cause::HardFalse) => {
             assert_eq!(optimum, None, "{name}: the encoding folds to false");
@@ -279,17 +307,37 @@ fn differential(name: &str, hard: &[Bool], soft: &[(Bool, u64)]) {
     };
     let cost = wcnf_cost(&wcnf, &wsoft, &values);
     assert_eq!(Some(cost), optimum, "{name}: the optimum");
-    let model = hand_back(&Solver::new(), 0, hard, &wcnf, &values)
+    let answer = accept(&wcnf, soft, cost - wcnf.offset, &values)
         .unwrap_or_else(|cause| panic!("{name}: {cause:?}"));
-    for (symbol, at) in &wcnf.originals {
-        let want = values[usize::try_from(*at - 1).unwrap()];
-        assert_eq!(holds(&model, symbol), want, "{name}: {symbol:?}");
-    }
     assert_eq!(
-        soft_cost(&model, soft),
+        answer_cost(&answer, soft),
         cost,
-        "{name}: the handed-back cost"
+        "{name}: the answer's cost"
     );
+    let oracle = Solver::new();
+    for assertion in hard {
+        oracle.assert(assertion);
+    }
+    let fixed: Vec<Bool> = wcnf
+        .originals
+        .iter()
+        .map(|(symbol, at)| {
+            if values[usize::try_from(*at - 1).unwrap()] {
+                symbol.clone()
+            } else {
+                !symbol
+            }
+        })
+        .collect();
+    assert_eq!(oracle.check_assumptions(&fixed), SatResult::Sat, "{name}");
+    let model = oracle.get_model().unwrap();
+    let (hard_values, soft_values) = circuit_roots(&wcnf, &values);
+    for (term, value) in hard.iter().zip(&hard_values) {
+        assert_eq!(holds(&model, term), *value, "{name}: {term:?}");
+    }
+    for ((term, _), value) in soft.iter().zip(&soft_values) {
+        assert_eq!(holds(&model, term), *value, "{name}: soft {term:?}");
+    }
 }
 
 /// A problem as the optimize dump wrote it: (file, hard assertions, soft terms).
@@ -351,7 +399,8 @@ fn dumped(test: &str, code: &str, tag: &str) -> (ChildResult, Vec<Dumped>) {
     (result, problems)
 }
 
-/// P1 (RED before the encoder exists): the encoding keeps the optimum, and its assignment hands back.
+/// P1 (RED before the encoder exists): the encoding keeps the optimum, and its assignment is accepted
+/// (R1555-2: the circuit, every root equal to z3's own evaluation on every assignment).
 /// On a problem of every operator, every assignment of the mapped variables is feasible in the
 /// WCNF exactly when it is in the problem, at the same cost. On the fixtures' optimize problems (as
 /// the optimize dump writes them), the written WCNF's optimum -- found by z3 over the file's clauses
@@ -363,7 +412,7 @@ fn r1543_2_p1_the_encoding_keeps_every_optimum_and_hands_it_back() {
         return;
     }
     let (hard, soft) = operator_problem();
-    let wcnf = encode(&hard, &soft).expect("every operator is supported");
+    let wcnf = encode(&hard, &soft, &[]).expect("every operator is supported");
     assert_eq!(wcnf.units, 2);
     assert_eq!(wcnf.offset, 4, "h folds false");
     assert_eq!(wcnf.originals.len(), 6);
@@ -392,11 +441,26 @@ fn r1543_2_p1_the_encoding_keeps_every_optimum_and_hands_it_back() {
             propagate(vars, &clauses, &fixed),
         ) {
             (SatResult::Sat, Some(values)) => {
-                let cost = soft_cost(&solver.get_model().unwrap(), &soft);
+                let model = solver.get_model().unwrap();
+                let cost = soft_cost(&model, &soft);
                 assert_eq!(wcnf_cost(&wcnf, &wsoft, &values), cost, "mask {mask:06b}");
+                let (hard_values, soft_values) = circuit_roots(&wcnf, &values);
+                assert!(hard_values.iter().all(|&v| v), "mask {mask:06b}");
+                for ((term, _), value) in soft.iter().zip(&soft_values) {
+                    assert_eq!(holds(&model, term), *value, "mask {mask:06b}: {term:?}");
+                }
                 feasible.push(cost);
             }
-            (SatResult::Unsat, None) => {}
+            (SatResult::Unsat, None) => {
+                // R1555-2: every symbol is mapped or unit-fixed, so an infeasible assignment
+                // leaves a hard root false in the circuit.
+                let mut values = vec![false; vars];
+                for &(at, value) in &fixed {
+                    values[at] = value;
+                }
+                let (hard_values, _) = circuit_roots(&wcnf, &values);
+                assert!(hard_values.iter().any(|&v| !v), "mask {mask:06b}");
+            }
             (original, encoded) => panic!(
                 "mask {mask:06b}: the problem {original:?}, the WCNF {}",
                 encoded.is_some()
@@ -439,14 +503,12 @@ fn script(dir: &Path, name: &str, body: &str) -> String {
     format!("/bin/sh {} {{wcnf}}", path.display())
 }
 
-/// The P2 / P4 cases on the operator problem: `(tag, run line, limit, the hand-back solver's own
-/// assertion, synced, the scope's extra assertion, expected)`; `Ok(())` is a handed-back model.
+/// The P2 / P4 cases on the operator problem: `(tag, run line, limit, the scope's extra assertion,
+/// expected)`; `Ok(())` is an accepted answer.
 struct Case {
     tag: &'static str,
     line: String,
     limit: Duration,
-    base: Option<Bool>,
-    synced: Option<usize>,
     extra: Option<Bool>,
     dir: Option<PathBuf>,
     expected: Result<(), Cause>,
@@ -460,13 +522,23 @@ fn cases(dir: &Path, wcnf: &Wcnf) -> Vec<Case> {
         tag,
         line: script(dir, tag, body),
         limit: Duration::from_secs(60),
-        base: None,
-        synced: None,
         extra: None,
         dir: None,
         expected,
     };
     let top = top_written(wcnf);
+    // R1555-2: the optimum with `a` flipped (a1 b0 c1 d1 e1 f0) is no feasible assignment, so a
+    // hard root of the circuit is false under it.
+    let a = Bool::new_const("r1543_2_p1_a");
+    let (_, a_at) = wcnf
+        .originals
+        .iter()
+        .find(|(symbol, _)| *symbol == a)
+        .unwrap();
+    let mut flipped: Vec<char> = bits.chars().collect();
+    let at = usize::try_from(*a_at - 1).unwrap();
+    flipped[at] = if flipped[at] == '1' { '0' } else { '1' };
+    let flipped: String = flipped.into_iter().collect();
     let not_a_dir = dir.join("a-file");
     std::fs::write(&not_a_dir, "").unwrap();
     vec![
@@ -544,15 +616,12 @@ fn cases(dir: &Path, wcnf: &Wcnf) -> Vec<Case> {
             extra: Some(Bool::from_bool(false)),
             ..case("hard-false", &found, Err(Cause::HardFalse))
         },
-        // The optimum has a = false; a hand-back solver that holds a cannot take it.
-        Case {
-            base: Some(Bool::new_const("r1543_2_p1_a")),
-            ..case("handback", &found, Err(Cause::HandBack("unsat".into())))
-        },
-        Case {
-            synced: Some(usize::MAX),
-            ..case("sync", &found, Err(Cause::Sync))
-        },
+        // R1555-2: the circuit refuses an answer that breaks a hard assertion.
+        case(
+            "hard-eval",
+            &format!("echo 'o {o}'; echo 's OPTIMUM FOUND'; echo 'v {flipped}'"),
+            Err(Cause::HardEval),
+        ),
     ]
 }
 
@@ -562,18 +631,15 @@ fn run(
     dir: &Path,
     hard: &[Bool],
     soft: &[(Bool, u64)],
-) -> (Result<Model, Cause>, Duration, bool) {
+) -> (Result<Answer, Cause>, Duration, bool) {
     let mut scope = hard.to_vec();
     scope.extend(case.extra.clone());
-    let solver = Solver::new();
-    if let Some(base) = &case.base {
-        solver.assert(base);
-    }
     let check = Check {
         scope: &scope,
         soft,
-        solver: &solver,
-        synced: case.synced.unwrap_or(0),
+        reads: &[],
+        started: Instant::now(),
+        prepare: 0.0,
     };
     let dir = case.dir.clone().unwrap_or_else(|| dir.join(case.tag));
     let line = RunLine::parse(&case.line).expect("a run line");
@@ -602,11 +668,11 @@ fn r1543_2_p2_every_fallback_cause_leaves_the_check_to_z3() {
     }
     let dir = scratch("r1543-p2");
     let (hard, soft) = operator_problem();
-    let wcnf = encode(&hard, &soft).expect("supported");
+    let wcnf = encode(&hard, &soft, &[]).expect("supported");
     for case in cases(&dir, &wcnf) {
         let (result, wall, _) = run(&case, &dir, &hard, &soft);
         match (&result, &case.expected) {
-            (Ok(model), Ok(())) => assert_eq!(soft_cost(model, &soft), 9, "{}", case.tag),
+            (Ok(answer), Ok(())) => assert_eq!(answer_cost(answer, &soft), 9, "{}", case.tag),
             (Err(found), Err(expected)) => {
                 assert!(same_cause(found, expected), "{}: {found:?}", case.tag);
             }
@@ -686,7 +752,7 @@ fn r1543_2_p3_unset_starts_no_process_and_writes_no_file() {
 fn r1543_2_p4_the_file_is_gone_after_every_check() {
     let dir = scratch("r1543-p4");
     let (hard, soft) = operator_problem();
-    let wcnf = encode(&hard, &soft).expect("supported");
+    let wcnf = encode(&hard, &soft, &[]).expect("supported");
     let mut handed_back = 0;
     for case in cases(&dir, &wcnf) {
         let (result, _, gone) = run(&case, &dir, &hard, &soft);
@@ -767,6 +833,10 @@ fn r1543_2_p5_uwrmaxsat_on_a_fixture() {
         !checks.is_empty() && checks.iter().all(|line| line.contains(" status=OPTIMUM ")),
         "{err}"
     );
+    // R1555-2 (main 357 §5): the pieces of the path with no z3 after the answer.
+    for line in &checks {
+        check_fields(line);
+    }
     for line in lines(&err, "maxsat:fallback") {
         assert!(
             line.contains("cause=hard-false ") || line.contains("cause=status:UNSATISFIABLE "),
@@ -834,8 +904,6 @@ fn r1543_2_p7_the_limit_holds_when_the_line_forks() {
         tag: "limit-fork",
         line: script(&dir, "limit-fork", "sleep 30; true"),
         limit: Duration::from_secs(1),
-        base: None,
-        synced: None,
         extra: None,
         dir: None,
         expected: Err(Cause::Limit),
@@ -865,7 +933,7 @@ fn r1543_2_p8_an_unwritten_top_index_is_not_asked_for() {
         Bool::or(&[c, Bool::from_bool(true)]),
     ];
     let soft = vec![(a, 1), (b, 2)];
-    let wcnf = encode(&hard, &soft).expect("supported");
+    let wcnf = encode(&hard, &soft, &[]).expect("supported");
     assert_eq!(
         (wcnf.vars, top_written(&wcnf)),
         (3, 2),
@@ -880,15 +948,13 @@ fn r1543_2_p8_an_unwritten_top_index_is_not_asked_for() {
                 &format!("echo 'o 0'; echo 's OPTIMUM FOUND'; echo 'v {values}'"),
             ),
             limit: Duration::from_secs(60),
-            base: None,
-            synced: None,
             extra: None,
             dir: None,
             expected: Ok(()),
         };
         let (result, _, gone) = run(&case, &dir, &hard, &soft);
-        let model = result.unwrap_or_else(|cause| panic!("{tag}: {cause:?}"));
-        assert_eq!(soft_cost(&model, &soft), 0, "{tag}");
+        let answer = result.unwrap_or_else(|cause| panic!("{tag}: {cause:?}"));
+        assert_eq!(answer_cost(&answer, &soft), 0, "{tag}");
         assert!(gone, "{tag}");
     }
 }
@@ -906,7 +972,7 @@ fn r1543_2_p9_a_planted_directory_is_refused() {
     std::fs::write(target.join("keep"), "keep").unwrap();
     std::os::unix::fs::symlink(&target, dir.join("planted")).unwrap();
     let (hard, soft) = operator_problem();
-    let wcnf = encode(&hard, &soft).expect("supported");
+    let wcnf = encode(&hard, &soft, &[]).expect("supported");
     let (o, bits) = answer(&wcnf);
     let case = Case {
         tag: "planted",
@@ -916,8 +982,6 @@ fn r1543_2_p9_a_planted_directory_is_refused() {
             &format!("echo 'o {o}'; echo 's OPTIMUM FOUND'; echo 'v {bits}'"),
         ),
         limit: Duration::from_secs(60),
-        base: None,
-        synced: None,
         extra: None,
         dir: None,
         expected: Err(Cause::Write(String::new())),
@@ -940,5 +1004,368 @@ fn r1543_2_p9_a_planted_directory_is_refused() {
             .unwrap()
             .file_type()
             .is_symlink()
+    );
+}
+
+/// R1555-2 (main 357 §5): a `maxsat:check end` line carries the path's pieces and none of the z3
+/// hand-back's.
+fn check_fields(line: &str) {
+    for field in [
+        " prepare=",
+        " encode=",
+        " circuit=",
+        " write=",
+        " solve=",
+        " eval=",
+        " readers=",
+        " total=",
+        " nodes=",
+        " reads=",
+    ] {
+        assert!(line.contains(field), "{field}: {line}");
+    }
+    for gone in ["handback=", " model="] {
+        assert!(!line.contains(gone), "{gone}: {line}");
+    }
+}
+
+/// P10 (R1555-2, main 357 §2 / §5 / §6): the circuit's leaves and the line. A symbol fixed by a
+/// top-level unit and used elsewhere reads the unit's value; an index in no clause reads false; a
+/// symbol the encoder never saw (a reader's) reads false, z3's model completion; a reader's
+/// compound term is evaluated; a reader's term of an unknown kind is a typed `Unsupported`, before
+/// any process starts. The fields of the line are the path's. `maxsat.rs` holds no z3 solver,
+/// model or evaluation (the ratchet).
+#[test]
+fn r1555_2_p10_the_circuit_reads_units_unseen_symbols_and_readers() {
+    let dir = scratch("r1555-p10");
+    let a = Bool::new_const("r1555_2_p10_a");
+    let b = Bool::new_const("r1555_2_p10_b");
+    let c = Bool::new_const("r1555_2_p10_c");
+    let d = Bool::new_const("r1555_2_p10_d");
+    let hard = vec![
+        a.clone(),
+        Bool::or(&[!&a, b.clone()]),
+        Bool::or(&[c.clone(), Bool::from_bool(true)]),
+    ];
+    // `c` is in no soft term, so its index is above the file's highest.
+    let soft = vec![(b.clone(), 1), (a.clone(), 4)];
+    let reads = vec![
+        d.clone(),
+        Bool::and(&[a.clone(), b.clone()]),
+        c.clone(),
+        !&d,
+    ];
+    let wcnf = encode(&hard, &soft, &reads).expect("supported");
+    assert_eq!(wcnf.units, 1);
+    assert_eq!((wcnf.vars, top_written(&wcnf)), (2, 1), "b written, c not");
+    let line = RunLine::parse(&script(
+        &dir,
+        "units",
+        "echo 'o 0'; echo 's OPTIMUM FOUND'; echo 'v 1'",
+    ))
+    .unwrap();
+    let check = Check {
+        scope: &hard,
+        soft: &soft,
+        reads: &reads,
+        started: Instant::now(),
+        prepare: 0.0,
+    };
+    let mut report = Report::default();
+    let answer = attempt(
+        &line,
+        &dir.join("units"),
+        Duration::from_secs(60),
+        &check,
+        &mut report,
+    )
+    .unwrap_or_else(|cause| panic!("{cause:?}"));
+    assert_eq!(
+        answer.soft,
+        [true, true],
+        "b from the answer, a from its unit"
+    );
+    assert_eq!(answer.reads, [false, true, false, true]);
+    assert_eq!(answer_cost(&answer, &soft), 0);
+    let fields = format!(" {}", report.fields());
+    check_fields(&fields);
+    assert!(fields.contains(" reads=4 "), "{fields}");
+
+    let unknown = vec![Bool::or(&[
+        a.clone(),
+        Int::new_const("r1555_2_p10_n").eq(Int::from_i64(1)),
+    ])];
+    let check = Check {
+        scope: &hard,
+        soft: &soft,
+        reads: &unknown,
+        started: Instant::now(),
+        prepare: 0.0,
+    };
+    let result = attempt(
+        &line,
+        &dir.join("unknown"),
+        Duration::from_secs(60),
+        &check,
+        &mut Report::default(),
+    );
+    assert!(
+        matches!(result, Err(Cause::Unsupported(_))),
+        "{:?}",
+        result.as_ref().map(|_| ())
+    );
+    assert!(!dir.join("unknown").exists(), "no file before a known kind");
+
+    let source = include_str!("../maxsat.rs");
+    for word in [
+        "Solver",
+        "Model",
+        "SatResult",
+        ".eval(",
+        "push()",
+        "pop(1)",
+        "check_assumptions",
+        "HardLoopSolver",
+    ] {
+        assert!(!source.contains(word), "maxsat.rs holds {word:?}");
+    }
+}
+
+const TEST_SOLVER_FILE: &str = "R1555_2_TEST_SOLVER_WCNF";
+
+/// R1555-2, test-only: a MaxSAT solver for P11, z3 over the file's clauses (z3 as the tests'
+/// oracle; the path under test calls no z3 after the answer). It runs as the run line's process:
+/// the file in `R1555_2_TEST_SOLVER_WCNF`, the answer on stdout in the 2022+ format. Without the
+/// variable it does nothing.
+#[test]
+#[ignore = "the test solver of r1555_2_p11; run by its run line"]
+fn r1555_2_test_solver() {
+    let Some(file) = std::env::var_os(TEST_SOLVER_FILE) else {
+        return;
+    };
+    let text = std::fs::read_to_string(file).unwrap();
+    let mut hard = Vec::new();
+    let mut soft = Vec::new();
+    for line in text.lines().filter(|line| !line.starts_with('c')) {
+        let mut words = line.split_whitespace();
+        let head = words.next().expect("a word");
+        let mut lits: Vec<i32> = words.map(|word| word.parse().unwrap()).collect();
+        assert_eq!(lits.pop(), Some(0), "{line}");
+        if head == "h" {
+            hard.push(lits);
+        } else {
+            soft.push((head.parse::<u64>().unwrap(), lits[0]));
+        }
+    }
+    let top = hard
+        .iter()
+        .flatten()
+        .chain(soft.iter().map(|(_, lit)| lit))
+        .map(|&lit| index(lit) + 1)
+        .max()
+        .unwrap_or(0);
+    match solve_written(top, &hard, &soft) {
+        Some(values) => {
+            let o: u64 = soft
+                .iter()
+                .filter(|(_, lit)| !true_under(&values, *lit))
+                .map(|(weight, _)| *weight)
+                .sum();
+            let bits: String = values.iter().map(|&v| if v { '1' } else { '0' }).collect();
+            // The leading newline: libtest prints `test … ` before the output, on the same line.
+            println!("\no {o}\ns OPTIMUM FOUND\nv {bits}");
+        }
+        None => println!("\ns UNSATISFIABLE"),
+    }
+}
+
+/// The run line of the test solver: a script that runs this test binary's `r1555_2_test_solver`.
+fn test_solver_line(dir: &Path) -> String {
+    let exe = std::env::current_exe().unwrap();
+    script(
+        dir,
+        "test-solver",
+        &format!(
+            "exec env {TEST_SOLVER_FILE}=\"$1\" '{}' bo_rewriter::maxsat_tests::r1555_2_test_solver --exact --ignored --nocapture --test-threads=1",
+            exe.display()
+        ),
+    )
+}
+
+/// P11 (R1555-2, main 357 §3 / §6): the whole rewrite with the switch on and the test solver, on
+/// P5's fixture (every dumped optimum unique) and on the cascade fixture: every check is accepted
+/// (`OPTIMUM`, no fallback), the line carries the path's pieces, the readers' terms were replayed
+/// (`reads=` above 0 on some check), and on the unique fixture the emitted model is the z3 run's.
+#[test]
+fn r1555_2_p11_the_readers_replay_to_the_z3_runs_model() {
+    if child() {
+        return;
+    }
+    let name = test("r1555_2_p11_the_readers_replay_to_the_z3_runs_model");
+    let dir = scratch("r1555-p11");
+    let line = test_solver_line(&dir);
+    let mut replayed = 0;
+    for (tag, code) in [("unique", UNIQUE), ("cascade", CASCADE_TIE)] {
+        let (off, _) = spawn(&name, code, &format!("r1555-p11-{tag}-off"), "frozen", &[]);
+        let (on, err) = spawn(
+            &name,
+            code,
+            &format!("r1555-p11-{tag}-on"),
+            "frozen",
+            &[
+                (SWITCH, line.clone().into()),
+                ("CRAT_BO_PHASE_LOG", "on".into()),
+            ],
+        );
+        assert_eq!(on.kind, "emitted", "{tag}: {on:?}");
+        assert!(lines(&err, "maxsat:fallback").is_empty(), "{tag}:\n{err}");
+        let checks = lines(&err, "maxsat:check");
+        assert!(!checks.is_empty(), "{tag}:\n{err}");
+        for line in &checks {
+            assert!(line.contains(" status=OPTIMUM "), "{line}");
+            check_fields(line);
+            replayed += usize::from(!line.contains(" reads=0 "));
+        }
+        if tag == "unique" {
+            assert_eq!(on.model_sha256, off.model_sha256, "{tag}:\n{err}");
+            assert_eq!(on.decision(), off.decision(), "{tag}");
+        }
+    }
+    assert!(replayed > 0, "no check had a reader's term");
+}
+
+/// P12's synthetic problem (R1555-2 §2(ii)): r470's first check had 1,925,748 WCNF variables (about
+/// 1.77 M mapped), `units=2871041`, `hard=4908652` clauses and 295,335 soft terms written.
+const P12_SYMBOLS: usize = 1_770_000;
+const P12_UNITS: usize = 2_871_041;
+const P12_COMPOUND: usize = 2_900_000;
+const P12_SLOTS: usize = 147_669;
+const P12_READS: usize = 150_000;
+
+fn p12_hash(i: usize, salt: u64) -> usize {
+    let x =
+        (i as u64 ^ salt.wrapping_mul(0x9E37_79B9_7F4A_7C15)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    usize::try_from((x ^ (x >> 31)) >> 1).unwrap()
+}
+
+/// P12 (R1555-2 §2(ii), main 357 §6; ignored, run by name): the path's own pieces at P02's size on
+/// synthetic terms of P02's shapes, all true under one assignment. The walls of the encoding, the
+/// circuit, the acceptance (`eval`) and the readers (the kinds of 147,669 slots and a replay of
+/// 150,000 values) are printed; `eval` + `readers` must stay within 40 s.
+#[test]
+#[ignore = "R1555-2 size test (≈ 7.5 M terms); run by name"]
+fn r1555_2_p12_the_path_after_the_answer_at_p02_size() {
+    let started = Instant::now();
+    let s: Vec<Bool> = (0..P12_SYMBOLS)
+        .map(|k| Bool::new_const(format!("r1555_2_p12_s{k}")))
+        .collect();
+    let value: Vec<bool> = (0..P12_SYMBOLS).map(|k| p12_hash(k, 7) % 5 < 2).collect();
+    let u: Vec<Bool> = (0..P12_UNITS)
+        .map(|k| Bool::new_const(format!("r1555_2_p12_u{k}")))
+        .collect();
+    let unit = |k: usize| k % 3 == 0;
+    let mut hard: Vec<Bool> = (0..P12_UNITS)
+        .map(|k| if unit(k) { u[k].clone() } else { !&u[k] })
+        .collect();
+    let pick = |i: usize, salt: u64| p12_hash(i, salt) % P12_SYMBOLS;
+    for i in 0..P12_COMPOUND {
+        let (a, b, c, d) = (pick(i, 1), pick(i, 2), pick(i, 3), pick(i, 4));
+        let w = p12_hash(i, 5) % P12_UNITS;
+        let (term, truth) = match i % 6 {
+            0 => (Bool::or(&[!&s[a], s[b].clone()]), !value[a] || value[b]),
+            1 => (
+                Bool::or(&[s[a].clone(), s[b].clone(), !&s[c]]),
+                value[a] || value[b] || !value[c],
+            ),
+            2 => (
+                s[a].implies(Bool::and(&[s[b].clone(), !&s[c]])),
+                !value[a] || (value[b] && !value[c]),
+            ),
+            3 => (s[a].iff(&s[b]), value[a] == value[b]),
+            4 => (
+                Bool::or(&[!&s[a], s[b].clone(), s[c].clone(), !&u[w]]),
+                !value[a] || value[b] || value[c] || !unit(w),
+            ),
+            _ => (
+                s[a].ite(&s[b], &s[c].xor(&s[d])),
+                if value[a] {
+                    value[b]
+                } else {
+                    value[c] ^ value[d]
+                },
+            ),
+        };
+        hard.push(if truth { term } else { !term });
+    }
+    let weight = u64::try_from(P12_SLOTS + 1).unwrap();
+    let soft: Vec<(Bool, u64)> = (0..P12_SLOTS)
+        .flat_map(|k| [(s[2 * k].clone(), weight), (s[2 * k + 1].clone(), 1)])
+        .collect();
+    let reads: Vec<Bool> = (0..P12_READS)
+        .map(|i| {
+            if i % 10 == 0 {
+                Bool::and(&[s[pick(i, 6)].clone(), !&s[pick(i, 7)]])
+            } else {
+                s[pick(i, 8)].clone()
+            }
+        })
+        .collect();
+    let by_symbol: rustc_hash::FxHashMap<Bool, bool> =
+        s.iter().cloned().zip(value.iter().copied()).collect();
+    let setup = started.elapsed();
+
+    let started = Instant::now();
+    let wcnf = encode(&hard, &soft, &reads).expect("supported");
+    let encode_wall = started.elapsed().as_secs_f64() - wcnf.circuit_wall;
+    let mut values = vec![false; usize::try_from(wcnf.vars).unwrap()];
+    for (symbol, at) in &wcnf.originals {
+        values[usize::try_from(*at - 1).unwrap()] = by_symbol[symbol];
+    }
+    let line_cost: u64 = soft
+        .iter()
+        .zip((0..P12_SLOTS).flat_map(|k| [value[2 * k], value[2 * k + 1]]))
+        .filter(|(_, v)| !*v)
+        .map(|((_, weight), _)| *weight)
+        .sum();
+
+    let started = Instant::now();
+    let answer = accept(&wcnf, &soft, line_cost - wcnf.offset, &values)
+        .unwrap_or_else(|cause| panic!("{cause:?}"));
+    let eval = started.elapsed();
+
+    let started = Instant::now();
+    let kinds: Vec<u8> = answer
+        .soft
+        .chunks_exact(2)
+        .map(|pair| if pair[1] { 2 } else { u8::from(pair[0]) })
+        .collect();
+    let mut replay = answer.reads.iter();
+    let mut asked = 0usize;
+    let mut read = |_: &Bool| {
+        asked += 1;
+        replay.next().copied()
+    };
+    let replayed: usize = reads.iter().filter_map(&mut read).filter(|&v| v).count();
+    let readers = started.elapsed();
+    assert_eq!(asked, P12_READS);
+    assert_eq!(kinds.len(), P12_SLOTS);
+    println!(
+        "r1555-2 p12: setup {:.3} s, encode {:.3} s, circuit {:.3} s, eval {:.3} s, readers {:.3} s; \
+         vars {} hard {} soft {} units {} nodes {} reads {} (true {replayed})",
+        setup.as_secs_f64(),
+        encode_wall,
+        wcnf.circuit_wall,
+        eval.as_secs_f64(),
+        readers.as_secs_f64(),
+        wcnf.vars,
+        wcnf.hard_count,
+        wcnf.soft.len(),
+        wcnf.units,
+        wcnf.circuit.node_count(),
+        wcnf.circuit.reads.len(),
+    );
+    assert!(
+        eval + readers <= Duration::from_secs(40),
+        "eval {eval:?} + readers {readers:?}"
     );
 }

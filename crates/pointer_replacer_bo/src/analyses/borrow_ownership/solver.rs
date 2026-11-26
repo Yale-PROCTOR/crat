@@ -3439,24 +3439,14 @@ impl KindSolver {
         })
     }
 
-    /// [`Self::optimized_model_under_hard`] without the round's hard solver.
-    #[cfg(test)]
-    pub(crate) fn optimized_model_under(
-        &self,
-        relaxed: &RelaxedSelectors,
-    ) -> Option<FxHashMap<SlotRef, SlotKind>> {
-        self.optimized_model_under_hard(relaxed, None)
-    }
-
     /// Materialize the objective-selected model for one validation round after
     /// hard-only selector decisions have fixed its active set. The fixed
     /// mandatory and surviving endpoint-retraction literals are temporary plain-hard assertions;
-    /// the Optimize check itself carries no assumptions. `hard` is the round's hard solver, which
-    /// an external optimum (R1543-2 Part 2, [`Self::external_optimum`]) is handed back to.
-    pub(crate) fn optimized_model_under_hard(
+    /// the Optimize check itself carries no assumptions. With `CRAT_BO_MAXSAT_CMD` set, the check is
+    /// the external process's ([`Self::external_optimum`]); no z3 solves or evaluates its answer.
+    pub(crate) fn optimized_model_under(
         &self,
         relaxed: &RelaxedSelectors,
-        hard: Option<&HardLoopSolver>,
     ) -> Option<FxHashMap<SlotRef, SlotKind>> {
         self.optimize_materialization_count
             .set(self.optimize_materialization_count.get().saturating_add(1));
@@ -3486,7 +3476,7 @@ impl KindSolver {
             crate::optimize_dump::before_check(&self.solver, "optimize", self.soft_terms());
         // R1543-2 Part 2: the external process's optimum when the switch is set; else, and on a
         // fallback, today's check.
-        let external = self.external_optimum(hard);
+        let external = self.external_optimum();
         // Relay main/388 O2: the deciding check's own wall, for the budget predicate. It starts after
         // the external attempt, so a fallback's wall is z3's check alone (the review of 9595db605).
         let check_started = Instant::now();
@@ -3554,8 +3544,12 @@ impl KindSolver {
             outcome,
         );
         let kinds = if outcome == SatResult::Sat {
-            match external.or_else(|| self.solver.get_model()) {
-                Some(model) => {
+            match external
+                .map(Ok)
+                .or_else(|| self.solver.get_model().map(Err))
+            {
+                Some(Ok(external)) => Some(self.read_external(external)),
+                Some(Err(model)) => {
                     self.read_version_owns(&model);
                     Some(self.read_kinds(&model))
                 }
@@ -3614,37 +3608,123 @@ impl KindSolver {
     }
 
     /// R1543-2 Part 2 (main 346, R1543-4): with `CRAT_BO_MAXSAT_CMD` set and the objective built,
-    /// this check's optimum from the external process, handed back to z3 (`maxsat.rs`). `None` --
-    /// the switch unset, no objective (R1543-4 (4): no line either), or a fallback (its line
-    /// written) -- leaves the check to z3's `Optimize`. The hand-back runs on `hard`, the round's
-    /// hard solver, whose assertions are a prefix of the `Optimize`'s; without one, on a plain
-    /// solver built here.
-    fn external_optimum(&self, hard: Option<&HardLoopSolver>) -> Option<Model> {
+    /// this check's optimum from the external process (`maxsat.rs`). `None` -- the switch unset, no
+    /// objective (R1543-4 (4): no line either), or a fallback (its line written) -- leaves the check
+    /// to z3's `Optimize`. R1555-2 (main 357): no z3 solves, evaluates or walks anything after the
+    /// answer. Before it, every term a reader will ask for is collected -- the model selection's by
+    /// one recording pass of `Selection::from_model` (its order of requests does not depend on the
+    /// values), the export's version ASTs -- and translated with the scope into `maxsat.rs`'s
+    /// circuit; after it, the readers replay the circuit's values in the same order.
+    fn external_optimum(&self) -> Option<ExternalModel> {
         let line = crate::maxsat::run_line()?;
         let ref_weight = self.objective_ref_weight?;
-        let soft: Vec<(Bool, u64)> = self
-            .vars
-            .values()
-            .flat_map(|vars| [(vars.ref_.clone(), ref_weight), (vars.own.clone(), 1)])
-            .collect();
+        let started = Instant::now();
+        let mut slots = Vec::with_capacity(self.vars.len());
+        let mut soft: Vec<(Bool, u64)> = Vec::with_capacity(2 * self.vars.len());
+        for (&slot, vars) in &self.vars {
+            slots.push(slot);
+            soft.push((vars.ref_.clone(), ref_weight));
+            soft.push((vars.own.clone(), 1));
+        }
         let scope = self.solver.get_assertions();
-        let plain;
-        let (solver, synced) = match hard {
-            Some(hard) => (&hard.solver, hard.synced_assertions.get()),
-            None => {
-                plain = Solver::new();
-                plain.set_params(&fixed_query_params());
-                (&plain, 0)
-            }
-        };
+        let facts = self.ownership_facts();
+        let mut reads: Vec<Bool> = Vec::new();
+        if let Some(facts) = &facts {
+            let _ = super::licensing::model_selection::Selection::from_model(
+                Rc::clone(facts),
+                |term| {
+                    reads.push(term.clone());
+                    None
+                },
+            );
+        }
+        let selection_reads = reads.len();
+        let version_asts = super::export::version_asts();
+        if let Some(asts) = &version_asts {
+            reads.extend(asts.iter().cloned());
+        }
+        let version_reads = reads.len() - selection_reads;
+        #[cfg(test)]
+        let capture_asts = OWNERSHIP_MODEL_CAPTURE.with(|capture| {
+            capture
+                .borrow()
+                .as_ref()
+                .and_then(|capture| capture.asts.clone())
+        });
+        #[cfg(test)]
+        if let Some(asts) = &capture_asts {
+            reads.extend(asts.iter().cloned());
+        }
         let check = crate::maxsat::Check {
             scope: &scope,
             soft: &soft,
-            solver,
-            synced,
+            reads: &reads,
+            started,
+            prepare: started.elapsed().as_secs_f64(),
         };
         let limit = Duration::from_millis(u64::from(execution_guard::query_timeout_ms()));
-        crate::maxsat::optimum(line, &check, limit)
+        crate::maxsat::optimum(line, &check, limit, |answer| {
+            // `read_kinds`'s rule (own first) on the soft pairs, slot by slot.
+            let kinds: FxHashMap<SlotRef, SlotKind> = slots
+                .iter()
+                .zip(answer.soft.chunks_exact(2))
+                .map(|(&slot, pair)| {
+                    let kind = if pair[1] {
+                        SlotKind::Owning
+                    } else if pair[0] {
+                        SlotKind::Ref
+                    } else {
+                        SlotKind::Raw
+                    };
+                    (slot, kind)
+                })
+                .collect();
+            let (selection_values, rest) = answer.reads.split_at(selection_reads);
+            let (version_values, _capture_values) = rest.split_at(version_reads);
+            let selection = match facts {
+                Some(facts) => {
+                    let mut values = selection_values.iter();
+                    let mut asked = 0usize;
+                    let selection =
+                        super::licensing::model_selection::Selection::from_model(facts, |_| {
+                            asked += 1;
+                            values.next().copied()
+                        });
+                    if asked != selection_reads {
+                        return Err(crate::maxsat::Cause::Readers(format!(
+                            "replay:{selection_reads}/{asked}"
+                        )));
+                    }
+                    Some(Rc::new(selection))
+                }
+                None => None,
+            };
+            Ok(ExternalModel {
+                kinds,
+                selection,
+                version_owns: version_asts.map(|_| IndexVec::from_raw(version_values.to_vec())),
+                #[cfg(test)]
+                capture: capture_asts.map(|_| IndexVec::from_raw(_capture_values.to_vec())),
+            })
+        })
+    }
+
+    /// R1555-2: [`Self::read_version_owns`] and [`Self::read_kinds`] for an external answer, from
+    /// crat's own values (no z3 model).
+    fn read_external(&self, external: ExternalModel) -> FxHashMap<SlotRef, SlotKind> {
+        *self.original_cell_model.borrow_mut() = external.selection;
+        if let Some(owns) = external.version_owns {
+            super::export::record_version_owns_from(|_| owns);
+        }
+        #[cfg(test)]
+        if let Some(values) = external.capture {
+            OWNERSHIP_MODEL_CAPTURE.with(|capture| {
+                if let Some(capture) = capture.borrow_mut().as_mut() {
+                    capture.observation.model_reads.push(values);
+                }
+            });
+        }
+        external.kinds
     }
 
     /// R1529-2, log only: the soft terms the build asserted (two per slot with the objective).
@@ -3666,7 +3746,7 @@ impl KindSolver {
         match self.relax_selectors_hard_typed(hard, selectors) {
             HardRelaxResult::Sat(relaxed) => {
                 let dropped = relaxed.dropped.clone();
-                let kinds = self.optimized_model_under_hard(&relaxed, Some(hard));
+                let kinds = self.optimized_model_under(&relaxed);
                 if kinds.is_none() {
                     // R1468-2 (i), log only: the relaxation was Sat; the optimize declined.
                     self.last_relax_exit
@@ -4185,6 +4265,15 @@ impl IncumbentRefusal {
             Self::HardEvalFailed => "hard-eval-failed",
         }
     }
+}
+
+/// R1555-2 (main 357 §3): what the external MaxSAT path hands the round, as crat's own values.
+pub(crate) struct ExternalModel {
+    kinds: FxHashMap<SlotRef, SlotKind>,
+    selection: Option<Rc<super::licensing::model_selection::Selection>>,
+    version_owns: Option<IndexVec<Var, bool>>,
+    #[cfg(test)]
+    capture: Option<IndexVec<Var, bool>>,
 }
 
 /// Relay main/388 O2 (R1382-1 / R1383-1): the verdict on an Unknown optimize's model -- taken only

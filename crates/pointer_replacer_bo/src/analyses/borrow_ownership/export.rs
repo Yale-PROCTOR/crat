@@ -944,6 +944,15 @@ pub(crate) fn record_version_asts(asts: &IndexVec<Var, Bool>) {
     VERSION_ASTS.with(|c| *c.borrow_mut() = Some(asts.clone()));
 }
 
+/// R1555-2 (main 357 §3): the stashed ASTs, when a capture is active, for the external MaxSAT
+/// path to translate before the solver's answer.
+pub(crate) fn version_asts() -> Option<IndexVec<Var, Bool>> {
+    if !capturing() {
+        return None;
+    }
+    VERSION_ASTS.with(|c| c.borrow().clone())
+}
+
 /// Evaluate the stashed ASTs against a live model.
 ///
 /// `eval` runs only when a capture is active AND the ASTs were stashed, so the
