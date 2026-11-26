@@ -1221,11 +1221,6 @@ impl Circuit {
     /// Every node's value under `values` (the answer, by WCNF index − 1; an index past its end
     /// reads false). One pass in order; no z3.
     pub(crate) fn values(&self, values: &[bool]) -> Vec<bool> {
-        // RED: the evaluation is not built yet; every node reads false.
-        if self.nodes.len() > 1 {
-            let _ = values;
-            return vec![false; self.nodes.len()];
-        }
         let mut out: Vec<bool> = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let kids = |start: u32, len: u32| {
