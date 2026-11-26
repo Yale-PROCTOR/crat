@@ -3479,11 +3479,6 @@ impl KindSolver {
     /// the demand evidence (one Sat query and the final selection), the relax exit and the test trace.
     fn external_relaxation(&self, selectors: &Selectors, record: bool) -> Option<HardRelaxResult> {
         let line = crate::maxsat::run_line()?;
-        // RED: the external relaxation is not wired yet; every relaxation is z3's.
-        if std::hint::black_box(true) {
-            let _ = (line, selectors, record);
-            return None;
-        }
         let started = Instant::now();
         let mut hard = self.solver.get_assertions();
         hard.extend(self.mandatory_tracks());
