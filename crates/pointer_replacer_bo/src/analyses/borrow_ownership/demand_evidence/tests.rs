@@ -464,3 +464,55 @@ fn e5_h_demand_unknown_query_cannot_be_declared_terminal_success() {
         },
     );
 }
+
+/// R1556-3 §4(d) (main 358 H1): under `CRAT_BO_MAXSAT_CMD` an epoch's relaxation is one external call,
+/// recorded as ONE `SelectorSearch` query (no candidate, Sat, active = the kept endpoints, no core)
+/// and the epoch's final selection (Sat, the dropped endpoints). On the realloc fixture whose z3
+/// drop loop has mixed cores and a restoration, every epoch rewritten to that shape still validates,
+/// so the export's only consumer of the evidence (its canonical JSON) accepts H1's runs.
+#[test]
+fn r1556_2_h1_one_query_per_epoch_validates() {
+    inspect(
+        "unsafe extern \"C\" { fn opaque() -> *mut u8; fn realloc(p: *mut u8, n: usize) -> *mut u8; } pub unsafe fn f() { let p = opaque(); let _q = realloc(p, 8); }",
+        |_, _, evidence| {
+            let mut h1 = evidence.clone();
+            let mut rewritten = 0;
+            for unit in &mut h1.constructions {
+                let all: Vec<EndpointKey> =
+                    unit.endpoints.iter().map(|row| row.key.clone()).collect();
+                let finals = unit.final_selections.clone();
+                unit.queries.clear();
+                for state in &finals {
+                    let dropped = state.dropped.clone().unwrap_or_default();
+                    unit.queries.push(QueryEvent {
+                        id: EventId {
+                            epoch: state.epoch,
+                            ordinal: 0,
+                        },
+                        phase: QueryPhase::SelectorSearch,
+                        candidate: None,
+                        active: all
+                            .iter()
+                            .filter(|key| !dropped.contains(key))
+                            .cloned()
+                            .collect(),
+                        core_endpoints: Vec::new(),
+                        mandatory_core_labels: Vec::new(),
+                        outcome: QueryOutcome::Sat,
+                    });
+                    rewritten += 1;
+                }
+            }
+            assert!(rewritten > 0, "the fixture has an epoch");
+            assert!(
+                evidence.constructions.iter().any(|unit| unit
+                    .final_selections
+                    .iter()
+                    .any(|state| state.dropped.as_ref().is_some_and(|d| !d.is_empty()))),
+                "the fixture drops an endpoint"
+            );
+            h1.validate().expect("H1's one-query epochs validate");
+            h1.canonical_json().expect("and serialize");
+        },
+    );
+}

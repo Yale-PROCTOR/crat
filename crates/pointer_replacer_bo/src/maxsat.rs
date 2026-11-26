@@ -1114,30 +1114,59 @@ pub(crate) fn accept(
     })
 }
 
-/// The check's answer from the run line's process, turned by `readers` into what the caller
-/// reads; `None` is a fallback (its line written), and the caller runs today's check. `limit` is
-/// crat's query limit.
+/// Which call of the round this is: the optimize check (R1543-2 Part 2) or the selector relaxation
+/// (R1556-2, main 358 H1). They differ only in their lines' names and closing fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Phase {
+    Check,
+    Relax,
+}
+
+impl Phase {
+    /// The phase-log names of the accepted line and of the fallback line.
+    fn names(self) -> (&'static str, &'static str) {
+        match self {
+            Phase::Check => ("maxsat:check", "maxsat:fallback"),
+            Phase::Relax => ("maxsat:relax", "maxsat:relax-fallback"),
+        }
+    }
+}
+
+/// The call's answer from the run line's process, turned by `readers` into what the caller reads
+/// (and the line's closing fields); `None` is a fallback (its line written), and the caller runs
+/// today's z3 query. `limit` is crat's query limit.
 pub(crate) fn optimum<T>(
     line: &RunLine,
     check: &Check<'_>,
     limit: Duration,
-    readers: impl FnOnce(&Answer) -> Result<T, Cause>,
+    phase: Phase,
+    readers: impl FnOnce(&Answer) -> Result<(T, String), Cause>,
 ) -> Option<T> {
+    let (accepted, fallback) = phase.names();
     let mut report = Report::default();
     let result = attempt(line, &wcnf_dir(), limit, check, &mut report).and_then(|answer| {
         let started = Instant::now();
         let read = readers(&answer);
         report.readers = started.elapsed().as_secs_f64();
-        read.map(|read| (read, kinds(&answer.soft)))
+        read.map(|(read, fields)| {
+            let closing = match phase {
+                Phase::Check => {
+                    let (refs, owns, raws) = kinds(&answer.soft);
+                    format!("ref={refs} own={owns} raw={raws}")
+                }
+                Phase::Relax => fields,
+            };
+            (read, closing)
+        })
     });
     report.total = check.started.elapsed().as_secs_f64();
     match result {
-        Ok((read, (refs, owns, raws))) => {
+        Ok((read, closing)) => {
             crate::phase_log::mark(
-                "maxsat:check",
+                accepted,
                 "end",
                 &format!(
-                    "{} status=OPTIMUM o={} ref={refs} own={owns} raw={raws}",
+                    "{} status=OPTIMUM o={} {closing}",
                     report.fields(),
                     report.o
                 ),
@@ -1146,7 +1175,7 @@ pub(crate) fn optimum<T>(
         }
         Err(cause) => {
             crate::phase_log::mark(
-                "maxsat:fallback",
+                fallback,
                 "progress",
                 &format!(
                     "cause={} {}{}",

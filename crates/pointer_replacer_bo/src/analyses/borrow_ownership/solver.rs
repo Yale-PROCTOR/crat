@@ -8,7 +8,10 @@ use std::{
 use rustc_hash::FxHashMap;
 use rustc_index::IndexVec;
 use rustc_span::def_id::LocalDefId;
-use z3::{Model, Optimize, SatResult, Solver, ast::Bool};
+use z3::{
+    Model, Optimize, SatResult, Solver,
+    ast::{Ast, Bool},
+};
 
 use super::{
     SlotKind,
@@ -840,6 +843,7 @@ impl KindSolver {
             SlotKind::Ref => &vars.ref_,
             SlotKind::Owning => &vars.own,
         };
+        hard.sync_from(self);
         let mut bundle = self.assumption_bundle(kept);
         bundle.push(bit.clone());
         match hard.solver.check_assumptions(&bundle) {
@@ -2971,7 +2975,14 @@ impl KindSolver {
         );
         let solver = Solver::new();
         solver.set_params(&fixed_query_params());
-        let assertions = self.solver.get_assertions();
+        // R1556-2 (main 358 H1): with `CRAT_BO_MAXSAT_CMD` set the relaxation is the external
+        // solver's, so the copy of the hard part is made only when a relaxation falls back (its
+        // first `sync_from` copies every assertion).
+        let assertions = if crate::maxsat::run_line().is_some() {
+            Vec::new()
+        } else {
+            self.solver.get_assertions()
+        };
         for assertion in &assertions {
             solver.assert(assertion);
         }
@@ -3250,7 +3261,6 @@ impl KindSolver {
             optimize: self.hard_assertion_count(),
             hard: hard.assertion_count(),
         });
-        hard.sync_from(self);
         let expected_hard = self.mandatory_tracks().len() + selectors.all().len();
         assert_eq!(
             self.hard_assertion_count(),
@@ -3258,12 +3268,33 @@ impl KindSolver {
             "endpoint-retraction no-bypass tripwire: every Optimize hard assertion must be either a mandatory \
              tracked constraint or a typed endpoint assertion"
         );
+        self.begin_demand_epoch(selectors);
+        // R1556-2 (main 358 H1): the relaxation as one call to the external solver; on its fallback,
+        // today's z3 drop loop below.
+        #[cfg(test)]
+        if std::env::var_os(DUAL_RELAXATION).is_some() {
+            return self.dual_relaxation(hard, selectors, expected_hard);
+        }
+        if let Some(result) = self.external_relaxation(selectors, true) {
+            return result;
+        }
+        self.z3_relaxation(hard, selectors, expected_hard)
+    }
+
+    /// Today's relaxation on the round's z3 hard solver: the drop loop on unsat cores (the
+    /// smallest sort key first), then the restoration in sort order.
+    fn z3_relaxation(
+        &self,
+        hard: &HardLoopSolver,
+        selectors: &Selectors,
+        expected_hard: usize,
+    ) -> HardRelaxResult {
+        hard.sync_from(self);
         assert_eq!(
             hard.assertion_count(),
             expected_hard,
             "endpoint-retraction hard-loop mirror omitted or duplicated a tracked assertion"
         );
-        self.begin_demand_epoch(selectors);
         let mut assumptions = selectors.all().to_vec();
         let mut dropped = Vec::new();
         // R1468-2 (i), log only: where this relaxation stops, for the `verify:decline` line.
@@ -3437,6 +3468,128 @@ impl KindSolver {
             assumptions,
             dropped,
         })
+    }
+
+    /// R1556-2 (main 358 H1): the selector relaxation as ONE call to the external MaxSAT solver.
+    /// Hard: the `Optimize`'s hard assertions and the mandatory tracks as units. Soft: every selector,
+    /// weight 1. The answer is accepted by `maxsat.rs`'s circuit (every hard root true, the cost the
+    /// `o` line's); the selectors it leaves false are the dropped ones -- a correction set of minimum
+    /// size, so the kept set is maximal (the solver's optimum, as for the optimize check). No z3
+    /// solves anything; `None` is a fallback (its line written) or the switch unset. `record` writes
+    /// the demand evidence (one Sat query and the final selection), the relax exit and the test trace.
+    fn external_relaxation(&self, selectors: &Selectors, record: bool) -> Option<HardRelaxResult> {
+        let line = crate::maxsat::run_line()?;
+        // RED: the external relaxation is not wired yet; every relaxation is z3's.
+        if std::hint::black_box(true) {
+            let _ = (line, selectors, record);
+            return None;
+        }
+        let started = Instant::now();
+        let mut hard = self.solver.get_assertions();
+        hard.extend(self.mandatory_tracks());
+        let all = selectors.all();
+        let soft: Vec<(Bool, u64)> = all.iter().map(|selector| (selector.clone(), 1)).collect();
+        let check = crate::maxsat::Check {
+            scope: &hard,
+            soft: &soft,
+            reads: &[],
+            started,
+            prepare: started.elapsed().as_secs_f64(),
+        };
+        let limit = Duration::from_millis(u64::from(execution_guard::query_timeout_ms()));
+        let kept =
+            crate::maxsat::optimum(line, &check, limit, crate::maxsat::Phase::Relax, |answer| {
+                let dropped = answer.soft.iter().filter(|keep| !**keep).count();
+                Ok((
+                    answer.soft.clone(),
+                    format!("selectors={} dropped={dropped}", all.len()),
+                ))
+            })?;
+        let mut assumptions = Vec::with_capacity(all.len());
+        let mut dropped_indices = Vec::new();
+        for (index, (selector, keep)) in all.iter().zip(&kept).enumerate() {
+            if *keep {
+                assumptions.push(selector.clone());
+            } else {
+                dropped_indices.push(index);
+            }
+        }
+        dropped_indices.sort_by(|left, right| {
+            selectors.keys[*left]
+                .sort_key()
+                .cmp(&selectors.keys[*right].sort_key())
+        });
+        let dropped: Vec<Bool> = dropped_indices
+            .iter()
+            .map(|&index| all[index].clone())
+            .collect();
+        if record {
+            self.prepare_demand_query(QueryPhase::SelectorSearch, None);
+            self.note_demand_query(&assumptions, SatResult::Sat, &[], None);
+            self.last_relax_exit.set(Some(RelaxExit {
+                phase: "maxsat-relax",
+                hard_checks: 0,
+                rechecks: 0,
+                drops: dropped.len(),
+                restored: 0,
+            }));
+            SELECTOR_TRACE_CAPTURE.with(|capture| {
+                if let Some(trace) = capture.borrow_mut().as_mut() {
+                    if trace.epochs.is_empty() {
+                        trace.n_sources = selectors.n_sources;
+                        trace.total = selectors.all.len();
+                    }
+                    trace.epochs.push(SelectorEpochTrace {
+                        events: Vec::new(),
+                        final_dropped: dropped_indices.clone(),
+                    });
+                }
+            });
+            self.finish_demand_epoch(&dropped);
+        }
+        Some(HardRelaxResult::Sat(RelaxedSelectors {
+            assumptions,
+            dropped,
+        }))
+    }
+
+    /// R1556-3 §4(c), test builds only: both relaxations on the same problem -- the external one
+    /// (nothing recorded) and today's z3 drop loop (recorded, and its result returned) -- and one
+    /// `[r1556-dual]` stderr line comparing them.
+    #[cfg(test)]
+    fn dual_relaxation(
+        &self,
+        hard: &HardLoopSolver,
+        selectors: &Selectors,
+        expected_hard: usize,
+    ) -> HardRelaxResult {
+        let external = self.external_relaxation(selectors, false);
+        let z3 = self.z3_relaxation(hard, selectors, expected_hard);
+        let dropped = |result: &HardRelaxResult| match result {
+            HardRelaxResult::Sat(relaxed) => {
+                let mut indices = selectors.indices_of(&relaxed.dropped);
+                indices.sort_unstable();
+                Some(indices)
+            }
+            _ => None,
+        };
+        let (h1, z) = (external.as_ref().and_then(dropped), dropped(&z3));
+        let list = |indices: &[usize]| {
+            let words: Vec<String> = indices.iter().map(usize::to_string).collect();
+            format!("[{}]", words.join(","))
+        };
+        eprintln!(
+            "[r1556-dual] selectors={} z3={} h1={} same={}",
+            selectors.all().len(),
+            z.as_deref().map_or("none".to_owned(), list),
+            match (&external, &h1) {
+                (None, _) => "fallback".to_owned(),
+                (Some(_), None) => "unsat".to_owned(),
+                (Some(_), Some(d)) => list(d),
+            },
+            h1.is_some() && h1 == z
+        );
+        z3
     }
 
     /// Materialize the objective-selected model for one validation round after
@@ -3638,6 +3791,12 @@ impl KindSolver {
                 },
             );
         }
+        // The review of 1a1d6ffca, finding 1: the replay checks each term's identity (the pointer
+        // the z3 handle stores; reading it is no z3 call), not only the count.
+        let identities: Vec<usize> = reads
+            .iter()
+            .map(|term| term.get_z3_ast().as_ptr() as usize)
+            .collect();
         let selection_reads = reads.len();
         let version_asts = super::export::version_asts();
         if let Some(asts) = &version_asts {
@@ -3663,7 +3822,7 @@ impl KindSolver {
             prepare: started.elapsed().as_secs_f64(),
         };
         let limit = Duration::from_millis(u64::from(execution_guard::query_timeout_ms()));
-        crate::maxsat::optimum(line, &check, limit, |answer| {
+        crate::maxsat::optimum(line, &check, limit, crate::maxsat::Phase::Check, |answer| {
             // `read_kinds`'s rule (own first) on the soft pairs, slot by slot.
             let kinds: FxHashMap<SlotRef, SlotKind> = slots
                 .iter()
@@ -3685,8 +3844,15 @@ impl KindSolver {
                 Some(facts) => {
                     let mut values = selection_values.iter();
                     let mut asked = 0usize;
+                    let mut mismatch = None;
                     let selection =
-                        super::licensing::model_selection::Selection::from_model(facts, |_| {
+                        super::licensing::model_selection::Selection::from_model(facts, |term| {
+                            if mismatch.is_none()
+                                && identities.get(asked)
+                                    != Some(&(term.get_z3_ast().as_ptr() as usize))
+                            {
+                                mismatch = Some(asked);
+                            }
                             asked += 1;
                             values.next().copied()
                         });
@@ -3695,17 +3861,25 @@ impl KindSolver {
                             "replay:{selection_reads}/{asked}"
                         )));
                     }
+                    if let Some(at) = mismatch {
+                        return Err(crate::maxsat::Cause::Readers(format!(
+                            "replay-identity:{at}"
+                        )));
+                    }
                     Some(Rc::new(selection))
                 }
                 None => None,
             };
-            Ok(ExternalModel {
-                kinds,
-                selection,
-                version_owns: version_asts.map(|_| IndexVec::from_raw(version_values.to_vec())),
-                #[cfg(test)]
-                capture: capture_asts.map(|_| IndexVec::from_raw(_capture_values.to_vec())),
-            })
+            Ok((
+                ExternalModel {
+                    kinds,
+                    selection,
+                    version_owns: version_asts.map(|_| IndexVec::from_raw(version_values.to_vec())),
+                    #[cfg(test)]
+                    capture: capture_asts.map(|_| IndexVec::from_raw(_capture_values.to_vec())),
+                },
+                String::new(),
+            ))
         })
     }
 
@@ -4266,6 +4440,10 @@ impl IncumbentRefusal {
         }
     }
 }
+
+/// R1556-3 §4(c), test builds only: run both relaxations and compare them.
+#[cfg(test)]
+pub(crate) const DUAL_RELAXATION: &str = "CRAT_R1556_DUAL_RELAXATION";
 
 /// R1555-2 (main 357 §3): what the external MaxSAT path hands the round, as crat's own values.
 pub(crate) struct ExternalModel {

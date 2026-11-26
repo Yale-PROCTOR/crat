@@ -29,6 +29,22 @@ pub(crate) struct GuardBinding {
     pub(crate) predicate: Bool,
 }
 
+/// R1556-4 S1: the guard bindings by equation, built in one pass over `guards`: `Some(row)` for an
+/// equation with exactly one binding, `None` for one with more than one (ambiguous); an equation with
+/// none is absent. It replaces the scan of every binding per equation (the same answers).
+pub(crate) fn unique_guards(
+    guards: &[GuardBinding],
+) -> BTreeMap<EquationId, Option<&GuardBinding>> {
+    let mut index: BTreeMap<EquationId, Option<&GuardBinding>> = BTreeMap::new();
+    for row in guards {
+        index
+            .entry(row.equation)
+            .and_modify(|slot| *slot = None)
+            .or_insert(Some(row));
+    }
+    index
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Facts {
     /// Explicit existing FrozenBenchmarkGraph frame, never inferred from calls.

@@ -1219,6 +1219,21 @@ fn r1555_2_p11_the_readers_replay_to_the_z3_runs_model() {
         );
         assert_eq!(on.kind, "emitted", "{tag}: {on:?}");
         assert!(lines(&err, "maxsat:fallback").is_empty(), "{tag}:\n{err}");
+        // R1556-2 (main 358 H1): every relaxation is the external solver's, with its fields.
+        assert!(
+            lines(&err, "maxsat:relax-fallback").is_empty(),
+            "{tag}:\n{err}"
+        );
+        let relaxations = lines(&err, "maxsat:relax");
+        assert!(!relaxations.is_empty(), "{tag}:\n{err}");
+        for line in &relaxations {
+            assert!(line.contains(" status=OPTIMUM "), "{line}");
+            assert!(
+                line.contains(" selectors=") && line.contains(" dropped="),
+                "{line}"
+            );
+            check_fields(line);
+        }
         let checks = lines(&err, "maxsat:check");
         assert!(!checks.is_empty(), "{tag}:\n{err}");
         for line in &checks {
@@ -1248,20 +1263,16 @@ fn p12_hash(i: usize, salt: u64) -> usize {
     usize::try_from((x ^ (x >> 31)) >> 1).unwrap()
 }
 
-/// P12 (R1555-2 §2(ii), main 357 §6; ignored, run by name): the path's own pieces at P02's size on
-/// synthetic terms of P02's shapes, all true under one assignment. The walls of the encoding, the
-/// circuit, the acceptance (`eval`) and the readers (the kinds of 147,669 slots and a replay of
-/// 150,000 values) are printed; `eval` + `readers` must stay within 40 s.
-#[test]
-#[ignore = "R1555-2 size test (≈ 7.5 M terms); run by name"]
-fn r1555_2_p12_the_path_after_the_answer_at_p02_size() {
-    let started = Instant::now();
+/// P12's hard part (R1555-2 §2(ii)): P12_SYMBOLS symbols with their reference values, P12_UNITS unit
+/// assertions over their own symbols (`u_k` true when `k % 3 == 0`), and P12_COMPOUND compound
+/// assertions of P02's shapes, each true under the reference values. Symbols are named by `tag`.
+fn p12_hard(tag: &str) -> (Vec<Bool>, Vec<bool>, Vec<Bool>, Vec<Bool>) {
     let s: Vec<Bool> = (0..P12_SYMBOLS)
-        .map(|k| Bool::new_const(format!("r1555_2_p12_s{k}")))
+        .map(|k| Bool::new_const(format!("r1555_2_{tag}_s{k}")))
         .collect();
     let value: Vec<bool> = (0..P12_SYMBOLS).map(|k| p12_hash(k, 7) % 5 < 2).collect();
     let u: Vec<Bool> = (0..P12_UNITS)
-        .map(|k| Bool::new_const(format!("r1555_2_p12_u{k}")))
+        .map(|k| Bool::new_const(format!("r1555_2_{tag}_u{k}")))
         .collect();
     let unit = |k: usize| k % 3 == 0;
     let mut hard: Vec<Bool> = (0..P12_UNITS)
@@ -1297,6 +1308,19 @@ fn r1555_2_p12_the_path_after_the_answer_at_p02_size() {
         };
         hard.push(if truth { term } else { !term });
     }
+    (s, value, u, hard)
+}
+
+/// P12 (R1555-2 §2(ii), main 357 §6; ignored, run by name): the path's own pieces at P02's size on
+/// synthetic terms of P02's shapes, all true under one assignment. The walls of the encoding, the
+/// circuit, the acceptance (`eval`) and the readers (the kinds of 147,669 slots and a replay of
+/// 150,000 values) are printed; `eval` + `readers` must stay within 40 s.
+#[test]
+#[ignore = "R1555-2 size test (≈ 7.5 M terms); run by name"]
+fn r1555_2_p12_the_path_after_the_answer_at_p02_size() {
+    let started = Instant::now();
+    let (s, value, _u, hard) = p12_hard("p12");
+    let pick = |i: usize, salt: u64| p12_hash(i, salt) % P12_SYMBOLS;
     let weight = u64::try_from(P12_SLOTS + 1).unwrap();
     let soft: Vec<(Bool, u64)> = (0..P12_SLOTS)
         .flat_map(|k| [(s[2 * k].clone(), weight), (s[2 * k + 1].clone(), 1)])
@@ -1368,4 +1392,184 @@ fn r1555_2_p12_the_path_after_the_answer_at_p02_size() {
         eval + readers <= Duration::from_secs(40),
         "eval {eval:?} + readers {readers:?}"
     );
+}
+
+/// P13 (R1556-3 §3, main 358 §4; ignored, run by name with `CRAT_BO_MAXSAT_CMD` set to the archived
+/// UWrMaxSat line): one relaxation call at P02's size. P12's hard part plus 2,000 selectors
+/// `sel_j => clause`; the 1,988 with a clause true under the reference values can all hold, the 12
+/// with `sel_j => !u` (u a hard unit) cannot. The call must drop exactly those 12, and its own pieces
+/// (encode, circuit, write, solve, eval) must stay within 60 s.
+#[test]
+#[ignore = "R1556-3 relaxation size test; needs the solver CRAT_BO_MAXSAT_CMD names; run by name"]
+fn r1556_2_p13_one_relaxation_at_p02_size() {
+    const SELECTORS: usize = 2_000;
+    const BLOCKED: usize = 12;
+    let line = RunLine::parse(&std::env::var(SWITCH).expect("CRAT_BO_MAXSAT_CMD names the solver"))
+        .expect("a run line");
+    let (s, value, u, mut hard) = p12_hard("p13");
+    let selectors: Vec<Bool> = (0..SELECTORS)
+        .map(|j| Bool::new_const(format!("r1556_2_p13_sel{j}")))
+        .collect();
+    for (j, selector) in selectors.iter().enumerate() {
+        let consequence = if j < BLOCKED {
+            // u_{3j} is asserted true (k % 3 == 0), so this selector cannot hold.
+            !&u[3 * j]
+        } else {
+            let k = p12_hash(j, 9) % P12_SYMBOLS;
+            let m = p12_hash(j, 10) % P12_SYMBOLS;
+            let a = if value[k] { s[k].clone() } else { !&s[k] };
+            Bool::or(&[a, s[m].clone()])
+        };
+        hard.push(selector.implies(&consequence));
+    }
+    let soft: Vec<(Bool, u64)> = selectors.iter().map(|sel| (sel.clone(), 1)).collect();
+    let dir = scratch("r1556-p13");
+    let check = Check {
+        scope: &hard,
+        soft: &soft,
+        reads: &[],
+        started: Instant::now(),
+        prepare: 0.0,
+    };
+    let mut report = Report::default();
+    let answer = attempt(
+        &line,
+        &dir.join("relax"),
+        Duration::from_secs(600),
+        &check,
+        &mut report,
+    )
+    .unwrap_or_else(|cause| panic!("{cause:?}"));
+    let dropped: Vec<usize> = answer
+        .soft
+        .iter()
+        .enumerate()
+        .filter(|(_, keep)| !**keep)
+        .map(|(j, _)| j)
+        .collect();
+    let fields = report.fields();
+    println!("\nr1556-2 p13: {fields} dropped={}", dropped.len());
+    assert_eq!(dropped, (0..BLOCKED).collect::<Vec<_>>(), "{fields}");
+    let wall: f64 = ["encode=", "circuit=", "write=", "solve=", "eval="]
+        .iter()
+        .map(|key| {
+            let at = fields.find(key).unwrap() + key.len();
+            fields[at..]
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+        })
+        .sum();
+    assert!(wall <= 60.0, "{wall} s: {fields}");
+}
+
+/// P14's fixtures beyond P5's and P11's: main 322's cascade (a source / sink tie), the may-overlap
+/// pair, and the demand evidence's realloc shapes.
+const P14_REALLOC: &str = "unsafe extern \"C\" { fn realloc(p: *mut u8, n: usize) -> *mut u8; fn free(p: *mut u8); } pub unsafe fn f(p: *mut u8) { let q = realloc(p, 8); if q.is_null() { free(p); } else { free(q); } }";
+const P14_OPAQUE: &str = "unsafe extern \"C\" { fn opaque() -> *mut u8; fn realloc(p: *mut u8, n: usize) -> *mut u8; } pub unsafe fn f() { let p = opaque(); let _q = realloc(p, 8); }";
+const P14_MALLOC: &str = "unsafe extern \"C\" { fn malloc(n: usize) -> *mut u8; fn free(p: *mut u8); } pub unsafe fn f() { let p = malloc(8); let q = p; free(q); }";
+
+/// P14 (R1556-3 §4(c)): on each fixture, every relaxation runs both ways on the same problem -- the
+/// external one (H1, with the test solver) and today's z3 drop loop, whose result the run keeps.
+/// H1 never falls back, its kept set is accepted by the circuit, and it never drops more than z3's
+/// loop; the fixtures where the two kept sets differ are printed, and at least one relaxation drops
+/// something (so the comparison is not empty).
+#[test]
+fn r1556_2_p14_h1_drops_no_more_than_the_z3_loop() {
+    if child() {
+        return;
+    }
+    let name = test("r1556_2_p14_h1_drops_no_more_than_the_z3_loop");
+    let dir = scratch("r1556-p14");
+    let line = test_solver_line(&dir);
+    let mut compared = 0;
+    let mut dropping = 0;
+    let mut differ = Vec::new();
+    for (tag, code) in [
+        ("cascade", CASCADE_TIE),
+        ("overlap", OVERLAP),
+        ("unique", UNIQUE),
+        ("realloc", P14_REALLOC),
+        ("opaque", P14_OPAQUE),
+        ("malloc", P14_MALLOC),
+    ] {
+        let (on, err) = spawn(
+            &name,
+            code,
+            &format!("r1556-p14-{tag}"),
+            "frozen",
+            &[
+                (SWITCH, line.clone().into()),
+                (
+                    crate::analyses::borrow_ownership::solver::DUAL_RELAXATION,
+                    "on".into(),
+                ),
+                ("CRAT_BO_PHASE_LOG", "on".into()),
+            ],
+        );
+        assert_eq!(on.kind, "emitted", "{tag}: {on:?}");
+        for dual in err.lines().filter(|line| line.starts_with("[r1556-dual] ")) {
+            let field = |key: &str| {
+                let at = dual.find(key).unwrap() + key.len();
+                dual[at..].split(' ').next().unwrap().to_owned()
+            };
+            let (z3, h1) = (field(" z3="), field(" h1="));
+            assert!(
+                z3.starts_with('['),
+                "{tag}: the z3 loop was not Sat: {dual}"
+            );
+            assert!(
+                h1.starts_with('['),
+                "{tag}: H1 fell back or was unsat: {dual}"
+            );
+            let count = |list: &str| list.matches(',').count() + usize::from(list != "[]");
+            assert!(count(&h1) <= count(&z3), "{tag}: H1 drops more: {dual}");
+            compared += 1;
+            dropping += usize::from(z3 != "[]" || h1 != "[]");
+            if field(" same=") != "true" {
+                differ.push(format!("{tag}: z3 {z3} h1 {h1}"));
+            }
+        }
+    }
+    eprintln!(
+        "r1556-2 p14: {compared} relaxations compared, {dropping} with drops, differing: {differ:?}"
+    );
+    assert!(
+        compared > 0 && dropping > 0,
+        "{compared} compared, {dropping} dropping"
+    );
+}
+
+/// P15 (R1556-3 §4(f)): a relaxation whose external call fails falls back to today's z3 drop loop on
+/// a hard solver copied only then. A run line that answers `s UNKNOWN` makes every relaxation and
+/// every optimize check fall back: one `maxsat:relax-fallback` line per relaxation (cause named),
+/// no `maxsat:relax end` line, and the decision equal to the switch-off run's.
+#[test]
+fn r1556_2_p15_a_failed_relaxation_falls_back_to_the_z3_loop() {
+    if child() {
+        return;
+    }
+    let name = test("r1556_2_p15_a_failed_relaxation_falls_back_to_the_z3_loop");
+    let dir = scratch("r1556-p15");
+    let unknown = script(&dir, "unknown", "echo 's UNKNOWN'");
+    let (off, _) = spawn(&name, CASCADE_TIE, "r1556-p15-off", "frozen", &[]);
+    let (on, err) = spawn(
+        &name,
+        CASCADE_TIE,
+        "r1556-p15-on",
+        "frozen",
+        &[(SWITCH, unknown.into()), ("CRAT_BO_PHASE_LOG", "on".into())],
+    );
+    assert_eq!(on.decision(), off.decision(), "{err}");
+    let fallbacks = lines(&err, "maxsat:relax-fallback");
+    assert!(
+        !fallbacks.is_empty()
+            && fallbacks
+                .iter()
+                .all(|line| line.contains("cause=status:UNKNOWN ")),
+        "{err}"
+    );
+    assert!(lines(&err, "maxsat:relax").is_empty(), "{err}");
 }

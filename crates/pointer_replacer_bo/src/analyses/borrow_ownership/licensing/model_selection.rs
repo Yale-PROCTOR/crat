@@ -39,10 +39,11 @@ impl Selection {
             })
             .collect();
         let mut values = BTreeMap::new();
+        // R1556-4 S1: one index of the bindings in place of a scan per key; the keys are asked in
+        // the same order (the BTreeSet's), so the calls of `evaluate` are today's.
+        let guards = super::facts::unique_guards(&facts.guards);
         for key in expected {
-            let mut rows = facts.guards.iter().filter(|row| row.equation == key);
-            if let Some(row) = rows.next()
-                && rows.next().is_none()
+            if let Some(Some(row)) = guards.get(&key)
                 && let Some(value) = evaluate(&row.predicate)
             {
                 values.insert(key, value);
@@ -76,6 +77,71 @@ impl Selection {
         Self {
             move_store_owns,
             fold_values: super::fold_custody::capture(&facts, &mut evaluate),
+            facts,
+            values,
+            traversal_owns,
+        }
+    }
+
+    /// R1556-4 S1, test builds only: `from_model` as it was before the indexes (every key scans
+    /// every binding), the reference the indexed one is compared with.
+    #[cfg(test)]
+    pub(crate) fn from_model_by_scan(
+        facts: Rc<Facts>,
+        mut evaluate: impl FnMut(&z3::ast::Bool) -> Option<bool>,
+    ) -> Self {
+        let expected: BTreeSet<_> = facts
+            .equations
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.operation.as_str(),
+                    "guarded-original-cell-frame" | "guarded-traversal-call" | "guarded-fold-call"
+                )
+            })
+            .map(|row| EquationId {
+                construction: row.point.construction,
+                ordinal: row.ordinal,
+            })
+            .collect();
+        let mut values = BTreeMap::new();
+        for key in expected {
+            let mut rows = facts.guards.iter().filter(|row| row.equation == key);
+            if let Some(row) = rows.next()
+                && rows.next().is_none()
+                && let Some(value) = evaluate(&row.predicate)
+            {
+                values.insert(key, value);
+            }
+        }
+        let required = facts
+            .licensing
+            .as_ref()
+            .and_then(|f| super::traversal_call::valuation_nodes(&facts, &f.traversal_calls).ok())
+            .unwrap_or_default();
+        let traversal_owns = required
+            .into_iter()
+            .filter_map(|node| {
+                facts
+                    .ownership_asts
+                    .get(super::super::ssa::constraint::Var::from_u32(node.var))
+                    .and_then(&mut evaluate)
+                    .map(|value| (node, value))
+            })
+            .collect();
+        let move_store_owns = super::super::move_store::destination_vars_by_scan(&facts)
+            .into_iter()
+            .filter_map(|var| {
+                facts
+                    .ownership_asts
+                    .get(super::super::ssa::constraint::Var::from_u32(var))
+                    .and_then(&mut evaluate)
+                    .map(|value| (var, value))
+            })
+            .collect();
+        Self {
+            move_store_owns,
+            fold_values: super::fold_custody::capture_by_scan(&facts, &mut evaluate),
             facts,
             values,
             traversal_owns,

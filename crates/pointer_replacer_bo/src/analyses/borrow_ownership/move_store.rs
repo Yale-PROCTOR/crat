@@ -56,23 +56,48 @@ pub(crate) fn candidates(facts: &Facts) -> Vec<Candidate> {
         return Vec::new();
     }
     let mut out = Vec::new();
+    // R1556-4 S1: construction 0's equations by (function, block, statement) and its consumes by
+    // (function, ordinal), each bucket in the facts' order, in place of a scan of every equation per
+    // store and of every consume per transfer (the same candidates, in the same order).
+    let mut equations: FxHashMap<(&str, u32, usize), Vec<&super::ownership_evidence::Equation>> =
+        FxHashMap::default();
+    for equation in &facts.equations {
+        let point = &equation.point;
+        if point.construction == 0
+            && let (Some(function), Some(block), Some(statement)) =
+                (point.function.as_deref(), point.block, point.statement)
+        {
+            equations
+                .entry((function, block, statement))
+                .or_default()
+                .push(equation);
+        }
+    }
+    let mut consumes: FxHashMap<(&str, usize), Vec<&super::ownership_occurrence::Consumption>> =
+        FxHashMap::default();
+    for consume in &facts.consumes {
+        if consume.point.construction == 0
+            && let Some(function) = consume.point.function.as_deref()
+        {
+            consumes
+                .entry((function, consume.ordinal))
+                .or_default()
+                .push(consume);
+        }
+    }
     for store in &facts.field_support_inputs.stores {
         if !store.direct_projection {
             continue;
         }
         let StoredValue::Value(source) = &store.value else { continue };
         let site = &store.site;
-        let scoped = |point: &super::ownership_evidence::Point| {
-            point.construction == 0 && point.function.as_deref() == Some(site.function.as_str())
-        };
-        let transfers: Vec<_> = facts
-            .equations
-            .iter()
-            .filter(|equation| scoped(&equation.point))
+        let transfers: Vec<_> = equations
+            .get(&(site.function.as_str(), site.block, site.statement))
+            .into_iter()
+            .flatten()
+            .copied()
             .filter(|equation| {
-                equation.point.block == Some(site.block)
-                    && equation.point.statement == Some(site.statement)
-                    && matches!(equation.operation.as_str(), "linear" | "equal")
+                matches!(equation.operation.as_str(), "linear" | "equal")
                     && equation.validate().is_ok()
             })
             .filter_map(|equation| {
@@ -95,12 +120,14 @@ pub(crate) fn candidates(facts: &Facts) -> Vec<Candidate> {
                     return None;
                 }
                 let head = |id, use_var, def_var| {
-                    facts.consumes.iter().any(|consume| {
-                        scoped(&consume.point)
-                            && consume.ordinal == id
-                            && matches!(&consume.projected, Availability::Present(window)
+                    consumes
+                        .get(&(site.function.as_str(), id))
+                        .into_iter()
+                        .flatten()
+                        .any(|consume| {
+                            matches!(&consume.projected, Availability::Present(window)
                                 if window.use_start == use_var && window.def_start == def_var)
-                    })
+                        })
                 };
                 (head(
                     destination.consume,
@@ -699,6 +726,87 @@ pub(crate) fn clear_removed(
 /// The round's store candidates' destination tokens, for `Selection::from_model`.
 pub(crate) fn destination_vars(facts: &Facts) -> Vec<u32> {
     candidates(facts)
+        .into_iter()
+        .map(|candidate| candidate.destination_def)
+        .collect()
+}
+
+/// R1556-4 S1, test builds only: `candidates` before the indexes, the reference.
+#[cfg(test)]
+fn candidates_by_scan(facts: &Facts) -> Vec<Candidate> {
+    if facts.constructions != 1 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for store in &facts.field_support_inputs.stores {
+        if !store.direct_projection {
+            continue;
+        }
+        let StoredValue::Value(source) = &store.value else { continue };
+        let site = &store.site;
+        let scoped = |point: &super::ownership_evidence::Point| {
+            point.construction == 0 && point.function.as_deref() == Some(site.function.as_str())
+        };
+        let transfers: Vec<_> = facts
+            .equations
+            .iter()
+            .filter(|equation| scoped(&equation.point))
+            .filter(|equation| {
+                equation.point.block == Some(site.block)
+                    && equation.point.statement == Some(site.statement)
+                    && matches!(equation.operation.as_str(), "linear" | "equal")
+                    && equation.validate().is_ok()
+            })
+            .filter_map(|equation| {
+                let transfer = equation.transfer.as_ref()?;
+                let (Availability::Present(destination), Availability::Present(rhs)) =
+                    (&transfer.destination, &transfer.source)
+                else {
+                    return None;
+                };
+                if destination.local != site.place.local
+                    || destination.projection != site.place.projection
+                    || rhs.local != source.local
+                    || rhs.projection != source.projection
+                {
+                    return None;
+                }
+                if !matches!(destination.path.last(), Some(PathStep::Field { structure, index, .. })
+                    if format!("{structure}::field{index}@d0") == site.field_key)
+                {
+                    return None;
+                }
+                let head = |id, use_var, def_var| {
+                    facts.consumes.iter().any(|consume| {
+                        scoped(&consume.point)
+                            && consume.ordinal == id
+                            && matches!(&consume.projected, Availability::Present(window)
+                                if window.use_start == use_var && window.def_start == def_var)
+                    })
+                };
+                (head(
+                    destination.consume,
+                    transfer.destination_use,
+                    transfer.destination_def,
+                ) && head(rhs.consume, transfer.source_use, transfer.source_def))
+                .then_some((equation, transfer))
+            })
+            .collect();
+        let [(equation, transfer)] = transfers.as_slice() else { continue };
+        if moved_transfer(&equation.operation, transfer.by_move) {
+            out.push(Candidate {
+                site: site.clone(),
+                destination_def: transfer.destination_def,
+            });
+        }
+    }
+    out
+}
+
+/// R1556-4 S1, test builds only: `destination_vars` before the indexes.
+#[cfg(test)]
+pub(crate) fn destination_vars_by_scan(facts: &Facts) -> Vec<u32> {
+    candidates_by_scan(facts)
         .into_iter()
         .map(|candidate| candidate.destination_def)
         .collect()

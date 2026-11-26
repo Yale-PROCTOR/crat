@@ -57,6 +57,37 @@ pub(crate) fn capture(
             evaluate(ast).map(|value| (node, value))
         })
         .collect();
+    // R1556-4 S1: one index of the bindings in place of a scan per key (the same order of calls).
+    let index = super::facts::unique_guards(&facts.guards);
+    let guards = guards
+        .into_iter()
+        .filter_map(|key| {
+            let row = (*index.get(&key)?)?;
+            evaluate(&row.predicate).map(|value| (key, value))
+        })
+        .collect();
+    Some(Values { ownership, guards })
+}
+
+/// R1556-4 S1, test builds only: `capture` before the index, the reference.
+#[cfg(test)]
+pub(crate) fn capture_by_scan(
+    facts: &Facts,
+    evaluate: &mut impl FnMut(&z3::ast::Bool) -> Option<bool>,
+) -> Option<Values> {
+    let licensing = facts.licensing.as_ref()?;
+    let rows = licensing.fold_callers.as_deref()?;
+    let (nodes, guards) = required(rows, licensing.fold_members.as_deref().unwrap_or_default());
+    let ownership = nodes
+        .into_iter()
+        .filter_map(|node| {
+            (facts.constructions == 1 && node.construction == 0).then_some(())?;
+            let ast = facts
+                .ownership_asts
+                .get(super::super::ssa::constraint::Var::from_u32(node.var))?;
+            evaluate(ast).map(|value| (node, value))
+        })
+        .collect();
     let guards = guards
         .into_iter()
         .filter_map(|key| {

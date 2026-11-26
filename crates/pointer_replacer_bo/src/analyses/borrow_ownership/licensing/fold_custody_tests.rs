@@ -391,3 +391,95 @@ fn oc09_custody_covers_the_member_requirements_in_the_accepting_model() {
     assert_eq!(guards.len(), proof.requirements.guards.len());
     assert_eq!(accepted.stamp()["fold_values"], encoded["fold_values"]);
 }
+
+/// R1556-4 S1's move-store fixture (the null-paths W60 `P` shape: a field store by move).
+const S1_MOVED: &str = r#"
+#[repr(C)] pub struct Node { pub key: i32, pub left: *mut Node }
+unsafe extern "C" { fn malloc(n: usize) -> *mut Node; fn free(p: *mut Node); }
+unsafe fn new() -> *mut Node { let n = malloc(16); (*n).key = 0; (*n).left = 0 as *mut Node; n }
+unsafe fn attach(y: *mut Node, x: *mut Node) -> *mut Node { let t = x; (*y).left = t; y }
+unsafe fn leftmost(n: *mut Node) -> *mut Node { let mut c = n; while !(*c).left.is_null() { c = (*c).left; } c }
+unsafe fn destroy(n: *mut Node) { if !n.is_null() { destroy((*n).left); free(n); } }
+#[no_mangle] pub unsafe extern "C" fn run() -> i32 { let t = attach(new(), new()); let m = leftmost(t); let k = (*m).key; destroy(t); k }
+"#;
+
+/// R1556-4 S1 (a), (b): the indexed `from_model` (guards by equation, move-store equations and
+/// consumes by site) gives the reference scan's results with the same calls of `evaluate`, in the
+/// same order, by term identity. On the fold-custody and move-store fixtures, each as built, with a
+/// guard key given a second binding (ambiguous: neither reads it) and with one given none (absent),
+/// and under two value patterns: the sequence of asked terms (their z3 pointers, read without a z3
+/// call) and every reader's result (the guard values, the traversal owns, the fold values, the
+/// move-store owns) are equal.
+#[test]
+fn r1556_4_s1_the_indexed_selection_is_the_scan() {
+    use std::rc::Rc;
+
+    use z3::ast::Ast;
+
+    use super::model_selection::Selection;
+    let mut compared = 0;
+    let mut move_stores = 0;
+    for (tag, code) in [("fold", CODE), ("moved", S1_MOVED)] {
+        super::graph_tests::with_facts(code, |facts| {
+            let mut variants = vec![("as-built", facts.clone())];
+            if let Some(first) = facts.guards.first().cloned() {
+                let mut two = facts.clone();
+                two.guards.push(first.clone());
+                variants.push(("two-bindings", two));
+                let mut none = facts.clone();
+                none.guards.retain(|row| row.equation != first.equation);
+                variants.push(("no-binding", none));
+            }
+            for (variant, facts) in variants {
+                let facts = Rc::new(facts);
+                let vars = super::super::move_store::destination_vars(&facts);
+                assert_eq!(
+                    vars,
+                    super::super::move_store::destination_vars_by_scan(&facts),
+                    "{tag} {variant}: move-store candidates"
+                );
+                move_stores += vars.len();
+                for flip in [false, true] {
+                    let run = |indexed: bool| {
+                        let mut asked = Vec::new();
+                        let evaluate = |term: &z3::ast::Bool| {
+                            asked.push(term.get_z3_ast().as_ptr() as usize);
+                            Some((asked.len() % 2 == 0) != flip)
+                        };
+                        let selection = if indexed {
+                            Selection::from_model(facts.clone(), evaluate)
+                        } else {
+                            Selection::from_model_by_scan(facts.clone(), evaluate)
+                        };
+                        (asked, selection)
+                    };
+                    let (indexed_asked, indexed) = run(true);
+                    let (scan_asked, scan) = run(false);
+                    let at = format!("{tag} {variant} flip={flip}");
+                    assert_eq!(indexed_asked, scan_asked, "{at}: the order of calls");
+                    assert_eq!(indexed.values(&facts), scan.values(&facts), "{at}");
+                    assert_eq!(
+                        indexed.traversal_ownership(&facts),
+                        scan.traversal_ownership(&facts),
+                        "{at}"
+                    );
+                    assert_eq!(
+                        indexed.fold_values(&facts),
+                        scan.fold_values(&facts),
+                        "{at}"
+                    );
+                    for &var in &vars {
+                        assert_eq!(
+                            indexed.move_store_own(&facts, var),
+                            scan.move_store_own(&facts, var),
+                            "{at} var {var}"
+                        );
+                    }
+                    compared += 1;
+                }
+            }
+        });
+    }
+    assert!(compared >= 8, "{compared} comparisons");
+    assert!(move_stores > 0, "the move-store fixture has a candidate");
+}
