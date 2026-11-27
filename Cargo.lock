@@ -1007,7 +1007,6 @@ dependencies = [
  "tracing",
  "typed-arena",
  "utils",
- "z3",
 ]
 
 [[package]]

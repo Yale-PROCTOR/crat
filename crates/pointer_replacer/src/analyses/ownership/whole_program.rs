@@ -23,7 +23,8 @@ use crate::analyses::{
         ssa::{
             AnalysisResults, FnResults,
             constraint::{
-                Database, Gen, GlobalAssumptions, Var, Z3Database, infer::Renamer, initialize_local,
+                Database, Gen, GlobalAssumptions, SatDatabase, Var, infer::Renamer,
+                initialize_local,
             },
             consume::Consume,
             state::SSAState,
@@ -55,7 +56,7 @@ fn verbose() -> bool {
 }
 
 impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for WholeProgramAnalysis {
-    type DB = Z3Database;
+    type DB = SatDatabase;
     type InterCtxt = &'analysis InterCtxt;
     type Results = WholeProgramResults<'tcx>;
 
@@ -74,12 +75,26 @@ impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for WholeProgramAn
             3,
         );
 
+        let started = std::time::Instant::now();
+
         // first stage
         let mut results = solve_crate(&mut crate_ctxt, Left((output_params, required_precision)))?;
+        let mut passes = 1;
+        print_model(passes, &results.0);
 
         // second stage
         for _ in 1..2 * required_precision {
             results = solve_crate(&mut crate_ctxt, Right(results))?;
+            passes += 1;
+            print_model(passes, &results.0);
+        }
+
+        if verbose() {
+            println!(
+                "ownership analysis: {:.3} s, {passes} passes, {} vars",
+                started.elapsed().as_secs_f64(),
+                results.0.len() - 1
+            );
         }
 
         let (model, fn_locals, struct_fields) = results;
@@ -118,6 +133,26 @@ impl<'tcx> WholeProgramResults<'tcx> {
     pub fn precision(&self, did: &DefId) -> Precision {
         self.fn_locals.fn_summaries[did].1
     }
+
+    #[cfg(test)]
+    pub fn model(&self) -> &[Ownership] {
+        &self.model
+    }
+}
+
+/// Under the verbose flag, one pass's model as one line: `O` owning, `T` transient, `?` unknown.
+fn print_model(pass: usize, model: &[Ownership]) {
+    if verbose() {
+        let model: String = model
+            .iter()
+            .map(|value| match value {
+                Ownership::Owning => 'O',
+                Ownership::Transient => 'T',
+                Ownership::Unknown => '?',
+            })
+            .collect();
+        println!("ownership model pass {pass}: {model}");
+    }
 }
 
 struct SolveBodyCtxt<'a, 'tcx> {
@@ -125,7 +160,7 @@ struct SolveBodyCtxt<'a, 'tcx> {
     inter_ctxt: &'a InterCtxt,
     global_assumptions: &'a GlobalAssumptions,
     var_gen: &'a mut Gen,
-    database: &'a mut Z3Database,
+    database: &'a mut SatDatabase,
 }
 
 fn solve_body<'tcx>(
@@ -152,7 +187,7 @@ fn solve_body<'tcx>(
         database,
     } = ctxt;
 
-    database.solver.push();
+    database.open_scope();
 
     let mut rn = Renamer::new(body, ssa_state, crate_ctxt.tcx);
 
@@ -178,19 +213,20 @@ fn solve_body<'tcx>(
 
     let results = FnSummary::new(rn, infer_cx);
 
-    match database.solver.check() {
-        z3::SatResult::Unsat => {
+    match database.check_scope() {
+        Some(false) => {
             if verbose() {
                 println!("\u{274C}");
             }
-            database.solver.pop(1);
+            database.close_scope(false);
             Ok((results, precision - 1))
         }
-        z3::SatResult::Unknown => bail!("z3 status: unknown"),
-        z3::SatResult::Sat => {
+        None => bail!("sat status: unknown"),
+        Some(true) => {
             if verbose() {
                 println!("\u{2705}");
             }
+            database.close_scope(true);
             Ok((results, precision))
         }
     }
@@ -266,7 +302,7 @@ fn solve_crate(
         }
     };
 
-    let model = retrieve_model(database, var_gen);
+    let model = retrieve_model(database, var_gen)?;
 
     let fn_locals = FnLocals {
         fn_sigs,
@@ -276,24 +312,16 @@ fn solve_crate(
     Ok((model, fn_locals, global_assumptions))
 }
 
-fn retrieve_model(database: Z3Database, var_gen: Gen) -> Vec<Ownership> {
-    assert!(matches!(database.solver.check(), z3::SatResult::Sat));
-    let z3_model = database.solver.get_model().unwrap();
+fn retrieve_model(mut database: SatDatabase, var_gen: Gen) -> anyhow::Result<Vec<Ownership>> {
+    let values = database.model(var_gen.next())?;
     let mut model = Vec::with_capacity(var_gen.next().index());
 
     assert_eq!(Var::MIN.index(), 1);
 
     model.push(Ownership::Unknown);
+    model.extend(values.into_iter().map(Ownership::from));
 
-    for sig in Var::MIN..var_gen.next() {
-        let value = z3_model
-            .eval(&database.z3_ast[sig], false)
-            .unwrap()
-            .as_bool();
-        model.push(value.into());
-    }
-
-    model
+    Ok(model)
 }
 
 impl<'analysis_results, 'tcx: 'analysis_results> AnalysisResults<'analysis_results>
@@ -378,7 +406,7 @@ impl FnLocals {
         model: Vec<Ownership>,
         crate_ctxt: &CrateCtxt<'tcx>,
         var_gen: &mut Gen,
-        database: &mut Z3Database,
+        database: &mut SatDatabase,
     ) -> (
         InterCtxt,
         impl Iterator<Item = (DefId, SSAState, Precision)> + 'tcx,

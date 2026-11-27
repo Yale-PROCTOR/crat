@@ -308,63 +308,292 @@ impl Database for () {
     fn push_eq_min_impl(&mut self, _: Var, _: Var, _: Var) {}
 }
 
-pub struct Z3Database {
-    pub solver: z3::Solver,
-    pub z3_ast: IndexVec<Var, z3::ast::Bool>,
+/// The ownership constraints as CNF, solved in-process and incrementally by CaDiCaL.
+///
+/// One function's constraints are solved in a scope ([SatDatabase::open_scope]). Each clause added
+/// while the scope is open is guarded by the scope's activation literal `a` (it is added as
+/// `¬a ∨ C`), and [SatDatabase::check_scope] solves under the assumption `a`. The scope is then
+/// closed ([SatDatabase::close_scope]): kept, where the unit `a` makes its clauses permanent, or
+/// discarded, where the unit `¬a` satisfies them so that they constrain nothing more. Clauses
+/// added outside a scope are permanent.
+///
+/// The solver variable of a [Var] means "the [Var] is NOT owning"; the [Var]'s own literal is its
+/// negation. CaDiCaL decides a free variable true first (its initial phase), so a [Var] the kept
+/// clauses leave free tends toward not owning. For the same reason [SatDatabase::model] solves
+/// under a fresh assumption: CaDiCaL's lucky phases, which run only in a solve without
+/// assumptions and may try all-false (here: all owning) first, stay out of it.
+///
+/// This is a tendency, not a guarantee. A variable that bounded variable elimination removed is
+/// never decided: its value is rebuilt starting from false (changed only where a removed clause
+/// needs it), and false here means owning. Phase saving records every assignment, including those
+/// made while solving a scope that was then discarded, so a later solve can start a [Var] from a
+/// phase an earlier scope left. Rephasing and local search can move the saved phases too. The
+/// validity of the model rests on none of this: the self-check covers every kept clause.
+pub struct SatDatabase {
+    solver: cadical::Solver,
+    /// The solver variable of each [Var], true when the [Var] is NOT owning: 0 until the [Var]
+    /// first occurs in a clause.
+    lits: IndexVec<Var, i32>,
+    /// Whether each [Var] occurs in a kept clause (outside every scope, or in a kept scope).
+    kept: IndexVec<Var, bool>,
+    /// The last solver variable handed out, to a [Var] or to a scope's activation literal.
+    last_lit: i32,
+    /// The kept clauses over solver literals, each followed by 0, for the model's self-check.
+    clauses: Vec<i32>,
+    scope: Option<Scope>,
 }
 
-impl Z3Database {
+struct Scope {
+    activation: i32,
+    /// The scope's clauses over solver literals (without the activation literal), each followed
+    /// by 0.
+    clauses: Vec<i32>,
+    /// The [Var]s the scope's clauses name that were not kept before.
+    vars: Vec<Var>,
+}
+
+impl SatDatabase {
     pub fn new() -> Self {
-        let mut z3_ast = IndexVec::with_capacity(100);
-        z3_ast.push(z3::ast::Bool::new_const("dummy"));
-        Z3Database {
-            solver: z3::Solver::new(),
-            z3_ast,
+        let mut lits = IndexVec::with_capacity(100);
+        let mut kept = IndexVec::with_capacity(100);
+        // [Var::INVALID]
+        lits.push(0);
+        kept.push(false);
+        SatDatabase {
+            solver: cadical::Solver::new(),
+            lits,
+            kept,
+            last_lit: 0,
+            clauses: Vec::new(),
+            scope: None,
         }
+    }
+
+    fn fresh_lit(&mut self) -> i32 {
+        self.last_lit = self
+            .last_lit
+            .checked_add(1)
+            .expect("too many SAT variables");
+        self.last_lit
+    }
+
+    /// The solver literal of `x` (owning) when `positive`, else of `¬x`. The solver variable of
+    /// `x` means "`x` is NOT owning", so `x` itself is its negation.
+    fn lit(&mut self, x: Var, positive: bool) -> i32 {
+        if self.lits[x] == 0 {
+            let lit = self.fresh_lit();
+            self.lits[x] = lit;
+        }
+        if positive {
+            -self.lits[x]
+        } else {
+            self.lits[x]
+        }
+    }
+
+    /// Adds the clause of the given literals, each a [Var] and its polarity.
+    fn clause<const N: usize>(&mut self, literals: [(Var, bool); N]) {
+        let clause = literals.map(|(x, positive)| self.lit(x, positive));
+        match &mut self.scope {
+            Some(scope) => {
+                self.solver
+                    .add_clause(std::iter::once(-scope.activation).chain(clause));
+                scope.clauses.extend(clause);
+                scope.clauses.push(0);
+                for (x, _) in literals {
+                    if !self.kept[x] {
+                        scope.vars.push(x);
+                    }
+                }
+            }
+            None => {
+                self.solver.add_clause(clause);
+                self.clauses.extend(clause);
+                self.clauses.push(0);
+                for (x, _) in literals {
+                    self.kept[x] = true;
+                }
+            }
+        }
+    }
+
+    /// Opens the scope of one function's constraints.
+    pub fn open_scope(&mut self) {
+        assert!(self.scope.is_none(), "ownership scopes do not nest");
+        let activation = self.fresh_lit();
+        self.scope = Some(Scope {
+            activation,
+            clauses: Vec::new(),
+            vars: Vec::new(),
+        });
+    }
+
+    /// Solves the kept clauses together with the open scope's: `Some(true)` satisfiable,
+    /// `Some(false)` unsatisfiable, `None` when the solver gave no answer.
+    pub fn check_scope(&mut self) -> Option<bool> {
+        let activation = self.scope.as_ref().expect("no open scope").activation;
+        self.solver.solve_with([activation])
+    }
+
+    /// Closes the open scope: its clauses are kept, and constrain every later check and the model,
+    /// or discarded, and constrain nothing more.
+    pub fn close_scope(&mut self, keep: bool) {
+        let scope = self.scope.take().expect("no open scope");
+        if keep {
+            self.solver.add_clause([scope.activation]);
+            self.clauses.extend(scope.clauses);
+            for x in scope.vars {
+                self.kept[x] = true;
+            }
+        } else {
+            self.solver.add_clause([-scope.activation]);
+        }
+    }
+
+    /// The value of each [Var] in `Var::MIN..end` under a model of the kept clauses.
+    ///
+    /// A [Var] that occurs in no kept clause reads `None` (unknown): no kept constraint gives it a
+    /// value, and the solver's model, which is total, would otherwise report an arbitrary one.
+    /// z3's model evaluation without completion gave such a [Var] no value either; it could also
+    /// leave out a [Var] that does occur in kept clauses (one its search did not need), which
+    /// here reads the value of CaDiCaL's model.
+    ///
+    /// Self-check: every kept clause must be true under the model read out; otherwise an error.
+    pub fn model(&mut self, end: Var) -> anyhow::Result<Vec<Option<bool>>> {
+        assert!(self.scope.is_none(), "a scope is still open");
+        // A fresh literal in no clause, assumed only to keep the lucky phases out of this solve.
+        let fresh = self.fresh_lit();
+        assert_eq!(self.solver.solve_with([fresh]), Some(true));
+
+        for (index, clause) in self.clauses.split(|&lit| lit == 0).enumerate() {
+            if !clause.is_empty()
+                && !clause
+                    .iter()
+                    .any(|&lit| self.solver.value(lit) == Some(true))
+            {
+                anyhow::bail!("the SAT model violates kept ownership clause {index}: {clause:?}");
+            }
+        }
+
+        Ok((Var::MIN..end)
+            .map(|x| {
+                self.kept[x]
+                    .then_some(self.lits[x])
+                    .and_then(|not_owning| self.solver.value(-not_owning))
+            })
+            .collect())
     }
 }
 
-impl Database for Z3Database {
+impl Database for SatDatabase {
     fn new_vars(&mut self, var_gen: &mut Gen, size: u32) -> Range<Var> {
         let sigs = var_gen.new_sigs(size);
         for sig in sigs.clone() {
-            assert_eq!(
-                sig,
-                self.z3_ast.push(z3::ast::Bool::new_const(sig.as_u32()))
-            )
+            assert_eq!(sig, self.lits.push(0));
+            assert_eq!(sig, self.kept.push(false));
         }
         sigs
     }
 
     fn push_linear_impl(&mut self, x: Var, y: Var, z: Var) {
-        let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
-        self.solver.assert(z3::ast::Bool::or(&[&!x, &!y]));
-        self.solver.assert(z3::ast::Bool::or(&[&!x, z]));
-        self.solver.assert(z3::ast::Bool::or(&[x, y, &!z]));
-        self.solver.assert(z3::ast::Bool::or(&[&!y, z]));
+        self.clause([(x, false), (y, false)]);
+        self.clause([(x, false), (z, true)]);
+        self.clause([(x, true), (y, true), (z, false)]);
+        self.clause([(y, false), (z, true)]);
     }
 
     fn push_assume_impl(&mut self, x: Var, sign: bool) {
-        let x = &self.z3_ast[x];
-        let value = z3::ast::Bool::from_bool(sign);
-        self.solver.assert(&!(x.xor(&value)))
-        // self.solver.assert(&!z3::ast::Bool::xor(x, &value));
+        self.clause([(x, sign)]);
     }
 
     fn push_equal_impl(&mut self, x: Var, y: Var) {
-        let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
-        self.solver.assert(&!(x.xor(y)));
+        self.clause([(x, false), (y, true)]);
+        self.clause([(x, true), (y, false)]);
     }
 
     fn push_less_equal_impl(&mut self, x: Var, y: Var) {
-        let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
-        self.solver.assert(z3::ast::Bool::or(&[&!x, y]));
+        self.clause([(x, false), (y, true)]);
     }
 
     fn push_eq_min_impl(&mut self, x: Var, y: Var, z: Var) {
-        let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
-        self.solver.assert(z3::ast::Bool::or(&[&!x, y]));
-        self.solver.assert(z3::ast::Bool::or(&[&!x, z]));
-        self.solver.assert(z3::ast::Bool::or(&[x, &!y, &!z]));
+        self.clause([(x, false), (y, true)]);
+        self.clause([(x, false), (z, true)]);
+        self.clause([(x, true), (y, false), (z, false)]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// x is kept outside any scope; a kept scope adds x <= y, z = min(x, y) and f <= g, which
+    /// leaves f and g free; a discarded scope adds y = 0, which contradicts them, and w = y, the
+    /// only clause that names w; v is in no clause.
+    fn build() -> (SatDatabase, Gen, [Var; 7]) {
+        let mut var_gen = Gen::new();
+        let mut db = SatDatabase::new();
+        let vars = db.new_vars(&mut var_gen, 7);
+        let [x, y, z, w, v, f, g] = std::array::from_fn(|i| vars.start + i as u32);
+
+        db.push_assume_impl(x, true);
+
+        db.open_scope();
+        db.push_less_equal_impl(x, y);
+        db.push_eq_min_impl(z, x, y);
+        db.push_less_equal_impl(f, g);
+        assert_eq!(db.check_scope(), Some(true));
+        db.close_scope(true);
+
+        db.open_scope();
+        db.push_assume_impl(y, false);
+        db.push_equal_impl(w, y);
+        assert_eq!(db.check_scope(), Some(false));
+        db.close_scope(false);
+
+        (db, var_gen, [x, y, z, w, v, f, g])
+    }
+
+    #[test]
+    fn sat_database_scopes_unknown_and_self_check() {
+        let (mut db, var_gen, [x, _, _, w, ..]) = build();
+        let model = db.model(var_gen.next()).expect("every kept clause holds");
+        // x by its unit, y by x <= y, z = min(x, y); w and v occur in no kept clause; f and g are
+        // free but kept: not owning, the bias of the negated solver variable.
+        assert_eq!(
+            model,
+            [
+                Some(true),
+                Some(true),
+                Some(true),
+                None,
+                None,
+                Some(false),
+                Some(false)
+            ]
+        );
+
+        // The discarded scope constrains nothing more (w = 1 would contradict its w = y, y = 0);
+        // the kept clauses still do (x = 0 contradicts the unit x).
+        db.open_scope();
+        db.push_assume_impl(w, true);
+        assert_eq!(db.check_scope(), Some(true));
+        db.close_scope(false);
+        db.open_scope();
+        db.push_assume_impl(x, false);
+        assert_eq!(db.check_scope(), Some(false));
+        db.close_scope(false);
+
+        // The same calls give the same model, the free f and g included.
+        let (mut again, var_gen, _) = build();
+        assert_eq!(again.model(var_gen.next()).unwrap(), model);
+    }
+
+    #[test]
+    fn sat_database_self_check_rejects_a_false_kept_clause() {
+        let (mut db, var_gen, [x, ..]) = build();
+        // A kept clause ¬x that the solver never saw: the model (x owning) falsifies it.
+        let lit = db.lit(x, false);
+        db.clauses.extend([lit, 0]);
+        assert!(db.model(var_gen.next()).is_err());
     }
 }

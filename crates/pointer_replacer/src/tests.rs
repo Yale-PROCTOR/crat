@@ -10494,6 +10494,96 @@ pub unsafe fn make_holder() -> Holder {
             },
         );
     }
+
+    /// The old pass's ownership analysis solves with an in-process SAT solver: its sources may not
+    /// call into z3 and the crate's manifest may not declare it.
+    #[test]
+    fn ownership_solver_is_not_z3() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_guarded_rust_files(&manifest_dir.join("src/analyses/ownership"), &mut files);
+        files.sort();
+        assert!(!files.is_empty());
+
+        let needle = [b"z3".as_slice(), b"::".as_slice()].concat();
+        let mut offenders = files
+            .into_iter()
+            .filter(|path| {
+                fs::read(path)
+                    .unwrap_or_else(|err| panic!("failed to read `{}`: {err}", path.display()))
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_slice())
+            })
+            .map(|path| {
+                path.strip_prefix(manifest_dir)
+                    .unwrap_or(path.as_path())
+                    .display()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml"))
+            .unwrap_or_else(|err| panic!("failed to read Cargo.toml: {err}"));
+        if manifest.lines().any(|line| {
+            let line = line.trim();
+            line == "[dependencies.z3]"
+                || line
+                    .strip_prefix("z3")
+                    .is_some_and(|rest| rest.trim_start().starts_with(['=', '.']))
+        }) {
+            offenders.push("Cargo.toml".to_string());
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "z3 is still named by the ownership analysis:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Two analyses of the same program give the same model.
+    #[test]
+    fn ownership_model_is_deterministic() {
+        const CODE: &str = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+    fn free(ptr: *mut i32);
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn make() -> *mut i32 {
+    malloc(4)
+}
+
+pub unsafe fn pick(a: *mut i32, b: *mut i32, c: bool) -> *mut i32 {
+    if c { a } else { b }
+}
+
+pub unsafe fn fill(h: *mut Holder) {
+    (*h).p = make();
+}
+
+pub unsafe fn drain(h: *mut Holder) {
+    free((*h).p);
+}
+"#;
+        let analyze = || {
+            let mut model = Vec::new();
+            run_compiler(CODE, |tcx| {
+                let program = collect_program(tcx);
+                model = analyze_program(&program).model().to_vec();
+            });
+            model
+        };
+
+        let first = analyze();
+        assert!(first.iter().any(|value| *value != Ownership::Unknown));
+        assert_eq!(first, analyze());
+    }
 }
 
 #[test]
