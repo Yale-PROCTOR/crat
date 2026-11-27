@@ -398,18 +398,14 @@ pub(crate) fn validate_skeleton_view(
             "statement-pair metadata labels must equal reportable labels in depth-first order",
         ));
     }
-    for (label, _, disposition) in &flattened {
-        if !matches!(
+    let groups = canonical_statement_groups(item);
+    let reportable = flattened.iter().filter(|(_, _, disposition)| {
+        matches!(
             disposition,
             StatementDispositionKind::Transform | StatementDispositionKind::Mechanical
-        ) {
-            continue;
-        }
-        let metadata = view
-            .statement_pair_metadata
-            .iter()
-            .find(|metadata| metadata.label == *label)
-            .expect("metadata labels were validated above");
+        )
+    });
+    for ((label, _, disposition), metadata) in reportable.zip(&view.statement_pair_metadata) {
         if *disposition == StatementDispositionKind::Mechanical
             && metadata.printf_template.is_none()
         {
@@ -418,7 +414,7 @@ pub(crate) fn validate_skeleton_view(
                 format!("mechanical label {label} requires trusted printf metadata"),
             ));
         }
-        let Some(group) = canonical_statement_group(item, *label) else {
+        let Some(group) = groups.get(label) else {
             if metadata.printf_template.is_none() {
                 continue;
             }
@@ -496,11 +492,13 @@ pub(crate) fn validate_cross_view_topology(
             "baseline and applied skeletons have different depth-first label/control topology",
         ));
     }
+    let baseline_groups = canonical_statement_groups(baseline);
+    let applied_groups = canonical_statement_groups(applied);
     for (label, _) in &baseline_data.topology {
-        let Some(baseline_group) = canonical_statement_group(baseline, *label) else {
+        let Some(baseline_group) = baseline_groups.get(label) else {
             continue;
         };
-        let Some(applied_group) = canonical_statement_group(applied, *label) else {
+        let Some(applied_group) = applied_groups.get(label) else {
             continue;
         };
         if baseline_group.len() == 1
@@ -1847,37 +1845,30 @@ fn groups(statements: &[Stmt]) -> Vec<Group> {
     output
 }
 
-pub(crate) fn canonical_statement_group(item: &Item, target: u32) -> Option<Vec<Stmt>> {
-    struct Collector {
-        target: u32,
-        statements: Option<Vec<Stmt>>,
-    }
+pub(crate) fn canonical_statement_groups(item: &Item) -> HashMap<u32, &[Stmt]> {
+    struct Collector<'ast>(HashMap<u32, &'ast [Stmt]>);
 
-    impl<'ast> Visitor<'ast> for Collector {
+    impl<'ast> Visitor<'ast> for Collector<'ast> {
         fn visit_block(&mut self, block: &'ast rustc_ast::Block) {
-            if self.statements.is_some() {
-                return;
-            }
-            if let Some(group) = groups(&block.stmts)
-                .into_iter()
-                .find(|group| group.label == Some(self.target))
-            {
-                self.statements = Some(group.statements);
-                return;
+            for group in block.stmts.chunk_by(|left, right| {
+                let label = statement_label(left);
+                label.is_some() && label == statement_label(right)
+            }) {
+                if let Some(label) = statement_label(&group[0]) {
+                    self.0.entry(label).or_insert(group);
+                }
             }
             visit::walk_block(self, block);
         }
     }
 
-    let ItemKind::Fn(box function) = &item.kind else {
-        return None;
-    };
-    let mut collector = Collector {
-        target,
-        statements: None,
-    };
-    collector.visit_block(function.body.as_ref()?);
-    collector.statements
+    let mut collector = Collector(HashMap::new());
+    if let ItemKind::Fn(function) = &item.kind
+        && let Some(body) = &function.body
+    {
+        collector.visit_block(body);
+    }
+    collector.0
 }
 
 fn statement_label(statement: &Stmt) -> Option<u32> {
@@ -1965,14 +1956,44 @@ mod tests {
         P(utils::ast::parse_item(source.to_owned()))
     }
 
+    #[test]
+    fn canonical_groups_keep_adjacent_statements_in_their_own_blocks() {
+        rustc_span::create_session_if_not_set_then(
+            rustc_span::edition::Edition::Edition2021,
+            |_| {
+                let item = parse_item(
+                    r#"
+unsafe fn example() {
+    #[proctor(0)] {
+        #[proctor(1)] let first = 1;
+        #[proctor(1)] let second = first;
+        #[proctor(2)] drop(second);
+    }
+    #[proctor(3)] return;
+}
+"#,
+                );
+                let groups = canonical_statement_groups(&item);
+                assert_eq!(groups.len(), 4);
+                assert_eq!(groups[&0].len(), 1);
+                assert_eq!(groups[&1].len(), 2);
+                assert!(pprust::stmt_to_string(&groups[&1][0]).contains("let first = 1"));
+                assert!(pprust::stmt_to_string(&groups[&1][1]).contains("let second = first"));
+                assert_eq!(groups[&2].len(), 1);
+                assert_eq!(groups[&3].len(), 1);
+            },
+        );
+    }
+
     fn view(source: &str) -> SkeletonView {
         let item = parse_item(source);
         let labels = collect_label_topology(&item).unwrap();
+        let groups = canonical_statement_groups(&item);
         let mut transformed = HashSet::new();
         let mut mechanical = HashSet::new();
         let mut metadata = vec![];
         for (label, _) in labels {
-            let group = canonical_statement_group(&item, label).unwrap();
+            let group = groups[&label];
             let template = parse_print_macro_statement(&group[0]).ok().map(|parsed| {
                 crate::PrintfTemplateMetadata {
                     rust_format: parsed.format,

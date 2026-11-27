@@ -8,11 +8,13 @@ pub(super) fn initial_pointer_decisions(
     tcx: TyCtxt<'_>,
     api: &FxHashSet<String>,
     callbacks: &FxHashSet<LocalDefId>,
+    skip_andersen: bool,
 ) -> InitialPointerDecisions {
     let original = pointer_replacer::initial_pointer_decisions(
         &pointer_replacer::Config::default(),
         pointer_replacer::PointerDecisionOptions {
             assume_nonnegative_offsets: true,
+            skip_andersen,
         },
         tcx,
     );

@@ -38,6 +38,7 @@ fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> Skeleton
             &HashSet::new(),
         )
         .map_err(|problem| global_error(ReplacementErrorKind::InvalidRequest, problem.message))?;
+        let groups = canonical_statement_groups(&krate.items[0]);
         Ok(SkeletonView {
             skeleton: skeleton.to_owned(),
             needs_transformation: needs,
@@ -47,7 +48,8 @@ fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> Skeleton
                 .map(|label| StatementPairMetadata {
                     label,
                     before_statement: "test".to_owned(),
-                    printf_template: canonical_statement_group(&krate.items[0], label)
+                    printf_template: groups
+                        .get(&label)
                         .and_then(|group| (group.len() == 1).then_some(group))
                         .and_then(|group| parse_print_macro_statement(&group[0]).ok())
                         .map(|parsed| PrintfTemplateMetadata {
@@ -130,6 +132,7 @@ fn mixed_preservation_item(
             &HashSet::new(),
         )
         .map_err(|problem| global_error(ReplacementErrorKind::InvalidRequest, problem.message))?;
+        let groups = canonical_statement_groups(&krate.items[0]);
         Ok(SkeletonView {
             skeleton: skeleton.to_owned(),
             needs_transformation: !transformed.is_empty(),
@@ -140,7 +143,8 @@ fn mixed_preservation_item(
                 .map(|label| StatementPairMetadata {
                     label,
                     before_statement: "test".to_owned(),
-                    printf_template: canonical_statement_group(&krate.items[0], label)
+                    printf_template: groups
+                        .get(&label)
                         .and_then(|group| (group.len() == 1).then_some(group))
                         .and_then(|group| parse_print_macro_statement(&group[0]).ok())
                         .map(|parsed| PrintfTemplateMetadata {

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize, ser::SerializeStruct};
 use crate::{
     SkeletonView,
     preservation::{
-        canonical_parameter_pattern, canonical_statement_group, canonicalize_function_with_view,
+        canonical_parameter_pattern, canonical_statement_groups, canonicalize_function_with_view,
         validate_skeleton_view,
     },
     printf::{parse_print_macro_statement, validate_print_macro_statement},
@@ -380,14 +380,16 @@ fn validate_expected_skeleton(item: &Item, entry: &ExpectedFunction) -> Result<(
             entry.name, entry.id
         )
     })?;
+    let groups = canonical_statement_groups(item);
+    let templates = entry
+        .view
+        .statement_pair_metadata
+        .iter()
+        .filter_map(|metadata| Some((metadata.label, metadata.printf_template.as_ref()?)))
+        .collect::<HashMap<_, _>>();
     for label in entry.view.transform_labels() {
-        let template = entry
-            .view
-            .statement_pair_metadata
-            .iter()
-            .find(|metadata| metadata.label == label)
-            .and_then(|metadata| metadata.printf_template.as_ref());
-        let Some(group) = canonical_statement_group(item, label) else {
+        let template = templates.get(&label).copied();
+        let Some(group) = groups.get(&label) else {
             if template.is_some() {
                 return Err(format!(
                     "Expected skeleton for `{}` (item {}) has no print template group at label {label}",
@@ -761,43 +763,38 @@ fn validate_function(
     let mut result_scan = BodyScanner::new(false);
     result_scan.visit_block(result_body);
 
-    let printf_labels = expected
+    let printf_templates = expected
         .metadata
         .view
         .statement_pair_metadata
         .iter()
-        .filter_map(|metadata| metadata.printf_template.as_ref().map(|_| metadata.label))
-        .collect::<HashSet<_>>();
+        .filter_map(|metadata| Some((metadata.label, metadata.printf_template.as_ref()?)))
+        .collect::<HashMap<_, _>>();
     result_scan.macro_temporaries.retain(|occurrence| {
         occurrence
             .label
-            .is_none_or(|label| !printf_labels.contains(&label))
+            .is_none_or(|label| !printf_templates.contains_key(&label))
     });
     returned_scan.macro_temporaries.retain(|occurrence| {
         occurrence
             .label
-            .is_none_or(|label| !printf_labels.contains(&label))
+            .is_none_or(|label| !printf_templates.contains_key(&label))
     });
 
+    let expected_groups = canonical_statement_groups(&expected.item);
+    let result_groups = canonical_statement_groups(&canonical);
     let mut printf_errors = vec![];
     for label in expected.metadata.view.transform_labels() {
-        let Some(template_metadata) = expected
-            .metadata
-            .view
-            .statement_pair_metadata
-            .iter()
-            .find(|metadata| metadata.label == label)
-            .and_then(|metadata| metadata.printf_template.as_ref())
-        else {
+        let Some(template_metadata) = printf_templates.get(&label) else {
             continue;
         };
-        let Some(expected_group) = canonical_statement_group(&expected.item, label) else {
+        let Some(expected_group) = expected_groups.get(&label) else {
             continue;
         };
         if expected_group.len() != 1 {
             continue;
         }
-        let Some(result_group) = canonical_statement_group(&canonical, label) else {
+        let Some(result_group) = result_groups.get(&label) else {
             continue;
         };
         if result_group.len() != 1 {

@@ -31,6 +31,8 @@ enum Command {
     MakeSkeleton {
         #[arg(long)]
         use_bo_analysis: bool,
+        #[arg(long, conflicts_with = "use_bo_analysis")]
+        skip_andersen: bool,
         #[arg(long)]
         frozen_output: Option<PathBuf>,
         #[arg(long)]
@@ -596,6 +598,7 @@ fn main() {
         }
         Command::MakeSkeleton {
             use_bo_analysis,
+            skip_andersen,
             output,
             frozen_output,
             rules,
@@ -624,13 +627,20 @@ fn main() {
             let freeze = frozen_output.is_some();
             let api = skeleton_api_names(&input)
                 .unwrap_or_else(|error| fail("invalid_api_config", error));
+            let analysis = if use_bo_analysis {
+                tools::SkeletonPointerAnalysis::BorrowOwnership
+            } else if skip_andersen {
+                tools::SkeletonPointerAnalysis::WithoutAndersen
+            } else {
+                tools::SkeletonPointerAnalysis::Original
+            };
             let (records, frozen) = run_compiler_on_path(&source_path, move |tcx| {
                 let api = api.into_iter().collect();
-                let records = tools::make_skeletons_with_analysis(
+                let records = tools::make_skeletons_with_pointer_analysis(
                     &source,
                     rules.as_ref(),
                     &api,
-                    use_bo_analysis,
+                    analysis,
                     tcx,
                 )
                 .map_err(|error| format!("{}: {}", error.function_path, error.message))?;

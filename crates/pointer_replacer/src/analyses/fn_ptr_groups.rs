@@ -308,6 +308,7 @@ pub fn erased(flag: bool) -> *const () {
                 &Config::default(),
                 crate::PointerDecisionOptions {
                     assume_nonnegative_offsets: true,
+                    ..Default::default()
                 },
                 tcx,
             );

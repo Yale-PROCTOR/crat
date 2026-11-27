@@ -22,7 +22,7 @@ use rustc_middle::{
 use rustc_span::{
     DUMMY_SP, Ident, Symbol,
     def_id::{CRATE_DEF_ID, DefId, LocalDefId},
-    sym,
+    kw, sym,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::{SmallVec, smallvec};
@@ -218,13 +218,35 @@ pub fn make_skeletons_with_analysis(
     use_bo_analysis: bool,
     tcx: TyCtxt<'_>,
 ) -> Result<Vec<ItemRecord>, GenerationError> {
+    let analysis = if use_bo_analysis {
+        SkeletonPointerAnalysis::BorrowOwnership
+    } else {
+        SkeletonPointerAnalysis::Original
+    };
+    make_skeletons_with_pointer_analysis(source, rules, api, analysis, tcx)
+}
+
+#[derive(Clone, Copy)]
+pub enum SkeletonPointerAnalysis {
+    Original,
+    WithoutAndersen,
+    BorrowOwnership,
+}
+
+pub fn make_skeletons_with_pointer_analysis(
+    source: &str,
+    rules: Option<&RuleDocument>,
+    api: &FxHashSet<String>,
+    analysis: SkeletonPointerAnalysis,
+    tcx: TyCtxt<'_>,
+) -> Result<Vec<ItemRecord>, GenerationError> {
     make_skeletons_with_preservation_overrides(
         source,
         rules,
         tcx,
         &PreservationDecisionOverrides::default(),
         api,
-        use_bo_analysis,
+        analysis,
     )
 }
 
@@ -234,7 +256,7 @@ fn make_skeletons_with_preservation_overrides(
     tcx: TyCtxt<'_>,
     preservation_overrides: &PreservationDecisionOverrides,
     api: &FxHashSet<String>,
-    use_bo_analysis: bool,
+    analysis: SkeletonPointerAnalysis,
 ) -> Result<Vec<ItemRecord>, GenerationError> {
     let mut surface = utils::ast::parse_crate(source.to_owned());
     let mut mapper = utils::ir::AstToHirMapper::new(tcx);
@@ -263,7 +285,7 @@ fn make_skeletons_with_preservation_overrides(
         .map(|item| (item.def_id.to_def_id(), item.id))
         .collect();
     let mut decisions =
-        initial_pointer_decisions_for_api(tcx, api, use_bo_analysis).map_err(|message| {
+        initial_pointer_decisions_for_api(tcx, api, analysis).map_err(|message| {
             GenerationError {
                 kind: GenerationErrorKind::PointerAnalysis,
                 function_path: String::new(),
@@ -385,7 +407,9 @@ pub fn included_item_kind(item: &Item) -> Option<ItemKindName> {
     match item.kind {
         ItemKind::Fn(..) => Some(ItemKindName::Fn),
         ItemKind::Static(..) => Some(ItemKindName::Static),
-        ItemKind::Const(..) => Some(ItemKindName::Const),
+        ItemKind::Const(ref constant) if constant.ident.name != kw::Underscore => {
+            Some(ItemKindName::Const)
+        }
         ItemKind::TyAlias(..) => Some(ItemKindName::TyAlias),
         ItemKind::Enum(..) => Some(ItemKindName::Enum),
         ItemKind::Struct(..) => Some(ItemKindName::Struct),
@@ -2217,33 +2241,16 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
         external_roots.sort_by(|left, right| left.0.cmp(&right.0));
         external_roots.dedup();
 
-        struct ForeignDeclarations<'tcx> {
-            tcx: TyCtxt<'tcx>,
-            functions: HashMap<String, Vec<DefId>>,
-        }
-        impl<'tcx> Visitor<'tcx> for ForeignDeclarations<'tcx> {
-            type NestedFilter = nested_filter::OnlyBodies;
-
-            fn maybe_tcx(&mut self) -> Self::MaybeTyCtxt {
-                self.tcx
-            }
-
-            fn visit_foreign_item(&mut self, item: &'tcx hir::ForeignItem<'tcx>) {
-                let definition = item.owner_id.def_id.to_def_id();
-                if let Some(symbol) = local_c_foreign_function_symbol(definition, self.tcx) {
-                    self.functions
-                        .entry(symbol.to_string())
-                        .or_default()
-                        .push(definition);
-                }
-                intravisit::walk_foreign_item(self, item);
+        let mut foreign_functions: HashMap<String, Vec<DefId>> = HashMap::new();
+        for item in tcx.hir_crate_items(()).foreign_items() {
+            let definition = item.owner_id.def_id.to_def_id();
+            if let Some(symbol) = local_c_foreign_function_symbol(definition, tcx) {
+                foreign_functions
+                    .entry(symbol.to_string())
+                    .or_default()
+                    .push(definition);
             }
         }
-        let mut foreign = ForeignDeclarations {
-            tcx,
-            functions: HashMap::new(),
-        };
-        tcx.hir_visit_all_item_likes_in_crate(&mut foreign);
 
         Self {
             tcx,
@@ -2254,7 +2261,7 @@ impl<'a, 'tcx> TypeSpeller<'a, 'tcx> {
             implicit_prelude_enabled,
             implicit_prelude_disabled_by,
             prelude_module,
-            foreign_functions: foreign.functions,
+            foreign_functions,
         }
     }
 

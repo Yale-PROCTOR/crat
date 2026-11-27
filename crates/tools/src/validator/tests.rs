@@ -45,7 +45,9 @@ fn skeleton_view(skeleton: &str, transformed: Vec<u32>, needs: bool) -> Skeleton
                         .ok()
                         .and_then(Result::ok)
                         .and_then(|krate| {
-                            canonical_statement_group(&krate.items[0], label)
+                            canonical_statement_groups(&krate.items[0])
+                                .get(&label)
+                                .copied()
                                 .and_then(|group| (group.len() == 1).then_some(group))
                                 .and_then(|group| parse_print_macro_statement(&group[0]).ok())
                         })

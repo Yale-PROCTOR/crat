@@ -133,6 +133,71 @@ fn original_analysis_is_default_and_bo_is_explicit() {
 }
 
 #[test]
+fn skipping_andersen_preserves_callback_shapes_and_uses_conservative_pointer_facts() {
+    let source = r#"
+pub unsafe fn pair(left: *mut i32, right: *mut i32) {
+    *left += 1;
+    *right += 1;
+}
+pub unsafe fn read(pointer: *const i32) -> i32 {
+    let first = *pointer;
+    first + *pointer.offset(1)
+}
+unsafe fn callback(pointer: *mut i32) { *pointer += 1; }
+static CALLBACK: unsafe fn(*mut i32) = callback;
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons_with_pointer_analysis(
+            source,
+            None,
+            &FxHashSet::default(),
+            SkeletonPointerAnalysis::WithoutAndersen,
+            tcx,
+        )
+        .unwrap();
+        let pair = function(&records, "pair");
+        assert!(pair.target_signature.contains("left: *mut i32"));
+        assert!(pair.target_signature.contains("right: *mut i32"));
+        let read = function(&records, "read");
+        assert!(read.target_signature.contains("Option<&[i32]>"), "{read:?}");
+        let callback = function(&records, "callback");
+        assert_eq!(callback.target_signature, callback.source_signature);
+        let frozen = crate::freeze_project(source, &records, tcx).unwrap();
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    })
+    .unwrap();
+}
+
+#[test]
+fn anonymous_constants_are_preserved_in_the_frozen_crate_without_named_records() {
+    let source = r#"
+mod values {
+    const _: () = ();
+    const _: usize = 7;
+    const NAMED: usize = 9;
+    pub fn get() -> usize { NAMED }
+}
+"#;
+    run_compiler_on_str(source, |tcx| {
+        let records = make_skeletons(source, tcx).unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .filter_map(|record| match record {
+                    ItemRecord::Value(value) => Some(value.path.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["values::NAMED"],
+        );
+        let frozen = crate::freeze_project(source, &records, tcx).unwrap();
+        assert_eq!(frozen.target_source.matches("const _:").count(), 2);
+        run_compiler_on_str(&frozen.target_source, utils::type_check).expect(&frozen.target_source);
+    })
+    .unwrap();
+}
+
+#[test]
 fn original_slices_use_nullity_for_parameters_and_local_bindings() {
     let source = r#"
 pub unsafe fn nullable(pointer: *const i32, absent: bool) -> i32 {

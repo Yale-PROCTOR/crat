@@ -81,7 +81,12 @@ fn generate_bo(source: &str) -> Vec<ItemRecord> {
 }
 
 fn bo_pointer_decisions(tcx: TyCtxt<'_>) -> InitialPointerDecisions {
-    initial_pointer_decisions_for_api(tcx, &FxHashSet::default(), true).unwrap()
+    initial_pointer_decisions_for_api(
+        tcx,
+        &FxHashSet::default(),
+        SkeletonPointerAnalysis::BorrowOwnership,
+    )
+    .unwrap()
 }
 
 fn synthesized_printf_rules(
@@ -7411,7 +7416,7 @@ pub unsafe fn move_future(mut left: FutureField, right: FutureField) -> i32 {
             tcx,
             &overrides,
             &FxHashSet::default(),
-            false,
+            SkeletonPointerAnalysis::Original,
         )
         .unwrap()
     })
@@ -7447,7 +7452,7 @@ pub unsafe fn scalar_caller(value: i32) -> i32 { scalar_callee(value) }
             tcx,
             &overrides,
             &FxHashSet::default(),
-            false,
+            SkeletonPointerAnalysis::Original,
         )
         .unwrap()
     })

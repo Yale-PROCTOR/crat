@@ -26,7 +26,7 @@ use thin_vec::ThinVec;
 use crate::{
     SkeletonView,
     preservation::{
-        canonical_parameter_pattern, canonical_statement_group, canonicalize_function_with_view,
+        canonical_parameter_pattern, canonical_statement_groups, canonicalize_function_with_view,
         validate_skeleton_view,
     },
     skeleton::{
@@ -750,8 +750,9 @@ fn prepare_transformations(
                 format!("{}: {}", problem.code, problem.message),
             ));
         }
+        let groups = canonical_statement_groups(&canonical);
         for label in requested.view.report_labels() {
-            let group = canonical_statement_group(&canonical, label).ok_or_else(|| {
+            let group = groups.get(&label).ok_or_else(|| {
                 item_error(
                     ReplacementErrorKind::InvalidTransformation,
                     requested,
@@ -762,7 +763,7 @@ fn prepare_transformations(
                 item_id: requested.id,
                 path: requested.path.clone(),
                 label,
-                after_statement: render_statement_group(&group),
+                after_statement: render_statement_group(group),
             });
         }
         transformations.insert(requested.name.clone(), canonical);

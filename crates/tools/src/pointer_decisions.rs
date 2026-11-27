@@ -31,6 +31,8 @@ mod return_flow;
 mod struct_types;
 pub(super) use struct_types::{FieldRegion, TypeLifetimes};
 
+use crate::SkeletonPointerAnalysis;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PtrKind {
     Raw(bool),
@@ -144,7 +146,11 @@ impl InitialPointerDecisions {
 pub(super) fn initial_pointer_decisions(
     tcx: TyCtxt<'_>,
 ) -> Result<InitialPointerDecisions, String> {
-    initial_pointer_decisions_for_api(tcx, &FxHashSet::default(), false)
+    initial_pointer_decisions_for_api(
+        tcx,
+        &FxHashSet::default(),
+        SkeletonPointerAnalysis::Original,
+    )
 }
 
 pub(super) fn requires_unstructured_body(function: LocalDefId, tcx: TyCtxt<'_>) -> bool {
@@ -222,12 +228,17 @@ fn collect_frozen_callbacks(tcx: TyCtxt<'_>) -> FxHashSet<LocalDefId> {
 pub(super) fn initial_pointer_decisions_for_api(
     tcx: TyCtxt<'_>,
     api: &FxHashSet<String>,
-    use_bo_analysis: bool,
+    analysis: SkeletonPointerAnalysis,
 ) -> Result<InitialPointerDecisions, String> {
     // Frozen stubs share the original callback types in preserved crate context.
     let callbacks = collect_frozen_callbacks(tcx);
-    if !use_bo_analysis {
-        return Ok(original::initial_pointer_decisions(tcx, api, &callbacks));
+    if !matches!(analysis, SkeletonPointerAnalysis::BorrowOwnership) {
+        return Ok(original::initial_pointer_decisions(
+            tcx,
+            api,
+            &callbacks,
+            matches!(analysis, SkeletonPointerAnalysis::WithoutAndersen),
+        ));
     }
     let mut analysis = analyze_pointers(tcx)?;
     let representations = representation_facts(&analysis, tcx);

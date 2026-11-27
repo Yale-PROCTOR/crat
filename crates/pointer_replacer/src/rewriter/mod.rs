@@ -50,6 +50,7 @@ pub use epoch_split::rewrite_epoch_split;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PointerDecisionOptions {
     pub assume_nonnegative_offsets: bool,
+    pub skip_andersen: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,21 +185,21 @@ fn analyze<'tcx>(
 ) {
     let input = collect_input(tcx);
     let arena = typed_arena::Arena::new();
-    let tss = utils::ty_shape::get_ty_shapes(&arena, tcx, false);
-    let andersen_config = andersen::Config {
-        use_optimized_mir: false,
-        c_exposed_fns: config.c_exposed_fns.clone(),
+    let shapes =
+        (!options.skip_andersen).then(|| utils::ty_shape::get_ty_shapes(&arena, tcx, false));
+    let (points_to, aliases) = if let Some(tss) = &shapes {
+        let config = andersen::Config {
+            use_optimized_mir: false,
+            c_exposed_fns: config.c_exposed_fns.clone(),
+        };
+        let pre = andersen::pre_analyze(&config, tss, tcx);
+        let solutions = andersen::analyze(&config, &pre, tss, tcx);
+        let aliases = find_param_aliases(&pre, &solutions, tcx);
+        let result = andersen::post_analyze(&config, pre.clone(), solutions.clone(), tss, tcx);
+        (Some((tss, pre, solutions, result)), aliases)
+    } else {
+        (None, conservative_param_aliases(&input))
     };
-    let pre_points_to = andersen::pre_analyze(&andersen_config, &tss, tcx);
-    let points_to_solutions = andersen::analyze(&andersen_config, &pre_points_to, &tss, tcx);
-    let aliases = find_param_aliases(&pre_points_to, &points_to_solutions, tcx);
-    let points_to = andersen::post_analyze(
-        &andersen_config,
-        pre_points_to.clone(),
-        points_to_solutions.clone(),
-        &tss,
-        tcx,
-    );
 
     let mutability_result =
         analyses::type_qualifier::foster::mutability::mutability_analysis(&input);
@@ -232,7 +233,10 @@ fn analyze<'tcx>(
         result.access_signs = source_var_groups.postprocess_offset_signs(result.access_signs);
         result
     };
-    let mut nullity_result = analyses::nullity::analyze(&input, &points_to);
+    let mut nullity_result = points_to
+        .as_ref()
+        .map(|(_, _, _, facts)| analyses::nullity::analyze(&input, facts))
+        .unwrap_or_default();
     nullity_result.non_null_locals =
         source_var_groups.postprocess_non_null_locals(nullity_result.non_null_locals);
     let analysis_results = Analysis {
@@ -251,20 +255,15 @@ fn analyze<'tcx>(
         struct_copy_result,
     };
 
-    let fn_ptr_groups = FnPtrGroups::build(
-        &pre_points_to,
-        &points_to_solutions,
-        &input,
-        &analysis_results,
-    );
-    let fn_ptr_rewrite = FnPtrRewriteDecision::build(
-        &pre_points_to,
-        &points_to_solutions,
-        &input,
-        &analysis_results,
-        &tss,
-        &fn_ptr_groups,
-    );
+    let (fn_ptr_groups, fn_ptr_rewrite) = if let Some((tss, pre, solutions, _)) = points_to {
+        let groups = FnPtrGroups::build(&pre, &solutions, &input, &analysis_results);
+        let rewrite =
+            FnPtrRewriteDecision::build(&pre, &solutions, &input, &analysis_results, tss, &groups);
+        (groups, rewrite)
+    } else {
+        // An empty group table keeps address-taken signatures locked.
+        (FnPtrGroups::default(), FnPtrRewriteDecision::default())
+    };
     (input, analysis_results, fn_ptr_groups, fn_ptr_rewrite)
 }
 
@@ -516,6 +515,37 @@ pub(crate) fn find_param_aliases<'tcx>(
         }
     }
     param_aliases
+}
+
+fn conservative_param_aliases(
+    input: &RustProgram<'_>,
+) -> FxHashMap<LocalDefId, FxHashMap<Local, FxHashSet<Local>>> {
+    input
+        .functions
+        .iter()
+        .filter_map(|&function| {
+            // Use signature inputs, since C variadic MIR also has a va_list local.
+            let count = input
+                .tcx
+                .fn_sig(function)
+                .skip_binder()
+                .inputs()
+                .skip_binder()
+                .len();
+            (count > 1).then(|| {
+                let aliases = (1..=count)
+                    .map(|index| {
+                        let others = (1..=count)
+                            .filter(|&other| other != index)
+                            .map(Local::from_usize)
+                            .collect();
+                        (Local::from_usize(index), others)
+                    })
+                    .collect();
+                (function, aliases)
+            })
+        })
+        .collect()
 }
 
 #[allow(unused)]
