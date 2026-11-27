@@ -1,7 +1,6 @@
 //! Selected returned-borrow targets; loan identity and reservation stay unchanged.
 
 use rustc_abi::FieldIdx;
-use rustc_index::bit_set::SparseBitMatrix;
 use rustc_middle::{
     mir::{
         Body, Local, Location, Place, PlaceElem, Rvalue, Statement, StatementKind, Terminator,
@@ -113,11 +112,7 @@ pub(super) fn retarget<'tcx>(
             killed.remove(loan);
         }
     }
-    let mut local_map = SparseBitMatrix::new(inference.borrow_set.loans.len());
-    for (loan, data) in inference.borrow_set.loans.iter_enumerated() {
-        local_map.insert(data.borrowed.local, loan);
-    }
-    inference.borrow_set.local_map = local_map;
+    inference.borrow_set.rebuild_local_map();
     // Adapted from analyses/borrow/killed.rs::KillsCollector: preserve its exact
     // StorageDead/assignment/call-destination law, recomputing selected columns only.
     let target_locals: Vec<_> = normalized

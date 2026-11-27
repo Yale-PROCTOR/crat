@@ -1,23 +1,19 @@
-use rustc_index::bit_set::SparseBitMatrix;
 use rustc_mir_dataflow::points::PointIndex;
 
-use super::{BorrowSet, Loan, invalidates::Invalidates, loan_liveness::LoanLiveness};
+use super::{invalidates::Invalidates, loan_liveness::LoanLiveness, loan_sets::LoanRows};
 
-pub(crate) type Errors = SparseBitMatrix<PointIndex, Loan>;
+pub type Errors = LoanRows<PointIndex>;
 
-pub fn compute_errors(
-    borrow_set: &BorrowSet,
-    loan_liveness: &LoanLiveness,
-    invalidates: &Invalidates,
-) -> Errors {
-    let mut answer = SparseBitMatrix::new(borrow_set.loans.len());
+pub fn compute_errors(loan_liveness: &LoanLiveness, invalidates: &Invalidates) -> Errors {
+    let mut answer = Errors::default();
 
-    for row in loan_liveness.rows() {
+    for row in invalidates.rows() {
         if let (Some(invalidates_at), Some(loan_live_at)) =
             (invalidates.row(row), loan_liveness.row(row))
         {
-            answer.union_row(row, loan_live_at);
-            answer.intersect_row(row, invalidates_at);
+            let mut errors = invalidates_at.clone();
+            errors.intersect(loan_live_at);
+            answer.set_row(row, errors);
         }
     }
 

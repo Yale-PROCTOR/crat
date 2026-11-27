@@ -68,6 +68,68 @@ fn fn_name(tcx: TyCtxt, def_id: LocalDefId) -> String {
     tcx.item_name(def_id.to_def_id()).to_string()
 }
 
+#[test]
+fn c_variadic_tail_has_no_call_argument_loans() {
+    ::utils::compilation::run_compiler_on_str(
+        r#"
+#![feature(c_variadic)]
+unsafe extern "C" fn variadic(left: *mut i32, right: *mut i32, _args: ...) {
+    let saved = left;
+    *saved = *right;
+}
+pub unsafe fn caller(pointer: *mut i32) {
+    variadic(
+        pointer, pointer, pointer, pointer, pointer, pointer,
+        pointer, pointer, pointer, pointer, pointer, pointer,
+    );
+}
+"#,
+        |tcx| {
+            let program = build_rust_program(tcx);
+            let ctxt = all_mutable_ctxt(&program);
+            let find = |name| {
+                program
+                    .functions
+                    .iter()
+                    .copied()
+                    .find(|&f| fn_name(tcx, f) == name)
+                    .unwrap()
+            };
+            let callee = find("variadic");
+            let caller = find("caller");
+            let callee_body = tcx.mir_drops_elaborated_and_const_checked(callee).borrow();
+            assert!(callee_body.local_decls.len() < 12);
+            assert!(
+                ctxt.provenances[&callee]
+                    .local_data
+                    .iter()
+                    .skip(3)
+                    .any(Option::is_some)
+            );
+
+            let inference = borrow_inference(tcx, caller, &ctxt);
+            let call_args: Vec<_> = inference
+                .borrow_set
+                .loans
+                .iter_enumerated()
+                .filter_map(|(loan, data)| match data.assigned {
+                    Borrower::CallArg(target, index) => {
+                        assert_eq!(target, callee);
+                        Some((loan, index, data.location))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let [(left, 0, location), (right, 1, other_location)] = call_args.as_slice() else {
+                panic!("expected two fixed argument loans, got {call_args:?}");
+            };
+            assert_eq!(location, other_location);
+            assert_eq!(inference.borrow_set.location_map[location], [*left, *right]);
+        },
+    )
+    .unwrap();
+}
+
 fn run_demote(code: &str) -> Vec<String> {
     ::utils::compilation::run_compiler_on_str(code, |tcx| {
         let program = build_rust_program(tcx);

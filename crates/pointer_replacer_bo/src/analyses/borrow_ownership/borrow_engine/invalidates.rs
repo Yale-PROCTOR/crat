@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_index::bit_set::{DenseBitSet, SparseBitMatrix};
+use rustc_index::bit_set::DenseBitSet;
 use rustc_middle::{
     mir::{
         Body, CopyNonOverlapping, InlineAsmOperand, Local, Location, NonDivergingIntrinsic,
@@ -24,14 +24,12 @@ use super::{
     places_conflict::{AccessDepth, PlaceConflictBias},
 };
 use crate::analyses::{
-    borrow::{Borrower, ProvenanceOwner, ProvenanceSet},
+    borrow::{Borrower, ProvenanceOwner, ProvenanceSet, invalidates::Invalidates},
     borrow_ownership::{
         borrow_fork::LoanLocation,
         boundary_table::{self, Matcher, Role},
     },
 };
-
-pub(crate) type Invalidates = SparseBitMatrix<PointIndex, Loan>;
 
 /// Guarded-repair-only side witness for one invalidation insertion attempt.
 ///
@@ -245,7 +243,7 @@ fn compute_invalidates_inner<'tcx>(
     accesses: Option<&mut Vec<InvalidationAccess>>,
     parameter_accesses: Option<&mut Vec<ParameterAccess<'tcx>>>,
 ) -> Invalidates {
-    let mut invalidates = SparseBitMatrix::new(borrow_set.loans.len());
+    let mut invalidates = Invalidates::default();
 
     LoanInvalidatesGenerator {
         facts: &mut invalidates,

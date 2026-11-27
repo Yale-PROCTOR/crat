@@ -11,10 +11,7 @@
 //!   [`collect_invalid_loan_demotions`]) and [`LoanLocation`].
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_index::{
-    IndexVec,
-    bit_set::{DenseBitSet, SparseBitMatrix},
-};
+use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{
         Body, Local, Location, Operand, Place, PlaceElem, Rvalue, StatementKind, Terminator,
@@ -287,12 +284,7 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
                                 borrowed: arg.project_deeper(&[PlaceElem::Deref], self.tcx),
                                 assigned: Borrower::CallArg(callee, arg_index),
                             });
-                            // self.location_map.insert(location, loan);
-                            self.location_map
-                                .entry(location)
-                                .and_modify(|loans| loans.push(loan))
-                                .or_default()
-                                .push(loan);
+                            self.location_map.entry(location).or_default().push(loan);
                         }
                     }
                 }
@@ -318,17 +310,7 @@ pub(crate) fn borrow_set<'tcx, 'local, 'global: 'local>(
         ..
     } = vis;
 
-    let mut local_map = SparseBitMatrix::new(loans.len());
-
-    for (loan, borrow_data) in loans.iter_enumerated() {
-        local_map.insert(borrow_data.borrowed.local, loan);
-    }
-
-    BorrowSet {
-        loans,
-        location_map,
-        local_map,
-    }
+    BorrowSet::new(loans, location_map)
 }
 
 /// The legacy `borrow_inference`, with [`borrow_set`] for the loan set.
@@ -347,7 +329,7 @@ pub(crate) fn borrow_inference<'tcx>(
     let constraint_graph =
         ProvenanceConstraintGraph::new(tcx, body, &borrow_set, provenance_set, global_borrow_ctxt);
     let subset_closure = compute_subset_closure(provenance_set, &constraint_graph);
-    let requires = compute_requires(&borrow_set, provenance_set, &constraint_graph);
+    let requires = compute_requires(provenance_set, &constraint_graph);
     let loan_liveness = compute_loan_liveness(
         tcx,
         body,
@@ -358,7 +340,7 @@ pub(crate) fn borrow_inference<'tcx>(
         &killed,
     );
     let invalidates = compute_invalidates(tcx, body, &borrow_set, provenance_set, &location_map);
-    let errors = compute_errors(&borrow_set, &loan_liveness, &invalidates);
+    let errors = compute_errors(&loan_liveness, &invalidates);
 
     BorrowInferenceResults {
         borrow_set,
@@ -431,7 +413,9 @@ fn invalid_loan_set(inference: &BorrowInferenceResults<'_>) -> DenseBitSet<Loan>
     let mut invalid_loans = DenseBitSet::new_empty(inference.borrow_set.loans.len());
     for row in inference.errors.rows() {
         if let Some(loans) = inference.errors.row(row) {
-            invalid_loans.union(loans);
+            for loan in loans.iter() {
+                invalid_loans.insert(loan);
+            }
         }
     }
     invalid_loans

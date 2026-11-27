@@ -12,10 +12,7 @@ use provenance_liveness::{ProvenanceLiveness, compute_provenance_liveness};
 use requires::{ProvenanceRequiresLoan, compute_requires};
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_hir::def_id::DefId;
-use rustc_index::{
-    IndexVec,
-    bit_set::{DenseBitSet, SparseBitMatrix},
-};
+use rustc_index::{IndexVec, bit_set::DenseBitSet};
 use rustc_middle::{
     mir::{
         Body, HasLocalDecls, Local, Location, Operand, PassWhere, Place, PlaceElem, RETURN_PLACE,
@@ -43,6 +40,7 @@ pub mod invalidates;
 pub mod killed;
 pub mod lifetime_flow;
 pub mod loan_liveness;
+pub mod loan_sets;
 mod places_conflict;
 pub mod provenance_liveness;
 pub mod requires;
@@ -411,7 +409,29 @@ impl std::fmt::Debug for BorrowData<'_> {
 pub struct BorrowSet<'tcx> {
     pub loans: IndexVec<Loan, BorrowData<'tcx>>,
     pub location_map: FxHashMap<Location, Vec<Loan>>,
-    pub local_map: SparseBitMatrix<Local, Loan>,
+    pub local_map: loan_sets::LoanRows<Local>,
+}
+
+impl<'tcx> BorrowSet<'tcx> {
+    pub fn new(
+        loans: IndexVec<Loan, BorrowData<'tcx>>,
+        location_map: FxHashMap<Location, Vec<Loan>>,
+    ) -> Self {
+        let mut set = Self {
+            loans,
+            location_map,
+            local_map: Default::default(),
+        };
+        set.rebuild_local_map();
+        set
+    }
+
+    pub fn rebuild_local_map(&mut self) {
+        self.local_map = Default::default();
+        for (loan, data) in self.loans.iter_enumerated() {
+            self.local_map.insert(data.borrowed.local, loan);
+        }
+    }
 }
 
 pub trait HasBorrowSet<'tcx> {
@@ -566,7 +586,11 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                     && let Some(callee_provenance_set) =
                         self.global_borrow_ctxt.provenances.get(&callee)
                 {
-                    for (arg_index, arg) in mir_call.args.iter().enumerate() {
+                    // Only declared inputs have corresponding parameter provenances.
+                    let fixed_inputs = self.tcx.fn_sig(callee).skip_binder().inputs().skip_binder();
+                    for (arg_index, arg) in
+                        mir_call.args.iter().take(fixed_inputs.len()).enumerate()
+                    {
                         let arg = &arg.node;
                         if let Some(arg) = arg.place() {
                             let callee_local = Local::from_usize(arg_index + 1);
@@ -576,12 +600,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
                                     borrowed: arg.project_deeper(&[PlaceElem::Deref], self.tcx),
                                     assigned: Borrower::CallArg(callee, arg_index),
                                 });
-                                // self.location_map.insert(location, loan);
-                                self.location_map
-                                    .entry(location)
-                                    .and_modify(|loans| loans.push(loan))
-                                    .or_default()
-                                    .push(loan);
+                                self.location_map.entry(location).or_default().push(loan);
                             }
                         }
                     }
@@ -606,17 +625,7 @@ impl<'tcx> HasBorrowSet<'tcx> for Body<'tcx> {
             ..
         } = vis;
 
-        let mut local_map = SparseBitMatrix::new(loans.len());
-
-        for (loan, borrow_data) in loans.iter_enumerated() {
-            local_map.insert(borrow_data.borrowed.local, loan);
-        }
-
-        BorrowSet {
-            loans,
-            location_map,
-            local_map,
-        }
+        BorrowSet::new(loans, location_map)
     }
 }
 
@@ -652,7 +661,6 @@ impl ProvenanceConstraintGraph {
             graph: &'this mut ProvenanceConstraintGraph,
             borrow_set: &'this BorrowSet<'tcx>,
             provenance_set: &'this ProvenanceSet,
-            global_borrow_ctxt: &'this GBorrowInferCtxt,
         }
 
         impl<'tcx> Visitor<'tcx> for Vis<'_, 'tcx> {
@@ -709,32 +717,16 @@ impl ProvenanceConstraintGraph {
                 disallow_interprocedural!();
                 // specially handle borrowing method (e.g., offset) calls for pointers,
                 // just like assingments of Ralue::Use(Operand::Copy(place) | Operand::Move(place)).
-                if let CallKind::RustLib(def_id) = &mir_call.func {
-                    if is_borrowing_method(*def_id, self.tcx) {
-                        let arg0 = &mir_call.args[0].node;
-                        if let Some(arg0_place) = arg0.place() {
-                            self.visit_assign(
-                                &mir_call.destination,
-                                &Rvalue::Use(Operand::Copy(arg0_place)),
-                                location,
-                            );
-                        }
-                    }
-                } else if let Some(callee) = mir_call.func.did()
-                    && let Some(callee) = callee.as_local()
-                    && let Some(callee_provenance_set) =
-                        self.global_borrow_ctxt.provenances.get(&callee)
+                if let CallKind::RustLib(def_id) = &mir_call.func
+                    && is_borrowing_method(*def_id, self.tcx)
+                    && let Some(arg0_place) = mir_call.args[0].node.place()
                 {
-                    for (arg_index, arg) in mir_call.args.iter().enumerate() {
-                        let arg = &arg.node;
-                        if let Some(_arg) = arg.place() {
-                            let callee_local = Local::from_usize(arg_index + 1);
-                            if callee_provenance_set.local_data[callee_local].is_some() {
-                                // TODO incorporating interprocedural constraints
-                            }
-                        }
-                    }
-                };
+                    self.visit_assign(
+                        &mir_call.destination,
+                        &Rvalue::Use(Operand::Copy(arg0_place)),
+                        location,
+                    );
+                }
             }
         }
 
@@ -749,7 +741,6 @@ impl ProvenanceConstraintGraph {
             graph: &mut graph,
             borrow_set,
             provenance_set,
-            global_borrow_ctxt,
         }
         .visit_body(body);
 
@@ -814,7 +805,7 @@ pub fn borrow_inference<'tcx>(
     let constraint_graph =
         ProvenanceConstraintGraph::new(tcx, body, &borrow_set, provenance_set, global_borrow_ctxt);
     let subset_closure = compute_subset_closure(provenance_set, &constraint_graph);
-    let requires = compute_requires(&borrow_set, provenance_set, &constraint_graph);
+    let requires = compute_requires(provenance_set, &constraint_graph);
     let loan_liveness = compute_loan_liveness(
         tcx,
         body,
@@ -825,7 +816,7 @@ pub fn borrow_inference<'tcx>(
         &killed,
     );
     let invalidates = compute_invalidates(tcx, body, &borrow_set, provenance_set, &location_map);
-    let errors = compute_errors(&borrow_set, &loan_liveness, &invalidates);
+    let errors = compute_errors(&loan_liveness, &invalidates);
 
     BorrowInferenceResults {
         borrow_set,
@@ -1020,7 +1011,7 @@ pub fn demote_pointers_iterative_with_fields(
             ..
         } = inference;
 
-        let mut invalid_loans = DenseBitSet::new_empty(borrow_set.loans.len());
+        let mut invalid_loans = loan_sets::LoanSet::default();
         for row in errors.rows() {
             if let Some(loans) = errors.row(row) {
                 invalid_loans.union(loans);

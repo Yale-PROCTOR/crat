@@ -34,6 +34,65 @@ mod tests {
     };
 
     #[test]
+    fn proxy_for_a_nested_union_field_keeps_its_inferred_ownership() {
+        utils::compilation::run_compiler_on_str(
+            r#"
+#[derive(Clone, Copy)]
+struct Record { ptr: *mut u8 }
+union Value { record: Record }
+fn sink(_: *mut u8) {}
+unsafe fn from_union(value: *const Value) {
+    sink((*value).record.ptr);
+}
+"#,
+            |tcx| {
+                let program = crate::rewriter::collect_input(tcx);
+                let mutable = mutability_analysis(&program);
+                let output = compute_output_params(&program, &mutable, &Default::default());
+                let ownership = WholeProgramAnalysis::analyze(CrateCtxt::new(&program), &output)
+                    .expect("union field ownership inference");
+                let solid = ownership.solidify(&program);
+                let function = program
+                    .functions
+                    .iter()
+                    .copied()
+                    .find(|&function| tcx.item_name(function.to_def_id()).as_str() == "from_union")
+                    .unwrap();
+                let body = tcx
+                    .mir_drops_elaborated_and_const_checked(function)
+                    .borrow();
+                let proxy = body
+                    .basic_blocks
+                    .iter()
+                    .flat_map(|block| &block.statements)
+                    .find_map(|statement| {
+                        let StatementKind::Assign(box (proxy, Rvalue::Use(operand))) =
+                            &statement.kind
+                        else {
+                            return None;
+                        };
+                        let source = operand.place()?;
+                        matches!(
+                            &source.projection[..],
+                            [
+                                ProjectionElem::Deref,
+                                ProjectionElem::Field(..),
+                                ProjectionElem::Field(..)
+                            ]
+                        )
+                        .then(|| proxy.as_local().unwrap())
+                    })
+                    .expect("call temporary copied from a nested union field");
+                assert_eq!(
+                    solid.fn_results(&function.to_def_id()).local_result(proxy),
+                    [super::Ownership::Transient],
+                );
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn constant_index_patterns_share_ownership_with_dynamic_indices() {
         utils::compilation::run_compiler_on_str(
             r#"
@@ -369,7 +428,7 @@ impl<'tcx> WholeProgramResults<'tcx> {
             }
 
             for (bb, bb_data) in body.basic_blocks.iter_enumerated() {
-                for statement_index in
+                'statement: for statement_index in
                     0usize..(bb_data.statements.len() + bb_data.terminator.is_some() as usize)
                 {
                     let location = Location {
@@ -422,14 +481,12 @@ impl<'tcx> WholeProgramResults<'tcx> {
                                     ty = ty.builtin_deref(true).unwrap();
                                 }
                                 rustc_middle::mir::ProjectionElem::Field(f, field_ty) => {
-                                    assert_eq!(index, ownership.len());
-                                    let Some(adt_def) = ty.ty_adt_def() else {
-                                        continue;
+                                    let Some(adt_def) = ty.ty_adt_def().filter(|adt| {
+                                        struct_fields.0.did_idx.contains_key(&adt.did())
+                                    }) else {
+                                        continue 'statement;
                                     };
-                                    if adt_def.is_union() {
-                                        ownership = &[];
-                                        continue;
-                                    }
+                                    assert_eq!(index, ownership.len());
                                     let Range { start, end } =
                                         struct_fields.field(&adt_def.did(), f.index());
                                     ownership = &model.raw[start.index()..end.index()];

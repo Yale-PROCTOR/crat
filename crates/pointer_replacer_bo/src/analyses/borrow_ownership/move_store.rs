@@ -13,7 +13,6 @@
 use std::{cell::RefCell, rc::Rc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_index::bit_set::SparseBitMatrix;
 use rustc_middle::mir::{
     BasicBlock, Body, Local, Location, Mutability, Operand, Place, RETURN_PLACE, Rvalue,
     StatementKind, TerminatorKind,
@@ -35,7 +34,7 @@ use super::{
 };
 use crate::{
     analyses::{
-        borrow::{BorrowSet, Borrower, Loan, ProvenanceOwner, StructFieldSlot},
+        borrow::{BorrowSet, Borrower, ProvenanceOwner, StructFieldSlot, invalidates::Invalidates},
         borrow_ownership::borrow_fork::LoanLocation,
     },
     utils::rustc::RustProgram,
@@ -635,7 +634,7 @@ fn uses_at<'tcx>(
 pub(crate) fn clear_removed(
     function: LocalDefId,
     borrow_set: &BorrowSet<'_>,
-    invalidates: &mut SparseBitMatrix<PointIndex, Loan>,
+    invalidates: &mut Invalidates,
 ) {
     let Some(rule) = CURRENT.with(|current| {
         current

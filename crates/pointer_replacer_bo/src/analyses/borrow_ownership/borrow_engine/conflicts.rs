@@ -182,11 +182,8 @@ fn overwrite_with_engine_facts_recording<'tcx>(
         &inference.borrow_set,
         &mut inference.invalidates,
     );
-    inference.errors = super::errors::compute_errors(
-        &inference.borrow_set,
-        &inference.loan_liveness,
-        &inference.invalidates,
-    );
+    inference.errors =
+        super::errors::compute_errors(&inference.loan_liveness, &inference.invalidates);
     parameter_conflicts
 }
 
@@ -222,11 +219,8 @@ fn overwrite_with_engine_facts_capturing<'tcx>(
         &inference.borrow_set,
         &mut inference.invalidates,
     );
-    inference.errors = super::errors::compute_errors(
-        &inference.borrow_set,
-        &inference.loan_liveness,
-        &inference.invalidates,
-    );
+    inference.errors =
+        super::errors::compute_errors(&inference.loan_liveness, &inference.invalidates);
     accesses.retain(|access| {
         inference
             .errors
@@ -242,7 +236,9 @@ fn invalid_loan_set(inference: &BorrowInferenceResults<'_>) -> DenseBitSet<Loan>
     let mut invalid_loans = DenseBitSet::new_empty(inference.borrow_set.loans.len());
     for row in inference.errors.rows() {
         if let Some(loans) = inference.errors.row(row) {
-            invalid_loans.union(loans);
+            for loan in loans.iter() {
+                invalid_loans.insert(loan);
+            }
         }
     }
     invalid_loans

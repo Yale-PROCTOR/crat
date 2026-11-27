@@ -1,7 +1,7 @@
-use rustc_index::{IndexVec, bit_set::DenseBitSet};
+use rustc_index::IndexVec;
 use rustc_middle::{
     mir::{
-        Body, Local, Location, Place, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
+        Body, Location, Place, Rvalue, Statement, StatementKind, Terminator, TerminatorKind,
         visit::Visitor,
     },
     ty::TyCtxt,
@@ -9,11 +9,12 @@ use rustc_middle::{
 use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 
 use super::{
-    BorrowSet, Loan,
+    BorrowSet,
+    loan_sets::LoanSet,
     places_conflict::{AccessDepth, PlaceConflictBias, places_conflict},
 };
 
-pub(crate) type Killed = IndexVec<PointIndex, DenseBitSet<Loan>>;
+pub type Killed = IndexVec<PointIndex, LoanSet>;
 
 pub fn compute_killed<'tcx>(
     body: &Body<'tcx>,
@@ -21,10 +22,7 @@ pub fn compute_killed<'tcx>(
     location_map: &DenseLocationMap,
     borrow_set: &BorrowSet<'tcx>,
 ) -> Killed {
-    let mut killed = IndexVec::from_elem_n(
-        DenseBitSet::new_empty(borrow_set.loans.len()),
-        location_map.num_points(),
-    );
+    let mut killed = IndexVec::from_elem_n(LoanSet::default(), location_map.num_points());
 
     let mut collector = KillsCollector {
         killed: &mut killed,
@@ -49,12 +47,9 @@ struct KillsCollector<'kill, 'tcx> {
 
 impl<'kill, 'tcx> KillsCollector<'kill, 'tcx> {
     fn record_killed_borrows_for_place(&mut self, place: Place<'tcx>, location: Location) {
-        let other_borrows_of_local = self
-            .borrow_set
-            .local_map
-            .row(place.local)
-            .into_iter()
-            .flat_map(|bit_set| bit_set.iter());
+        let Some(other_borrows_of_local) = self.borrow_set.local_map.row(place.local) else {
+            return;
+        };
 
         let point_index = self.location_map.point_from_location(location);
 
@@ -62,9 +57,7 @@ impl<'kill, 'tcx> KillsCollector<'kill, 'tcx> {
         // local must conflict. This is purely an optimization so we don't have to call
         // `places_conflict` for every borrow.
         if place.projection.is_empty() {
-            for loan in other_borrows_of_local {
-                self.killed[point_index].insert(loan);
-            }
+            self.killed[point_index] = other_borrows_of_local.clone();
             return;
         }
 
@@ -72,7 +65,7 @@ impl<'kill, 'tcx> KillsCollector<'kill, 'tcx> {
         // pair of array indices are not equal, so that when `places_conflict` returns true, we
         // will be assured that two places being compared definitely denotes the same sets of
         // locations.
-        let definitely_conflicting_borrows = other_borrows_of_local.filter(|&i| {
+        let definitely_conflicting_borrows = other_borrows_of_local.iter().filter(|&i| {
             places_conflict(
                 self.tcx,
                 self.body,
@@ -87,28 +80,13 @@ impl<'kill, 'tcx> KillsCollector<'kill, 'tcx> {
             self.killed[point_index].insert(loan);
         }
     }
-
-    fn record_killed_borrows_for_local(&mut self, local: Local, location: Location) {
-        let other_borrows_of_local = self
-            .borrow_set
-            .local_map
-            .row(local)
-            .into_iter()
-            .flat_map(|bit_set| bit_set.iter());
-
-        let point_index = self.location_map.point_from_location(location);
-
-        for loan in other_borrows_of_local {
-            self.killed[point_index].insert(loan);
-        }
-    }
 }
 
 impl<'kill, 'tcx> Visitor<'tcx> for KillsCollector<'kill, 'tcx> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         // Make sure there are no remaining borrows for locals that have gone out of scope.
         if let StatementKind::StorageDead(local) = statement.kind {
-            self.record_killed_borrows_for_local(local, location);
+            self.record_killed_borrows_for_place(Place::from(local), location);
         }
 
         self.super_statement(statement, location);

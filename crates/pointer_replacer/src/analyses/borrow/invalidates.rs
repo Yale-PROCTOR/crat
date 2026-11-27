@@ -1,4 +1,3 @@
-use rustc_index::bit_set::SparseBitMatrix;
 use rustc_middle::{
     mir::{
         Body, CopyNonOverlapping, InlineAsmOperand, Location, NonDivergingIntrinsic, Operand,
@@ -9,12 +8,13 @@ use rustc_middle::{
 use rustc_mir_dataflow::points::{DenseLocationMap, PointIndex};
 
 use super::{
-    BorrowSet, Loan,
+    BorrowSet,
+    loan_sets::LoanRows,
     places_conflict::{AccessDepth, PlaceConflictBias, places_conflict},
 };
 use crate::analyses::borrow::ProvenanceSet;
 
-pub(crate) type Invalidates = SparseBitMatrix<PointIndex, Loan>;
+pub type Invalidates = LoanRows<PointIndex>;
 
 pub fn compute_invalidates<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -23,7 +23,7 @@ pub fn compute_invalidates<'tcx>(
     provenance_set: &ProvenanceSet,
     location_map: &DenseLocationMap,
 ) -> Invalidates {
-    let mut invalidates = SparseBitMatrix::new(borrow_set.loans.len());
+    let mut invalidates = Invalidates::default();
 
     LoanInvalidatesGenerator {
         facts: &mut invalidates,

@@ -858,14 +858,11 @@ fn matcher<'tcx, T, U, DB>(
 
     let (ptr_depth, adt_def) = decompose_ty(ty);
 
-    if ptr_depth as u8 > lhs_precision
-        || ptr_depth as u8 > rhs_precision
-        || lhs_precision == rhs_precision
+    if let Some(adt_def) = adt_def
+        && ptr_depth as u8 <= lhs_precision
+        && ptr_depth as u8 <= rhs_precision
+        && lhs_precision != rhs_precision
     {
-        for (lhs, rhs) in lhs_result.zip(rhs_result) {
-            on_matched(lhs, rhs, database);
-        }
-    } else {
         for (lhs, rhs) in lhs_result
             .by_ref()
             .zip(rhs_result.by_ref())
@@ -879,7 +876,6 @@ fn matcher<'tcx, T, U, DB>(
 
         let delta = lhs_precision.abs_diff(rhs_precision);
 
-        let adt_def = adt_def.unwrap();
         if lhs_precision < rhs_precision {
             fit(
                 adt_def,
@@ -901,5 +897,44 @@ fn matcher<'tcx, T, U, DB>(
                 |rhs, lhs| on_matched(lhs, rhs, database),
             )
         }
+    } else {
+        for (lhs, rhs) in lhs_result.zip(rhs_result) {
+            on_matched(lhs, rhs, database);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unequal_precision_for_a_scalar_pointee_matches_the_shared_slots() {
+        utils::compilation::run_compiler_on_str("fn pointer(_: *const i8) {}", |tcx| {
+            let program = crate::rewriter::collect_input(tcx);
+            let ty = tcx
+                .fn_sig(program.functions[0])
+                .skip_binder()
+                .inputs()
+                .skip_binder()[0];
+            let mut structs = StructCtxt::new(tcx, &[]);
+            structs.increase_precision(tcx);
+            assert_eq!(structs.absolute_precision(ty, 1), 1);
+            assert_eq!(structs.absolute_precision(ty, 2), 2);
+
+            let mut matched = Vec::new();
+            matcher(
+                ty,
+                [0].into_iter(),
+                [1, 2].into_iter(),
+                &structs,
+                &mut matched,
+                |left, right, matched| {
+                    matched.push((left, right));
+                },
+            );
+            assert_eq!(matched, [(0, 1)]);
+        })
+        .unwrap();
     }
 }

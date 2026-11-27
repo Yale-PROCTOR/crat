@@ -1,4 +1,3 @@
-use rustc_index::bit_set::{DenseBitSet, SparseBitMatrix};
 use rustc_middle::{
     mir::{Body, Location, Statement, Terminator, TerminatorEdges},
     ty::TyCtxt,
@@ -9,12 +8,15 @@ use rustc_mir_dataflow::{
 };
 
 use super::{
-    BorrowSet, Loan, killed::Killed, provenance_liveness::ProvenanceLiveness,
+    BorrowSet,
+    killed::Killed,
+    loan_sets::{LoanRows, LoanSet},
+    provenance_liveness::ProvenanceLiveness,
     requires::ProvenanceRequiresLoan,
 };
 
-/// The set of program points that a [`Loan`] is live on entry
-pub(crate) type LoanLiveness = SparseBitMatrix<PointIndex, Loan>;
+/// Loans live on entry at each program point.
+pub type LoanLiveness = LoanRows<PointIndex>;
 
 pub fn compute_loan_liveness<'tcx>(
     tcx: TyCtxt<'tcx>,
@@ -25,7 +27,7 @@ pub fn compute_loan_liveness<'tcx>(
     requires: &ProvenanceRequiresLoan,
     killed: &Killed,
 ) -> LoanLiveness {
-    let mut loan_liveness = SparseBitMatrix::new(borrow_set.loans.len());
+    let mut loan_liveness = LoanLiveness::default();
 
     let mut loan_live_at = LoanLiveAt {
         borrow_set,
@@ -51,7 +53,7 @@ pub fn compute_loan_liveness<'tcx>(
             let liveness = loan_live_at.get();
             if !liveness.is_empty() {
                 let point_index = location_map.point_from_location(location);
-                loan_liveness.union_row(point_index, liveness);
+                loan_liveness.set_row(point_index, liveness.clone());
             }
         }
     }
@@ -68,26 +70,24 @@ pub struct LoanLiveAt<'analysis, 'tcx> {
 }
 
 impl<'analysis, 'tcx> LoanLiveAt<'analysis, 'tcx> {
-    fn apply_location_effect(&mut self, state: &mut DenseBitSet<Loan>, location: Location) {
+    fn apply_location_effect(&mut self, state: &mut LoanSet, location: Location) {
         let point_index = self.location_map.point_from_location(location);
 
         let killed = &self.killed[point_index];
 
-        let mut requires = DenseBitSet::new_empty(killed.domain_size());
-
-        for provenance in self
-            .provenance_liveness
-            .row(point_index)
-            .into_iter()
-            .flat_map(|bit_set| bit_set.iter())
-        {
-            if let Some(loans) = self.requires.row(provenance) {
-                requires.union(loans);
+        if !state.is_empty() {
+            let mut requires = LoanSet::default();
+            if let Some(live) = self.provenance_liveness.row(point_index) {
+                for loans in live
+                    .iter()
+                    .filter_map(|provenance| self.requires.row(provenance))
+                {
+                    requires.union(loans);
+                }
             }
+            state.intersect(&requires);
+            state.subtract(killed);
         }
-
-        state.intersect(&requires);
-        state.subtract(killed);
 
         if let Some(loans) = self.borrow_set.location_map.get(&location) {
             for &loan in loans {
@@ -99,12 +99,12 @@ impl<'analysis, 'tcx> LoanLiveAt<'analysis, 'tcx> {
 
 impl<'analysis, 'tcx> Analysis<'tcx> for LoanLiveAt<'analysis, 'tcx> {
     type Direction = rustc_mir_dataflow::Forward;
-    type Domain = DenseBitSet<Loan>;
+    type Domain = LoanSet;
 
     const NAME: &'static str = "loan_live_at";
 
     fn bottom_value(&self, _body: &Body<'tcx>) -> Self::Domain {
-        DenseBitSet::new_empty(self.borrow_set.loans.len())
+        LoanSet::default()
     }
 
     fn initialize_start_block(&self, _: &Body<'tcx>, _: &mut Self::Domain) {}

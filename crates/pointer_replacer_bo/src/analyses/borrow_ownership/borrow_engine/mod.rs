@@ -8,8 +8,8 @@
 //!
 //! **Thin fork.** Production `borrow::borrow_inference` (pub) already exposes every
 //! pre-invalidation fact as a pub field, so this engine REUSES it and forks only the loan
-//! set + invalidation walk. The fact types (`Invalidates`/`Errors`/`LoanLiveness`) are
-//! `SparseBitMatrix<PointIndex, Loan>` aliases — reused by value, no struct copies.
+//! set + invalidation walk. The fact types (`Invalidates`/`Errors`/`LoanLiveness`)
+//! are shared by both engines.
 //!
 //! **Two-class copy discipline.**
 //! - `places_conflict.rs` — MIRRORED LEAF: byte-identical to production, never diverges; guarded by

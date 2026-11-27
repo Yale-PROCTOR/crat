@@ -19,6 +19,8 @@ use crate::{
         borrow::{
             BorrowInferenceResults, Borrower, GBorrowInferCtxt, Loan, Provenance, ProvenanceOwner,
             ProvenanceSet, StructFieldSlot,
+            loan_liveness::compute_loan_liveness,
+            requires::{ProvenanceRequiresLoan, propagate_requires},
         },
         borrow_ownership::{
             borrow_fork::{LoanLocation, borrow_inference},
@@ -293,8 +295,8 @@ impl<'a> NativeBorrowContext<'a> {
         // The landed whole-body relation is computed in BOTH modes: `Off` consumes it, and `On`
         // needs it as the tripwire's reference (and leaves it on `facts` so production's own
         // consumers are untouched).
-        inference.requires = graph.requires(&inference, provenance_set, &subset_graph);
-        let landed_loan_liveness = loan_liveness::compute_loan_liveness(
+        inference.requires = graph.requires(provenance_set);
+        let landed_loan_liveness = compute_loan_liveness(
             tcx,
             body,
             &inference.borrow_set,
@@ -958,29 +960,15 @@ impl NativeConstraintGraph {
         answer
     }
 
-    fn requires(
-        &self,
-        inference: &BorrowInferenceResults<'_>,
-        provenance_set: &ProvenanceSet,
-        subset_graph: &IndexVec<Provenance, SmallVec<[Provenance; 4]>>,
-    ) -> SparseBitMatrix<Provenance, Loan> {
-        let mut answer = SparseBitMatrix::new(inference.borrow_set.loans.len());
-        let mut stack = vec![];
-        let mut visited = DenseBitSet::new_empty(provenance_set.provenance_data.len());
-
-        for &(loan, provenance) in &self.membership {
-            stack.clear();
-            visited.clear();
-            stack.push(provenance);
-            while let Some(provenance) = stack.pop() {
-                if !visited.insert(provenance) {
-                    continue;
-                }
-                answer.insert(provenance, loan);
-                stack.extend_from_slice(&subset_graph[provenance]);
-            }
-        }
-        answer
+    fn requires(&self, provenance_set: &ProvenanceSet) -> ProvenanceRequiresLoan {
+        propagate_requires(
+            provenance_set.provenance_data.len(),
+            self.subset
+                .iter()
+                .map(|&(sub, sup, _)| (sub, sup))
+                .collect(),
+            self.membership.iter().copied(),
+        )
     }
 }
 

@@ -18,6 +18,7 @@ pub(crate) const LEGACY_FILES: &[&str] = &[
     "analyses/borrow/killed.rs",
     "analyses/borrow/lifetime_flow.rs",
     "analyses/borrow/loan_liveness.rs",
+    "analyses/borrow/loan_sets.rs",
     "analyses/borrow/mod.rs",
     "analyses/borrow/places_conflict.rs",
     "analyses/borrow/provenance_liveness.rs",
