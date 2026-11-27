@@ -15,9 +15,10 @@ fn main() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"));
     let analyses = manifest.join("src/analyses");
     let legacy = manifest.join("../pointer_replacer/src");
+    let points_to = manifest.join("../points_to/src");
     let toolchain = manifest.join("../../rust-toolchain.toml");
     let lock = manifest.join("../../Cargo.lock");
-    let roots = code_fingerprint::analysis_roots(&analyses, &legacy);
+    let roots = code_fingerprint::analysis_roots(&analyses, &legacy, &points_to);
 
     let covered = code_fingerprint::covered(&roots);
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
@@ -41,6 +42,7 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", analyses.display());
+    println!("cargo:rerun-if-changed={}", points_to.display());
     for (_, path) in covered
         .iter()
         .filter(|(name, _)| name.starts_with("legacy/"))

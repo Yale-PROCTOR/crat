@@ -927,6 +927,7 @@ mod tests {
             "legacy/analyses/borrow/",
             "legacy/analyses/mir_variable_grouping.rs",
             "bo/borrow_ownership/",
+            "points_to/andersen.rs",
             "legacy/analyses/type_qualifier/foster/",
             "legacy/analyses/mir/",
             "legacy/analyses/offset_sign/",
@@ -947,7 +948,8 @@ mod tests {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let analyses = manifest.join("src/analyses");
         let legacy = manifest.join("../pointer_replacer/src");
-        let roots = super::super::code_fingerprint::analysis_roots(&analyses, &legacy);
+        let points_to = manifest.join("../points_to/src");
+        let roots = super::super::code_fingerprint::analysis_roots(&analyses, &legacy, &points_to);
         assert_eq!(
             env!("BO_ANALYSIS_FINGERPRINT"),
             super::super::code_fingerprint::fingerprint(&roots),

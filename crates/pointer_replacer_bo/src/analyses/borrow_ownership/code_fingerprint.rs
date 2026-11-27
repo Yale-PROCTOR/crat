@@ -85,9 +85,12 @@ pub(crate) struct Root<'a> {
     pub(crate) files: Option<&'a [&'a str]>,
 }
 
-/// The two roots of the analysis: this crate's `src/analyses` (every byte) and
-/// the legacy crate's listed files.
-pub(crate) fn analysis_roots<'a>(bo_analyses: &'a Path, legacy_src: &'a Path) -> [Root<'a>; 2] {
+/// Hash BO's analysis tree, the listed legacy files, and the points-to sources.
+pub(crate) fn analysis_roots<'a>(
+    bo_analyses: &'a Path,
+    legacy_src: &'a Path,
+    points_to_src: &'a Path,
+) -> [Root<'a>; 3] {
     [
         Root {
             label: "bo",
@@ -98,6 +101,11 @@ pub(crate) fn analysis_roots<'a>(bo_analyses: &'a Path, legacy_src: &'a Path) ->
             label: "legacy",
             dir: legacy_src,
             files: Some(LEGACY_FILES),
+        },
+        Root {
+            label: "points_to",
+            dir: points_to_src,
+            files: None,
         },
     ]
 }

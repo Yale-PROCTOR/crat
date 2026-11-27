@@ -1654,21 +1654,21 @@ impl Graph {
 
                 // update solutions
                 for (rep, ids) in &cycles {
-                    let mut intersection = ChunkedBitSet::new_empty(len);
-                    intersection.insert_all();
+                    let mut solutions_differ = false;
                     for id in *ids {
-                        intersection.intersect(&solutions[*id]);
                         if rep != id {
                             let set = std::mem::replace(
                                 &mut solutions[*id],
                                 ChunkedBitSet::new_empty(len),
                             );
+                            solutions_differ = solutions_differ || solutions[*rep] != set;
                             solutions[*rep].union(&set);
                         }
                     }
-                    let mut union = solutions[*rep].clone();
-                    union.subtract(&intersection);
-                    deltas[*rep].union(&union);
+                    // Differing solutions mean at least one member gained facts in the merge.
+                    if solutions_differ {
+                        deltas[*rep].union(&solutions[*rep]);
+                    }
                 }
 
                 // update zero_weight_edges
@@ -1719,13 +1719,8 @@ impl Graph {
                 );
 
                 for l in zero_weight_edges[v].iter() {
-                    if l == v {
-                        continue;
-                    }
-                    for f in delta.iter() {
-                        if solutions[l].insert(f) {
-                            deltas[l].insert(f);
-                        }
+                    if l != v {
+                        propagate_facts(&delta, &mut solutions[l], &mut deltas[l]);
                     }
                 }
 
@@ -1755,6 +1750,18 @@ impl Graph {
         }
 
         solutions
+    }
+}
+
+#[inline]
+fn propagate_facts(
+    incoming: &ChunkedBitSet<Loc>,
+    solution: &mut ChunkedBitSet<Loc>,
+    pending: &mut ChunkedBitSet<Loc>,
+) {
+    if solution.union(incoming) {
+        // Pending work may include known facts. Only solution growth queues additional work.
+        pending.union(incoming);
     }
 }
 
@@ -1817,15 +1824,11 @@ fn propagate_deref(
                 }
                 let f = id_to_rep[f];
                 let (l, r) = if deref_eq { (f, *w) } else { (*w, f) };
-                if !zero_weight_edges[r].insert(l) {
+                if !zero_weight_edges[r].insert(l) || l == r {
                     continue;
                 }
-                let mut diff = solutions[r].clone();
-                diff.subtract(&solutions[l]);
-                if !diff.is_empty() {
-                    solutions[l].union(&diff);
-                    deltas[l].union(&diff);
-                }
+                let (target, source) = solutions.pick2_mut(l, r);
+                propagate_facts(source, target, &mut deltas[l]);
             }
         }
     }
@@ -1908,5 +1911,49 @@ impl<'tcx> Visitor<'tcx> for FnPtrVisitor<'tcx> {
             _ => {}
         }
         self.super_rvalue(rvalue, location);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_full_set_propagation(connect: impl FnOnce(&mut Graph, Loc, Loc)) {
+        let size = 64;
+        let mut graph = Graph::new(size);
+        let source = Loc::new(0);
+        let target = Loc::new(1);
+        let downstream = Loc::new(2);
+        graph.solutions[source].insert_all();
+        graph.add_solution(target, source);
+        connect(&mut graph, source, target);
+        graph.add_edge(downstream, target, 0);
+
+        let ends = graph.solutions.indices().collect();
+        let solutions = graph.solve(&ends);
+        assert_eq!(solutions[target], ChunkedBitSet::new_filled(size));
+        assert_eq!(solutions[downstream], ChunkedBitSet::new_filled(size));
+    }
+
+    #[test]
+    fn copy_edges_propagate_full_sets_through_partial_targets() {
+        assert_full_set_propagation(|graph, source, target| graph.add_edge(target, source, 0));
+    }
+
+    #[test]
+    fn dereference_edges_propagate_full_sets_through_partial_targets() {
+        assert_full_set_propagation(|graph, source, target| {
+            let pointer = Loc::new(3);
+            graph.add_solution(pointer, source);
+            graph.add_eq_deref(target, pointer, 0);
+        });
+    }
+
+    #[test]
+    fn merged_cycles_propagate_full_sets_from_members_with_different_solutions() {
+        assert_full_set_propagation(|graph, source, target| {
+            graph.add_edge(target, source, 0);
+            graph.add_edge(source, target, 0);
+        });
     }
 }
