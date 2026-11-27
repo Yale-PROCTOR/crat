@@ -1,6 +1,7 @@
 mod state;
 
 use std::{
+    cell::Cell,
     ops::Range,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -10,6 +11,7 @@ use either::Either::{self, Left, Right};
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::{Body, Local, Location};
+use serde::Deserialize;
 
 use self::state::{initial_inter_ctxt, initial_ssa_state, refine_state};
 use super::{AnalysisKind, Ownership, Precision, total_deref_level};
@@ -23,7 +25,8 @@ use crate::analyses::{
         ssa::{
             AnalysisResults, FnResults,
             constraint::{
-                Database, Gen, GlobalAssumptions, Var, Z3Database, infer::Renamer, initialize_local,
+                Database, Gen, GlobalAssumptions, SolverDatabase, Var, infer::Renamer,
+                initialize_local,
             },
             consume::Consume,
             state::SSAState,
@@ -54,8 +57,54 @@ fn verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
+/// The solver of the ownership analysis: CaDiCaL in-process (the default), or z3 as on master.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnershipSolver {
+    #[default]
+    Cadical,
+    Z3,
+}
+
+impl std::str::FromStr for OwnershipSolver {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "cadical" => Ok(Self::Cadical),
+            "z3" => Ok(Self::Z3),
+            _ => Err(format!(
+                "unknown ownership solver `{s}`: expected `cadical` or `z3`"
+            )),
+        }
+    }
+}
+
+thread_local! {
+    // Per thread, unlike VERBOSE: the analysis runs on the thread that selects the solver, and tests
+    // run analyses in parallel under both solvers.
+    static SOLVER: Cell<OwnershipSolver> = const { Cell::new(OwnershipSolver::Cadical) };
+}
+
+pub struct SolverGuard(OwnershipSolver);
+
+/// Selects the solver of the analyses run on this thread until the guard drops.
+pub fn set_solver(solver: OwnershipSolver) -> SolverGuard {
+    SolverGuard(SOLVER.replace(solver))
+}
+
+impl Drop for SolverGuard {
+    fn drop(&mut self) {
+        SOLVER.set(self.0);
+    }
+}
+
+pub fn selected_solver() -> OwnershipSolver {
+    SOLVER.get()
+}
+
 impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for WholeProgramAnalysis {
-    type DB = Z3Database;
+    type DB = SolverDatabase;
     type InterCtxt = &'analysis InterCtxt;
     type Results = WholeProgramResults<'tcx>;
 
@@ -74,12 +123,26 @@ impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for WholeProgramAn
             3,
         );
 
+        let started = std::time::Instant::now();
+
         // first stage
         let mut results = solve_crate(&mut crate_ctxt, Left((output_params, required_precision)))?;
+        let mut passes = 1;
+        print_model(passes, &results.0);
 
         // second stage
         for _ in 1..2 * required_precision {
             results = solve_crate(&mut crate_ctxt, Right(results))?;
+            passes += 1;
+            print_model(passes, &results.0);
+        }
+
+        if verbose() {
+            println!(
+                "ownership analysis: {:.3} s, {passes} passes, {} vars",
+                started.elapsed().as_secs_f64(),
+                results.0.len() - 1
+            );
         }
 
         let (model, fn_locals, struct_fields) = results;
@@ -118,6 +181,26 @@ impl<'tcx> WholeProgramResults<'tcx> {
     pub fn precision(&self, did: &DefId) -> Precision {
         self.fn_locals.fn_summaries[did].1
     }
+
+    #[cfg(test)]
+    pub fn model(&self) -> &[Ownership] {
+        &self.model
+    }
+}
+
+/// Under the verbose flag, one pass's model as one line: `O` owning, `T` transient, `?` unknown.
+fn print_model(pass: usize, model: &[Ownership]) {
+    if verbose() {
+        let model: String = model
+            .iter()
+            .map(|value| match value {
+                Ownership::Owning => 'O',
+                Ownership::Transient => 'T',
+                Ownership::Unknown => '?',
+            })
+            .collect();
+        println!("ownership model pass {pass}: {model}");
+    }
 }
 
 struct SolveBodyCtxt<'a, 'tcx> {
@@ -125,7 +208,7 @@ struct SolveBodyCtxt<'a, 'tcx> {
     inter_ctxt: &'a InterCtxt,
     global_assumptions: &'a GlobalAssumptions,
     var_gen: &'a mut Gen,
-    database: &'a mut Z3Database,
+    database: &'a mut SolverDatabase,
 }
 
 fn solve_body<'tcx>(
@@ -152,7 +235,7 @@ fn solve_body<'tcx>(
         database,
     } = ctxt;
 
-    database.solver.push();
+    database.open_scope();
 
     let mut rn = Renamer::new(body, ssa_state, crate_ctxt.tcx);
 
@@ -178,19 +261,20 @@ fn solve_body<'tcx>(
 
     let results = FnSummary::new(rn, infer_cx);
 
-    match database.solver.check() {
-        z3::SatResult::Unsat => {
+    match database.check_scope() {
+        Some(false) => {
             if verbose() {
                 println!("\u{274C}");
             }
-            database.solver.pop(1);
+            database.close_scope(false);
             Ok((results, precision - 1))
         }
-        z3::SatResult::Unknown => bail!("z3 status: unknown"),
-        z3::SatResult::Sat => {
+        None => bail!("{:?} status: unknown", selected_solver()),
+        Some(true) => {
             if verbose() {
                 println!("\u{2705}");
             }
+            database.close_scope(true);
             Ok((results, precision))
         }
     }
@@ -202,7 +286,7 @@ fn solve_crate(
 ) -> anyhow::Result<IntermediateResults> {
     let mut var_gen = Gen::new();
 
-    let mut database = <WholeProgramAnalysis as AnalysisKind>::DB::new();
+    let mut database = SolverDatabase::new(selected_solver());
 
     let global_assumptions = GlobalAssumptions::new(&*crate_ctxt, &mut var_gen, &mut database);
 
@@ -266,7 +350,7 @@ fn solve_crate(
         }
     };
 
-    let model = retrieve_model(database, var_gen);
+    let model = retrieve_model(database, var_gen)?;
 
     let fn_locals = FnLocals {
         fn_sigs,
@@ -276,24 +360,16 @@ fn solve_crate(
     Ok((model, fn_locals, global_assumptions))
 }
 
-fn retrieve_model(database: Z3Database, var_gen: Gen) -> Vec<Ownership> {
-    assert!(matches!(database.solver.check(), z3::SatResult::Sat));
-    let z3_model = database.solver.get_model().unwrap();
+fn retrieve_model(mut database: SolverDatabase, var_gen: Gen) -> anyhow::Result<Vec<Ownership>> {
+    let values = database.model(var_gen.next())?;
     let mut model = Vec::with_capacity(var_gen.next().index());
 
     assert_eq!(Var::MIN.index(), 1);
 
     model.push(Ownership::Unknown);
+    model.extend(values.into_iter().map(Ownership::from));
 
-    for sig in Var::MIN..var_gen.next() {
-        let value = z3_model
-            .eval(&database.z3_ast[sig], false)
-            .unwrap()
-            .as_bool();
-        model.push(value.into());
-    }
-
-    model
+    Ok(model)
 }
 
 impl<'analysis_results, 'tcx: 'analysis_results> AnalysisResults<'analysis_results>
@@ -378,7 +454,7 @@ impl FnLocals {
         model: Vec<Ownership>,
         crate_ctxt: &CrateCtxt<'tcx>,
         var_gen: &mut Gen,
-        database: &mut Z3Database,
+        database: &mut SolverDatabase,
     ) -> (
         InterCtxt,
         impl Iterator<Item = (DefId, SSAState, Precision)> + 'tcx,

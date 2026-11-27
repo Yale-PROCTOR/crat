@@ -31,6 +31,7 @@ pub mod analyses;
 pub mod rewriter;
 pub mod utils;
 
+pub use analyses::ownership::whole_program::OwnershipSolver;
 pub use rewriter::{
     BytemuckDependency, Config, InitialPointerDecisions, PointerDecisionOptions, PtrKind,
     SigDecision, SigDecisions, initial_pointer_decisions, replace_local_borrows,

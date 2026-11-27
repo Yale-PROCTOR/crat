@@ -9947,15 +9947,26 @@ mod ownership_analysis {
             ownership::{
                 AnalysisKind, CrateCtxt, Ownership, Param,
                 ssa::{AnalysisResults, consume::Consume},
-                whole_program::WholeProgramAnalysis,
+                whole_program::{
+                    OwnershipSolver, WholeProgramAnalysis, selected_solver, set_solver,
+                },
             },
             type_qualifier::foster::mutability::mutability_analysis,
         },
         utils::rustc::RustProgram,
     };
 
-    fn run_compiler<F: FnOnce(TyCtxt<'_>) + Send>(code: &str, f: F) {
-        ::utils::compilation::run_compiler_on_str(code, f).unwrap_or_else(|e| e.raise());
+    const SOLVERS: [OwnershipSolver; 2] = [OwnershipSolver::Cadical, OwnershipSolver::Z3];
+
+    /// Runs `f` on `code` once under each ownership solver: the tests below hold under both.
+    fn run_compiler<F: Fn(TyCtxt<'_>) + Sync>(code: &str, f: F) {
+        for solver in SOLVERS {
+            ::utils::compilation::run_compiler_on_str(code, |tcx| {
+                let _solver = set_solver(solver);
+                f(tcx)
+            })
+            .unwrap_or_else(|e| e.raise());
+        }
     }
 
     fn collect_program(tcx: TyCtxt<'_>) -> RustProgram<'_> {
@@ -10493,6 +10504,69 @@ pub unsafe fn make_holder() -> Holder {
                 assert_eq!(fields[0].len(), 1);
             },
         );
+    }
+
+    /// Two analyses of the same program give the same model.
+    #[test]
+    fn ownership_model_is_deterministic() {
+        const CODE: &str = r#"
+extern "C" {
+    fn malloc(size: usize) -> *mut i32;
+    fn free(ptr: *mut i32);
+}
+
+#[repr(C)]
+pub struct Holder {
+    pub p: *mut i32,
+}
+
+pub unsafe fn make() -> *mut i32 {
+    malloc(4)
+}
+
+pub unsafe fn pick(a: *mut i32, b: *mut i32, c: bool) -> *mut i32 {
+    if c { a } else { b }
+}
+
+pub unsafe fn fill(h: *mut Holder) {
+    (*h).p = make();
+}
+
+pub unsafe fn drain(h: *mut Holder) {
+    free((*h).p);
+}
+"#;
+        let analyze = |solver| {
+            let mut model = Vec::new();
+            ::utils::compilation::run_compiler_on_str(CODE, |tcx| {
+                let _solver = set_solver(solver);
+                let program = collect_program(tcx);
+                model = analyze_program(&program).model().to_vec();
+            })
+            .unwrap_or_else(|e| e.raise());
+            model
+        };
+
+        for solver in SOLVERS {
+            let first = analyze(solver);
+            assert!(first.iter().any(|value| *value != Ownership::Unknown));
+            assert_eq!(first, analyze(solver));
+        }
+    }
+
+    /// The ownership analysis solves with CaDiCaL unless z3 is selected.
+    #[test]
+    fn ownership_solver_default_is_cadical() {
+        assert_eq!(crate::Config::default().solver, OwnershipSolver::Cadical);
+        assert_eq!(selected_solver(), OwnershipSolver::Cadical);
+        assert_eq!("cadical".parse(), Ok(OwnershipSolver::Cadical));
+        assert_eq!("z3".parse(), Ok(OwnershipSolver::Z3));
+        assert!("minisat".parse::<OwnershipSolver>().is_err());
+        {
+            let _z3 = set_solver(OwnershipSolver::Z3);
+            assert_eq!(selected_solver(), OwnershipSolver::Z3);
+        }
+        assert_eq!(selected_solver(), OwnershipSolver::Cadical);
     }
 }
 

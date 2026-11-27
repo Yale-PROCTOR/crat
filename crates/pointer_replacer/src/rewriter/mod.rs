@@ -80,6 +80,9 @@ pub struct Config {
     pub c_exposed_fns: FxHashSet<String>,
     #[serde(default)]
     pub verbose: bool,
+    /// The solver of the ownership analysis: CaDiCaL (the default) or z3.
+    #[serde(default)]
+    pub solver: crate::analyses::ownership::whole_program::OwnershipSolver,
     #[cfg(test)]
     pub force_ownership_analysis_failure: bool,
 }
@@ -449,6 +452,7 @@ fn maybe_solidified_ownership<'tcx>(
     }
 
     let _verbose_guard = crate::analyses::ownership::whole_program::set_verbose(_config.verbose);
+    let _solver_guard = crate::analyses::ownership::whole_program::set_solver(_config.solver);
     let crate_ctxt = CrateCtxt::new(input);
     <WholeProgramAnalysis as OwnershipAnalysisKind>::analyze(crate_ctxt, output_params)
         .ok()
