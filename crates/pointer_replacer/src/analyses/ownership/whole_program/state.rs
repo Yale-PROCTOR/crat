@@ -9,7 +9,7 @@ use crate::analyses::{
         call_graph::FnSig,
         infer::FnSummary,
         ssa::{
-            constraint::{Database, Gen, SatDatabase, initialize_local},
+            constraint::{Database, Gen, SolverDatabase, initialize_local},
             consume::{Consume, initial_definitions},
             dom::compute_dominance_frontier,
             state::SSAState,
@@ -21,7 +21,7 @@ pub(super) fn initial_inter_ctxt(
     crate_ctxt: &CrateCtxt,
     output_params: &OutputParams,
     var_gen: &mut Gen,
-    database: &mut SatDatabase,
+    database: &mut SolverDatabase,
 ) -> InterCtxt {
     const INIT_PRECISION: Precision = 1;
 

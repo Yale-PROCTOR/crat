@@ -1,6 +1,7 @@
 mod state;
 
 use std::{
+    cell::Cell,
     ops::Range,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -10,6 +11,7 @@ use either::Either::{self, Left, Right};
 use rustc_hash::FxHashMap;
 use rustc_hir::def_id::DefId;
 use rustc_middle::mir::{Body, Local, Location};
+use serde::Deserialize;
 
 use self::state::{initial_inter_ctxt, initial_ssa_state, refine_state};
 use super::{AnalysisKind, Ownership, Precision, total_deref_level};
@@ -23,7 +25,7 @@ use crate::analyses::{
         ssa::{
             AnalysisResults, FnResults,
             constraint::{
-                Database, Gen, GlobalAssumptions, SatDatabase, Var, infer::Renamer,
+                Database, Gen, GlobalAssumptions, SolverDatabase, Var, infer::Renamer,
                 initialize_local,
             },
             consume::Consume,
@@ -55,8 +57,54 @@ fn verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
+/// The solver of the ownership analysis: CaDiCaL in-process (the default), or z3 as on master.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnershipSolver {
+    #[default]
+    Cadical,
+    Z3,
+}
+
+impl std::str::FromStr for OwnershipSolver {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "cadical" => Ok(Self::Cadical),
+            "z3" => Ok(Self::Z3),
+            _ => Err(format!(
+                "unknown ownership solver `{s}`: expected `cadical` or `z3`"
+            )),
+        }
+    }
+}
+
+thread_local! {
+    // Per thread, unlike VERBOSE: the analysis runs on the thread that selects the solver, and tests
+    // run analyses in parallel under both solvers.
+    static SOLVER: Cell<OwnershipSolver> = const { Cell::new(OwnershipSolver::Cadical) };
+}
+
+pub struct SolverGuard(OwnershipSolver);
+
+/// Selects the solver of the analyses run on this thread until the guard drops.
+pub fn set_solver(solver: OwnershipSolver) -> SolverGuard {
+    SolverGuard(SOLVER.replace(solver))
+}
+
+impl Drop for SolverGuard {
+    fn drop(&mut self) {
+        SOLVER.set(self.0);
+    }
+}
+
+pub fn selected_solver() -> OwnershipSolver {
+    SOLVER.get()
+}
+
 impl<'analysis, 'db, 'tcx> AnalysisKind<'analysis, 'db, 'tcx> for WholeProgramAnalysis {
-    type DB = SatDatabase;
+    type DB = SolverDatabase;
     type InterCtxt = &'analysis InterCtxt;
     type Results = WholeProgramResults<'tcx>;
 
@@ -160,7 +208,7 @@ struct SolveBodyCtxt<'a, 'tcx> {
     inter_ctxt: &'a InterCtxt,
     global_assumptions: &'a GlobalAssumptions,
     var_gen: &'a mut Gen,
-    database: &'a mut SatDatabase,
+    database: &'a mut SolverDatabase,
 }
 
 fn solve_body<'tcx>(
@@ -221,7 +269,7 @@ fn solve_body<'tcx>(
             database.close_scope(false);
             Ok((results, precision - 1))
         }
-        None => bail!("sat status: unknown"),
+        None => bail!("{:?} status: unknown", selected_solver()),
         Some(true) => {
             if verbose() {
                 println!("\u{2705}");
@@ -238,7 +286,7 @@ fn solve_crate(
 ) -> anyhow::Result<IntermediateResults> {
     let mut var_gen = Gen::new();
 
-    let mut database = <WholeProgramAnalysis as AnalysisKind>::DB::new();
+    let mut database = SolverDatabase::new(selected_solver());
 
     let global_assumptions = GlobalAssumptions::new(&*crate_ctxt, &mut var_gen, &mut database);
 
@@ -312,7 +360,7 @@ fn solve_crate(
     Ok((model, fn_locals, global_assumptions))
 }
 
-fn retrieve_model(mut database: SatDatabase, var_gen: Gen) -> anyhow::Result<Vec<Ownership>> {
+fn retrieve_model(mut database: SolverDatabase, var_gen: Gen) -> anyhow::Result<Vec<Ownership>> {
     let values = database.model(var_gen.next())?;
     let mut model = Vec::with_capacity(var_gen.next().index());
 
@@ -406,7 +454,7 @@ impl FnLocals {
         model: Vec<Ownership>,
         crate_ctxt: &CrateCtxt<'tcx>,
         var_gen: &mut Gen,
-        database: &mut SatDatabase,
+        database: &mut SolverDatabase,
     ) -> (
         InterCtxt,
         impl Iterator<Item = (DefId, SSAState, Precision)> + 'tcx,

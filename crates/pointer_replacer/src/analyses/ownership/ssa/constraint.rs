@@ -10,6 +10,7 @@ use rustc_middle::{
 use super::consume::Voidable;
 use crate::analyses::ownership::{
     CrateCtxt, ptr::Measurable, struct_ctxt::StructCtxt, vec_vec::VecVec,
+    whole_program::OwnershipSolver,
 };
 
 pub mod infer;
@@ -306,6 +307,174 @@ impl Database for () {
     fn push_less_equal_impl(&mut self, _: Var, _: Var) {}
 
     fn push_eq_min_impl(&mut self, _: Var, _: Var, _: Var) {}
+}
+
+/// The database of the selected [OwnershipSolver]: the driver's scope calls and the constraints go
+/// to [SatDatabase] (CaDiCaL) or to [Z3Database] (z3, as on master).
+pub enum SolverDatabase {
+    Cadical(SatDatabase),
+    Z3(Z3Database),
+}
+
+impl SolverDatabase {
+    pub fn new(solver: OwnershipSolver) -> Self {
+        match solver {
+            OwnershipSolver::Cadical => Self::Cadical(SatDatabase::new()),
+            OwnershipSolver::Z3 => Self::Z3(Z3Database::new()),
+        }
+    }
+
+    /// Opens one function's scope (z3: `push`).
+    pub fn open_scope(&mut self) {
+        match self {
+            Self::Cadical(db) => db.open_scope(),
+            Self::Z3(db) => db.solver.push(),
+        }
+    }
+
+    /// Whether the constraints so far are satisfiable; `None` when the solver cannot tell.
+    pub fn check_scope(&mut self) -> Option<bool> {
+        match self {
+            Self::Cadical(db) => db.check_scope(),
+            Self::Z3(db) => match db.solver.check() {
+                z3::SatResult::Sat => Some(true),
+                z3::SatResult::Unsat => Some(false),
+                z3::SatResult::Unknown => None,
+            },
+        }
+    }
+
+    /// Closes the scope: kept, or discarded (z3: `pop`; a kept z3 scope is never popped).
+    pub fn close_scope(&mut self, keep: bool) {
+        match self {
+            Self::Cadical(db) => db.close_scope(keep),
+            Self::Z3(db) => {
+                if !keep {
+                    db.solver.pop(1);
+                }
+            }
+        }
+    }
+
+    /// The value of each [Var] below `end` (`None`: Unknown). z3 reads its model without model
+    /// completion, so a [Var] the model leaves out is Unknown, as on master.
+    pub fn model(&mut self, end: Var) -> anyhow::Result<Vec<Option<bool>>> {
+        match self {
+            Self::Cadical(db) => db.model(end),
+            Self::Z3(db) => {
+                assert!(matches!(db.solver.check(), z3::SatResult::Sat));
+                let model = db.solver.get_model().unwrap();
+                Ok((Var::MIN..end)
+                    .map(|x| model.eval(&db.z3_ast[x], false).unwrap().as_bool())
+                    .collect())
+            }
+        }
+    }
+}
+
+impl Database for SolverDatabase {
+    fn new_vars(&mut self, var_gen: &mut Gen, size: u32) -> Range<Var> {
+        match self {
+            Self::Cadical(db) => db.new_vars(var_gen, size),
+            Self::Z3(db) => db.new_vars(var_gen, size),
+        }
+    }
+
+    fn push_linear_impl(&mut self, x: Var, y: Var, z: Var) {
+        match self {
+            Self::Cadical(db) => db.push_linear_impl(x, y, z),
+            Self::Z3(db) => db.push_linear_impl(x, y, z),
+        }
+    }
+
+    fn push_assume_impl(&mut self, x: Var, sign: bool) {
+        match self {
+            Self::Cadical(db) => db.push_assume_impl(x, sign),
+            Self::Z3(db) => db.push_assume_impl(x, sign),
+        }
+    }
+
+    fn push_equal_impl(&mut self, x: Var, y: Var) {
+        match self {
+            Self::Cadical(db) => db.push_equal_impl(x, y),
+            Self::Z3(db) => db.push_equal_impl(x, y),
+        }
+    }
+
+    fn push_less_equal_impl(&mut self, x: Var, y: Var) {
+        match self {
+            Self::Cadical(db) => db.push_less_equal_impl(x, y),
+            Self::Z3(db) => db.push_less_equal_impl(x, y),
+        }
+    }
+
+    fn push_eq_min_impl(&mut self, x: Var, y: Var, z: Var) {
+        match self {
+            Self::Cadical(db) => db.push_eq_min_impl(x, y, z),
+            Self::Z3(db) => db.push_eq_min_impl(x, y, z),
+        }
+    }
+}
+
+pub struct Z3Database {
+    pub solver: z3::Solver,
+    pub z3_ast: IndexVec<Var, z3::ast::Bool>,
+}
+
+impl Z3Database {
+    pub fn new() -> Self {
+        let mut z3_ast = IndexVec::with_capacity(100);
+        z3_ast.push(z3::ast::Bool::new_const("dummy"));
+        Z3Database {
+            solver: z3::Solver::new(),
+            z3_ast,
+        }
+    }
+}
+
+impl Database for Z3Database {
+    fn new_vars(&mut self, var_gen: &mut Gen, size: u32) -> Range<Var> {
+        let sigs = var_gen.new_sigs(size);
+        for sig in sigs.clone() {
+            assert_eq!(
+                sig,
+                self.z3_ast.push(z3::ast::Bool::new_const(sig.as_u32()))
+            )
+        }
+        sigs
+    }
+
+    fn push_linear_impl(&mut self, x: Var, y: Var, z: Var) {
+        let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
+        self.solver.assert(z3::ast::Bool::or(&[&!x, &!y]));
+        self.solver.assert(z3::ast::Bool::or(&[&!x, z]));
+        self.solver.assert(z3::ast::Bool::or(&[x, y, &!z]));
+        self.solver.assert(z3::ast::Bool::or(&[&!y, z]));
+    }
+
+    fn push_assume_impl(&mut self, x: Var, sign: bool) {
+        let x = &self.z3_ast[x];
+        let value = z3::ast::Bool::from_bool(sign);
+        self.solver.assert(&!(x.xor(&value)))
+        // self.solver.assert(&!z3::ast::Bool::xor(x, &value));
+    }
+
+    fn push_equal_impl(&mut self, x: Var, y: Var) {
+        let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
+        self.solver.assert(&!(x.xor(y)));
+    }
+
+    fn push_less_equal_impl(&mut self, x: Var, y: Var) {
+        let [x, y] = [x, y].map(|sig| &self.z3_ast[sig]);
+        self.solver.assert(z3::ast::Bool::or(&[&!x, y]));
+    }
+
+    fn push_eq_min_impl(&mut self, x: Var, y: Var, z: Var) {
+        let [x, y, z] = [x, y, z].map(|sig| &self.z3_ast[sig]);
+        self.solver.assert(z3::ast::Bool::or(&[&!x, y]));
+        self.solver.assert(z3::ast::Bool::or(&[&!x, z]));
+        self.solver.assert(z3::ast::Bool::or(&[x, &!y, &!z]));
+    }
 }
 
 /// The ownership constraints as CNF, solved in-process and incrementally by CaDiCaL.
