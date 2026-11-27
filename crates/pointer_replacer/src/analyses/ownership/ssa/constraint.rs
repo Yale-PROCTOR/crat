@@ -498,6 +498,15 @@ impl Database for Z3Database {
 /// made while solving a scope that was then discarded, so a later solve can start a [Var] from a
 /// phase an earlier scope left. Rephasing and local search can move the saved phases too. The
 /// validity of the model rests on none of this: the self-check covers every kept clause.
+///
+/// A satisfiable check is often answered without solving ([SatDatabase::check_scope]). The
+/// database keeps a copy of a model of every clause added so far outside the open scope; a
+/// scope's new solver variables occur in no clause outside it. If the copy, extended to those
+/// variables, makes every clause of the scope true, the kept clauses and the scope are satisfiable
+/// together, so the answer is exactly the solver's. Otherwise the solver decides: every
+/// unsatisfiable answer and the final model ([SatDatabase::model]) are still the solver's, and the
+/// self-check still covers the final model. With fewer solves the solver's saved phases differ, so
+/// the final model can be another valid one.
 pub struct SatDatabase {
     solver: cadical::Solver,
     /// The solver variable of each [Var], true when the [Var] is NOT owning: 0 until the [Var]
@@ -510,6 +519,16 @@ pub struct SatDatabase {
     /// The kept clauses over solver literals, each followed by 0, for the model's self-check.
     clauses: Vec<i32>,
     scope: Option<Scope>,
+    /// A model of every clause added so far outside the open scope, one value per solver variable
+    /// (index 0 unused), or `None` until the next satisfiable solve: see
+    /// [SatDatabase::check_scope].
+    copy: Option<Vec<bool>>,
+    /// The values the copy's extension chose for the open scope's new solver variables, when the
+    /// scope was accepted from the copy.
+    extension: Option<Vec<(i32, bool)>>,
+    /// The solves of [SatDatabase::check_scope], for the tests.
+    #[cfg(test)]
+    solves: usize,
 }
 
 struct Scope {
@@ -535,6 +554,11 @@ impl SatDatabase {
             last_lit: 0,
             clauses: Vec::new(),
             scope: None,
+            // The empty clause set: every variable not owning (solver variable true).
+            copy: Some(vec![true]),
+            extension: None,
+            #[cfg(test)]
+            solves: 0,
         }
     }
 
@@ -576,6 +600,15 @@ impl SatDatabase {
                 }
             }
             None => {
+                if let Some(copy) = &mut self.copy {
+                    copy.resize(self.last_lit as usize + 1, true);
+                    if !clause
+                        .iter()
+                        .any(|&lit| copy[lit.unsigned_abs() as usize] == (lit > 0))
+                    {
+                        self.copy = None;
+                    }
+                }
                 self.solver.add_clause(clause);
                 self.clauses.extend(clause);
                 self.clauses.push(0);
@@ -599,15 +632,96 @@ impl SatDatabase {
 
     /// Solves the kept clauses together with the open scope's: `Some(true)` satisfiable,
     /// `Some(false)` unsatisfiable, `None` when the solver gave no answer.
+    ///
+    /// Satisfiable without a solve when the copy extends to the scope; after a satisfiable solve
+    /// the copy is read again from the solver's model.
     pub fn check_scope(&mut self) -> Option<bool> {
         let activation = self.scope.as_ref().expect("no open scope").activation;
-        self.solver.solve_with([activation])
+        self.extension = self.extend_copy();
+        if self.extension.is_some() {
+            return Some(true);
+        }
+        #[cfg(test)]
+        {
+            self.solves += 1;
+        }
+        let result = self.solver.solve_with([activation]);
+        if result == Some(true) {
+            let max = self.solver.max_variable();
+            let mut copy = Vec::with_capacity(max as usize + 1);
+            copy.push(true);
+            copy.extend((1..=max).map(|var| self.solver.value(var) != Some(false)));
+            self.copy = Some(copy);
+        }
+        result
+    }
+
+    /// The copy extended to the open scope's new solver variables (those it does not cover):
+    /// unit propagation over the scope's clauses with the copy's variables fixed, then the rest
+    /// true (not owning). `Some` with the new variables' values if every scope clause is then
+    /// true.
+    fn extend_copy(&self) -> Option<Vec<(i32, bool)>> {
+        let copy = self.copy.as_ref()?;
+        let scope = self.scope.as_ref()?;
+        let clauses = || {
+            scope
+                .clauses
+                .split(|&lit| lit == 0)
+                .filter(|c| !c.is_empty())
+        };
+        let mut new = rustc_hash::FxHashMap::default();
+        let value = |new: &rustc_hash::FxHashMap<i32, bool>, lit: i32| {
+            let var = lit.abs();
+            let value = match copy.get(var as usize) {
+                Some(&value) => Some(value),
+                None => new.get(&var).copied(),
+            };
+            value.map(|value| value == (lit > 0))
+        };
+        loop {
+            let mut changed = false;
+            for clause in clauses() {
+                if clause.iter().any(|&lit| value(&new, lit) == Some(true)) {
+                    continue;
+                }
+                let mut open = clause.iter().filter(|&&lit| value(&new, lit).is_none());
+                match (open.next(), open.next()) {
+                    (None, _) => return None,
+                    (Some(&lit), None) => {
+                        new.insert(lit.abs(), lit > 0);
+                        changed = true;
+                    }
+                    _ => {}
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for clause in clauses() {
+            for &lit in clause {
+                if lit.unsigned_abs() as usize >= copy.len() {
+                    new.entry(lit.abs()).or_insert(true);
+                }
+            }
+        }
+        clauses()
+            .all(|clause| clause.iter().any(|&lit| value(&new, lit) == Some(true)))
+            .then(|| new.into_iter().collect())
     }
 
     /// Closes the open scope: its clauses are kept, and constrain every later check and the model,
     /// or discarded, and constrain nothing more.
     pub fn close_scope(&mut self, keep: bool) {
         let scope = self.scope.take().expect("no open scope");
+        let extension = self.extension.take();
+        if let Some(copy) = &mut self.copy {
+            copy.resize(self.last_lit as usize + 1, true);
+            for (var, value) in extension.into_iter().flatten() {
+                copy[var as usize] = value;
+            }
+            copy[scope.activation as usize] = keep;
+        }
         if keep {
             self.solver.add_clause([scope.activation]);
             self.clauses.extend(scope.clauses);
@@ -755,6 +869,87 @@ mod tests {
         // The same calls give the same model, the free f and g included.
         let (mut again, var_gen, _) = build();
         assert_eq!(again.model(var_gen.next()).unwrap(), model);
+    }
+
+    /// x owning, accepted from the copy without a solve, still constrains the next scope: x not
+    /// owning is unsatisfiable.
+    #[test]
+    fn sat_database_scope_from_the_copy_constrains_later_scopes() {
+        let mut var_gen = Gen::new();
+        let mut db = SatDatabase::new();
+        let x = db.new_vars(&mut var_gen, 1).start;
+
+        db.open_scope();
+        db.push_assume_impl(x, true);
+        assert_eq!(db.check_scope(), Some(true));
+        db.close_scope(true);
+        assert_eq!(db.solves, 0, "accepted from the copy");
+
+        db.open_scope();
+        db.push_assume_impl(x, false);
+        assert_eq!(db.check_scope(), Some(false));
+        db.close_scope(false);
+        assert_eq!(
+            db.solves, 1,
+            "the copy cannot show Unsat: the solver decides"
+        );
+
+        assert_eq!(db.model(var_gen.next()).unwrap(), [Some(true)]);
+    }
+
+    /// x <= y is accepted from the copy (both not owning). x owning needs the copy's x changed, so
+    /// the solver decides, and the copy is refreshed from its model (x and y owning); y owning is
+    /// then accepted from the refreshed copy.
+    #[test]
+    fn sat_database_scope_needing_an_old_value_changed_goes_to_the_solver() {
+        let mut var_gen = Gen::new();
+        let mut db = SatDatabase::new();
+        let vars = db.new_vars(&mut var_gen, 2);
+        let [x, y] = std::array::from_fn(|i| vars.start + i as u32);
+
+        db.open_scope();
+        db.push_less_equal_impl(x, y);
+        assert_eq!(db.check_scope(), Some(true));
+        db.close_scope(true);
+        assert_eq!(db.solves, 0, "accepted from the copy");
+
+        db.open_scope();
+        db.push_assume_impl(x, true);
+        assert_eq!(db.check_scope(), Some(true));
+        db.close_scope(true);
+        assert_eq!(db.solves, 1, "x changed: the solver decides");
+        let copy = db.copy.as_ref().expect("refreshed from the solver's model");
+        assert!(!copy[db.lits[x] as usize] && !copy[db.lits[y] as usize]);
+
+        db.open_scope();
+        db.push_assume_impl(y, true);
+        assert_eq!(db.check_scope(), Some(true));
+        db.close_scope(true);
+        assert_eq!(db.solves, 1, "accepted from the refreshed copy");
+
+        assert_eq!(db.model(var_gen.next()).unwrap(), [Some(true), Some(true)]);
+    }
+
+    /// A base clause the copy violates (x owning, against the copy's not owning) drops the copy;
+    /// the next scope goes to the solver, whose model refreshes it.
+    #[test]
+    fn sat_database_base_clause_violating_the_copy_drops_it() {
+        let mut var_gen = Gen::new();
+        let mut db = SatDatabase::new();
+        let vars = db.new_vars(&mut var_gen, 2);
+        let [x, y] = std::array::from_fn(|i| vars.start + i as u32);
+
+        db.push_assume_impl(x, true);
+        assert!(db.copy.is_none());
+
+        db.open_scope();
+        db.push_less_equal_impl(x, y);
+        assert_eq!(db.check_scope(), Some(true));
+        db.close_scope(true);
+        assert_eq!(db.solves, 1, "no copy: the solver decides");
+        assert!(db.copy.is_some());
+
+        assert_eq!(db.model(var_gen.next()).unwrap(), [Some(true), Some(true)]);
     }
 
     #[test]
