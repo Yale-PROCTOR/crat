@@ -80,8 +80,12 @@ enum CfgValueCondition {
     NotFeature(String),
 }
 
-pub fn merge(translations_json: &Path, output_root: &Path) -> Result<(), String> {
-    let translations = load_translations(translations_json)?;
+pub fn merge(
+    translations_json: &Path,
+    output_root: &Path,
+    ignore_boolean: bool,
+) -> Result<(), String> {
+    let translations = load_translations(translations_json, ignore_boolean)?;
     let common_dir_name = common_dir_name(&translations)?;
 
     if output_root.exists() && !output_root.is_dir() {
@@ -102,7 +106,11 @@ pub fn merge(translations_json: &Path, output_root: &Path) -> Result<(), String>
     let toolchain = shared_toolchain_file(&translations)?;
 
     write_shared_file(&output_dir, &cargo_toml)?;
-    add_features_to_cargo_toml(&output_dir.join("Cargo.toml"), feature_union(&translations))?;
+    add_features_to_cargo_toml(
+        &output_dir.join("Cargo.toml"),
+        feature_union(&translations),
+        ignore_boolean.then_some(&translations[0].boolean_params),
+    )?;
     if let Some(file) = build_rs.as_ref() {
         write_shared_file(&output_dir, file)?;
     }
@@ -117,7 +125,10 @@ pub fn merge(translations_json: &Path, output_root: &Path) -> Result<(), String>
     Ok(())
 }
 
-fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, String> {
+fn load_translations(
+    translations_json: &Path,
+    ignore_boolean: bool,
+) -> Result<Vec<Translation>, String> {
     let content = fs::read_to_string(translations_json)
         .map_err(|e| format!("failed to read {translations_json:?}: {e}"))?;
     let raw: Vec<RawTranslation> = serde_json::from_str(&content)
@@ -129,9 +140,28 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
     }
 
     let base_dir = translations_json.parent().unwrap_or_else(|| Path::new("."));
+    let translations = prepare_translations(raw, base_dir, ignore_boolean)?;
+    for translation in &translations {
+        if !translation.dir.is_dir() {
+            return Err(format!("{:?} is not a directory", translation.dir));
+        }
+    }
+    Ok(translations)
+}
+
+fn prepare_translations(
+    raw: Vec<RawTranslation>,
+    base_dir: &Path,
+    ignore_boolean: bool,
+) -> Result<Vec<Translation>, String> {
     let expected_keys: BTreeSet<String> = raw[0].config.keys().cloned().collect();
     let varying_params = varying_params(&raw, &expected_keys)?;
     let boolean_params = boolean_params(&raw, &expected_keys);
+    if ignore_boolean && let Some(param) = boolean_params.intersection(&varying_params).next() {
+        return Err(format!(
+            "--ignore-boolean requires a fixed value for {param:?}"
+        ));
+    }
     let mut feature_map = BTreeMap::<String, (String, String)>::new();
     let mut seen_configs = BTreeSet::<BTreeMap<String, String>>::new();
     let mut translations = Vec::with_capacity(raw.len());
@@ -146,18 +176,19 @@ fn load_translations(translations_json: &Path) -> Result<Vec<Translation>, Strin
         }
 
         let dir = resolve_dir(base_dir, &entry.dir);
-        if !dir.is_dir() {
-            return Err(format!("{dir:?} is not a directory"));
-        }
 
         let mut config = BTreeMap::new();
         let mut features = Vec::with_capacity(varying_params.len());
         for (param, value) in entry.config {
             let raw_value = config_value_to_string(&param, &value)?;
-            if varying_params.contains(&param)
-                && let Some(feature) =
-                    feature_name_for_config_value(&param, &raw_value, &boolean_params)
-            {
+            let feature = if ignore_boolean && boolean_params.contains(&param) {
+                Some(param.clone())
+            } else if varying_params.contains(&param) {
+                feature_name_for_config_value(&param, &raw_value, &boolean_params)
+            } else {
+                None
+            };
+            if let Some(feature) = feature {
                 if let Some((existing_param, existing_value)) = feature_map.get(&feature) {
                     if existing_param != &param || existing_value != &raw_value {
                         return Err(format!(
@@ -371,7 +402,11 @@ fn feature_union(translations: &[Translation]) -> Vec<String> {
     features.into_iter().collect()
 }
 
-fn add_features_to_cargo_toml(cargo_toml: &Path, features: Vec<String>) -> Result<(), String> {
+fn add_features_to_cargo_toml(
+    cargo_toml: &Path,
+    features: Vec<String>,
+    ignored_booleans: Option<&BTreeSet<String>>,
+) -> Result<(), String> {
     let content = fs::read_to_string(cargo_toml)
         .map_err(|e| format!("failed to read {cargo_toml:?}: {e}"))?;
     let mut doc = content
@@ -387,7 +422,15 @@ fn add_features_to_cargo_toml(cargo_toml: &Path, features: Vec<String>) -> Resul
         .ok_or_else(|| format!("{cargo_toml:?} has a non-table [features] entry"))?;
 
     for feature in features {
-        if !feature_table.contains_key(&feature) {
+        if let Some(existing) = feature_table.get(&feature) {
+            if ignored_booleans.is_some_and(|params| params.contains(&feature))
+                && !existing.as_array().is_some_and(Array::is_empty)
+            {
+                return Err(format!(
+                    "ignored boolean {feature:?} conflicts with an existing Cargo feature"
+                ));
+            }
+        } else {
             feature_table[&feature] = value(Array::default());
         }
     }
@@ -877,12 +920,12 @@ fn grouped_item_name(item: &rustc_ast::Item) -> Option<String> {
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet},
-        path::PathBuf,
+        path::{Path, PathBuf},
     };
 
     use super::{
         ItemBucket, OrderedItem, Translation, feature_name_for_config_value, feature_union,
-        merged_cfg_attribute, reorder_items,
+        merged_cfg_attribute, prepare_translations, reorder_items,
     };
 
     fn translation_with_features(
@@ -1116,6 +1159,41 @@ mod tests {
             merged_cfg_attribute("pub fn both() {}", &item_variants, &translations, &variants),
             Some("#[cfg(all(feature = \"ENABLE_EXTRA\", feature = \"WORD_SIZE_32\"))]".to_string())
         );
+    }
+
+    #[test]
+    fn ignored_fixed_booleans_are_declared_without_controlling_cfg() {
+        for flag in [true, false] {
+            let raw = serde_json::from_value(serde_json::json!([
+                {"dir": "case-32", "EXTRA": flag, "WIDTH": 32},
+                {"dir": "case-64", "EXTRA": flag, "WIDTH": 64}
+            ]))
+            .unwrap();
+            let translations = prepare_translations(raw, Path::new("."), true).unwrap();
+            assert_eq!(
+                feature_union(&translations),
+                ["EXTRA", "WIDTH_32", "WIDTH_64"]
+            );
+
+            let variants = [(0, PathBuf::from("case-32")), (1, PathBuf::from("case-64"))];
+            let item = "pub fn example() {}";
+            let item_variants = BTreeMap::from([(item.to_string(), BTreeSet::from([0]))]);
+            assert_eq!(
+                merged_cfg_attribute(item, &item_variants, &translations, &variants),
+                Some("#[cfg(feature = \"WIDTH_32\")]".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_boolean_rejects_varying_boolean_values() {
+        let raw = serde_json::from_value(serde_json::json!([
+            {"dir": "case-on", "EXTRA": true},
+            {"dir": "case-off", "EXTRA": false}
+        ]))
+        .unwrap();
+        let result = prepare_translations(raw, Path::new("."), true);
+        assert!(matches!(result, Err(error) if error.contains("fixed value for \"EXTRA\"")));
     }
 
     #[test]
